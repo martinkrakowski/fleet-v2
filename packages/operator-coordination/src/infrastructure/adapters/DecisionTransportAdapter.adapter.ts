@@ -70,6 +70,16 @@ const AWAITING: DecisionAnswer = {
 export class DecisionTransportAdapter implements DecisionTransportPort {
   constructor(private readonly options: DecisionTransportAdapterOptions = {}) {}
 
+  /**
+   * The directory decision answers are read from and written to, exposed for
+   * non-secret coordinate printouts (`<decisionsDir>/<requestId>.json`);
+   * `undefined` when no state directory is configured.
+   */
+  get decisionsDirectory(): string | undefined {
+    return this.options.decisionsDir;
+  }
+
+
   async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
     const { requestId } = query;
     // A request id that could carry path structure is refused before any

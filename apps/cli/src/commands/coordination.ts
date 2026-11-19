@@ -2,6 +2,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import {
   COORDINATION_KINDS,
@@ -12,6 +13,7 @@ import {
   isReleaseRootCoordinate,
   releaseGrantDigestPayload,
   shadowImportDigestPayload,
+  buildPreSignShadowImportPlan,
   buildSignableDecisionFields,
   parseSignDecisionInput,
 } from '@fleet/operator-coordination';
@@ -189,6 +191,9 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         grantId: optStr(p, 'grantId') ?? str(p, 'grant-id'),
       }),
     'sign-decision': async (p, rt) => {
+      if (p['preSign'] === true || p['preSign'] === 'true') {
+        return preSignShadowImportDecision(p, rt);
+      }
       const requestId = str(p, 'request');
       const answer = optStr(p, 'answer');
       const grantId = optStr(p, 'grantId');
@@ -393,4 +398,141 @@ async function releaseRequestDecision(
     releaseRoot: normalizedRoot,
     releaseNonce: nonce,
   });
+}
+
+/**
+ * KEY1c: the `sign-decision --pre-sign` entry for a standing
+ * `merge:import-shadow` grant. The owner pre-signs the grant's answer file
+ * from its coordinates BEFORE `request-decision` records the awaiting
+ * request, so arming does not need a manual answer-recording step. The
+ * request id and the deterministic grant id are derived from the coordinates'
+ * digest exactly like `shadowImportRequestDecision` does; the answer is
+ * written through the same KEY1a writer (`signAndWriteDecisionAnswer`), so
+ * the key read, the pinned-key check, the atomic write and the self-verify
+ * are never re-implemented here.
+ *
+ * Refusals, in order: a non-shadow scope, a malformed flag or a missing
+ * `--key` is a usage error (exit 2) before any key is read or any file is
+ * written; an already-recorded request id refuses
+ * `shadow-request-already-recorded`; a missing `--state-dir` refuses
+ * `state-dir-required`; a missing `--yes` prints the non-secret coordinates
+ * and refuses without reading the key. All coordinates printed are
+ * non-secret handles.
+ */
+async function preSignShadowImportDecision(
+  p: Payload,
+  rt: FleetCliRuntime,
+): Promise<unknown> {
+  const actionScope = str(p, 'actionScope');
+  if (actionScope !== SHADOW_IMPORT_ACTION_SCOPE) {
+    throw new CliUsageError('sign-decision: --pre-sign only supports --action-scope merge:import-shadow');
+  }
+  const repositoryRaw = optStr(p, 'repository')?.trim() ?? '';
+  const segments = repositoryRaw.split('/');
+  if (
+    repositoryRaw === '' ||
+    segments.length !== 2 ||
+    !REPOSITORY_SEGMENT_PATTERN.test(segments[0]!) ||
+    !REPOSITORY_SEGMENT_PATTERN.test(segments[1]!)
+  ) {
+    throw new CliUsageError('sign-decision: --repository must be owner/repo for merge:import-shadow');
+  }
+  const projectId = optStr(p, 'projectId') ?? optStr(p, 'project');
+  if (projectId === undefined) {
+    throw new CliUsageError('sign-decision: --project (or --project-id) is required for --pre-sign');
+  }
+  const expiresAtIso = optStr(p, 'expiresAtIso') ?? optStr(p, 'expiresAt');
+  if (expiresAtIso === undefined) {
+    throw new CliUsageError('sign-decision: --expires-at (or --expires-at-iso) is required for --pre-sign');
+  }
+  const keyPath = optStr(p, 'key');
+  if (keyPath === undefined) {
+    throw new CliUsageError('sign-decision: --key is required for --pre-sign');
+  }
+  // `--now-iso` is ignored for --pre-sign: the plan's moment is always the
+  // trusted clock, never a caller-supplied one.
+  // `--decision-revision` is never forwarded for --pre-sign: the revision is
+  // the deterministic default `DEFAULT_PRE_SIGN_DECISION_REVISION` (`'1'`)
+  // the domain planner sets when the field is omitted — the same default
+  // `sign-decision` (KEY1a) falls back to (`decision-signing.ts`). Passing
+  // it would make the pre-signed answer bind a revision the deterministic
+  // coordinates never name, so it is a usage error.
+  if (optStr(p, 'decisionRevision') !== undefined) {
+    throw new CliUsageError('sign-decision: --decision-revision cannot be combined with --pre-sign');
+  }
+  // `--grant-id` is dropped for --pre-sign: the grant id is always derived
+  // deterministically from the coordinates' digest, so a caller-supplied one
+  // can only name a grant the plan does not sign — it is a usage error, not
+  // an ignored flag.
+  if (optStr(p, 'grantId') !== undefined || optStr(p, 'grant-id') !== undefined) {
+    throw new CliUsageError('sign-decision: --grant-id cannot be combined with --pre-sign');
+  }
+  const plan = buildPreSignShadowImportPlan({
+    actionScope,
+    repository: { owner: segments[0]!, repo: segments[1]! },
+    expiresAtIso,
+    nowIso: new Date().toISOString(),
+    projectId,
+  });
+  if (!plan.ok) {
+    // A malformed repository or expiry is a usage error (exit 2); every other
+    // domain refusal is a typed refusal (exit 1) — still before any key is
+    // read or any file is written.
+    if (
+      plan.code === 'shadow-import-grant-invalid-repository' ||
+      plan.code === 'shadow-import-grant-invalid-expiry' ||
+      plan.code === 'shadow-import-grant-not-object' ||
+      plan.code === 'shadow-import-grant-unexpected-key' ||
+      plan.code === 'shadow-import-grant-invalid-input'
+    ) {
+      throw new CliUsageError('sign-decision: invalid shadow import grant coordinates for --pre-sign');
+    }
+    return { outcome: 'refused', reason: plan.code };
+  }
+  const digestHex = sha256HexDigest(plan.value.digestPayload);
+  const requestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${digestHex}`;
+  const grantId = `shadow-import-grant-${digestHex.slice(0, 16)}`;
+  const decisionRevision = plan.value.decisionRevision;
+  const coordinates = {
+    requestId,
+    projectId: plan.value.projectId,
+    actionScope,
+    repository: { owner: plan.value.repository.owner, repo: plan.value.repository.repo },
+    expiresAtIso: plan.value.expiresAtIso,
+    grantId,
+    decisionRevision,
+  };
+  // An already-recorded request (awaiting or decided) refuses before any key
+  // is read or any file is written: an awaiting record never gains a grantId,
+  // and re-signing a live grant blocks it with `decision-signature-invalid`.
+  const existing = await rt.coordination.coordinationRequestRepository.findRequestById(requestId);
+  if (existing !== null) {
+    return { outcome: 'refused', reason: 'shadow-request-already-recorded', ...coordinates };
+  }
+  const decisionsDir = rt.coordination.decisionTransport.decisionsDirectory;
+  if (decisionsDir === undefined || decisionsDir.trim().length === 0) {
+    return { outcome: 'refused', reason: 'state-dir-required', ...coordinates };
+  }
+  const answerPath = join(decisionsDir, `${requestId}.json`);
+  const yes = p['yes'] === true || p['yes'] === 'true';
+  if (!yes) {
+    // Coordinates only: no key is read, no decision file is written.
+    return { outcome: 'refused', reason: 'yes-required', ...coordinates, answerPath };
+  }
+  const written = await rt.coordination.decisionTransport.signAndWriteDecisionAnswer({
+    fields: {
+      requestId,
+      projectId: plan.value.projectId,
+      actionScope,
+      expectedHeadSha: null,
+      decisionRevision,
+      grantId,
+      state: 'approved',
+    },
+    keyPath,
+  });
+  if (!written.ok) {
+    return { outcome: 'refused', reason: written.code };
+  }
+  return { outcome: 'signed', ...coordinates, answerPath };
 }

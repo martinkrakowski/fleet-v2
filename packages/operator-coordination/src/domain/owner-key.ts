@@ -57,6 +57,47 @@ const PATH_INPUT_KEYS: readonly string[] = ['targetPath', 'ancestorGitMarkers', 
 /** Canonical base64 of exactly `RAW_ED25519_PUBLIC_KEY_BYTES` raw bytes. */
 const CANONICAL_RAW_KEY = /^[A-Za-z0-9+/]{43}=$/;
 
+/** The standard base64 alphabet, in encoding order. */
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/**
+ * Whether `value` decodes, with the pure bit-level base64 decoder below, to
+ * exactly `RAW_ED25519_PUBLIC_KEY_BYTES` raw bytes and re-encodes to the
+ * same string. The domain stays pure: no `Buffer`, no `node:*` — the decode
+ * is plain arithmetic over the standard alphabet.
+ */
+function decodesToExactly32RawBytes(value: string): boolean {
+  let bits = 0;
+  let bitCount = 0;
+  let byteIndex = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === '=') {
+      if (index !== value.length - 1) {
+        return false;
+      }
+      break;
+    }
+    const digit = BASE64_ALPHABET.indexOf(char);
+    if (digit < 0) {
+      return false;
+    }
+    bits = (bits << 6) | digit;
+    bitCount += 6;
+    if (bitCount >= 8) {
+      if (byteIndex >= RAW_ED25519_PUBLIC_KEY_BYTES) {
+        return false;
+      }
+      bitCount -= 8;
+      bits &= (1 << bitCount) - 1;
+      byteIndex += 1;
+    }
+  }
+  // Exactly 32 bytes must be produced, and the leftover bits (the two low
+  // bits of the 43rd character) must be zero for the round trip to hold.
+  return byteIndex === RAW_ED25519_PUBLIC_KEY_BYTES && (bits & ((1 << bitCount) - 1)) === 0;
+}
+
 /**
  * Lexical path normalization with plain string operations (the domain stays
  * pure: no `node:path`). Splits on both separators, drops empty and `.`
@@ -103,44 +144,43 @@ function checkPathString(value: unknown): 'invalid-input' | 'path-too-long' | 'h
 }
 
 /**
- * The marker array read through own property descriptors only: a real array
- * (never an array-like object), with an own dense set of string entries, no
- * accessor, no extra own keys, and a length at or below
- * `MAX_PATH_SEGMENTS` — the length is refused before any traversal, so a
- * sparse array of length 2**32 - 1 costs O(1) to refuse.
+ * The declared `length` of a marker candidate, read from its own data
+ * descriptor only (a Proxy would otherwise run its `get` trap for `length`,
+ * and an accessor is never read), with the array/prototype/length shape
+ * checks. Refusal before any traversal keeps a sparse array of length
+ * `2**32 - 1` an O(1) rejection.
  */
-function readMarkerArray(value: unknown): { ok: true; markers: readonly string[] } | { ok: false; code: OwnerKeyPathErrorCode } {
-  let isArray: boolean;
+function readMarkerLength(value: object): { ok: true; length: number } | { ok: false; code: OwnerKeyPathErrorCode } {
   let prototype: unknown;
-  let ownKeys: PropertyKey[];
-  let length: unknown;
+  let lengthDescriptor: PropertyDescriptor | undefined;
   try {
-    isArray = Array.isArray(value);
-    if (!isArray) {
-      return { ok: false, code: 'invalid-input' };
-    }
-    prototype = Object.getPrototypeOf(value as object);
-    ownKeys = Reflect.ownKeys(value as object);
-    // `length` is read from its own data descriptor only: a Proxy would
-    // otherwise run its `get` trap for `length`, and an accessor is never
-    // read.
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(value as object, 'length');
-    if (lengthDescriptor === undefined) {
-      return { ok: false, code: 'hostile-input' };
-    }
-    if (lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined) {
-      return { ok: false, code: 'hostile-input' };
-    }
-    length = lengthDescriptor.value;
+    prototype = Object.getPrototypeOf(value);
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   } catch {
     return { ok: false, code: 'hostile-input' };
   }
   if (prototype !== Array.prototype && prototype !== null) {
     return { ok: false, code: 'invalid-input' };
   }
+  if (lengthDescriptor === undefined) {
+    return { ok: false, code: 'hostile-input' };
+  }
+  if (lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined) {
+    return { ok: false, code: 'hostile-input' };
+  }
+  const length = lengthDescriptor.value;
   if (typeof length !== 'number' || length > MAX_PATH_SEGMENTS) {
     return { ok: false, code: 'too-many-segments' };
   }
+  return { ok: true, length };
+}
+
+/**
+ * The marker entries `0 .. length - 1`, each read through its own data
+ * descriptor only: a hole (a sparse array) is refused, never traversed with
+ * `in`, and an accessor's value is never read.
+ */
+function readMarkerEntries(value: object, length: number): { ok: true; markers: readonly string[] } | { ok: false; code: OwnerKeyPathErrorCode } {
   const markers: string[] = [];
   for (let index = 0; index < length; index += 1) {
     let descriptor: PropertyDescriptor | undefined;
@@ -162,32 +202,69 @@ function readMarkerArray(value: unknown): { ok: true; markers: readonly string[]
     }
     markers.push(entry);
   }
-  for (const key of ownKeys) {
-    if (typeof key !== 'string') {
-      return { ok: false, code: 'invalid-input' };
-    }
-    const isIndex = /^\d+$/.test(key) && Number(key) < length;
-    if (!isIndex && key !== 'length') {
-      return { ok: false, code: 'hostile-input' };
-    }
-  }
   return { ok: true, markers };
 }
 
 /**
- * Validate the boundary input for one owner-key file write: an optional
- * `stateDir` exclusion and the ancestor git-marker list, against the
- * `targetPath`. Only own enumerable data properties are read (a getter
- * never runs); a non-plain object, a symbol key, a prototype-polluting own
- * key, a Proxy whose traps throw, a sparse or over-long marker array, or an
- * over-long or NUL-carrying path is refused. `targetPath` inside
- * `stateDir`, or any normalized ancestor marker that is a `.git` entry on
- * the target's path, is refused. Never throws; linear in the capped input.
+ * The own keys of a marker candidate: every key must be a string that is
+ * either a used index or exactly `length`; anything else (a symbol key, an
+ * extra property) is refused.
  */
-export function checkOwnerKeyPathSafety(raw: unknown): OwnerKeyPathSafetyResult {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return { ok: false, code: 'invalid-input' };
+function checkMarkerOwnKeys(ownKeys: PropertyKey[], length: number): OwnerKeyPathErrorCode | null {
+  for (const key of ownKeys) {
+    if (typeof key !== 'string') {
+      return 'invalid-input';
+    }
+    const isIndex = /^\d+$/.test(key) && Number(key) < length;
+    if (!isIndex && key !== 'length') {
+      return 'hostile-input';
+    }
   }
+  return null;
+}
+
+/**
+ * The marker array read through own property descriptors only: a real array
+ * (never an array-like object), with an own dense set of string entries, no
+ * accessor, no extra own keys, and a length at or below
+ * `MAX_PATH_SEGMENTS` — the length is refused before any traversal, so a
+ * sparse array of length 2**32 - 1 costs O(1) to refuse.
+ */
+function readMarkerArray(value: unknown): { ok: true; markers: readonly string[] } | { ok: false; code: OwnerKeyPathErrorCode } {
+  let isArray: boolean;
+  let ownKeys: PropertyKey[];
+  try {
+    isArray = Array.isArray(value);
+    if (!isArray) {
+      return { ok: false, code: 'invalid-input' };
+    }
+    ownKeys = Reflect.ownKeys(value as object);
+  } catch {
+    return { ok: false, code: 'hostile-input' };
+  }
+  const lengthRead = readMarkerLength(value as object);
+  if (!lengthRead.ok) {
+    return lengthRead;
+  }
+  const entriesRead = readMarkerEntries(value as object, lengthRead.length);
+  if (!entriesRead.ok) {
+    return entriesRead;
+  }
+  const ownKeyCode = checkMarkerOwnKeys(ownKeys, lengthRead.length);
+  if (ownKeyCode !== null) {
+    return { ok: false, code: ownKeyCode };
+  }
+  return { ok: true, markers: entriesRead.markers };
+}
+
+/**
+ * Read the boundary input's own enumerable data properties into a map,
+ * refusing everything that is not a plain record of known string/array
+ * keys: a non-plain object, a symbol key, a prototype-polluting own key, an
+ * unknown key, a non-enumerable property, or an accessor (a getter never
+ * runs).
+ */
+function readPathInputRecord(raw: object): { ok: true; values: Map<string, unknown> } | { ok: false; code: OwnerKeyPathErrorCode } {
   let prototype: unknown;
   let ownKeys: PropertyKey[];
   try {
@@ -225,48 +302,84 @@ export function checkOwnerKeyPathSafety(raw: unknown): OwnerKeyPathSafetyResult 
     }
     values.set(key, descriptor.value);
   }
-  for (const required of ['targetPath', 'ancestorGitMarkers'] as const) {
-    if (!values.has(required)) {
-      return { ok: false, code: 'invalid-input' };
-    }
-  }
-  const targetCheck = checkPathString(values.get('targetPath'));
-  if (targetCheck !== null) {
-    return { ok: false, code: targetCheck };
-  }
+  return { ok: true, values };
+}
+
+/**
+ * The git-marker verdict for one already-validated marker against the
+ * normalized target path: only a `.git` entry that is the target itself or
+ * an ancestor of it refuses.
+ */
+function markerRefusesTarget(normalizedTarget: string, marker: string): boolean {
+  const normalizedMarker = normalizePath(marker);
+  const segments = normalizedMarker.split('/').filter((segment) => segment !== '');
+  const isGitMarker = segments[segments.length - 1] === '.git';
+  return isGitMarker && (normalizedMarker === '' || liesInside(normalizedTarget, normalizedMarker));
+}
+
+/**
+ * The path verdicts once the record has been read and validated: the
+ * `stateDir` exclusion, the ancestor git markers, and a `.git` segment in
+ * the target path itself.
+ */
+function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPath: string } | { ok: false; code: OwnerKeyPathErrorCode } {
   const targetPath = values.get('targetPath') as string;
-  let stateDir: string | undefined;
-  if (values.has('stateDir')) {
-    const stateCheck = checkPathString(values.get('stateDir'));
-    if (stateCheck !== null) {
-      return { ok: false, code: stateCheck };
-    }
-    stateDir = values.get('stateDir') as string;
-  }
+  const normalizedTarget = normalizePath(targetPath);
   const markersRead = readMarkerArray(values.get('ancestorGitMarkers'));
   if (!markersRead.ok) {
-    return { ok: false, code: markersRead.code };
+    return markersRead;
   }
-  const normalizedTarget = normalizePath(targetPath);
-  if (stateDir !== undefined) {
-    const normalizedStateDir = normalizePath(stateDir);
+  if (values.has('stateDir')) {
+    const normalizedStateDir = normalizePath(values.get('stateDir') as string);
     if (normalizedStateDir === '' || liesInside(normalizedTarget, normalizedStateDir)) {
       return { ok: false, code: 'unsafe-path-state-dir' };
     }
   }
   for (const marker of markersRead.markers) {
-    const normalizedMarker = normalizePath(marker);
-    const segments = normalizedMarker.split('/').filter((segment) => segment !== '');
-    const isGitMarker = segments[segments.length - 1] === '.git';
-    if (isGitMarker && (normalizedMarker === '' || liesInside(normalizedTarget, normalizedMarker))) {
+    if (markerRefusesTarget(normalizedTarget, marker)) {
       return { ok: false, code: 'unsafe-path-git-repo' };
     }
   }
-  const targetSegments = normalizedTarget.split('/');
-  if (targetSegments.includes('.git')) {
+  if (normalizedTarget.split('/').includes('.git')) {
     return { ok: false, code: 'unsafe-path-git-repo' };
   }
   return { ok: true, targetPath };
+}
+
+/**
+ * Validate the boundary input for one owner-key file write: an optional
+ * `stateDir` exclusion and the ancestor git-marker list, against the
+ * `targetPath`. Only own enumerable data properties are read (a getter
+ * never runs); a non-plain object, a symbol key, a prototype-polluting own
+ * key, a Proxy whose traps throw, a sparse or over-long marker array, or an
+ * over-long or NUL-carrying path is refused. `targetPath` inside
+ * `stateDir`, or any normalized ancestor marker that is a `.git` entry on
+ * the target's path, is refused. Never throws; linear in the capped input.
+ */
+export function checkOwnerKeyPathSafety(raw: unknown): OwnerKeyPathSafetyResult {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, code: 'invalid-input' };
+  }
+  const recordRead = readPathInputRecord(raw);
+  if (!recordRead.ok) {
+    return recordRead;
+  }
+  for (const required of ['targetPath', 'ancestorGitMarkers'] as const) {
+    if (!recordRead.values.has(required)) {
+      return { ok: false, code: 'invalid-input' };
+    }
+  }
+  const targetCheck = checkPathString(recordRead.values.get('targetPath'));
+  if (targetCheck !== null) {
+    return { ok: false, code: targetCheck };
+  }
+  if (recordRead.values.has('stateDir')) {
+    const stateCheck = checkPathString(recordRead.values.get('stateDir'));
+    if (stateCheck !== null) {
+      return { ok: false, code: stateCheck };
+    }
+  }
+  return evaluatePathSafety(recordRead.values);
 }
 
 /**
@@ -287,11 +400,7 @@ export function formatOwnerInstallationEdit(rawPublicKeyBase64: unknown): OwnerI
   ) {
     return { ok: false, code: 'invalid-public-key' };
   }
-  const decoded = Buffer.from(rawPublicKeyBase64, 'base64');
-  if (
-    decoded.length !== RAW_ED25519_PUBLIC_KEY_BYTES ||
-    decoded.toString('base64') !== rawPublicKeyBase64
-  ) {
+  if (!decodesToExactly32RawBytes(rawPublicKeyBase64)) {
     return { ok: false, code: 'invalid-public-key' };
   }
   return {

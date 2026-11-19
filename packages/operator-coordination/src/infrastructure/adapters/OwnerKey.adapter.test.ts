@@ -28,6 +28,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
             }
           : handle.writeFile.bind(handle),
         stat: handle.stat.bind(handle),
+        readFile: handle.readFile.bind(handle),
         chmod: handle.chmod.bind(handle),
         close: failureFlags.close
           ? async () => {
@@ -245,6 +246,15 @@ describe('deriveOwnerPublicKeyFromFile', () => {
     if (!result.ok) {
       expect(result.code).toBe('unreadable-key');
     }
+  });
+
+  it('returns a typed result and never throws when handle.close() rejects', async () => {
+    const { keyPath, publicBase64 } = await makeKey('close-fail.pem');
+    failureFlags.close = true;
+    // The body produced a success before the close ran: that result stands,
+    // and the rejecting close never escapes as a thrown error.
+    const result = await deriveOwnerPublicKeyFromFile({ keyPath });
+    expect(result).toEqual({ ok: true, publicKey: publicBase64 });
   });
 
   it('refuses a non-Ed25519 private key', async () => {

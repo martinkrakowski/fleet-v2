@@ -321,6 +321,15 @@ export async function deriveOwnerPublicKeyFromFile(options: DeriveOwnerPublicKey
   } catch {
     return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file could not be read' };
   } finally {
-    await handle.close();
+    // A rejecting close must never escape this function: it is caught here,
+    // and the result the body already produced (a success or a typed
+    // refusal) stands; if the body produced no result, its own refusal
+    // above already is that typed refusal. Nothing ever throws out of the
+    // `finally`.
+    try {
+      await handle.close();
+    } catch {
+      // Swallowed on purpose: the body's result stands.
+    }
   }
 }

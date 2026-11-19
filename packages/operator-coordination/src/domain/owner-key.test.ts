@@ -297,6 +297,31 @@ describe('formatOwnerInstallationEdit hostile input', () => {
     });
   });
 
+  it('non-canonical trailing bits in the last data character', () => {
+    // The last data character carries two padding bits: a non-canonical
+    // encoding re-encodes to a different string, so it is refused purely
+    // (no Buffer, no node:* import in the domain).
+    const base = VALID_KEY.slice(0, 42);
+    const nonCanonical = `${base}/=`;
+    expect(formatOwnerInstallationEdit(nonCanonical)).toEqual({
+      ok: false,
+      code: 'invalid-public-key',
+    });
+  });
+
+  it('an invalid key returns a typed result and never throws', () => {
+    expect(() => formatOwnerInstallationEdit({ not: 'a string' })).not.toThrow();
+    expect(formatOwnerInstallationEdit({ not: 'a string' })).toEqual({
+      ok: false,
+      code: 'invalid-input',
+    });
+    expect(() => formatOwnerInstallationEdit('not base64 at all!!')).not.toThrow();
+    expect(formatOwnerInstallationEdit('not base64 at all!!')).toEqual({
+      ok: false,
+      code: 'invalid-public-key',
+    });
+  });
+
   it('accepts a canonical key and prints the exact installation edit', () => {
     const result = formatOwnerInstallationEdit(VALID_KEY);
     expect(result).toEqual({

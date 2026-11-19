@@ -110,6 +110,128 @@ function copyEnumerableDataKey(value: Record<string, unknown>, key: string | sym
   return true;
 }
 
+/** A dense array of own enumerable data elements, with its true length. */
+export interface BoundedDenseArray {
+  readonly array: readonly unknown[];
+  readonly length: number;
+}
+
+/**
+ * Cost policy (decided, BL06a): ECMAScript `[[OwnPropertyKeys]]` has no
+ * count-only primitive, so this helper applies an `O(1)` pre-gate on length
+ * and prototype (invalid `cap`, non-array, wrong prototype, and every
+ * forbidden `length` are refused before any key enumeration), then pays an
+ * accepted engine-level `O(K)` bound in the target's own-property count `K`
+ * for the single `Reflect.ownKeys` call needed to reject foreign named,
+ * symbol and non-enumerable keys, followed by an `O(cap)` bound for the
+ * per-index descriptor checks. There is no "linear in the capped input"
+ * claim: the `O(K)` engine bound is the accepted cost of owning-keys
+ * validation on every JavaScript engine.
+ *
+ * Returns the array's elements as a fresh dense copy when `value` is a
+ * genuine `Array` (prototype exactly `Array.prototype`) whose own keys are
+ * exactly the canonical dense indices `0..length-1` plus a plain data
+ * `length`, with `length` a non-negative safe integer `<= cap`; null
+ * otherwise. A missing, accessor, non-number, non-safe-integer, negative,
+ * `>= 2**32 - 1`, or `> cap` length is refused in `O(1)` before any key
+ * enumeration, so a revoked Proxy that throws there never reaches
+ * `Reflect.ownKeys`. Holes, accessors, non-enumerable indices, symbol keys,
+ * and extra named or non-canonical own keys (including `__proto__`,
+ * `constructor`, `prototype`, `"01"`) return null without ever invoking a
+ * getter or a Proxy `get` trap. Every failure, including a revoked Proxy
+ * throwing anywhere along the path, returns null and never throws.
+ */
+export function readBoundedDenseArray(value: unknown, cap: number): BoundedDenseArray | null {
+  if (!Number.isSafeInteger(cap) || cap < 0) {
+    return null;
+  }
+  let isArray: boolean;
+  let prototype: unknown;
+  let lengthDescriptor: PropertyDescriptor | undefined;
+  try {
+    isArray = Array.isArray(value);
+    prototype = isArray ? Object.getPrototypeOf(value) : undefined;
+    lengthDescriptor = isArray ? Object.getOwnPropertyDescriptor(value, 'length') : undefined;
+  } catch {
+    return null;
+  }
+  // O(1) gate: refuse everything a property descriptor can decide before any
+  // key enumeration runs.
+  if (
+    !isArray ||
+    prototype !== Array.prototype ||
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number'
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length >= 2 ** 32 - 1 ||
+    length > cap
+  ) {
+    return null;
+  }
+  let ownKeys: PropertyKey[];
+  try {
+    // Accepted O(K) engine bound: `[[OwnPropertyKeys]]` materializes all K
+    // own keys; no count-only primitive exists on any engine.
+    ownKeys = Reflect.ownKeys(value as object);
+  } catch {
+    return null;
+  }
+  if (ownKeys.length !== length + 1) {
+    return null;
+  }
+  for (const key of ownKeys) {
+    if (typeof key === 'symbol') {
+      return null;
+    }
+    if (key === 'length') {
+      continue;
+    }
+    const index = Number(key);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== key) {
+      return null;
+    }
+  }
+  const out: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    // O(cap) traversal bound: one descriptor check per canonical index.
+    const descriptor = Object.getOwnPropertyDescriptor(value as object, index);
+    if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    out.push(readOwnDataElement(value as readonly unknown[], index));
+  }
+  return { array: out, length };
+}
+
+/**
+ * Read `array[index]` through its own property descriptor only (no getter
+ * ever runs), returning the element value; null-contract note: the caller
+ * validates the descriptor, so this returns the descriptor's value when the
+ * index is an enumerable own data property and `undefined` otherwise (the
+ * hole/accessor/non-enumerable rejection happens in the caller's descriptor
+ * check). O(1) per call; never throws.
+ */
+export function readOwnDataElement(array: readonly unknown[], index: number): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(array, index);
+  } catch {
+    return undefined;
+  }
+  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || descriptor.enumerable !== true) {
+    return undefined;
+  }
+  return descriptor.value;
+}
+
 /**
  * True when the date and time fields of an ISO-8601 string name a real calendar instant.
  * Date.parse rolls an impossible date such as 02-31 over into the next month instead of

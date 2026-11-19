@@ -188,6 +188,12 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
  * (or `lstat`/`unlink` fails), NOTHING is unlinked and `unlinked: false` is
  * returned so the caller's refusal can report the leftover path. Every
  * failure is swallowed here: the refusal that triggered the cleanup stands.
+ *
+ * Note: `lstat` followed by `unlink` is not atomic. A process running as the
+ * same uid could swap the file between the two calls. Node has no
+ * fd-relative unlink, so this documented residual is the best a same-uid
+ * cleanup can do; the dev/ino check only narrows the window, it cannot
+ * close it.
  */
 async function removeCreatedFile(handle: FileHandle, writePath: string): Promise<{ unlinked: boolean }> {
   try {
@@ -296,35 +302,28 @@ function createKeypairMaterial(): Promise<{ ok: true; publicKey: string; install
 }
 
 /**
- * Exclusively create `writePath` (`wx`, `0600`), write the private PEM into
- * it, enforce the mode on the open handle (chmod on the handle, never on the
- * path), and then — while the handle is still open — verify that the file
- * just written still has the same dev/ino at the `realpath` of `writePath`
- * and that the resolved path is still outside the state directory and any
- * git repository or worktree (closing the parent-swap race: `writePath` is
- * built from the resolved parent, and the identity check catches a swap
- * between the location checks and the open). If the write, the permission
- * enforcement, or the identity check fails, the created file is removed
- * best effort so a retry does not hit `already-exists`; a rejecting
- * `close()` is a typed refusal, never a thrown error. Returns `ok` or a
- * typed refusal.
+ * Refuse `writePath` when it already exists (`lstat` succeeds for a file,
+ * directory or symlink), leaving it untouched; return `null` when it is
+ * absent and the exclusive create below may proceed.
  */
-async function writePrivateKeyAtomically(
-  writePath: string,
-  privatePem: string,
-  stateDir: string | undefined,
-): Promise<{ ok: true } | GenerateRefusal> {
+async function refuseIfPathExists(writePath: string): Promise<GenerateRefusal | null> {
   try {
     await lstat(writePath);
-    // The target already exists (file, directory or symlink): refuse and
-    // leave it untouched.
     return { ok: false, code: 'already-exists', message: 'owner-key: the output path already exists' };
   } catch {
     // Absent: proceed to the exclusive create below.
+    return null;
   }
-  let handle: FileHandle;
+}
+
+/**
+ * Exclusively create `writePath` (`wx`, `0600`). An `EEXIST` on the create is
+ * the same refusal as the pre-check (the file appeared in between); any other
+ * failure is a typed write refusal.
+ */
+async function openExclusive(writePath: string): Promise<{ ok: true; handle: FileHandle } | GenerateRefusal> {
   try {
-    handle = await open(writePath, 'wx', 0o600);
+    return { ok: true, handle: await open(writePath, 'wx', 0o600) };
   } catch (error) {
     if (
       typeof error === 'object' &&
@@ -335,87 +334,137 @@ async function writePrivateKeyAtomically(
     }
     return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be created' };
   }
-  let writeFailed = false;
+}
+
+/**
+ * Write the private PEM into the open handle and enforce the mode on that
+ * same handle (chmod on the handle, never on the path — no rename race).
+ * Returns whether the write and mode enforcement succeeded.
+ */
+async function writeAndEnforceMode(handle: FileHandle, privatePem: string): Promise<boolean> {
   try {
     await handle.writeFile(privatePem, 'utf8');
     const stat = await handle.stat();
     if ((stat.mode & 0o777) !== 0o600) {
-      // Enforce the mode on the open handle, never by path (no rename race).
       await handle.chmod(0o600);
     }
+    return true;
   } catch {
-    writeFailed = true;
+    return false;
   }
-  if (!writeFailed) {
-    // Close the parent-swap race: while the handle is still open, verify
-    // that the file just written is still the same inode at the resolved
-    // path, and that the resolved path is still a safe location. A fake
-    // seam may stand in for the real check in tests. The seam itself can
-    // also fail: the failure is a typed refusal, never a thrown error.
-    let identity: { ok: true } | GenerateRefusal;
-    try {
-      identity = ownerKeyIdentitySeam.verify !== undefined
-        ? await ownerKeyIdentitySeam.verify(handle, writePath)
-        : await verifyWrittenIdentity(handle, writePath, stateDir);
-    } catch {
-      identity = {
-        ok: false,
-        code: 'identity-changed',
-        message: 'owner-key: the post-write verification of the written file failed',
-      };
-    }
-    if (!identity.ok) {
-      // Nothing this run created may be left behind: after the write, ANY
-      // refusal (`identity-changed`, `unsafe-path-state-dir`,
-      // `unsafe-path-git-repo`, or any other) removes the newly created
-      // file through the ONE guarded cleanup: the file at `writePath` is
-      // unlinked only when its dev/ino still match the open handle's
-      // `fstat`, so the cleanup can never delete a file some other writer
-      // put there; when the handle cannot be fstated the file stays and the
-      // refusal reports the leftover path.
-      const cleanup = await removeCreatedFile(handle, writePath);
-      try {
-        await handle.close();
-      } catch {
-        // The refusal below stands either way.
-      }
-      return { ...identity, message: identity.message + leftoverNote(writePath, cleanup) };
-    }
-  }
-  if (writeFailed) {
-    // The ONE guarded cleanup runs while the handle is still open: a
-    // half-written key file must not survive, so a retry gets a fresh
-    // exclusive create instead of `already-exists`; a file the guard cannot
-    // prove is this run's creation is left in place and reported.
-    const cleanup = await removeCreatedFile(handle, writePath);
-    try {
-      await handle.close();
-    } catch {
-      // The refusal below stands either way.
-    }
+}
+
+/**
+ * Close the parent-swap race: while the handle is still open, verify that the
+ * file just written still has the same dev/ino at the `realpath` of
+ * `writePath` and that the resolved path is still outside the state directory
+ * and any git repository or worktree (see `verifyWrittenIdentity`). A fake
+ * seam may stand in for the real check in tests. The seam itself can also
+ * fail: the failure is a typed refusal, never a thrown error.
+ */
+async function checkWrittenIdentity(
+  handle: FileHandle,
+  writePath: string,
+  stateDir: string | undefined,
+): Promise<{ ok: true } | GenerateRefusal> {
+  try {
+    return ownerKeyIdentitySeam.verify !== undefined
+      ? await ownerKeyIdentitySeam.verify(handle, writePath)
+      : await verifyWrittenIdentity(handle, writePath, stateDir);
+  } catch {
     return {
       ok: false,
-      code: 'write-failed',
-      message: 'owner-key: the output file could not be written with 0600 permissions' + leftoverNote(writePath, cleanup),
+      code: 'identity-changed',
+      message: 'owner-key: the post-write verification of the written file failed',
     };
   }
-  let closeFailed = false;
+}
+
+/**
+ * Run the ONE guarded cleanup while the handle is still open and close it,
+ * turning `refusal` into the caller's refusal. Nothing this run created may
+ * be left behind: after the write, ANY refusal (`identity-changed`,
+ * `unsafe-path-state-dir`, `unsafe-path-git-repo`, or any other) removes the
+ * newly created file through the ONE guarded cleanup: the file at
+ * `writePath` is unlinked only when its dev/ino still match the open
+ * handle's `fstat`, so the cleanup can never delete a file some other writer
+ * put there; when the handle cannot be fstated the file stays and the
+ * refusal reports the leftover path. A rejecting `close()` is swallowed: the
+ * refusal stands either way.
+ */
+async function refuseWithCleanup(handle: FileHandle, writePath: string, refusal: GenerateRefusal): Promise<GenerateRefusal> {
+  const cleanup = await removeCreatedFile(handle, writePath);
   try {
     await handle.close();
   } catch {
-    closeFailed = true;
+    // The refusal below stands either way.
   }
-  if (closeFailed) {
-    // The ONE guarded cleanup: the write "succeeded" but the handle could
-    // not be closed, so a refusal must not leave a newly created key file
-    // behind; if the failed handle cannot be fstated, the leftover path is
-    // reported instead of unlinking on a guess.
-    const cleanup = await removeCreatedFile(handle, writePath);
-    return {
+  return { ...refusal, message: refusal.message + leftoverNote(writePath, cleanup) };
+}
+
+/**
+ * Close the open handle and report a typed refusal when the close fails. The
+ * write "succeeded" but the handle could not be closed, so a refusal must not
+ * leave a newly created key file behind; the caller cleans up through the
+ * ONE guarded cleanup — if the failed handle cannot be fstated, the leftover
+ * path is reported instead of unlinking on a guess.
+ */
+async function closeHandle(handle: FileHandle): Promise<GenerateRefusal | null> {
+  try {
+    await handle.close();
+    return null;
+  } catch {
+    return { ok: false, code: 'write-failed', message: 'owner-key: the output file handle could not be closed' };
+  }
+}
+
+/**
+ * Write the private key atomically: refuse an existing target, exclusively
+ * create the file (`wx`, `0600`), write the private PEM into it, enforce the
+ * mode on the open handle (chmod on the handle, never on the path), and then
+ * — while the handle is still open — verify that the file just written still
+ * has the same dev/ino at the `realpath` of `writePath` and that the resolved
+ * path is still outside the state directory and any git repository or
+ * worktree (closing the parent-swap race: `writePath` is built from the
+ * resolved parent, and the identity check catches a swap between the
+ * location checks and the open). If the write, the permission enforcement,
+ * the identity check, or the close fails, the created file is removed best
+ * effort so a retry does not hit `already-exists`; every failure is a typed
+ * refusal, never a thrown error.
+ */
+async function writePrivateKeyAtomically(
+  writePath: string,
+  privatePem: string,
+  stateDir: string | undefined,
+): Promise<{ ok: true } | GenerateRefusal> {
+  const existing = await refuseIfPathExists(writePath);
+  if (existing !== null) {
+    return existing;
+  }
+  const opened = await openExclusive(writePath);
+  if (!opened.ok) {
+    return opened;
+  }
+  const handle = opened.handle;
+  if (await writeAndEnforceMode(handle, privatePem)) {
+    // Nothing this run created may be left behind on a post-write refusal.
+    const identity = await checkWrittenIdentity(handle, writePath, stateDir);
+    if (!identity.ok) {
+      return refuseWithCleanup(handle, writePath, identity);
+    }
+  } else {
+    // A half-written key file must not survive, so a retry gets a fresh
+    // exclusive create instead of `already-exists`.
+    return refuseWithCleanup(handle, writePath, {
       ok: false,
       code: 'write-failed',
-      message: 'owner-key: the output file handle could not be closed' + leftoverNote(writePath, cleanup),
-    };
+      message: 'owner-key: the output file could not be written with 0600 permissions',
+    });
+  }
+  const closeRefusal = await closeHandle(handle);
+  if (closeRefusal !== null) {
+    const cleanup = await removeCreatedFile(handle, writePath);
+    return { ...closeRefusal, message: closeRefusal.message + leftoverNote(writePath, cleanup) };
   }
   return { ok: true };
 }

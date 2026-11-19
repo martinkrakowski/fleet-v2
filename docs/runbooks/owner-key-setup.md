@@ -113,4 +113,8 @@ re-request and re-sign the affected decisions under the new key.
 
 Printing or archiving private key material, pinning a key from inside a git
 checkout, or treating a refused `owner-key` result as a partial success: every
-refusal exits 1 and changes nothing.
+refusal exits 1. A refusal raised before the key file was created changes
+nothing on disk. A refusal raised after the file was created removes it when
+its identity can be verified against the write (the dev/ino guard); when that
+cannot be proven, the refusal names the leftover path instead, which the owner
+should inspect and delete by hand.

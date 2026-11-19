@@ -5,6 +5,7 @@
  */
 
 import { sign } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -336,6 +337,31 @@ describe('deriveOwnerPublicKeyFromFile', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe('symlink-refused');
+    }
+  });
+
+  it('refuses a FIFO key path promptly (O_NONBLOCK, real fifo)', async () => {
+    const fifoPath = join(root, 'key-fifo');
+    try {
+      // `mkfifoSync` exists only on newer Node builds; fall back to the
+      // `mkfifo` utility, and skip when neither is available.
+      if (typeof mkfifoSync === 'function') {
+        mkfifoSync(fifoPath, 0o600);
+      } else {
+        execFileSync('mkfifo', [fifoPath]);
+      }
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (code === 'EPERM' || code === 'ENOSYS' || code === 'EINVAL' || code === 'ENOTSUP') {
+        // FIFOs are not supported on this platform or filesystem.
+        return;
+      }
+      throw error;
+    }
+    const result = await deriveOwnerPublicKeyFromFile({ keyPath: fifoPath });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('unreadable-key');
     }
   });
 

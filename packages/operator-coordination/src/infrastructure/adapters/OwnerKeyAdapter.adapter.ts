@@ -508,7 +508,9 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
  * Derive the raw 32-byte Ed25519 public key (canonical base64) from one
  * owner private key file. The file must be a regular file owned by the
  * current uid, mode `0600` or `0400`, at most `MAX_KEY_FILE_BYTES` bytes,
- * opened `O_NOFOLLOW` (a symlinked final component is refused), and its
+ * opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (a symlinked final component
+ * is refused, and a FIFO cannot block the open before `fstat` refuses the
+ * non-regular file), and its
  * PEM must parse as an Ed25519 private key. The private key never appears
  * in any return value, log, or error.
  */
@@ -519,7 +521,11 @@ export async function deriveOwnerPublicKeyFromFile(options: DeriveOwnerPublicKey
   }
   let handle: FileHandle;
   try {
-    handle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NONBLOCK matters alongside O_NOFOLLOW: without it, opening a FIFO
+    // blocks until a writer appears, so a FIFO key path could hang the
+    // caller before the fstat below refuses the non-regular file. With
+    // O_NONBLOCK the open returns immediately and the refusal is prompt.
+    handle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     if (
       typeof error === 'object' &&

@@ -7,6 +7,12 @@ import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
 import { coordinationCommands } from './commands/coordination.js';
 import { createFleetCliRuntime } from './composition.js';
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './__tests__/signed-decision-fixture.js';
 
 // CO24d: the CLI composition binds a grant to the attempt resolved for it.
 // Everything below runs through the real CLI composition's authorization
@@ -14,6 +20,9 @@ import { createFleetCliRuntime } from './composition.js';
 // subprocess is a spy.
 
 const HEAD = '3'.repeat(40);
+
+/** KEY0c1b: the ephemeral owner key every runtime in this file pins and signs against. */
+const ownerKey = ephemeralOwnerKey();
 
 function workOrder(id: string): WorkOrderRecord {
   return {
@@ -96,7 +105,14 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   });
 
   async function seed(runtime: ReturnType<typeof createFleetCliRuntime>, grantId: string): Promise<void> {
-    await runtime.coordination.coordinationRequestRepository.saveRequest(grant(grantId));
+    const record = grant(grantId);
+    await runtime.coordination.coordinationRequestRepository.saveRequest(record);
+    // KEY0c1b: the seeded approved owner grant carries its correctly signed
+    // answer under the pinned ephemeral key, read back through the runtime's
+    // own transport.
+    const fields = approvedAnswerFields(record);
+    writeSignedAnswer(tempDir, fields, ownerKey);
+    await expectApprovedAnswerReadableThrough(runtime.coordination.decisionTransport, fields);
     for (const suffix of ['A', 'B']) {
       await runtime.execution.workOrderRepository.saveWorkOrder(workOrder(`wo-${suffix}`));
       await runtime.execution.attemptRepository.saveAttempt(attempt(`att-${suffix}`, `wo-${suffix}`));
@@ -118,6 +134,7 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   it('refuses a forge action for attempt B on a grant resolved for attempt A: forge never called, grant unconsumed', async () => {
     const runtime = createFleetCliRuntime({
       stateDir: tempDir,
+      ownerPublicKey: ownerKey.ownerPublicKey,
       forgeActionDelegate: { runGh, verifyCurrentHeadSha: async () => ({ outcome: 'verified' }) as never },
     });
     await seed(runtime, 'grant-1');
@@ -140,7 +157,7 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   });
 
   it('refuses a mismatching attempt at the authorization seam and consumes the matching one', async () => {
-    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
     await seed(runtime, 'grant-1');
     await resolveForA(runtime);
     const port = runtime.execution.actionAuthorization;
@@ -169,7 +186,7 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   });
 
   it('does not fall back to another collected attempt at the same head when the grant has no resolved attempt', async () => {
-    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
     await seed(runtime, 'grant-1');
     // No resolve ran: no coordinates exist for the grant, yet attempts A and B sit at the head.
     const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
@@ -184,7 +201,7 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   });
 
   it('uses the resolved attempt when the request names none', async () => {
-    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
     await seed(runtime, 'grant-1');
     await resolveForA(runtime);
     const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
@@ -197,7 +214,7 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
   });
 
   it('CO24g: an unbound owner grant resolved without an attempt refuses; with the attempt it binds', async () => {
-    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
     await seed(runtime, 'grant-1');
 
     // The resolve omits the attempt: the real CLI composition's coordination
@@ -254,6 +271,7 @@ describe('CLI composition: grant record names its attempt (CO24e)', () => {
   function runtimeOf() {
     return createFleetCliRuntime({
       stateDir: tempDir,
+      ownerPublicKey: ownerKey.ownerPublicKey,
       forgeActionDelegate: { runGh, verifyCurrentHeadSha: async () => ({ outcome: 'verified' }) as never },
     });
   }
@@ -280,11 +298,15 @@ describe('CLI composition: grant record names its attempt (CO24e)', () => {
   it('refuses attempt B on an owner grant recorded for attempt A, with no resolve in this process: forge never called', async () => {
     const runtime = runtimeOf();
     await seedAttempts(runtime);
-    await runtime.coordination.coordinationRequestRepository.saveRequest({
+    const grantARecord: CoordinationRequestRecord = {
       ...grant('grant-1'),
       grantRecordVersion: 2,
       grantAttemptId: 'att-A',
-    });
+    };
+    await runtime.coordination.coordinationRequestRepository.saveRequest(grantARecord);
+    // KEY0c1b: the seeded approved owner grant carries its correctly signed
+    // answer under the pinned ephemeral key.
+    writeSignedAnswer(tempDir, approvedAnswerFields(grantARecord), ownerKey);
 
     const result = await runtime.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction(
       forgeFor('B', 'grant-1'),
@@ -316,10 +338,10 @@ describe('CLI composition: grant record names its attempt (CO24e)', () => {
   it('refuses a version-2 grant that records no attempt, whoever asks', async () => {
     const runtime = runtimeOf();
     await seedAttempts(runtime);
-    await runtime.coordination.coordinationRequestRepository.saveRequest({
-      ...grant('grant-1'),
-      grantRecordVersion: 2,
-    });
+    const unrecorded: CoordinationRequestRecord = { ...grant('grant-1'), grantRecordVersion: 2 };
+    await runtime.coordination.coordinationRequestRepository.saveRequest(unrecorded);
+    // KEY0c1b: signed answer under the pinned ephemeral key.
+    writeSignedAnswer(tempDir, approvedAnswerFields(unrecorded), ownerKey);
     const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
       authorizationGrantId: 'grant-1',
       actionId: 'action-a',
@@ -336,7 +358,10 @@ describe('CLI composition: grant record names its attempt (CO24e)', () => {
   it('residual path: a coordinate-less legacy grant is consumed by attempt B at the exact head (CO24d rule, kept for old grants)', async () => {
     const runtime = runtimeOf();
     await seedAttempts(runtime);
-    await runtime.coordination.coordinationRequestRepository.saveRequest(grant('grant-1'));
+    const residual = grant('grant-1');
+    await runtime.coordination.coordinationRequestRepository.saveRequest(residual);
+    // KEY0c1b: signed answer under the pinned ephemeral key.
+    writeSignedAnswer(tempDir, approvedAnswerFields(residual), ownerKey);
     // No resolve ran and the record names no attempt: scope and exact head are all that bind it.
     const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
       authorizationGrantId: 'grant-1',
@@ -351,7 +376,10 @@ describe('CLI composition: grant record names its attempt (CO24e)', () => {
   it('closes the residual: the same grant, once resolved for A (new version), refuses B even in a fresh process without the coordinates file', async () => {
     const first = runtimeOf();
     await seedAttempts(first);
-    await first.coordination.coordinationRequestRepository.saveRequest(grant('grant-1'));
+    const closable = grant('grant-1');
+    await first.coordination.coordinationRequestRepository.saveRequest(closable);
+    // KEY0c1b: signed answer under the pinned ephemeral key.
+    writeSignedAnswer(tempDir, approvedAnswerFields(closable), ownerKey);
     expect(
       await first.execution.actionAuthorization.resolveActionAuthorization({
         actionId: 'action-resolve',

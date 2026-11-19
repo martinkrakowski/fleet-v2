@@ -31,6 +31,7 @@ import { RequestScopedDecisionUseCase } from '../../../../../operator-coordinati
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import type { CoordinationRequestRecord } from '../../../../../operator-coordination/src/domain/coordination-records.js';
 import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+import { createSignedDecisionFixture, type SignedDecisionFixture } from '../../../application/use-cases/__tests__/signed-decision-fixture.js';
 
 // RR1: a release grant's request id carries the digest of its coordinates
 // ({ scope, projectId, expectedHeadSha, releaseRoot, nonce }), so a recorded grant
@@ -115,6 +116,7 @@ interface Harness {
   readonly lease: ConductorDriverLeaseAdapter;
   readonly store: ReleaseStoreAdapter;
   readonly grants: CoordinationRequestRepositoryAdapter;
+  readonly signer: SignedDecisionFixture;
   readonly root: string;
   readonly stateDir: string;
 }
@@ -123,6 +125,9 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
   const stateDir = await tempDir('co14b-state-');
   const root = await tempDir('co14b-root-');
   const grants = new CoordinationRequestRepositoryAdapter({ stateDir });
+  // KEY0c1a: the release owner grants are paired with Ed25519-signed answers
+  // recorded under an ephemeral test signer's key, next to the state dir.
+  const signer = createSignedDecisionFixture({ decisionsDir: join(stateDir, 'decisions') });
   // The real grant path: the same adapter-over-coordination-use-cases wiring the CLI uses.
   const authorization = new ActionAuthorizationAdapter({
     resolveGrant: async (request) => {
@@ -130,7 +135,11 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
       if (actionScope === null) {
         return { outcome: 'blocked', reason: 'not a release action' };
       }
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope,
         expectedHeadSha: request.expectedHeadSha,
@@ -151,7 +160,11 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
       if (actionScope === null || request.expectedHeadSha === undefined) {
         return { outcome: 'refused', reason: 'not a release grant consumption' };
       }
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).recordAuthorizationConsumption({
         consumptionId: consumptionId(request.actionId),
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
@@ -178,7 +191,7 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
     // root to it too, now that it runs only after authorization grants.
     stateDir,
   });
-  return { useCase, authorization, executor, lease: new ConductorDriverLeaseAdapter({ stateDir }), store: new ReleaseStoreAdapter(), grants, root, stateDir };
+  return { useCase, authorization, executor, lease: new ConductorDriverLeaseAdapter({ stateDir }), store: new ReleaseStoreAdapter(), grants, signer, root, stateDir };
 }
 
 const shaOf = (c: string) => c.repeat(40);
@@ -192,8 +205,16 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     h = await harness();
   });
 
+  /** KEY0c1a: seeds the grant and its signed answer under the ephemeral test signer. */
+  const seedGrant = async (record: CoordinationRequestRecord): Promise<void> => {
+    await h.grants.saveRequest(record);
+    await h.signer.writeApprovedAnswer(record);
+  };
+
   it('install stages the build and leaves current unmoved; swap repoints current atomically', async () => {
-    await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    // KEY0c1a self-check: the seeded answer verifies back as `approved`.
+    await h.signer.assertApprovedAnswerReadsBackApproved(releaseGrant('grant-a', 'release:install', shaA, h.root));
     const installA = await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -210,7 +231,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     // The grant was consumed exactly once.
     expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
 
-    await h.grants.saveRequest(releaseGrant('grant-b', 'release:install', shaB, h.root));
+    await seedGrant(releaseGrant('grant-b', 'release:install', shaB, h.root));
     const installB = await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -229,7 +250,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       expect(afterInstall.builds.map((build) => build.sha).sort()).toEqual([shaA, shaB].sort());
     }
 
-    await h.grants.saveRequest(releaseGrant('grant-swap', 'release:swap', shaA, h.root));
+    await seedGrant(releaseGrant('grant-swap', 'release:swap', shaA, h.root));
     const swap = await h.useCase.manageRelease({
       action: 'swap',
       root: h.root,
@@ -252,7 +273,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   });
 
   it('a second release for another target and an identical second release are both refused by the consumed grant', async () => {
-    await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
     const first = await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -303,15 +324,18 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
 
   async function installBuilds(...shas: string[]): Promise<void> {
     for (const sha of shas) {
-      await h.grants.saveRequest(releaseGrant(`grant-install-${sha[0]}`, 'release:install', sha, h.root));
+      const grant = releaseGrant(`grant-install-${sha[0]}`, 'release:install', sha, h.root);
+      await seedGrant(grant);
+      // KEY0c1a self-check: the seeded answer reads back as `approved`.
+      await h.signer.assertApprovedAnswerReadsBackApproved(grant);
       expect((await apply('install', sha)).outcome).toBe('applied');
     }
   }
 
   it('swap A, swap B, swap A again with no new grant: the third is refused and current stays on B', async () => {
     await installBuilds(shaA, shaB);
-    await h.grants.saveRequest(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
-    await h.grants.saveRequest(releaseGrant('grant-swap-b', 'release:swap', shaB, h.root));
+    await seedGrant(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
+    await seedGrant(releaseGrant('grant-swap-b', 'release:swap', shaB, h.root));
     expect((await apply('swap', shaA)).outcome).toBe('applied');
     expect((await apply('swap', shaB)).outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaB);
@@ -323,8 +347,8 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   it('a rollback replay with no new grant is refused', async () => {
     const shaC = shaOf('c');
     await installBuilds(shaA, shaB, shaC);
-    await h.grants.saveRequest(releaseGrant('grant-swap-c', 'release:swap', shaC, h.root));
-    await h.grants.saveRequest(releaseGrant('grant-rollback-b', 'release:rollback', shaB, h.root));
+    await seedGrant(releaseGrant('grant-swap-c', 'release:swap', shaC, h.root));
+    await seedGrant(releaseGrant('grant-rollback-b', 'release:rollback', shaB, h.root));
     expect((await apply('swap', shaC)).outcome).toBe('applied');
     expect((await apply('rollback', null)).outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaB);
@@ -332,15 +356,20 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     // carries a new per-request nonce, so it gets a new id and is issued
     // through `request-decision` instead of overwriting the spent record.
     const nonce2 = 'fedcba9876543210fedcba9876543210';
+    // KEY0c1a: the fresh swap grant's answer is a signed one under the
+    // ephemeral test signer, derived from the exact request it names.
+    const signedRequestId = releaseGrantId('release:swap', 'p', shaC, h.root, nonce2);
+    await h.signer.writeApprovedAnswer({
+      id: signedRequestId,
+      projectId: 'p',
+      actionScope: 'release:swap',
+      expectedHeadSha: shaC,
+      decisionRevision: 'dec-2',
+      grantId: 'grant-swap-c2',
+    });
     const issued = await new RequestScopedDecisionUseCase({
       requestRepo: h.grants,
-      decisionTransport: {
-        readDecisionAnswer: async () => ({
-          state: 'approved',
-          decisionRevision: 'dec-2',
-          grantId: 'grant-swap-c2',
-        }),
-      },
+      decisionTransport: h.signer.deps.decisionTransport,
       computeDigest: digest,
     }).requestScopedDecision({
       requestId: releaseGrantId('release:swap', 'p', shaC, h.root, nonce2),
@@ -354,6 +383,15 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       releaseNonce: nonce2,
     });
     expect(issued.outcome).toBe('requested');
+    // KEY0c1a self-check: the new request's answer verifies back as `approved`.
+    await h.signer.assertApprovedAnswerReadsBackApproved({
+      id: signedRequestId,
+      projectId: 'p',
+      actionScope: 'release:swap',
+      expectedHeadSha: shaC,
+      decisionRevision: 'dec-2',
+      grantId: 'grant-swap-c2',
+    });
     expect((await h.grants.findRequestByGrantId('grant-swap-c'))?.consumptions).toHaveLength(1);
     expect((await apply('swap', shaC)).outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaC);
@@ -370,7 +408,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   ])('a failing $label step', ({ step, ran }) => {
     it('refuses the install, stops the sequence there, leaves no build and moves nothing', async () => {
       h.executor.failStep = step;
-      await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+      await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
       const result = await apply('install', shaA);
       expect(result).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
       // The reviewed sequence ran in order and stopped at the failing step.
@@ -386,7 +424,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
 
   it('a build that succeeds but leaves no verifiable CLI entry is refused and installs nothing', async () => {
     h.executor.skipBuildOutput = true;
-    await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
     expect(await apply('install', shaA)).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
     expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
     // The grant is spent: a build that cannot be verified is never silently retried under it.
@@ -403,7 +441,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
 
   it('a genuine crash between consume and repoint resumes exactly once, then refuses', async () => {
     await installBuilds(shaA, shaB);
-    await h.grants.saveRequest(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
+    await seedGrant(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
     // First run: the repoint crashes after the grant was consumed.
     const crashingUseCase = new ManageReleaseUseCase({
       store: new (class extends ReleaseStoreAdapter {
@@ -435,7 +473,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   });
 
   it('two concurrent identical requests: exactly one proceeds', async () => {
-    await h.grants.saveRequest(releaseGrant('grant-install-a', 'release:install', shaA, h.root));
+    await seedGrant(releaseGrant('grant-install-a', 'release:install', shaA, h.root));
     const results = await Promise.all([apply('install', shaA), apply('install', shaA)]);
     expect(results.filter((r) => r.outcome === 'applied')).toHaveLength(1);
     expect(results.filter((r) => r.outcome === 'refused')).toHaveLength(1);
@@ -445,7 +483,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   it('the swap removes an orphaned repoint temp link under the lease and never a build or current', async () => {
     await installBuilds(shaA, shaB);
     await symlink(shaA, join(h.root, '.current.orphan.tmp'));
-    await h.grants.saveRequest(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
+    await seedGrant(releaseGrant('grant-swap-a', 'release:swap', shaA, h.root));
     expect((await apply('swap', shaA)).outcome).toBe('applied');
     const names = await readdir(h.root);
     expect(names).not.toContain('.current.orphan.tmp');
@@ -453,7 +491,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
   });
 
   it('a live driver lease in the root\'s state directory refuses the swap and current stays on the old build', async () => {
-    await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
     await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -464,7 +502,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       projectId: 'p',
     });
     // An old verified build is already current before the lease is held.
-    await h.grants.saveRequest(releaseGrant('grant-swap-old', 'release:swap', shaA, h.root));
+    await seedGrant(releaseGrant('grant-swap-old', 'release:swap', shaA, h.root));
     const firstSwap = await h.useCase.manageRelease({
       action: 'swap',
       root: h.root,
@@ -476,7 +514,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     });
     expect(firstSwap.outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaA);
-    await h.grants.saveRequest(releaseGrant('grant-b', 'release:install', shaB, h.root));
+    await seedGrant(releaseGrant('grant-b', 'release:install', shaB, h.root));
     await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -497,7 +535,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       nowIso: NOW,
     });
     expect(held.outcome).toBe('ok');
-    await h.grants.saveRequest(releaseGrant('grant-swap', 'release:swap', shaB, h.root));
+    await seedGrant(releaseGrant('grant-swap', 'release:swap', shaB, h.root));
     const refused = await h.useCase.manageRelease({
       action: 'swap',
       root: h.root,

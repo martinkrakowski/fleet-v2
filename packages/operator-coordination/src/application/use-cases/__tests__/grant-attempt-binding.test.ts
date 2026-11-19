@@ -5,7 +5,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,11 +15,13 @@ import { GRANT_RECORD_VERSION } from '../../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../../domain/entities/CoordinationRequest.js';
 import { CoordinationRequestRepositoryAdapter } from '../../../infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
+import { DecisionTransportAdapter } from '../../../infrastructure/adapters/DecisionTransportAdapter.adapter.js';
 import { IssuePolicyForgeGrantUseCase } from '../IssuePolicyForgeGrantUseCase.use-case.js';
 import { RecordAuthorizationConsumptionUseCase } from '../RecordAuthorizationConsumptionUseCase.use-case.js';
 import { RequestScopedDecisionUseCase } from '../RequestScopedDecisionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
 import type { AttemptFactsRecord } from '../../ports/out/AttemptFactsReadPort.out-port.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 
 const HEAD = 'c'.repeat(40);
 const SCOPE = 'forge:push-and-open-pr';
@@ -74,19 +76,23 @@ function consume(grantId: string, attemptId: string, actionId = 'action-1') {
 describe('grant attempt binding (CO24e)', () => {
   let dir: string;
   let repo: CoordinationRequestRepositoryAdapter;
+  let signer: ReturnType<typeof createSignedDecisionFixture>;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'co24e-oc-'));
     repo = new CoordinationRequestRepositoryAdapter({ stateDir: dir });
+    // KEY0c1a: the seeded owner grants are paired with Ed25519-signed answers
+    // recorded under an ephemeral test signer's key, next to the state dir.
+    signer = createSignedDecisionFixture({ decisionsDir: join(dir, 'decisions') });
   });
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  const consumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+  const consumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signer.deps });
   const resolver = (facts = attemptFacts({ attemptId: 'att-A', projectId: 'project-1', collectedHeadSha: HEAD }, { attemptId: 'att-B', projectId: 'project-1', collectedHeadSha: HEAD })) =>
-    new ResolveActionAuthorizationUseCase({ requestRepo: repo, attemptFactsRead: facts });
+    new ResolveActionAuthorizationUseCase({ requestRepo: repo, ...signer.deps, attemptFactsRead: facts });
 
   describe('the stored record', () => {
     it('round-trips a version-2 owner grant with its attempt through the file', async () => {
@@ -280,6 +286,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('binds an unbound owner grant to the attempt that resolves it, durably', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       expect((await resolver().resolveActionAuthorization(resolveFor('att-A'))).outcome).toBe('authorized');
       const stored = await new CoordinationRequestRepositoryAdapter({ stateDir: dir }).findRequestByGrantId('grant-owner');
       expect(stored?.grantAttemptId).toBe('att-A');
@@ -289,6 +297,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('blocks a later resolve for another attempt and leaves the binding unchanged', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       await resolver().resolveActionAuthorization(resolveFor('att-A'));
       expect(await resolver().resolveActionAuthorization(resolveFor('att-B'))).toEqual({
         outcome: 'blocked',
@@ -300,6 +310,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('refuses an unbound owner grant resolved without an attempt: no bind, no consume, grant survives (CO24g)', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       expect(await resolver().resolveActionAuthorization(resolveFor())).toEqual({
         outcome: 'blocked',
         reason: 'attempt-required',
@@ -377,6 +389,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('refuses an unknown attempt without binding, and the legitimate resolve then binds (CO24f)', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       expect(await resolver().resolveActionAuthorization(resolveFor('nope'))).toEqual({
         outcome: 'blocked',
         reason: 'grant-attempt-unknown',
@@ -414,7 +428,10 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('binds nothing when the attempt-facts port is not configured (CO24f fail-closed)', async () => {
       await repo.saveRequest(ownerGrant());
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization(
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repo,
+        ...signer.deps,
+      }).resolveActionAuthorization(
         resolveFor('att-A'),
       );
       expect(result.outcome).toBe('blocked');
@@ -423,6 +440,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('binds exactly one of two concurrent first resolves; the other sees the grant moved (CO24f)', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       // Two resolves racing to bind different attempts: both read the same
       // unbound revision, so exactly one write lands and the other loses the
       // same-revision race and is refused as moved-while-binding.
@@ -483,11 +502,13 @@ describe('grant attempt binding (CO24e)', () => {
       ...(attemptId !== undefined ? { attemptId } : {}),
     });
     const releaseResolver = (facts = attemptFacts({ attemptId: 'att-A', projectId: 'project-1', collectedHeadSha: HEAD }, { attemptId: 'att-B', projectId: 'project-1', collectedHeadSha: HEAD })) =>
-      new ResolveActionAuthorizationUseCase({ requestRepo: repo, attemptFactsRead: facts, computeDigest: digest });
-    const releaseConsumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, computeDigest: digest });
+      new ResolveActionAuthorizationUseCase({ requestRepo: repo, ...signer.deps, attemptFactsRead: facts, computeDigest: digest });
+    const releaseConsumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signer.deps, computeDigest: digest });
 
     it('resolves a fresh release owner grant without an attempt, binding and consuming nothing', async () => {
       await repo.saveRequest(releaseGrant());
+      await signer.writeApprovedAnswer(releaseGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(releaseGrant());
       expect(await releaseResolver().resolveActionAuthorization(resolveRelease())).toEqual({
         outcome: 'authorized',
         grantId: 'grant-owner',
@@ -504,6 +525,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('resolves the same grant with its deterministic action id and still never binds', async () => {
       await repo.saveRequest(releaseGrant());
+      await signer.writeApprovedAnswer(releaseGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(releaseGrant());
       expect((await releaseResolver().resolveActionAuthorization(resolveRelease(ACTION_ID))).outcome).toBe('authorized');
       const stored = await repo.findRequestByGrantId('grant-owner');
       expect(stored?.grantAttemptId).toBeUndefined();
@@ -596,7 +619,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('authorizes a release:swap grant bound to attempt A when resolved with attempt A', async () => {
-      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
@@ -614,7 +640,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('resolves an unbound release:swap grant without an attempt', async () => {
-      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap' }));
+      const unboundGrant = releaseGrant({ actionScope: 'release:swap' });
+      await repo.saveRequest(unboundGrant);
+      await signer.writeApprovedAnswer(unboundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(unboundGrant);
       expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
@@ -627,6 +656,81 @@ describe('grant attempt binding (CO24e)', () => {
         expectedHeadSha: HEAD,
         policyRevision: 'pol-1',
         releaseRoot: RELEASE_ROOT,
+      });
+    });
+  });
+
+  describe('signed decision fixtures fail closed (KEY0c1a)', () => {
+    const resolveAwaiting = async () => {
+      await mkdir(join(dir, 'decisions'), { recursive: true });
+      const awaiting: CoordinationRequestRecord = {
+        ...ownerGrant(),
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantId: null,
+      };
+      await repo.saveRequest(awaiting);
+      const decisionTransport = new DecisionTransportAdapter({
+        ownerPublicKey: signer.ownerPublicKey,
+        decisionsDir: join(dir, 'decisions'),
+      });
+      return { awaiting, decisionTransport };
+    };
+
+    it('refuses tampered signed decision fixtures', async () => {
+      const { awaiting, decisionTransport } = await resolveAwaiting();
+      // The answer is shaped like the fixture's but carries a signature no
+      // owner could have made over these exact fields.
+      await writeFile(
+        join(dir, 'decisions', `${awaiting.id}.json`),
+        JSON.stringify({
+          state: 'approved',
+          decisionRevision: 'dec-1',
+          grantId: 'grant-owner',
+          signature: Buffer.alloc(64).toString('base64'),
+        }),
+      );
+      expect(await decisionTransport.readDecisionAnswer({
+        requestId: awaiting.id,
+        projectId: awaiting.projectId,
+        actionScope: awaiting.actionScope,
+        expectedHeadSha: awaiting.expectedHeadSha,
+      })).toEqual({ state: 'awaiting-decision', decisionRevision: null, grantId: null });
+      await signer.writeApprovedAnswer(awaiting);
+      // A tampered fixture never authorizes the resolve either.
+      expect(await new ResolveActionAuthorizationUseCase({
+        requestRepo: repo,
+        ...signer.deps,
+      }).resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        attemptId: 'att-A',
+      })).toEqual({
+        outcome: 'blocked',
+        reason: 'recorded request req-owner is awaiting-decision, which does not authorize an action',
+      });
+    });
+
+    it('keeps awaiting-decision blocked when the answer file is absent', async () => {
+      const { awaiting, decisionTransport } = await resolveAwaiting();
+      expect(await decisionTransport.readDecisionAnswer({
+        requestId: awaiting.id,
+        projectId: awaiting.projectId,
+        actionScope: awaiting.actionScope,
+        expectedHeadSha: awaiting.expectedHeadSha,
+      })).toEqual({ state: 'awaiting-decision', decisionRevision: null, grantId: null });
+      expect(await new ResolveActionAuthorizationUseCase({
+        requestRepo: repo,
+        ...signer.deps,
+      }).resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        attemptId: 'att-A',
+      })).toEqual({
+        outcome: 'blocked',
+        reason: 'recorded request req-owner is awaiting-decision, which does not authorize an action',
       });
     });
   });

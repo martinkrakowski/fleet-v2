@@ -4,6 +4,7 @@ import type { CoordinationRequestRecord } from '../../../domain/coordination-rec
 import { CoordinationRequestRepositoryAdapter } from '../../../infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
 import type { ResolveActionAuthorizationRequest } from '../../ports/in/ResolveActionAuthorizationPort.in-port.js';
 import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 
 const NOW_OLDER = '2026-10-27T00:00:00.000Z';
 const NOW_NEWER = '2026-10-27T01:00:00.000Z';
@@ -58,8 +59,12 @@ async function saveAll(
 function resolve(
   repository: CoordinationRequestRepositoryAdapter,
   request: ResolveActionAuthorizationRequest,
+  signer = createSignedDecisionFixture(),
 ) {
-  return new ResolveActionAuthorizationUseCase({ requestRepo: repository }).resolveActionAuthorization(
+  return new ResolveActionAuthorizationUseCase({
+    requestRepo: repository,
+    ...signer.deps,
+  }).resolveActionAuthorization(
     request,
   );
 }
@@ -82,17 +87,18 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
 
   it('does not shadow an owner grant with a newer policy grant', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
+    const ownerB = requestRecord({
+      id: 'request-owner-b',
+      grantId: 'grant-owner-b',
+      expectedHeadSha: HEAD_B,
+      decisionRevision: 'decision-example-b',
+      grantRecordVersion: 2,
+      grantAttemptId: ATTEMPT,
+      createdAtIso: NOW_OLDER,
+      updatedAtIso: NOW_OLDER,
+    });
     await saveAll(repository, [
-      requestRecord({
-        id: 'request-owner-b',
-        grantId: 'grant-owner-b',
-        expectedHeadSha: HEAD_B,
-        decisionRevision: 'decision-example-b',
-        grantRecordVersion: 2,
-        grantAttemptId: ATTEMPT,
-        createdAtIso: NOW_OLDER,
-        updatedAtIso: NOW_OLDER,
-      }),
+      ownerB,
       policyGrantRecord({
         id: 'request-policy-a',
         grantId: 'grant-policy-a',
@@ -101,6 +107,11 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
         updatedAtIso: NOW_NEWER,
       }),
     ]);
+    // KEY0c1a: the seeded approved owner grant carries a signed answer under
+    // the ephemeral test signer, self-checked against the record's own ids.
+    const signerB = createSignedDecisionFixture();
+    await signerB.writeApprovedAnswer(ownerB);
+    await signerB.assertApprovedAnswerReadsBackApproved(ownerB);
 
     const atB = await resolve(repository, {
       projectId: 'project-example',
@@ -124,15 +135,16 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
 
   it('does not shadow an owner grant with a cancelled policy grant', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
+    const owner = requestRecord({
+      id: 'request-owner',
+      grantId: 'grant-owner',
+      grantRecordVersion: 2,
+      grantAttemptId: ATTEMPT,
+      createdAtIso: NOW_OLDER,
+      updatedAtIso: NOW_OLDER,
+    });
     await saveAll(repository, [
-      requestRecord({
-        id: 'request-owner',
-        grantId: 'grant-owner',
-        grantRecordVersion: 2,
-        grantAttemptId: ATTEMPT,
-        createdAtIso: NOW_OLDER,
-        updatedAtIso: NOW_OLDER,
-      }),
+      owner,
       policyGrantRecord({
         id: 'request-policy-cancelled',
         state: 'cancelled',
@@ -141,6 +153,11 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
         updatedAtIso: NOW_NEWER,
       }),
     ]);
+    // KEY0c1a: the seeded approved owner grant carries a signed answer under
+    // the ephemeral test signer, self-checked against the record's own ids.
+    const signerOwner = createSignedDecisionFixture();
+    await signerOwner.writeApprovedAnswer(owner);
+    await signerOwner.assertApprovedAnswerReadsBackApproved(owner);
 
     const result = await resolve(repository, {
       projectId: 'project-example',
@@ -223,24 +240,31 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
 
   it('keeps the newer owner grant preference at the same head', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
-    await saveAll(repository, [
-      requestRecord({
-        id: 'request-owner-old',
-        grantId: 'grant-owner-old',
-        grantRecordVersion: 2,
-        grantAttemptId: ATTEMPT,
-        createdAtIso: NOW_OLDER,
-        updatedAtIso: NOW_OLDER,
-      }),
-      requestRecord({
-        id: 'request-owner-new',
-        grantId: 'grant-owner-new',
-        grantRecordVersion: 2,
-        grantAttemptId: ATTEMPT,
-        createdAtIso: NOW_NEWER,
-        updatedAtIso: NOW_NEWER,
-      }),
-    ]);
+    const ownerOld = requestRecord({
+      id: 'request-owner-old',
+      grantId: 'grant-owner-old',
+      grantRecordVersion: 2,
+      grantAttemptId: ATTEMPT,
+      createdAtIso: NOW_OLDER,
+      updatedAtIso: NOW_OLDER,
+    });
+    const ownerNew = requestRecord({
+      id: 'request-owner-new',
+      grantId: 'grant-owner-new',
+      grantRecordVersion: 2,
+      grantAttemptId: ATTEMPT,
+      createdAtIso: NOW_NEWER,
+      updatedAtIso: NOW_NEWER,
+    });
+    await saveAll(repository, [ownerOld, ownerNew]);
+    // KEY0c1a: both seeded approved owner grants carry signed answers under
+    // the ephemeral test signer, self-checked against each record's own ids.
+    const signerOld = createSignedDecisionFixture();
+    await signerOld.writeApprovedAnswer(ownerOld);
+    await signerOld.assertApprovedAnswerReadsBackApproved(ownerOld);
+    const signerNew = createSignedDecisionFixture();
+    await signerNew.writeApprovedAnswer(ownerNew);
+    await signerNew.assertApprovedAnswerReadsBackApproved(ownerNew);
 
     const result = await resolve(repository, {
       projectId: 'project-example',

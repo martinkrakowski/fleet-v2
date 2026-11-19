@@ -28,6 +28,7 @@ import { CoordinationRequestRepositoryAdapter } from '../../../../../operator-co
 import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-coordination/src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+import { createSignedDecisionFixture, type SignedDecisionFixture } from './signed-decision-fixture.js';
 
 const NOW = '2026-11-10T10:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
@@ -100,10 +101,17 @@ function grantFor(root: string): CoordinationRequestRecord {
   } as CoordinationRequestRecord;
 }
 
-function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageReleaseUseCase {
+function releaseUseCase(
+  grants: CoordinationRequestRepositoryAdapter,
+  signer: SignedDecisionFixture,
+): ManageReleaseUseCase {
   const authorization: ActionAuthorizationPort = {
     resolveActionAuthorization: async (request) => {
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope: 'release:install',
         expectedHeadSha: request.expectedHeadSha,
@@ -119,7 +127,11 @@ function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageRel
         : { outcome: 'blocked', reason: result.reason };
     },
     consumeActionAuthorization: async (request) => {
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).recordAuthorizationConsumption({
         consumptionId: `c-${request.actionId}`,
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
@@ -151,11 +163,16 @@ describe('release grant root binding (CO14 follow-up)', () => {
   let grants: CoordinationRequestRepositoryAdapter;
   let rootA: string;
   let rootB: string;
+  let signer: SignedDecisionFixture;
 
   beforeEach(async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'co14b-grant-'));
     dirs.push(stateDir);
     grants = new CoordinationRequestRepositoryAdapter({ stateDir });
+    // KEY0c1a: the release owner grants are paired with Ed25519-signed
+    // answers recorded under an ephemeral test signer's key, next to the
+    // state dir.
+    signer = createSignedDecisionFixture({ decisionsDir: join(stateDir, 'decisions') });
     rootA = await mkdtemp(join(tmpdir(), 'co14b-root-a-'));
     rootB = await mkdtemp(join(tmpdir(), 'co14b-root-b-'));
     dirs.push(rootA, rootB);
@@ -163,7 +180,7 @@ describe('release grant root binding (CO14 follow-up)', () => {
 
   it('a grant for one root cannot authorize another root', async () => {
     await grants.saveRequest(grantFor(rootA));
-    const result = await releaseUseCase(grants).manageRelease({
+    const result = await releaseUseCase(grants, signer).manageRelease({
       action: 'install',
       root: rootB,
       sha: SHA_A,
@@ -181,6 +198,10 @@ describe('release grant root binding (CO14 follow-up)', () => {
 
   it('a grant for the root it names authorizes that root, once', async () => {
     await grants.saveRequest(grantFor(rootA));
+    // KEY0c1a: the seeded approved release grant carries a signed answer
+    // under the ephemeral test signer, self-checked against the record.
+    await signer.writeApprovedAnswer(grantFor(rootA));
+    await signer.assertApprovedAnswerReadsBackApproved(grantFor(rootA));
     // The target build already exists, so no build runs; the staged install
     // consumes the grant without touching `current`.
     const store = new ReleaseStoreAdapter();
@@ -192,7 +213,7 @@ describe('release grant root binding (CO14 follow-up)', () => {
     await writeFile(join(entry, 'bin.js'), '// built\n');
     const built = await store.markVerified({ root: rootA, sha: SHA_A, buildId: staging.buildId, builtAtIso: NOW });
     expect(built.outcome).toBe('ok');
-    const result = await releaseUseCase(grants).manageRelease({
+    const result = await releaseUseCase(grants, signer).manageRelease({
       action: 'install',
       root: rootA,
       sha: SHA_A,
@@ -209,6 +230,8 @@ describe('release grant root binding (CO14 follow-up)', () => {
 
   it('a consumed grant does not authorize a second release', async () => {
     await grants.saveRequest(grantFor(rootA));
+    await signer.writeApprovedAnswer(grantFor(rootA));
+    await signer.assertApprovedAnswerReadsBackApproved(grantFor(rootA));
     const store = new ReleaseStoreAdapter();
     for (const sha of [SHA_A, SHA_B]) {
       const staging = await store.prepare({ root: rootA, sha });
@@ -219,7 +242,7 @@ describe('release grant root binding (CO14 follow-up)', () => {
       const built = await store.markVerified({ root: rootA, sha, buildId: staging.buildId, builtAtIso: NOW });
       if (built.outcome !== 'ok') throw new Error('mark failed');
     }
-    const useCase = releaseUseCase(grants);
+    const useCase = releaseUseCase(grants, signer);
     const first = await useCase.manageRelease({
       action: 'install',
       root: rootA,

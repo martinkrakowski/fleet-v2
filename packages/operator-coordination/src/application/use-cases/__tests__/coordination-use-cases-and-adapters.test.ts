@@ -52,6 +52,7 @@ import { ObservationPublicationAdapter } from '../../../infrastructure/adapters/
 import { ProjectProfileRepositoryAdapter } from '../../../infrastructure/adapters/ProjectProfileRepositoryAdapter.adapter.js';
 import { StateFileUnreadableError } from '../../../infrastructure/adapters/file-store.js';
 import { RelayTransportAdapter } from '../../../infrastructure/adapters/RelayTransportAdapter.adapter.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 import { InspectConfiguredCapabilitiesUseCase } from '../InspectConfiguredCapabilitiesUseCase.use-case.js';
 import { InspectOutstandingCoordinationUseCase } from '../InspectOutstandingCoordinationUseCase.use-case.js';
 import { InspectProjectProfileUseCase } from '../InspectProjectProfileUseCase.use-case.js';
@@ -1522,7 +1523,16 @@ describe('ResolveActionAuthorizationUseCase', () => {
     const repo = new StubRequestRepository([
       requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
     ]);
-    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+    // KEY0c1a: the seeded approved owner grant is paired with a signed answer
+    // under the ephemeral test signer, and the answer self-check verifies the
+    // record's own grant id and decision revision read back as `approved`.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(requestRecord());
+    await signer.assertApprovedAnswerReadsBackApproved(requestRecord());
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...signer.deps,
+    }).execute(
       request,
     );
     expect(result).toEqual({
@@ -1538,7 +1548,13 @@ describe('ResolveActionAuthorizationUseCase', () => {
     const repo = new StubRequestRepository([
       requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
     ]);
-    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(requestRecord());
+    await signer.assertApprovedAnswerReadsBackApproved(requestRecord());
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...signer.deps,
+    }).execute({
       projectId: 'project-atlas',
       actionScope: 'forge:merge',
       expectedHeadSha: 'abc123',
@@ -1563,7 +1579,10 @@ describe('ResolveActionAuthorizationUseCase', () => {
     ];
     for (const [name, overrides, expected] of cases) {
       const repo = new StubRequestRepository([requestRecord(overrides)]);
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repo,
+        ...createSignedDecisionFixture().deps,
+      }).execute(
         request,
       );
       expect(result.outcome, name).toBe('blocked');
@@ -1573,7 +1592,10 @@ describe('ResolveActionAuthorizationUseCase', () => {
 
   it('blocks a recorded request that carries no grant', async () => {
     const repo = new StubRequestRepository([requestRecord({ grantId: null })]);
-    const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...createSignedDecisionFixture().deps,
+    }).execute({
       projectId: 'project-atlas',
       actionScope: 'forge:merge',
       expectedHeadSha: 'abc123',
@@ -1583,11 +1605,17 @@ describe('ResolveActionAuthorizationUseCase', () => {
 
   it('blocks when nothing is recorded at all', async () => {
     const repo = new StubRequestRepository();
-    const missingGrant = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
+    const missingGrant = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...createSignedDecisionFixture().deps,
+    }).execute(
       request,
     );
     expect(missingGrant.outcome === 'blocked' && missingGrant.reason).toContain('grant-9');
-    const missingScope = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
+    const missingScope = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...createSignedDecisionFixture().deps,
+    }).execute({
       projectId: 'project-atlas',
       actionScope: 'forge:merge',
       expectedHeadSha: 'abc123',
@@ -1651,11 +1679,13 @@ describe('ResolveActionAuthorizationUseCase', () => {
     await expect(
       new ResolveActionAuthorizationUseCase({
         requestRepo: new StubRequestRepository(),
+        ...createSignedDecisionFixture().deps,
       }).execute(undefined),
     ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
     await expect(
       new ResolveActionAuthorizationUseCase({
         requestRepo: new StubRequestRepository(),
+        ...createSignedDecisionFixture().deps,
       }).execute({ ...request, expectedHeadSha: '' }),
     ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
   });
@@ -1666,6 +1696,9 @@ describe('ResolveActionAuthorizationUseCase', () => {
  * ------------------------------------------------------------------ */
 
 describe('RecordAuthorizationConsumptionUseCase', () => {
+  // KEY0c1a: every owner-grant consumption construction carries the signed
+  // decision transport the mandatory-transport switch (KEY0c3) will require.
+  const signedDeps = createSignedDecisionFixture().deps;
   const consumptionRequest = {
     consumptionId: 'consumption-1',
     grantId: 'grant-9',
@@ -1680,7 +1713,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('binds a grant to one action and attempt and completes the request', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
-    const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: repo }).execute(
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repo,
+      ...signedDeps,
+    }).execute(
       consumptionRequest,
     );
     expect(result.outcome).toBe('consumed');
@@ -1704,7 +1740,7 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('never lets one grant authorize a second, unrelated action', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
-    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signedDeps });
     await useCase.execute(consumptionRequest);
     const second = await useCase.execute({
       ...consumptionRequest,
@@ -1721,7 +1757,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const repo = new StubRequestRepository([
       requestRecord({ consumptions: [consumptionRecord()] }),
     ]);
-    const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: repo }).execute(
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repo,
+      ...signedDeps,
+    }).execute(
       consumptionRequest,
     );
     // CO14 follow-up: the same action replayed with its own consumption id
@@ -1735,7 +1774,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const unknownGrant = new StubRequestRepository();
     expect(
       (
-        await new RecordAuthorizationConsumptionUseCase({ requestRepo: unknownGrant }).execute(
+        await new RecordAuthorizationConsumptionUseCase({
+          requestRepo: unknownGrant,
+          ...signedDeps,
+        }).execute(
           consumptionRequest,
         )
       ).outcome === 'refused',
@@ -1744,7 +1786,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const declined = new StubRequestRepository([requestRecord({ state: 'declined' })]);
     expect(
       (
-        await new RecordAuthorizationConsumptionUseCase({ requestRepo: declined }).execute(
+        await new RecordAuthorizationConsumptionUseCase({
+          requestRepo: declined,
+          ...signedDeps,
+        }).execute(
           consumptionRequest,
         )
       ).outcome === 'refused',
@@ -1753,6 +1798,7 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const moved = new StubRequestRepository([requestRecord({ expectedHeadSha: 'def456' })]);
     const movedResult = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: moved,
+      ...signedDeps,
     }).execute(consumptionRequest);
     expect(movedResult.outcome === 'refused' && movedResult.reason).toContain('def456');
     expect(moved.saves).toHaveLength(0);
@@ -1760,7 +1806,7 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('refuses an incomplete consumption and refuses to run without dependencies', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
-    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signedDeps });
     const incomplete = await useCase.execute({ ...consumptionRequest, actionId: ' ' });
     expect(incomplete.outcome === 'refused' && incomplete.reason).toContain('actionId');
     const missingScope = await useCase.execute({ ...consumptionRequest, actionScope: ' ' });

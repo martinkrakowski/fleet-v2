@@ -175,10 +175,25 @@ export type BuiltSignableDecisionFields =
  * the capped input.
  */
 function snapshotRecord(raw: unknown): Record<string, unknown> | null {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+  // Every reflective read is wrapped: a revoked Proxy or a hostile trap can
+  // make even `Array.isArray`, `Object.getPrototypeOf` or
+  // `Object.getOwnPropertyDescriptor` throw, and every such throw is a typed
+  // refusal, never an exception escaping the exported function.
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(raw);
+  } catch {
     return null;
   }
-  const prototype = Object.getPrototypeOf(raw);
+  if (typeof raw !== 'object' || raw === null || isArray) {
+    return null;
+  }
+  let prototype: unknown;
+  try {
+    prototype = Object.getPrototypeOf(raw);
+  } catch {
+    return null;
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     return null;
   }
@@ -199,7 +214,12 @@ function snapshotRecord(raw: unknown): Record<string, unknown> | null {
     if ((FORBIDDEN_KEYS as readonly string[]).includes(key)) {
       return null;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    } catch {
+      return null;
+    }
     if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
       return null;
     }

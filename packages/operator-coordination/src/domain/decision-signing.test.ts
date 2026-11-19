@@ -390,3 +390,92 @@ describe('buildSignableDecisionFields', () => {
     });
   });
 });
+
+describe('never-throw on hostile reflective operations', () => {
+  it('refuses a Proxy with a throwing getPrototypeOf trap in buildSignableDecisionFields', () => {
+    const hostile = new Proxy(awaitingRecord(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf trap');
+      },
+    });
+    expect(buildSignableDecisionFields(hostile, validInput())).toEqual({
+      ok: false,
+      code: 'invalid-coordination-record',
+    });
+  });
+
+  it('refuses a Proxy with a throwing getOwnPropertyDescriptor trap in buildSignableDecisionFields', () => {
+    const hostile = new Proxy(awaitingRecord(), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile getOwnPropertyDescriptor trap');
+      },
+    });
+    expect(buildSignableDecisionFields(hostile, validInput())).toEqual({
+      ok: false,
+      code: 'invalid-coordination-record',
+    });
+  });
+
+  it('refuses a Proxy with a throwing ownKeys trap in buildSignableDecisionFields', () => {
+    const hostile = new Proxy(awaitingRecord(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys trap');
+      },
+    });
+    expect(buildSignableDecisionFields(hostile, validInput())).toEqual({
+      ok: false,
+      code: 'invalid-coordination-record',
+    });
+  });
+
+  it('refuses a Proxy with a throwing getPrototypeOf trap in parseSignDecisionInput', () => {
+    const hostile = new Proxy(validInput(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf trap');
+      },
+    });
+    expect(parseSignDecisionInput(hostile)).toEqual({
+      ok: false,
+      code: 'invalid-sign-decision-input',
+    });
+  });
+
+  it('refuses a Proxy with a throwing getOwnPropertyDescriptor trap in parseSignDecisionInput', () => {
+    const hostile = new Proxy(validInput(), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile getOwnPropertyDescriptor trap');
+      },
+    });
+    expect(parseSignDecisionInput(hostile)).toEqual({
+      ok: false,
+      code: 'invalid-sign-decision-input',
+    });
+  });
+
+  it('refuses a Proxy with a throwing ownKeys trap in parseSignDecisionInput', () => {
+    const hostile = new Proxy(validInput(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys trap');
+      },
+    });
+    expect(parseSignDecisionInput(hostile)).toEqual({
+      ok: false,
+      code: 'invalid-sign-decision-input',
+    });
+  });
+
+  it('refuses a revoked Proxy in both buildSignableDecisionFields and parseSignDecisionInput', () => {
+    const { proxy, revoke } = Proxy.revocable(validInput(), {});
+    revoke();
+    expect(() => parseSignDecisionInput(proxy)).not.toThrow();
+    expect(parseSignDecisionInput(proxy)).toEqual({
+      ok: false,
+      code: 'invalid-sign-decision-input',
+    });
+    expect(() => buildSignableDecisionFields(proxy, validInput())).not.toThrow();
+    expect(buildSignableDecisionFields(proxy, validInput())).toEqual({
+      ok: false,
+      code: 'invalid-coordination-record',
+    });
+  });
+});

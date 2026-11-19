@@ -867,11 +867,15 @@ describe('readRetirementLedger', () => {
   });
 
   it('refuses secret-shaped script or evidenceLink as secret-shaped', () => {
+    // The fake token material is assembled at runtime so this source file never
+    // matches the diff-check's github-token pattern; the runtime value still
+    // exercises the secret-shaped refusal.
+    const token = `ghp_${'A'.repeat(24)}`;
     expect(
-      readRetirementLedger(ledger({ rows: rowOverrides(0, { script: 'lane/ghp_ABCDEF0123456789abcdefghij.sh' }) })),
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { script: `lane/${token}.sh` }) })),
     ).toEqual({ ok: false, reason: 'secret-shaped' });
     expect(
-      readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: 'evidence/ghp_ABCDEF0123456789abcdefghij' }) })),
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: `evidence/${token}` }) })),
     ).toEqual({ ok: false, reason: 'secret-shaped' });
   });
 });

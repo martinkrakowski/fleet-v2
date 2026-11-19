@@ -60,8 +60,11 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     async stat(...args: Parameters<typeof actual.stat>) {
       const stat = await actual.stat(...args);
       if (failureFlags.statInoShift !== null) {
+        // stat.ino is `number | bigint` at the fs type level; narrow it
+        // before the shift so arithmetic stays on `number` for both.
+        const ino = typeof stat.ino === 'bigint' ? Number(stat.ino) : stat.ino;
         return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
-          ino: stat.ino + failureFlags.statInoShift,
+          ino: ino + failureFlags.statInoShift,
         });
       }
       return stat;

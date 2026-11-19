@@ -138,6 +138,11 @@ async function insideGitWorktree(resolvedPath: string, deps: OwnerKeyFsDeps): Pr
   // ancestor is a real directory. An error statting the start path other
   // than `ENOENT` leaves the location unknown.
   try {
+    // Same-uid residual (documented): if the resolved start path disappears
+    // and is recreated between this check and the exclusive write, the path
+    // can come to name a different file than the one verified here. That is
+    // a same-uid race only: the parent directory is verified uid-owned and
+    // not group/other-writable, so no other uid can swap the entry.
     const startStat = await deps.lstat(current);
     if (!startStat.isDirectory()) {
       const startParent = join(current, '..');

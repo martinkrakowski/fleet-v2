@@ -118,7 +118,15 @@ sign them under the new key.
 If the key may be COMPROMISED (someone else may hold it), re-pin a new
 `owner.publicKey` immediately: the old key's signatures stay valid until the
 pin changes, so every hour the old pin stands is an hour a holder of the old
-key can sign accepted decisions.
+key can sign accepted decisions. Then RESTART every consumer that holds the
+pin, so each one re-pins against the new key:
+
+- the API service,
+- the daemon (`systemctl --user restart` for the fleet-v2 daemon, intake,
+  record-day and conductor units),
+- any long-running CLI process.
+
+Until a consumer restarts, it may still accept signatures from the old key.
 
 ## Not this runbook
 

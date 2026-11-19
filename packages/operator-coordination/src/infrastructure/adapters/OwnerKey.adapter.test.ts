@@ -154,11 +154,19 @@ describe('generateOwnerKeyFile', () => {
     expect(existsSync(keyPath)).toBe(true);
   });
 
-  it('returns a typed refusal when handle.close() rejects', async () => {
+  it('returns a typed refusal when handle.close() rejects and removes the created key file', async () => {
     failureFlags.close = true;
     const keyPath = join(root, 'owner-key.pem');
     const result = await generateOwnerKeyFile({ outPath: keyPath });
     expect(result).toMatchObject({ ok: false, code: 'write-failed' });
+    // Best-effort cleanup: a refusal must change nothing on disk.
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('refuses a path inside a root state directory of `/`', async () => {
+    const result = await generateOwnerKeyFile({ outPath: join(root, 'owner-key.pem'), stateDir: '/' });
+    expect(result).toMatchObject({ ok: false, code: 'unsafe-path-state-dir' });
+    expect(existsSync(join(root, 'owner-key.pem'))).toBe(false);
   });
 
   it('refuses a missing parent directory', async () => {

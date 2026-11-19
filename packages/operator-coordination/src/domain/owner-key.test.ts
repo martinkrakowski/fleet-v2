@@ -249,6 +249,24 @@ describe('checkOwnerKeyPathSafety verdicts', () => {
       checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: ['/repo/not-git'] })),
     ).toEqual({ ok: true, targetPath: '/keys/owner-key.pem' });
   });
+
+  it('refuses a target inside a root state dir of `/`', () => {
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ targetPath: '/tmp/x', stateDir: '/' })),
+    ).toEqual({ ok: false, code: 'unsafe-path-state-dir' });
+  });
+
+  it('accepts a sibling of the state dir (`/srv/a` does not contain `/srv/ab`)', () => {
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ targetPath: '/srv/ab/owner-key.pem', stateDir: '/srv/a' })),
+    ).toEqual({ ok: true, targetPath: '/srv/ab/owner-key.pem' });
+  });
+
+  it('refuses a target inside a nested state dir (`/srv/a` contains `/srv/a/b`)', () => {
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ targetPath: '/srv/a/b/owner-key.pem', stateDir: '/srv/a' })),
+    ).toEqual({ ok: false, code: 'unsafe-path-state-dir' });
+  });
 });
 
 describe('formatOwnerInstallationEdit hostile input', () => {

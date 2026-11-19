@@ -15,7 +15,7 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:cry
 import { constants } from 'node:fs';
 import { lstat, open, realpath, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 
 import { checkOwnerKeyPathSafety, formatOwnerInstallationEdit } from '../../domain/owner-key.js';
 
@@ -58,9 +58,15 @@ export type OwnerKeyErrorCode =
   | 'unsafe-key-permissions'
   | 'unsafe-key-owner';
 
-/** Whether `child` is `parent` itself or lies inside it. Both real paths. */
-function liesInside(child: string, parent: string): boolean {
-  return child === parent || child.startsWith(`${parent}${sep}`);
+/**
+ * Whether `file` is `root` itself or lies inside it, decided from
+ * `path.relative` so a root of `/` cannot build a `//` prefix and a sibling
+ * like `/srv/ab` cannot be swallowed by `/srv/a`. Same segment-safe pattern
+ * as the KEY0a `isInside` helper.
+ */
+function isInside(root: string, file: string): boolean {
+  const rel = relative(root, file);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /**
@@ -115,7 +121,7 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   if (options.stateDir !== undefined) {
     try {
       const stateReal = await realpath(options.stateDir);
-      if (liesInside(parentReal, stateReal)) {
+      if (isInside(stateReal, parentReal)) {
         return { ok: false, code: 'unsafe-path-state-dir', message: 'owner-key: the output path is inside the state directory' };
       }
     } catch {
@@ -223,6 +229,13 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
     return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be written with 0600 permissions' };
   }
   if (closeFailed) {
+    // Best-effort cleanup: the write "succeeded" but the handle could not be
+    // closed, so a refusal must not leave a newly created key file behind.
+    try {
+      await unlink(outPath);
+    } catch {
+      // Best effort only: the refusal below stands either way.
+    }
     return { ok: false, code: 'write-failed', message: 'owner-key: the output file handle could not be closed' };
   }
   return { ok: true };

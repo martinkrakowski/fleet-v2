@@ -123,9 +123,35 @@ function normalizePath(input: string): string {
   return (isAbsolute ? '/' : '') + stack.join('/');
 }
 
-/** Whether `child` is `parent` itself or lies inside it. Both normalized. */
-function liesInside(child: string, parent: string): boolean {
-  return child === parent || child.startsWith(`${parent}/`);
+/**
+ * Whether `file` is `root` itself or lies inside it (both normalized POSIX
+ * paths), decided from a pure relative-path step so a root of `/` cannot
+ * build a `//` prefix and a sibling like `/srv/ab` cannot be swallowed by
+ * `/srv/a`. Same segment-safe pattern as the KEY0a `isInside` helper,
+ * without `node:path` (the domain stays pure). Linear in the input length.
+ */
+function isInside(root: string, file: string): boolean {
+  const rel = relativePosix(root, file);
+  return rel === '' || (rel !== '..' && !rel.startsWith('../') && rel[0] !== '/');
+}
+
+/**
+ * Pure POSIX `path.relative(root, file)` for normalized paths: `''` when
+ * equal, the remainder when `file` lies under `root` at a segment boundary,
+ * and `'..'` otherwise (a `..`-leading or absolute remainder means "not
+ * inside", which `isInside` refuses). Linear in the input length.
+ */
+function relativePosix(root: string, file: string): string {
+  if (root === file) {
+    return '';
+  }
+  if (root === '/') {
+    return file.startsWith('/') ? file.slice(1) : '..';
+  }
+  if (file.startsWith(`${root}/`)) {
+    return file.slice(root.length + 1);
+  }
+  return '..';
 }
 
 /**
@@ -314,7 +340,7 @@ function markerRefusesTarget(normalizedTarget: string, marker: string): boolean 
   const normalizedMarker = normalizePath(marker);
   const segments = normalizedMarker.split('/').filter((segment) => segment !== '');
   const isGitMarker = segments[segments.length - 1] === '.git';
-  return isGitMarker && (normalizedMarker === '' || liesInside(normalizedTarget, normalizedMarker));
+  return isGitMarker && (normalizedMarker === '' || isInside(normalizedMarker, normalizedTarget));
 }
 
 /**
@@ -331,7 +357,7 @@ function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPat
   }
   if (values.has('stateDir')) {
     const normalizedStateDir = normalizePath(values.get('stateDir') as string);
-    if (normalizedStateDir === '' || liesInside(normalizedTarget, normalizedStateDir)) {
+    if (normalizedStateDir === '' || isInside(normalizedStateDir, normalizedTarget)) {
       return { ok: false, code: 'unsafe-path-state-dir' };
     }
   }

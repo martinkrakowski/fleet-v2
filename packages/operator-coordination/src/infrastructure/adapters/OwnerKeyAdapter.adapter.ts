@@ -15,6 +15,7 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:cry
 import { constants } from 'node:fs';
 import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { checkOwnerKeyPathSafety, formatOwnerInstallationEdit } from '../../domain/owner-key.js';
@@ -64,7 +65,8 @@ export type OwnerKeyErrorCode =
   | 'symlink-refused'
   | 'unsafe-key-permissions'
   | 'unsafe-key-owner'
-  | 'identity-changed';
+  | 'identity-changed'
+  | 'location-unverifiable';
 
 /**
  * The read-only filesystem/identity dependency of the owner-key adapter.
@@ -78,6 +80,16 @@ export interface OwnerKeyFsDeps {
     filePath: string,
     stateDir: string | undefined,
   ) => Promise<{ ok: true } | { ok: false; code: OwnerKeyErrorCode; message: string }>;
+  readonly lstat: (path: string) => Promise<Stats>;
+  readonly realpath: (path: string) => Promise<string>;
+}
+
+/**
+ * Whether `error` is a Node errno error carrying exactly `code` (the only
+ * property this module ever inspects on a thrown error).
+ */
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === code;
 }
 
 /**
@@ -87,6 +99,8 @@ export interface OwnerKeyFsDeps {
 const realOwnerKeyFsDeps: OwnerKeyFsDeps = Object.freeze({
   verifyWrittenIdentity: (handle: FileHandle, filePath: string, stateDir: string | undefined) =>
     verifyWrittenIdentity(handle, filePath, stateDir),
+  lstat: (path: string) => lstat(path),
+  realpath: (path: string) => realpath(path),
 });
 
 /**
@@ -104,24 +118,36 @@ function isInside(root: string, file: string): boolean {
  * Whether any ancestor directory of `resolvedPath` carries a `.git` entry
  * (directory or, for a linked worktree, a file), checked with `lstat` up to
  * `MAX_PATH_SEGMENTS` ancestors. Linear in the ancestor count.
+ *
+ * Fail closed on unknown filesystem state: only `ENOENT` (no `.git` entry
+ * here) lets the walk continue. Any other `lstat` error (`EACCES`, `EIO`, …)
+ * means the repository status is UNKNOWN, so the answer is `'unknown'` and
+ * the caller refuses with `location-unverifiable` instead of guessing.
  */
-async function insideGitWorktree(resolvedPath: string): Promise<boolean> {
+async function insideGitWorktree(resolvedPath: string, deps: OwnerKeyFsDeps): Promise<'yes' | 'no' | 'unknown'> {
   // Start at the resolved path itself: its own parent chain begins here.
   let current = resolvedPath;
   for (let hops = 0; hops < 128; hops += 1) {
     try {
-      await lstat(join(current, '.git'));
-      return true;
-    } catch {
-      // No `.git` entry at this level; keep walking.
+      await deps.lstat(join(current, '.git'));
+      return 'yes';
+    } catch (error) {
+      // ENOENT: no `.git` entry here. ENOTDIR: an ancestor of the probed
+      // path is a regular file (the start path is the just-written key file
+      // in the post-write check), so no `.git` marker can exist there
+      // either. Both prove the absence of a marker at this level; any other
+      // error is an unknown state.
+      if (!isErrno(error, 'ENOENT') && !isErrno(error, 'ENOTDIR')) {
+        return 'unknown';
+      }
     }
     const parent = join(current, '..');
     if (parent === current) {
-      return false;
+      return 'no';
     }
     current = parent;
   }
-  return true;
+  return 'yes';
 }
 
 /** A refusal produced by one of the `generateOwnerKeyFile` helpers. */
@@ -131,19 +157,46 @@ type GenerateRefusal = { ok: false; code: OwnerKeyErrorCode; message: string };
  * Re-run the location checks (state directory, git repository/worktree) on
  * one already-resolved path. Returns `null` when the location is safe.
  */
-async function checkResolvedLocation(resolvedPath: string, stateDir: string | undefined): Promise<GenerateRefusal | null> {
+async function checkResolvedLocation(
+  resolvedPath: string,
+  stateDir: string | undefined,
+  deps: OwnerKeyFsDeps,
+): Promise<GenerateRefusal | null> {
   if (stateDir !== undefined) {
     try {
-      const stateReal = await realpath(stateDir);
+      const stateReal = await deps.realpath(stateDir);
       if (isInside(stateReal, resolvedPath)) {
         return { ok: false, code: 'unsafe-path-state-dir', message: 'owner-key: the output path is inside the state directory' };
       }
-    } catch {
-      // An unresolvable state directory cannot contain the output path.
+    } catch (error) {
+      // Fail closed on unknown filesystem state: only `ENOENT` (the state
+      // directory does not exist) proves the state directory cannot contain
+      // the output path. Any other `realpath` error (`EACCES`, `EIO`, …)
+      // leaves the status unknown and is refused.
+      if (!isErrno(error, 'ENOENT')) {
+        return {
+          ok: false,
+          code: 'location-unverifiable',
+          message: 'owner-key: the state directory could not be resolved, so the output location cannot be verified',
+        };
+      }
     }
   }
-  if (await insideGitWorktree(resolvedPath)) {
-    return { ok: false, code: 'unsafe-path-git-repo', message: 'owner-key: the output path is inside a git repository or worktree' };
+  const worktree = await insideGitWorktree(resolvedPath, deps);
+  if (worktree === 'unknown') {
+    // The repository status is unknown: refuse rather than guess.
+    return {
+      ok: false,
+      code: 'location-unverifiable',
+      message: 'owner-key: the repository status of the output path could not be verified',
+    };
+  }
+  if (worktree === 'yes') {
+    return {
+      ok: false,
+      code: 'unsafe-path-git-repo',
+      message: 'owner-key: the output path is inside a git repository or worktree',
+    };
   }
   return null;
 }
@@ -157,7 +210,7 @@ async function checkResolvedLocation(resolvedPath: string, stateDir: string | un
  * a symlink could be swapped in between the check and the write. Returns the
  * resolved parent or a typed refusal.
  */
-async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
+async function checkOutputLocation(options: GenerateOwnerKeyFileOptions, deps: OwnerKeyFsDeps):
   Promise<{ ok: true; parentReal: string } | GenerateRefusal> {
   // The domain only accepts ABSOLUTE paths: relative CLI paths (a relative
   // `--out` or `--state-dir`) are resolved here, against the process working
@@ -195,7 +248,7 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   if ((parentStat.mode & 0o022) !== 0) {
     return { ok: false, code: 'unsafe-parent-directory', message: 'owner-key: the resolved output parent is group- or world-writable' };
   }
-  const location = await checkResolvedLocation(parentReal, options.stateDir);
+  const location = await checkResolvedLocation(parentReal, options.stateDir, deps);
   if (location !== null) {
     return location;
   }
@@ -279,7 +332,7 @@ async function verifyWrittenIdentity(
       message: 'owner-key: the written file could not be re-resolved after the write',
     };
   }
-  const location = await checkResolvedLocation(resolvedForLocation, stateDir);
+  const location = await checkResolvedLocation(resolvedForLocation, stateDir, realOwnerKeyFsDeps);
   if (location !== null) {
     return location;
   }
@@ -515,7 +568,7 @@ export async function generateOwnerKeyFile(
   options: GenerateOwnerKeyFileOptions,
   deps: OwnerKeyFsDeps = realOwnerKeyFsDeps,
 ): Promise<GenerateOwnerKeyFileResult> {
-  const location = await checkOutputLocation(options);
+  const location = await checkOutputLocation(options, deps);
   if (!location.ok) {
     return location;
   }

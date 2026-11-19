@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as fsPromises from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -107,8 +108,13 @@ function fakeDeps(
     filePath: string,
     stateDir: string | undefined,
   ) => Promise<{ ok: true } | { ok: false; code: 'identity-changed' | 'unsafe-path-state-dir'; message: string }>,
+  overrides: { lstat?: OwnerKeyFsDeps['lstat']; realpath?: OwnerKeyFsDeps['realpath'] } = {},
 ): OwnerKeyFsDeps {
-  return { verifyWrittenIdentity: behavior };
+  return {
+    verifyWrittenIdentity: behavior,
+    lstat: overrides.lstat ?? ((path: string) => fsPromises.lstat(path)),
+    realpath: overrides.realpath ?? ((path: string) => fsPromises.realpath(path)),
+  };
 }
 
 let root: string;
@@ -223,6 +229,38 @@ describe('generateOwnerKeyFile', () => {
     if (!result.ok) {
       expect(result.code).toBe('unsafe-path-git-repo');
     }
+  });
+
+  it('refuses with location-unverifiable when an ancestor lstat fails with EACCES (unknown repo status)', async () => {
+    const result = await generateOwnerKeyFile({ outPath: join(root, 'owner-key.pem') }, fakeDeps(async () => ({ ok: true }), {
+      lstat: async () => {
+        throw Object.assign(new Error('simulated EACCES'), { code: 'EACCES' });
+      },
+    }));
+    expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
+  });
+
+  it('refuses with location-unverifiable when the state-directory realpath fails with EIO', async () => {
+    const stateDir = join(root, 'state');
+    mkdirPrivate(stateDir);
+    const result = await generateOwnerKeyFile(
+      { outPath: join(root, 'owner-key.pem'), stateDir },
+      fakeDeps(async () => ({ ok: true }), {
+        realpath: async () => {
+          throw Object.assign(new Error('simulated EIO'), { code: 'EIO' });
+        },
+      }),
+    );
+    expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
+  });
+
+  it('continues when the ancestor lstat fails with ENOENT (no .git marker)', async () => {
+    const result = await generateOwnerKeyFile({ outPath: join(root, 'owner-key.pem') }, fakeDeps(async () => ({ ok: true }), {
+      lstat: async () => {
+        throw Object.assign(new Error('simulated ENOENT'), { code: 'ENOENT' });
+      },
+    }));
+    expect(result).toMatchObject({ ok: true });
   });
 
   it('removes the created file when the write fails, so a retry does not hit already-exists', async () => {

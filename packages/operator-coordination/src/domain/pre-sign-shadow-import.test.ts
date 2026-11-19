@@ -79,6 +79,16 @@ describe('buildPreSignShadowImportPlan hostile inputs', () => {
     });
   });
 
+  it('refuses an array-like object with more keys than the cap as pre-sign-not-object, not pre-sign-unexpected-key', () => {
+    // An own `length` key is an array-like carrier: it is refused as a
+    // non-object BEFORE the unexpected-key check runs, even when the key
+    // count alone would exceed `MAX_PRE_SIGN_KEYS`.
+    expect(buildPreSignShadowImportPlan({ length: 1, a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 })).toEqual({
+      ok: false,
+      code: 'pre-sign-not-object',
+    });
+  });
+
   it('refuses a non-plain prototype (a class instance) with pre-sign-not-object', () => {
     class Seed {}
     expect(buildPreSignShadowImportPlan(new Seed())).toEqual({

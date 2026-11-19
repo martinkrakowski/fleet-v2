@@ -964,13 +964,14 @@ function readPreSignSnapshot(raw: object): PreSignSnapshot {
   } catch {
     return { ok: false, code: 'pre-sign-invalid-input' };
   }
-  if (ownKeys.length > MAX_PRE_SIGN_KEYS) {
-    return { ok: false, code: 'pre-sign-unexpected-key' };
-  }
   // An array-like object (`{ length: 1, 0: ... }`) is refused as a non-object
-  // before any key-set comparison or indexing can misread it.
+  // BEFORE the unexpected-key check runs, so an array-like carrier is never
+  // misreported by a key-count refusal.
   if (ownKeys.some((key) => key === 'length')) {
     return { ok: false, code: 'pre-sign-not-object' };
+  }
+  if (ownKeys.length > MAX_PRE_SIGN_KEYS) {
+    return { ok: false, code: 'pre-sign-unexpected-key' };
   }
   const values: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let hasRevision = false;
@@ -982,11 +983,6 @@ function readPreSignSnapshot(raw: object): PreSignSnapshot {
     if ((PRE_SIGN_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
       forbiddenCode = 'pre-sign-forbidden-key';
       continue;
-    }
-    if (key === 'length') {
-      // An array-like object (`{ length: 1, 0: ... }`) is refused as a
-      // non-object before any key-set comparison can misread it.
-      return { ok: false, code: 'pre-sign-not-object' };
     }
     if (!(PRE_SIGN_ALLOWED_KEYS as readonly string[]).includes(key)) {
       return { ok: false, code: 'pre-sign-unexpected-key' };
@@ -1019,36 +1015,24 @@ function readPreSignSnapshot(raw: object): PreSignSnapshot {
   return { ok: true, values, hasRevision };
 }
 
+type PreSignGrantRead =
+  | { readonly ok: true; readonly grant: ParsedShadowImportGrant }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode };
+
+/** The parsed standing grant behind a pre-sign plan. */
+interface ParsedShadowImportGrant {
+  readonly repository: MergeGrantRepositoryRef;
+  readonly expiresAtIso: string;
+}
+
 /**
- * Build the plan one `sign-decision --pre-sign` run signs from: hostile
- * `unknown` in, a typed plan or a named refusal out, and never a throw. Only
- * own data-property descriptors are read (a getter never runs, a Proxy `get`
- * trap is never invoked), arrays (including sparse ones) and array-like
- * objects are refused before any indexing, a `__proto__`/`constructor`/
- * `prototype` own key is refused before any field comparison, and the key set
- * is exact: `actionScope`, `repository` (a plain `{ owner, repo }` object),
- * `expiresAtIso`, `nowIso`, `projectId` and the optional `decisionRevision`.
- *
- * The grant coordinates are delegated to `parseShadowImportGrant` and the
- * digest payload to `shadowImportDigestPayload` (never re-implemented here);
- * their `shadow-import-grant-accessor-forbidden` code is mapped to
- * `pre-sign-accessor-forbidden` so an accessor on the root or on the nested
- * repository shares one refusal code. `nowIso` is strict ISO-8601 UTC — the
- * same `parseShadowImportExpiry` validator the codebase already uses for the
- * grant's ISO timestamps — and the expiry must parse after it and stay within
- * `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`; `projectId` is a
- * bounded, control-character-free string without surrounding whitespace (a
- * padded value would sign bytes `request-decision` never verifies, because it
- * trims the project id). `grantId` is never an input: it is derived
- * deterministically from the request id digest downstream.
- *
- * Cost is linear in the capped input: `MAX_PRE_SIGN_KEYS * 2` own descriptors
- * plus `MAX_PRE_SIGN_FIELD_LENGTH * 2` characters of field text plus
- * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
- * MAX_EXPIRES_AT_ISO_LENGTH` of grant-coordinate validation; nothing else is
- * read.
+ * Validate the plain-object shape of a pre-sign input: non-object, exotic
+ * prototype, array and snapshot refusals, in that order. Cost is linear in
+ * `MAX_PRE_SIGN_KEYS`.
  */
-export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportResult {
+function readPreSignInput(raw: unknown):
+  | { readonly ok: true; readonly snapshot: Extract<PreSignSnapshot, { ok: true }> }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode } {
   if (typeof raw !== 'object' || raw === null) {
     return { ok: false, code: 'pre-sign-not-object' };
   }
@@ -1074,13 +1058,17 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
   if (!snapshot.ok) {
     return snapshot;
   }
-  const values = snapshot.values;
-  if (values['actionScope'] !== SHADOW_IMPORT_ACTION_SCOPE) {
-    return { ok: false, code: 'pre-sign-unsupported-scope' };
-  }
-  // Delegate the grant coordinates to the standing grant parser: the fresh
-  // plain carrier is built from the snapshotted descriptor values, so no
-  // accessor of the hostile input can run through it.
+  return { ok: true, snapshot };
+}
+
+/**
+ * Parse the grant coordinates (repository, expiresAtIso) by delegating to
+ * `parseShadowImportGrant`; the parser's accessor code is mapped onto the one
+ * pre-sign accessor refusal. Cost is linear in
+ * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
+ * MAX_EXPIRES_AT_ISO_LENGTH`.
+ */
+function parsePreSignGrant(values: Record<string, unknown>): PreSignGrantRead {
   const grant = parseShadowImportGrant({
     repository: values['repository'],
     expiresAtIso: values['expiresAtIso'],
@@ -1094,38 +1082,62 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
           : grant.code,
     };
   }
-  // `nowIso` is strict ISO-8601 UTC: it goes through the SAME validator the
-  // codebase already uses for the grant's ISO timestamps
-  // (`parseShadowImportExpiry`, the bounded `SHADOW_IMPORT_EXPIRES_AT_PATTERN`
-  // check with real calendar fields and a canonical re-serialization), so a
-  // locale date like `'11/19/2026'` — which a bare finite `Date.parse`
-  // accepts — is refused.
-  const nowRaw = values['nowIso'];
+  return { ok: true, grant: grant.value };
+}
+
+type PreSignClockRead =
+  | { readonly ok: true; readonly nowIso: string; readonly nowMs: number; readonly expiresMs: number }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode };
+
+/**
+ * Validate the clock: `nowIso` through the same bounded ISO-8601 validator the
+ * grant timestamps use, the expiry strictly after it, and the TTL within
+ * `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`. Cost is linear in
+ * `MAX_EXPIRES_AT_ISO_LENGTH * 2`.
+ */
+function validatePreSignClock(
+  nowRaw: unknown,
+  expiresAtIso: string,
+): PreSignClockRead {
   const nowExpiry = parseShadowImportExpiry(nowRaw);
   if (!nowExpiry.ok) {
     return { ok: false, code: 'pre-sign-invalid-now' };
   }
   const nowMs = Date.parse(nowExpiry.expiresAtIso);
-  const expiresMs = Date.parse(grant.value.expiresAtIso);
+  const expiresMs = Date.parse(expiresAtIso);
   if (expiresMs <= nowMs) {
     return { ok: false, code: 'pre-sign-expired' };
   }
   if (expiresMs - nowMs > SHADOW_IMPORT_GRANT_MAX_TTL_DAYS * 86_400_000) {
     return { ok: false, code: 'pre-sign-ttl-exceeded' };
   }
-  const projectId = values['projectId'];
+  return { ok: true, nowIso: nowExpiry.expiresAtIso, nowMs, expiresMs };
+}
+
+type PreSignIdentityRead =
+  | { readonly ok: true; readonly projectId: string; readonly decisionRevision: string }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode };
+
+/**
+ * Validate the project id and the optional decision revision the answer
+ * binds. Cost is linear in `MAX_PRE_SIGN_FIELD_LENGTH * 2`.
+ */
+function derivePreSignIdentity(
+  projectIdRaw: unknown,
+  revisionRaw: unknown,
+  hasRevision: boolean,
+): PreSignIdentityRead {
   if (
-    typeof projectId !== 'string' ||
-    projectId.length === 0 ||
-    projectId.length > MAX_PRE_SIGN_FIELD_LENGTH ||
-    hasPreSignControlCharacter(projectId) ||
-    projectId !== projectId.trim()
+    typeof projectIdRaw !== 'string' ||
+    projectIdRaw.length === 0 ||
+    projectIdRaw.length > MAX_PRE_SIGN_FIELD_LENGTH ||
+    hasPreSignControlCharacter(projectIdRaw) ||
+    projectIdRaw !== projectIdRaw.trim()
   ) {
     return { ok: false, code: 'pre-sign-invalid-project' };
   }
   let decisionRevision: string = DEFAULT_PRE_SIGN_DECISION_REVISION;
-  if (snapshot.hasRevision) {
-    const revisionRaw = values['decisionRevision'];
+  if (hasRevision) {
     if (
       typeof revisionRaw !== 'string' ||
       revisionRaw.length === 0 ||
@@ -1136,7 +1148,70 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
     }
     decisionRevision = revisionRaw;
   }
-  const payloadResult = shadowImportDigestPayload(grant.value);
+  return { ok: true, projectId: projectIdRaw, decisionRevision };
+}
+
+/**
+ * Build the plan one `sign-decision --pre-sign` run signs from: hostile
+ * `unknown` in, a typed plan or a named refusal out, and never a throw. Only
+ * own data-property descriptors are read (a getter never runs, a Proxy `get`
+ * trap is never invoked), arrays (including sparse ones) and array-like
+ * objects are refused before any indexing, a `__proto__`/`constructor`/
+ * `prototype` own key is refused before any field comparison, and the key set
+ * is exact: `actionScope`, `repository` (a plain `{ owner, repo }` object),
+ * `expiresAtIso`, `nowIso`, `projectId` and the optional `decisionRevision`.
+ *
+ * The work is delegated in order to `readPreSignInput` (object shape and
+ * descriptor snapshot), `parsePreSignGrant` (grant coordinates via
+ * `parseShadowImportGrant`), `validatePreSignClock` (ISO `nowIso`, expiry
+ * ordering, TTL cap) and `derivePreSignIdentity` (project id, revision);
+ * the digest payload is delegated to `shadowImportDigestPayload`. The
+ * grant parser's `shadow-import-grant-accessor-forbidden` code is mapped to
+ * `pre-sign-accessor-forbidden` so an accessor on the root or on the nested
+ * repository shares one refusal code. `nowIso` is strict ISO-8601 UTC — the
+ * same `parseShadowImportExpiry` validator the codebase already uses for the
+ * grant's ISO timestamps — and the expiry must parse after it and stay within
+ * `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`; `projectId` is a
+ * bounded, control-character-free string without surrounding whitespace (a
+ * padded value would sign bytes `request-decision` never verifies, because it
+ * trims the project id). `grantId` is never an input: it is derived
+ * deterministically from the request id digest downstream.
+ *
+ * Cost is linear in the capped input: `MAX_PRE_SIGN_KEYS * 2` own descriptors
+ * plus `MAX_PRE_SIGN_FIELD_LENGTH * 2` characters of field text plus
+ * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
+ * MAX_EXPIRES_AT_ISO_LENGTH` of grant-coordinate validation; nothing else is
+ * read.
+ */
+export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportResult {
+  const input = readPreSignInput(raw);
+  if (!input.ok) {
+    return input;
+  }
+  const values = input.snapshot.values;
+  if (values['actionScope'] !== SHADOW_IMPORT_ACTION_SCOPE) {
+    return { ok: false, code: 'pre-sign-unsupported-scope' };
+  }
+  const grantRead = parsePreSignGrant(values);
+  if (!grantRead.ok) {
+    return grantRead;
+  }
+  const clock = validatePreSignClock(values['nowIso'], grantRead.grant.expiresAtIso);
+  if (!clock.ok) {
+    return clock;
+  }
+  const identity = derivePreSignIdentity(
+    values['projectId'],
+    values['decisionRevision'],
+    input.snapshot.hasRevision,
+  );
+  if (!identity.ok) {
+    return identity;
+  }
+  const payloadResult = shadowImportDigestPayload({
+    repository: grantRead.grant.repository,
+    expiresAtIso: grantRead.grant.expiresAtIso,
+  });
   if (!payloadResult.ok) {
     return {
       ok: false,
@@ -1149,11 +1224,11 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
   return {
     ok: true,
     value: Object.freeze({
-      repository: Object.freeze({ ...grant.value.repository }),
-      expiresAtIso: grant.value.expiresAtIso,
-      projectId,
-      decisionRevision,
-      nowIso: nowExpiry.expiresAtIso,
+      repository: Object.freeze({ ...grantRead.grant.repository }),
+      expiresAtIso: grantRead.grant.expiresAtIso,
+      projectId: identity.projectId,
+      decisionRevision: identity.decisionRevision,
+      nowIso: clock.nowIso,
       digestPayload: payloadResult.value,
     }),
   };

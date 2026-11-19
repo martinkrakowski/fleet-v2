@@ -546,6 +546,41 @@ export interface UnsealedRemovalAuthorizerDeps {
   readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
 }
 
+/** The scoped values one candidate question/consumer pairing is evaluated against. */
+interface UnsealedRemovalScope {
+  readonly projectId: string;
+  readonly actionId: string;
+  readonly actionScope: string;
+  readonly attemptId: string;
+  readonly expectedHeadSha: string;
+  readonly nowIso: string;
+}
+
+/** The non-null request record `findRequestById` can return. */
+type CoordinationRequestSnapshot = Exclude<
+  Awaited<ReturnType<CoordinationRequestRepositoryAdapter['findRequestById']>>,
+  null
+>;
+
+/**
+ * True when the single stored receipt names exactly this action id and
+ * attempt: the crash-recovery shape. The stored receipt alone is never
+ * authority; it only selects the verified replay path.
+ */
+function isCrashRecoveryConsumption(
+  coordReq: CoordinationRequestSnapshot,
+  scope: UnsealedRemovalScope,
+): boolean {
+  const consumption = coordReq.consumptions[0];
+  return (
+    coordReq.consumptions.length === 1 &&
+    consumption !== undefined &&
+    consumption.actionId === scope.actionId &&
+    consumption.attemptId === scope.attemptId &&
+    coordReq.grantId !== null
+  );
+}
+
 /**
  * C2': the scoped one-way owner approval behind the reap's
  * `--force-unsealed`. The delegate matches an answered one-way owner question
@@ -567,8 +602,14 @@ export function unsealedWorktreeRemovalAuthorizer(
       return { outcome: 'blocked', reason: 'invalid-request' };
     }
     const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = request;
-    const actionScope = unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath));
-    const actionId = unsealedWorktreeRemovalActionId(runId, attemptId);
+    const scope: UnsealedRemovalScope = {
+      projectId,
+      actionId: unsealedWorktreeRemovalActionId(runId, attemptId),
+      actionScope: unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath)),
+      attemptId,
+      expectedHeadSha,
+      nowIso,
+    };
     try {
       await coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
       const listed = await coordination.listOwnerQuestions.listOwnerQuestions();
@@ -593,80 +634,119 @@ export function unsealedWorktreeRemovalAuthorizer(
         );
         if (
           coordReq === null ||
-          coordReq.projectId !== projectId ||
-          coordReq.actionScope !== actionScope ||
-          coordReq.expectedHeadSha !== expectedHeadSha ||
+          coordReq.projectId !== scope.projectId ||
+          coordReq.actionScope !== scope.actionScope ||
+          coordReq.expectedHeadSha !== scope.expectedHeadSha ||
           coordReq.policyGrant !== undefined
         ) {
           continue;
         }
-        // Crash recovery: a grant already consumed by exactly this action id
-        // and attempt recovers only through the verified consume replay.
-        // KEY0c3: the stored `consumptions[0]` receipt alone is never
-        // authority — `recordAuthorizationConsumption` re-verifies the signed
-        // answer, so a missing or mismatching signed answer never returns
-        // `approved`.
-        const consumption = coordReq.consumptions[0];
-        if (
-          coordReq.consumptions.length === 1 &&
-          consumption !== undefined &&
-          consumption.actionId === actionId &&
-          consumption.attemptId === attemptId &&
-          coordReq.grantId !== null
-        ) {
-          const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
-            {
-              consumptionId: consumption.consumptionId,
-              grantId: coordReq.grantId,
-              actionId,
-              actionScope,
-              attemptId,
-              expectedHeadSha,
-              nowIso,
-            },
-          );
-          if (consumed.outcome === 'consumed') {
-            return {
-              outcome: 'approved',
-              approvalReference: `${question.questionId}:${coordReq.id}:${coordReq.grantId}`,
-            };
+        if (isCrashRecoveryConsumption(coordReq, scope)) {
+          const recovered = await recoverConsumedGrant(coordination, scope, question, coordReq);
+          if (recovered !== null) {
+            return recovered;
           }
           continue;
         }
-        const resolved = await coordination.resolveActionAuthorization.resolveActionAuthorization({
-          projectId,
-          actionScope,
-          expectedHeadSha,
-          // CO24g: the approval is bound to the one attempt it names; a resolve
-          // without the attempt can no longer authorize an unbound owner grant.
-          attemptId,
-        });
-        if (resolved.outcome !== 'authorized' || resolved.requestId !== coordReq.id) {
-          continue;
+        const consumed = await consumeFreshGrant(coordination, scope, question, coordReq);
+        if (consumed !== null) {
+          return consumed;
         }
-        const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
-          {
-            consumptionId: consumptionId(actionId),
-            grantId: resolved.grantId,
-            actionId,
-            actionScope,
-            attemptId,
-            expectedHeadSha,
-            nowIso,
-          },
-        );
-        if (consumed.outcome !== 'consumed') {
-          return { outcome: 'blocked', reason: 'consumption-refused' };
-        }
-        return {
-          outcome: 'approved',
-          approvalReference: `${question.questionId}:${coordReq.id}:${resolved.grantId}`,
-        };
       }
       return { outcome: 'blocked', reason: 'no-scoped-owner-approval' };
     } catch {
       return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
     }
+  };
+}
+
+/**
+ * Crash recovery: a grant already consumed by exactly this action id and
+ * attempt recovers only through the verified consume replay. KEY0c3: the
+ * stored `consumptions[0]` receipt alone is never authority —
+ * `recordAuthorizationConsumption` re-verifies the signed answer, so a
+ * missing or mismatching signed answer never returns `approved`.
+ *
+ * Returns the approved result on a verified replay, or null when the replay
+ * is refused (the caller never falls back to a fresh authorization for the
+ * same question).
+ */
+async function recoverConsumedGrant(
+  coordination: UnsealedRemovalAuthorizerDeps['coordination'],
+  scope: UnsealedRemovalScope,
+  question: { readonly questionId: string; readonly linkedRequestId: string },
+  coordReq: CoordinationRequestSnapshot,
+): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
+  const consumption = coordReq.consumptions[0];
+  if (
+    coordReq.consumptions.length !== 1 ||
+    consumption === undefined ||
+    consumption.actionId !== scope.actionId ||
+    consumption.attemptId !== scope.attemptId ||
+    coordReq.grantId === null
+  ) {
+    return null;
+  }
+  const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
+    {
+      consumptionId: consumption.consumptionId,
+      grantId: coordReq.grantId,
+      actionId: scope.actionId,
+      actionScope: scope.actionScope,
+      attemptId: scope.attemptId,
+      expectedHeadSha: scope.expectedHeadSha,
+      nowIso: scope.nowIso,
+    },
+  );
+  if (consumed.outcome !== 'consumed') {
+    return null;
+  }
+  return {
+    outcome: 'approved',
+    approvalReference: `${question.questionId}:${coordReq.id}:${coordReq.grantId}`,
+  };
+}
+
+/**
+ * Fresh authorization: resolve the owner grant for this exact attempt and
+ * consume it exactly once. Returns the approved result, or null when the
+ * resolve does not match this request (the caller moves on to the next
+ * question); a resolve that matches but is refused to consume is blocked.
+ */
+async function consumeFreshGrant(
+  coordination: UnsealedRemovalAuthorizerDeps['coordination'],
+  scope: UnsealedRemovalScope,
+  question: { readonly questionId: string; readonly linkedRequestId: string },
+  coordReq: CoordinationRequestSnapshot,
+): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
+  const resolved = await coordination.resolveActionAuthorization.resolveActionAuthorization({
+    projectId: scope.projectId,
+    actionScope: scope.actionScope,
+    expectedHeadSha: scope.expectedHeadSha,
+    // CO24g: the approval is bound to the one attempt it names; a resolve
+    // without the attempt can no longer authorize an unbound owner grant.
+    attemptId: scope.attemptId,
+  });
+  if (resolved.outcome !== 'authorized' || resolved.requestId !== coordReq.id) {
+    return null;
+  }
+  const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
+    {
+      consumptionId: consumptionId(scope.actionId),
+      grantId: resolved.grantId,
+      actionId: scope.actionId,
+      actionScope: scope.actionScope,
+      attemptId: scope.attemptId,
+      expectedHeadSha: scope.expectedHeadSha,
+      nowIso: scope.nowIso,
+    },
+  );
+  if (consumed.outcome !== 'consumed') {
+    return { outcome: 'blocked', reason: 'consumption-refused' };
+  }
+  return {
+    outcome: 'approved',
+    approvalReference: `${question.questionId}:${coordReq.id}:${resolved.grantId}`,
   };
 }
 

@@ -30,6 +30,7 @@ import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-c
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import type { CoordinationRequestRecord } from '../../../../../operator-coordination/src/domain/coordination-records.js';
 import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 
 const NOW = '2026-11-10T10:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
@@ -265,12 +266,22 @@ describe('release robustness bar (CO14 follow-up)', () => {
     // cases — never a stub that grants and consumes every replay.
     const grants = new CoordinationRequestRepositoryAdapter({ stateDir });
     await grants.saveRequest(releaseGrant('grant-1', 'release:swap', SHA_B, root));
+    // KEY0c1a: the seeded approved release grant carries a signed answer
+    // under the ephemeral test signer, self-checked against the record.
+    const signer = createSignedDecisionFixture({ decisionsDir: join(stateDir, 'decisions') });
+    const seededGrant = releaseGrant('grant-1', 'release:swap', SHA_B, root);
+    await signer.writeApprovedAnswer(seededGrant);
+    await signer.assertApprovedAnswerReadsBackApproved(seededGrant);
     // The crash window: the first attempt's consume succeeds durably and then
     // the process dies before the repoint, so the caller sees a refusal while
     // the grant is already consumed and `current` is unmoved.
     let crashed = true;
     const resolve = async (request: ResolveActionAuthorizationRequest) => {
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope: 'release:swap',
         expectedHeadSha: request.expectedHeadSha,
@@ -286,7 +297,11 @@ describe('release robustness bar (CO14 follow-up)', () => {
         : { outcome: 'blocked' as const, reason: result.reason };
     };
     const consume = async (request: ConsumeActionAuthorizationRequest) => {
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: grants,
+        ...signer.deps,
+        computeDigest: digest,
+      }).recordAuthorizationConsumption({
         consumptionId: `c-${request.actionId}`,
         grantId: request.authorizationGrantId,
         actionId: request.actionId,

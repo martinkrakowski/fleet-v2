@@ -13,8 +13,11 @@ import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import {
   evaluateShadowOneTimeCriteria,
+  serializeDaemonEventHeader,
+  serializeDaemonEventLine,
   SHADOW_ATTESTATION_FACTS,
   SHADOW_ONE_TIME_REQUIREMENTS,
+  type DaemonEventRecord,
 } from '@fleet/work-execution';
 
 const tempDirs: string[] = [];
@@ -359,18 +362,67 @@ describe('cutover shadow attest (AT1)', () => {
   it('record-day never writes cutover-shadow-attestations.json', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await fs.writeFile(path.join(fixtureDir, 'queue'), '');
+    // OD7a3 fix round: the manual record-day guard refuses `late-last-tick`
+    // when the day has no daemon ticks, which this test's fixture triggered.
+    // Seed the same full-day fixture as the cutover-record-day full-day test:
+    // one job tick per minute spanning [00:00Z, 24:00Z) of the day the
+    // command defaults to (yesterday), so S12's last-tick and gap guards hold
+    // and the day records normally. The clock is pinned (the same pattern the
+    // cutover-record-day tests use) so "yesterday" cannot fall inside the
+    // 15-minute `too-early` grace window right after a real UTC midnight.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    const cliUlid = (n: number): string => {
+      let rest = n;
+      let id = '0';
+      for (let i = 0; i < 25; i += 1) {
+        id += alphabet[rest % alphabet.length];
+        rest = Math.floor(rest / alphabet.length);
+      }
+      return id;
+    };
+    const tick = (index: number): DaemonEventRecord =>
+      ({
+        version: 1,
+        eventId: cliUlid(10_000 + index),
+        tickId: `tick-${cliUlid(index + 1)}`,
+        jobId: 'merge-pass:0123456789ab',
+        kind: 'job',
+        key: null,
+        entryId: null,
+        outcome: 'completed',
+        reasonCode: null,
+        recordedAtIso: `${day}T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+      }) as DaemonEventRecord;
+    const daemonDir = path.join(stateDir, 'daemon');
+    await fs.mkdir(daemonDir, { recursive: true });
+    const lines = [serializeDaemonEventHeader()];
+    for (let index = 0; index < 1440; index += 1) {
+      const line = serializeDaemonEventLine(tick(index));
+      if (line === null) {
+        throw new Error(`daemon event line did not serialize for index ${index}`);
+      }
+      lines.push(line);
+    }
+    await fs.writeFile(path.join(daemonDir, 'events.jsonl'), `${lines.join('\n')}\n`);
     const runtime = runtimeFor(stateDir);
-    const result = await cli(runtime, [
-      'cutover',
-      'shadow',
-      'record-day',
-      '--repository',
-      'fleet/v2',
-      '--legacy-state-dir',
-      fixtureDir,
-    ]);
-    expect(result.code).toBe(0);
-    expect(existsSync(path.join(stateDir, 'cutover-shadow.json'))).toBe(true);
-    expect(existsSync(path.join(stateDir, 'cutover-shadow-attestations.json'))).toBe(false);
+    try {
+      const result = await cli(runtime, [
+        'cutover',
+        'shadow',
+        'record-day',
+        '--repository',
+        'fleet/v2',
+        '--legacy-state-dir',
+        fixtureDir,
+      ]);
+      expect(result.code).toBe(0);
+      expect(existsSync(path.join(stateDir, 'cutover-shadow.json'))).toBe(true);
+      expect(existsSync(path.join(stateDir, 'cutover-shadow-attestations.json'))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

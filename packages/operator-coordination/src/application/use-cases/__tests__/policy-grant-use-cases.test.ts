@@ -24,6 +24,7 @@ import { CancelPolicyGrantsUseCase } from '../CancelPolicyGrantsUseCase.use-case
 import { IssuePolicyForgeGrantUseCase } from '../IssuePolicyForgeGrantUseCase.use-case.js';
 import { RecordAuthorizationConsumptionUseCase } from '../RecordAuthorizationConsumptionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 
 const NOW_ISO = '2026-10-27T10:00:00.000Z';
 const HA = 'a'.repeat(40);
@@ -342,6 +343,7 @@ describe('IssuePolicyForgeGrantUseCase', () => {
 
     const resolved = await new ResolveActionAuthorizationUseCase({
       requestRepo: repository,
+      ...createSignedDecisionFixture().deps,
     }).resolveActionAuthorization({
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
@@ -410,6 +412,7 @@ describe('IssuePolicyForgeGrantUseCase', () => {
 
     const resolvedFirst = await new ResolveActionAuthorizationUseCase({
       requestRepo: repository,
+      ...createSignedDecisionFixture().deps,
     }).resolveActionAuthorization({
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
@@ -778,6 +781,7 @@ describe('ResolveActionAuthorizationUseCase no-id resolve', () => {
     await repository.saveRequest(policyGrantRecord());
     const resolved = await new ResolveActionAuthorizationUseCase({
       requestRepo: repository,
+      ...createSignedDecisionFixture().deps,
     }).resolveActionAuthorization({
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
@@ -792,16 +796,21 @@ describe('ResolveActionAuthorizationUseCase no-id resolve', () => {
   it('returns the owner grant when an approved policy grant sits at the same head as a newer owner grant', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
     await repository.saveRequest(policyGrantRecord());
-    await repository.saveRequest(
-      ownerGrantRecord({
-        grantRecordVersion: 2,
-        grantAttemptId: 'attempt-example-a',
-        createdAtIso: '2026-10-27T09:59:30.000Z',
-        updatedAtIso: '2026-10-27T09:59:30.000Z',
-      }),
-    );
+    const owner = ownerGrantRecord({
+      grantRecordVersion: 2,
+      grantAttemptId: 'attempt-example-a',
+      createdAtIso: '2026-10-27T09:59:30.000Z',
+      updatedAtIso: '2026-10-27T09:59:30.000Z',
+    });
+    await repository.saveRequest(owner);
+    // KEY0c1a: the seeded approved owner grant carries a signed answer under
+    // the ephemeral test signer, self-checked against the record's own ids.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(owner);
+    await signer.assertApprovedAnswerReadsBackApproved(owner);
     const resolved = await new ResolveActionAuthorizationUseCase({
       requestRepo: repository,
+      ...signer.deps,
     }).resolveActionAuthorization({
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',

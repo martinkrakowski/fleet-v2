@@ -112,35 +112,58 @@ export class DaemonEventProjectionAdapter implements DaemonEventProjectionPort {
   }
 
   async readAfterCursor(cursorEventId: string | null): Promise<DaemonEventCursorRead> {
-    const records = await this.readAllEvents();
-    return eventsAfterCursor(records, cursorEventId);
+    const { events, eventPositions, droppedLines } = await this.readAllEvents();
+    const cursorRead = eventsAfterCursor(events, cursorEventId);
+    if (!cursorRead.ok) {
+      return cursorRead;
+    }
+    // The returned suffix starts at `events.length - cursorRead.events.length`,
+    // so slice `eventPositions` to the same window.
+    const offset = events.length - cursorRead.events.length;
+    return { ...cursorRead, eventPositions: eventPositions.slice(offset), droppedLines };
   }
 
-  private async readAllEvents(): Promise<readonly DaemonEventRecord[]> {
+  private async readAllEvents(): Promise<{
+    readonly events: readonly DaemonEventRecord[];
+    readonly eventPositions: readonly number[];
+    readonly droppedLines: readonly number[];
+  }> {
     const target = this.statePath;
     if (target === null) {
-      return [...this.inMemoryEvents];
+      return {
+        events: [...this.inMemoryEvents],
+        eventPositions: this.inMemoryEvents.map((_, index) => index),
+        droppedLines: [],
+      };
     }
     let text: string;
     try {
       text = await fs.readFile(target, 'utf8');
     } catch (error: unknown) {
       if (isENOENT(error)) {
-        return [];
+        return { events: [], eventPositions: [], droppedLines: [] };
       }
       throw error;
     }
     const records: DaemonEventRecord[] = [];
-    for (const line of text.split('\n')) {
+    const eventPositions: number[] = [];
+    const droppedLines: number[] = [];
+    const lines = text.split('\n');
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex];
       if (line.trim().length === 0) {
         continue;
       }
       const read = readDaemonEventLine(line);
       if (read.ok && read.lineKind === 'event') {
         records.push(read.record);
+        eventPositions.push(lineIndex);
+      } else if (!read.ok) {
+        droppedLines.push(lineIndex);
       }
+      // A well-formed header line is neither an event nor a dropped line.
     }
-    return records;
+    return { events: records, eventPositions, droppedLines };
   }
 
   private get statePath(): string | null {

@@ -300,7 +300,10 @@ function cleanFixture(day: string): Fixture {
     },
   ] as unknown as MergeQueueEntryRecord[];
   const daemonEvents: DaemonEventRecord[] = [];
-  for (let index = 0; index < 800; index += 1) {
+  // OD7a3: a full day of regular one-minute ticks spanning [00:00Z, 24:00Z),
+  // so the fixture meets the S12 coverage guards (last tick 23:59Z, gaps of
+  // 60 s) and only coverage-specific tests need partial fixtures.
+  for (let index = 0; index < 1440; index += 1) {
     daemonEvents.push(daemonJobEvent(index, day));
   }
   return {
@@ -1224,7 +1227,7 @@ describe('RecordShadowDayUseCase', () => {
       recordedAtIso: RECORDED_AT_ISO,
     });
     expect(dayRecord?.verdicts.S12?.digest).toBe(expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
-      totalTicks: 800,
+      totalTicks: 1440,
       budgetOverruns: 0,
       starvedJobs: 0,
     }));
@@ -2002,8 +2005,13 @@ describe('RecordShadowDayUseCase', () => {
     const moreDay = '2026-11-15';
     const fewerFixture = cleanFixture(fewerDay);
     const moreFixture = cleanFixture(moreDay);
-    const fewer = { ...fewerFixture, daemonEvents: fewerFixture.daemonEvents.slice(0, 720) };
-    const more = { ...moreFixture, daemonEvents: moreFixture.daemonEvents.slice(0, 721) };
+    // OD7a3: both days span the whole day so the S12 coverage guards hold;
+    // the tick counts differ (720 vs 721 distinct in-day tick ids).
+    const fewer = { ...fewerFixture, daemonEvents: fewerFixture.daemonEvents.filter((_, index) => index % 2 === 0) };
+    const more = {
+      ...moreFixture,
+      daemonEvents: [...moreFixture.daemonEvents.filter((_, index) => index % 2 === 0), moreFixture.daemonEvents[1439]],
+    };
     const harnessFewer = makeHarness(fewer, NOW);
     const harnessMore = makeHarness(more, NOW);
     const resultFewer = await new RecordShadowDayUseCase(harnessFewer.deps).execute(makeRequest({ day: fewerDay }));
@@ -2042,7 +2050,7 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(resultReversed);
 
     const expected = expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
-      totalTicks: 800,
+      totalTicks: 1440,
       budgetOverruns: 0,
       starvedJobs: 0,
     });
@@ -2415,7 +2423,7 @@ describe('RecordShadowDayUseCase', () => {
       orphanResults: 0,
     }));
     expect(dayRecord?.verdicts.S12?.digest).toBe(expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
-      totalTicks: 800,
+      totalTicks: 1440,
       budgetOverruns: 0,
       starvedJobs: 0,
     }));
@@ -4676,24 +4684,26 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
   it('scheduled mode never throws on malformed daemon events and writes nothing', async () => {
     // OD7a2 fix round: the first-tick loop dereferences `event.kind` before
     // S12 validates the events, so `readAfterCursor` may hand it anything.
-    // OD7a2 fix round 6: a malformed event FAILS CLOSED — `snapshotEvent`
-    // returning null stops the run as `s12-unknown` before anything is
-    // written, never as a silently shortened event list.
+    // OD7a3 fix round 6: a malformed event FAILS CLOSED at the snapshot —
+    // `snapshotEventsRead` snapshots every event exactly once, and an event
+    // that fails to snapshot makes the WHOLE read `'malformed'`, which
+    // stops the run as `daemon-events-corrupt` before anything is written,
+    // never as a silently shortened event list.
     const harness = scheduledHarness(cleanFixture(DAY));
     const projection = harness.deps.daemonEvents as {
       readAfterCursor: () => Promise<unknown>;
     };
     projection.readAfterCursor = async () => ({ ok: true as const, events: [null, 42, {}], nextCursor: null });
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
-    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });
 
   it('scheduled mode fails closed with unknown when one null event joins 800 valid in-day job ticks', async () => {
     // OD7a2 fix round 6: 800 good ticks plus ONE null must not pass S12 on a
-    // shortened list — a single un-snapshotable event makes the whole S12
-    // evaluation unknown, and nothing is written.
+    // shortened list — a single un-snapshotable event makes the whole read
+    // (and so the whole S12 evaluation) unknown, and nothing is written.
     const fixture = cleanFixture(DAY);
     const valid = Array.from({ length: 800 }, (_, index) => daemonJobEvent(index, DAY));
     (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [
@@ -4702,7 +4712,7 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     ];
     const harness = scheduledHarness(fixture);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
-    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });
@@ -4791,13 +4801,15 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
 
   it('never rejects when the events are a null entry and one valid 00:00Z job tick, and writes nothing', async () => {
     // OD7a2 fix round 6: a null entry FAILS CLOSED. The un-snapshotable event
-    // stops the run as `s12-unknown` before the first-tick guard or S12 runs,
-    // never as a silently shortened event list, and nothing is written.
+    // makes the whole read `'malformed'` (OD7a3 fix round 6: the snapshot is
+    // all-or-nothing), stopping the run as `daemon-events-corrupt` before
+    // the first-tick guard or S12 runs, never as a silently shortened event
+    // list, and nothing is written.
     const fixture = cleanFixture(DAY);
     (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [null, daemonJobEvent(0, DAY)] as unknown as DaemonEventRecord[];
     const harness = scheduledHarness(fixture);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
-    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });
@@ -4852,5 +4864,554 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'scheduled-evaluation-failed' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
+  });
+});
+
+describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event lines (OD7a3)', () => {
+  const PREV_DAY = '2026-11-15';
+
+  /** The clean fixture with every tick at or after `hour` removed (the daemon died). */
+  function deadFromFixture(hour: number): Fixture {
+    const fixture = cleanFixture(DAY);
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = fixture.daemonEvents.filter(
+      (event) => Date.parse(event.recordedAtIso) < Date.parse(`${DAY}T${String(hour).padStart(2, '0')}:00:00Z`),
+    );
+    return fixture;
+  }
+
+  /** The clean fixture with a 40-minute hole from 09:01Z to 09:40Z (indices 541..579). */
+  function gapFixture(): Fixture {
+    const fixture = cleanFixture(DAY);
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = fixture.daemonEvents.filter((event) => {
+      const minute = (Date.parse(event.recordedAtIso) - Date.parse(`${DAY}T00:00:00Z`)) / 60_000;
+      return minute <= 540 || minute >= 580;
+    });
+    return fixture;
+  }
+
+  /** The harness with the daemon-events read replaced by a fixed `DaemonEventCursorRead`. */
+  function harnessWithRead(harness: Harness, read: unknown): Harness {
+    const deps: RecordShadowDayDependencies = {
+      ...harness.deps,
+      daemonEvents: { readAfterCursor: async () => read as Awaited<ReturnType<typeof harness.deps.daemonEvents.readAfterCursor>> },
+    };
+    return { ...harness, deps };
+  }
+
+  /** A full-day read whose `eventPositions` are the natural 0..n-1 indexes. */
+  function dayRead(events: readonly DaemonEventRecord[], droppedLines?: readonly number[], eventPositions?: readonly number[]): unknown {
+    return {
+      ok: true,
+      events,
+      nextCursor: null,
+      eventPositions: eventPositions ?? events.map((_, index) => index),
+      ...(droppedLines === undefined ? {} : { droppedLines }),
+    };
+  }
+
+  it('scheduled mode skips late-last-tick when the daemon is dead from 13:00Z, writing nothing', async () => {
+    const harness = scheduledHarness(deadFromFixture(13));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'late-last-tick');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('scheduled mode skips coverage-gap for a 40-minute hole at 09:00Z, writing nothing', async () => {
+    const harness = scheduledHarness(gapFixture());
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'coverage-gap');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('manual mode refuses late-last-tick without writing to the ledger', async () => {
+    const harness = makeHarness(deadFromFixture(13), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'late-last-tick' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('manual mode refuses coverage-gap without writing to the ledger', async () => {
+    const harness = makeHarness(gapFixture(), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'coverage-gap' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('manual mode still records a full day with regular ticks (the guards hold only on coverage failures)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S12).toBe('pass');
+  });
+
+  it('answers unknown daemon-events-corrupt when a dropped line is bracketed inside the day, writing nothing', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = dayRead(harness.deps ? cleanFixture(DAY).daemonEvents : [], [700]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  // OD7a3 fix round: the same bracketed corrupt line makes SCHEDULED mode
+  // unknown too — scheduled prechecks must not turn a bracketed corrupt line
+  // into a skip or a write.
+  it('scheduled mode answers unknown daemon-events-corrupt for a valid bracketed droppedLines, writing nothing', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const read = dayRead(cleanFixture(DAY).daemonEvents, [700]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it('reads a Proxy event whose recordedAtIso descriptor changes between reads exactly once, and a bracketed corrupt line still makes the day unknown', async () => {
+    // OD7a3 fix round 6 (structural): `snapshotEventsRead` snapshots EVERY
+    // event exactly once, immediately after the port returns, and every
+    // downstream consumer (bracket, first-tick guard, S12 inputs) sees only
+    // the frozen copies. So a Proxy event whose `recordedAtIso` own
+    // descriptor returns a different value on each read is read exactly
+    // once — the FIRST read is the one used everywhere — and a corrupt line
+    // bracketed by in-day records still makes the day
+    // `unknown/daemon-events-corrupt` with nothing written.
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let descriptorReads = 0;
+    const base = daemonJobEvent(0, DAY);
+    const shifting = new Proxy(base, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'recordedAtIso') {
+          descriptorReads += 1;
+          return {
+            value:
+              descriptorReads === 1
+                ? (target as DaemonEventRecord).recordedAtIso
+                : `${PREV_DAY}T00:00:00Z`,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    // One in-day parsed record at position 0, and a dropped line at
+    // position 0 — bracketed by that record's bracket [0, 0].
+    const read = dayRead([shifting as unknown as DaemonEventRecord], [0]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(descriptorReads).toBe(1);
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it('ignores a corrupt line on an earlier day (outside the target day bracket) and records normally', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const events = [...prevEvents, ...cleanFixture(DAY).daemonEvents];
+    const read = dayRead(events, [1]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S12).toBe('pass');
+    expect(guarded.evidence.stored?.days.find((entry) => entry.day === DAY)).toBeDefined();
+  });
+
+  it('records normally when the dropped line lies outside the day bracket even on the same file', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const events = cleanFixture(DAY).daemonEvents;
+    const read = dayRead(events, [events.length + 5], events.map((_, index) => index));
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S12).toBe('pass');
+  });
+
+  it('ignores dropped lines when the day has no in-day parsed records (no bracket)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const read = dayRead(prevEvents, [1]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expectRecorded(result);
+    // No in-day events means S12 fails too-few-ticks (recorded), never unknown.
+    expect(result.recorded.S12).toBe('fail');
+  });
+
+  it('treats a missing droppedLines field as no dropped lines (backwards compatibility)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = { ok: true, events: cleanFixture(DAY).daemonEvents, nextCursor: null };
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S12).toBe('pass');
+  });
+
+  it.each([
+    ['a non-array droppedLines', 'nope'],
+    ['a negative position', [-1]],
+    ['a non-integer position', [1.5]],
+    ['a wrong primitive (a number where a list is due)', 42],
+    ['a non-iterable object where a list is due', {}],
+    ['an array-like object where a list is due', { length: 1, 0: 3 }],
+    ['a wrong primitive position element', ['x']],
+  ])('answers unknown daemon-events-corrupt for %s', async (_title, droppedLines) => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = dayRead(cleanFixture(DAY).daemonEvents, droppedLines as readonly number[]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+  });
+
+  // OD7a3 fix round: a malformed `droppedLines` fails closed BEFORE any
+  // bracketing logic, so it stays `unknown` even when the day has no in-day
+  // parsed records (no bracket) — in BOTH modes, writing nothing.
+  it.each([
+    ['a negative position', [-1]],
+    ['a non-integer position', [1.5]],
+    ['a wrong primitive position element', ['x']],
+    ['a non-array droppedLines', 'nope'],
+  ])('answers unknown daemon-events-corrupt for %s with no in-day records (manual mode)', async (_title, droppedLines) => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const read = dayRead(prevEvents, droppedLines as readonly number[]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it.each([
+    ['a negative position', [-1]],
+    ['a non-integer position', [1.5]],
+  ])('answers unknown daemon-events-corrupt for %s with no in-day records (scheduled mode)', async (_title, droppedLines) => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const read = dayRead(prevEvents, droppedLines as readonly number[]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it('answers unknown daemon-events-corrupt for a Proxy over a read with a malformed droppedLines and no in-day records', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let getTrapCalls = 0;
+    const trapKeys: string[] = [];
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const plain = dayRead(prevEvents, [-1]) as Record<string, unknown>;
+    const proxy = new Proxy(plain, {
+      get(target, key, receiver) {
+        // Awaiting the port result makes the promise protocol probe `then`
+        // on the resolved value; that is not a data read, so it is not
+        // counted — every data key must stay trap-free.
+        if (key !== 'then') {
+          getTrapCalls += 1;
+          trapKeys.push(String(key));
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const guarded = harnessWithRead(harness, proxy);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+    expect(getTrapCalls, trapKeys.join()).toBe(0);
+  });
+
+  it('answers unknown daemon-events-corrupt for a sparse droppedLines array (an array hole)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const sparse: number[] = [0];
+    delete sparse[0];
+    const read = dayRead(cleanFixture(DAY).daemonEvents, sparse);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+  });
+
+  it('refuses an enormous sparse droppedLines length before any traversal', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const huge: number[] = [];
+    huge.length = 2 ** 32 - 1;
+    const read = dayRead(cleanFixture(DAY).daemonEvents, huge);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+  });
+
+  it('answers unknown daemon-events-corrupt for a non-empty droppedLines with a missing eventPositions', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = { ok: true, events: cleanFixture(DAY).daemonEvents, nextCursor: null, droppedLines: [0] };
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+  });
+
+  it('answers unknown daemon-events-corrupt when eventPositions length does not match events.length', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = dayRead(cleanFixture(DAY).daemonEvents, [0], [0]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+  });
+
+  it('never runs a getter on a droppedLines element (own descriptor reads only)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let getterCalls = 0;
+    const droppedLines: number[] = [0, 1];
+    Object.defineProperty(droppedLines, 0, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return 0;
+      },
+    });
+    const read = dayRead(cleanFixture(DAY).daemonEvents, droppedLines);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('never runs a getter on the read root (own descriptor reads only)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let getterCalls = 0;
+    const read: Record<string, unknown> = dayRead(cleanFixture(DAY).daemonEvents, [700]) as Record<string, unknown>;
+    Object.defineProperty(read, 'droppedLines', {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return [700];
+      },
+    });
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('answers exactly the plain result over a Proxy read (the inspection never trusts a get trap)', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = dayRead(cleanFixture(DAY).daemonEvents, [700]) as Record<string, unknown>;
+    let getTrapCalls = 0;
+    const proxy = new Proxy(plain, {
+      get(target, key, receiver) {
+        // Awaiting the port result makes the promise protocol probe `then`
+        // on the resolved value; that is not a data read, so it is not
+        // counted — every data key must stay trap-free.
+        if (key !== 'then') {
+          getTrapCalls += 1;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const guarded = harnessWithRead(harness, proxy);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    // The Proxy must yield exactly the plain data's verdict, and no `get`
+    // trap may run for a data key: the inspection and the `ok` check read
+    // only through own data descriptors.
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    const plainResult = await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
+    expect(result).toEqual(plainResult);
+    expect(getTrapCalls).toBe(0);
+  });
+
+  it('is not satisfiable by a constant refusal: a clean read without dropped lines records normally', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = dayRead(cleanFixture(DAY).daemonEvents, [10_000]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S12).toBe('pass');
+  });
+
+  it('is not an identity echo of the input: the answer carries no droppedLines or events field', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const read = dayRead(cleanFixture(DAY).daemonEvents, [700]) as Record<string, unknown>;
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).not.toHaveProperty('events');
+    expect(result).not.toHaveProperty('droppedLines');
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+  });
+
+  // OD7a3 fix round: the read result is snapshotted once through its own data
+  // descriptors (`snapshotEventsRead`), so a Proxy whose `get` trap lies
+  // about `events` while its descriptors describe a valid full-day read must
+  // yield exactly the plain read's result — never a shortened list, and
+  // never `too-few-ticks`. Tested in scheduled AND manual mode.
+  it.each(['scheduled', 'manual'] as const)('a Proxy whose get returns events: [] over a valid full-day read gives the plain read result, never too-few-ticks (%s mode)', async (mode) => {
+    const plain = dayRead(cleanFixture(DAY).daemonEvents) as Record<string, unknown>;
+    const lying = new Proxy(plain, {
+      get(target, key, receiver) {
+        // The promise protocol probes `then` on the awaited value; that is
+        // not a data read. Every data key goes through this trap, which lies
+        // about `events` — the snapshot must never consult it.
+        if (key === 'events') {
+          return [];
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const proxiedResult =
+      mode === 'scheduled'
+        ? await new RecordShadowDayUseCase(harnessWithRead(scheduledHarness(cleanFixture(DAY)), lying).deps).execute(
+            makeRequest({ scheduled: true }),
+          )
+        : await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), lying).deps).execute(makeRequest());
+    const plainResult =
+      mode === 'scheduled'
+        ? await new RecordShadowDayUseCase(harnessWithRead(scheduledHarness(cleanFixture(DAY)), plain).deps).execute(
+            makeRequest({ scheduled: true }),
+          )
+        : await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
+    expect(proxiedResult).toEqual(plainResult);
+    expect(proxiedResult).toHaveProperty('recorded');
+    expect((proxiedResult as { recorded: Record<string, string> }).recorded.S12).toBe('pass');
+  });
+
+  // OD7a3 fix round: a Proxy whose `getOwnPropertyDescriptor` trap throws is
+  // caught by `snapshotEventsRead` and fails closed as
+  // `unknown/daemon-events-corrupt`, writing nothing, and `execute()`
+  // resolves without throwing. Tested in scheduled AND manual mode.
+  it.each(['scheduled', 'manual'] as const)('a Proxy with a throwing getOwnPropertyDescriptor trap gives unknown daemon-events-corrupt and writes nothing (%s mode)', async (mode) => {
+    const plain = dayRead(cleanFixture(DAY).daemonEvents) as Record<string, unknown>;
+    const explosive = new Proxy(plain, {
+      getOwnPropertyDescriptor() {
+        throw new Error('descriptor trap');
+      },
+    });
+    const harness =
+      mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+    const guarded = harnessWithRead(harness, explosive);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+      mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+    );
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  // OD7a3 fix round 4: only an own DATA property `ok === false` means
+  // `{ ok: false }`. A read whose `ok` is an accessor, which lacks `ok`, or
+  // whose `ok` is not a boolean is `'malformed'` — `unknown` /
+  // `daemon-events-corrupt` with nothing written in both modes — never a
+  // silent "no events" answer.
+  it.each(['scheduled', 'manual'] as const)(
+    'answers unknown daemon-events-corrupt for an accessor ok (%s mode)',
+    async (mode) => {
+      const events = cleanFixture(DAY).daemonEvents;
+      const read: Record<string, unknown> = { ok: true, events, nextCursor: null };
+      Object.defineProperty(read, 'ok', {
+        enumerable: true,
+        get() {
+          return true;
+        },
+      });
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it.each(['scheduled', 'manual'] as const)(
+    'answers unknown daemon-events-corrupt for a read that lacks ok (%s mode)',
+    async (mode) => {
+      const read = { events: cleanFixture(DAY).daemonEvents, nextCursor: null };
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it.each(['scheduled', 'manual'] as const)(
+    "answers unknown daemon-events-corrupt for a read whose ok is 'yes' (%s mode)",
+    async (mode) => {
+      const read = { ok: 'yes', events: cleanFixture(DAY).daemonEvents, nextCursor: null };
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it('still treats an own data ok: false as a failed read (not malformed), leaving S12 unevaluated', async () => {
+    const read = { ok: false, events: [], nextCursor: null };
+    const guarded = harnessWithRead(makeHarness(cleanFixture(DAY), NOW), read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect((result as unknown as { unevaluated: Array<{ criterion: string; reason: string }> }).unevaluated).toContainEqual(
+      expect.objectContaining({ criterion: 'S12', reason: 'daemon-events-unavailable' }),
+    );
+  });
+
+  // OD7a3 fix round 4: each droppedLines/eventPositions element is read
+  // exactly ONCE into the snapshot and the COPIED values are what is
+  // validated, so a Proxy whose index descriptor changes between reads
+  // cannot make the validator see a valid position and the snapshot a
+  // different one: the result must reflect a single read — exactly the plain
+  // data's result.
+  it('answers exactly the plain result for a Proxy whose index descriptor changes between reads (a single read)', async () => {
+    const events = cleanFixture(DAY).daemonEvents;
+    // A dropped line far OUTSIDE the day bracket: the plain read records
+    // normally, so the only way to differ from it is a second read.
+    // `droppedLines` itself is the Proxy: each element's
+    // `getOwnPropertyDescriptor` trap is honest on its FIRST call and
+    // poisoned on every LATER call, so a double read (validate then
+    // snapshot) sees two different values while the fixed single-read
+    // snapshot sees only the honest one.
+    const honest: number[] = [events.length + 5];
+    const perKeyReads = new Map<string, number>();
+    const shifting = new Proxy(honest, {
+      getOwnPropertyDescriptor(target, key) {
+        const keyName = String(key);
+        const seen = perKeyReads.get(keyName) ?? 0;
+        perKeyReads.set(keyName, seen + 1);
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        // A `Object.keys` shape check probes each key's descriptor once for
+        // enumerability BEFORE any value read. So a single-value-read
+        // implementation spends two descriptor calls per element (probe +
+        // read), while a double-reading implementation spends three — and
+        // the third one is poisoned.
+        if (seen < 2 || descriptor === undefined || !/^\d+$/.test(keyName)) {
+          return descriptor;
+        }
+        return { ...descriptor, value: 'poisoned' };
+      },
+    });
+    const plain = dayRead(events, [events.length + 5], events.map((_, index) => index)) as Record<string, unknown>;
+    const read = { ...plain, droppedLines: shifting };
+    const guarded = harnessWithRead(makeHarness(cleanFixture(DAY), NOW), read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    const plainResult = await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
+    expect(result).toEqual(plainResult);
+    expectRecorded(result);
+    expect((result as { recorded: Record<string, string> }).recorded.S12).toBe('pass');
   });
 });

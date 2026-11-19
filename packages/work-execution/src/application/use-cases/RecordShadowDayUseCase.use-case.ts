@@ -19,7 +19,6 @@
 // compare.
 
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { type DaemonEventRecord } from '../../domain/daemon-events.js';
 import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../domain/cutover-records.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { isMergeQueueEntryLive, type MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
@@ -55,6 +54,7 @@ import {
 import {
   evaluateShadowStateIntegrity,
   evaluateShadowTickHealth,
+  SHADOW_MAX_HEALTH_ITEMS,
   type ShadowStateIntegrityEvaluation,
   type ShadowTickHealthEvaluation,
 } from '../../domain/shadow-day-health.js';
@@ -294,7 +294,13 @@ function parseBoundedIsoMs(value: unknown): number | null {
 
 /** A skipped result: a scheduled-mode guard held, nothing was written. */
 function skippedResult(
-  reason: 'partial-day' | 'too-few-ticks' | 'grant-unavailable' | 'grant-not-covering-day',
+  reason:
+    | 'partial-day'
+    | 'too-few-ticks'
+    | 'grant-unavailable'
+    | 'grant-not-covering-day'
+    | 'late-last-tick'
+    | 'coverage-gap',
 ): RecordShadowDayResult {
   return { outcome: 'skipped', reason };
 }
@@ -751,6 +757,454 @@ function snapshotEvent(event: unknown): DaemonEventSnapshot | null {
 }
 
 /**
+ * OD7a3: the own `length` of a dense, non-Proxy plain `Array`, or null.
+ * Reads only the `length` own descriptor (no element values), so no getter
+ * and no Proxy `get` trap ever runs; an oversized, sparse or
+ * accessor-carrying array is refused from its length alone, before any
+ * element is touched. Cost is constant (the length descriptor only).
+ */
+function ownDenseArrayLengthWithinCap(value: unknown): number | null {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value > SHADOW_MAX_HEALTH_ITEMS
+  ) {
+    return null;
+  }
+  return lengthDescriptor.value;
+}
+
+/**
+ * OD7a3 fix round: the own `length` of a dense, non-Proxy plain `Array`
+ * within the cap, WITHOUT reading any element value — the shape check only
+ * (the `length` own descriptor plus the own-key count), so an element read
+ * through a descriptor is never spent here. Element values are validated on
+ * the snapshot copy, never on the original. Cost is linear in the array's
+ * capped length (the own-key walk is capped at `SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function readOwnArrayShape(value: unknown): number | null {
+  const lengthDescriptorValue = ownDenseArrayLengthWithinCap(value);
+  if (lengthDescriptorValue === null) {
+    return null;
+  }
+  if (Object.keys(value as object).length !== lengthDescriptorValue) {
+    return null;
+  }
+  return lengthDescriptorValue;
+}
+
+/**
+ * OD7a3 fix round: the ONE copy of a hostile array's elements. Every element
+ * is read EXACTLY ONCE, from its own data descriptor's `.value`
+ * (`ownElement`), into a NEW plain array; nothing on the original is ever
+ * read again, so a Proxy whose index descriptors change between reads (or
+ * whose `get` trap disagrees with its descriptors) can only yield the first
+ * descriptor read's values — the copy IS the validated snapshot's input.
+ * Cost is linear in the array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotOwnArrayElements(value: unknown, length: number): unknown[] {
+  const copy: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    copy.push(ownElement(value as object, String(index)));
+  }
+  return copy;
+}
+
+/**
+ * OD7a3 fix round: whether every copied element is a non-negative safe
+ * integer (the validation the original array's elements would have had).
+ * Cost is linear in the copy's length.
+ */
+function isNonNegativeSafeIntegerArray(copy: readonly unknown[]): copy is readonly number[] {
+  return copy.every(
+    (element) => typeof element === 'number' && Number.isSafeInteger(element) && element >= 0,
+  );
+}
+
+/**
+ * OD7a3 fix round: the `[first, last]` bracket of file positions among the
+ * SNAPSHOT records whose `recordedAtIso` falls inside `day`, or null when
+ * the day has no in-day parsed record (no bracket, so no dropped line
+ * affects the day). The input is the typed snapshot only — each event is the
+ * frozen plain copy `snapshotEvent` produced and each position an already
+ * validated non-negative safe integer — so no raw event and no `unknown`
+ * ever reaches the bracket, and a Proxy's `recordedAtIso` can never be read
+ * a second time here. Cost is linear in the snapshot's capped `events` array
+ * (at most `SHADOW_MAX_HEALTH_ITEMS` entries).
+ */
+/** Whether the event's `recordedAtIso` falls inside `day`. */
+function eventFallsInDay(event: DaemonEventSnapshot, day: string): boolean {
+  return event.recordedAtIso.slice(0, 10) === day;
+}
+
+/**
+ * The validated file position of one in-day snapshot event, or null when the
+ * event is not in `day`, or `'malformed'` when the position fails the
+ * non-negative safe-integer check. The snapshot invariant (validated in
+ * `snapshotEventsRead`) makes every position a non-negative safe integer;
+ * the type checker enforces it, and the runtime check below only backs that
+ * invariant fail-closed.
+ */
+function inDayRecordPosition(event: DaemonEventSnapshot, position: unknown, day: string): number | 'malformed' | null {
+  if (!eventFallsInDay(event, day)) {
+    return null;
+  }
+  if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+    return 'malformed';
+  }
+  return position;
+}
+
+/** The bracket widened to include `position`. */
+function widenBracket(
+  bracket: { readonly first: number; readonly last: number } | null,
+  position: number,
+): { readonly first: number; readonly last: number } {
+  const first = bracket === null || position < bracket.first ? position : bracket.first;
+  const last = bracket === null || position > bracket.last ? position : bracket.last;
+  return { first, last };
+}
+
+function inDayRecordBracket(
+  events: ReadonlyArray<DaemonEventSnapshot>,
+  eventPositions: ReadonlyArray<number>,
+  day: string,
+): { readonly first: number; readonly last: number } | 'malformed' | null {
+  let bracket: { readonly first: number; readonly last: number } | null = null;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event === undefined) {
+      continue;
+    }
+    const position = inDayRecordPosition(event, eventPositions[index], day);
+    if (position === 'malformed') {
+      return 'malformed';
+    }
+    if (position === null) {
+      continue;
+    }
+    bracket = widenBracket(bracket, position);
+  }
+  return bracket;
+}
+
+/**
+ * OD7a3: whether any of the validated dropped-line positions lies within a
+ * `[first, last]` bracket. Cost is linear in the positions array's length.
+ */
+function anyPositionWithin(positions: readonly number[], bracket: { readonly first: number; readonly last: number }): boolean {
+  return positions.some((position) => position >= bracket.first && position <= bracket.last);
+}
+
+/**
+ * OD7a3: the `droppedLines` field of an events read, classified without ever
+ * running a getter or a Proxy `get` trap: `absent` (a missing descriptor or
+ * an own `undefined` value, treated as `[]` for backwards compatibility),
+ * `empty` (an own array of length 0), `malformed` (an accessor, a
+ * sparse/oversized array — shape only, fail closed), or `present` with the
+ * length. Element values are NOT read here: the snapshot copies each element
+ * exactly once (`snapshotOwnArrayElements`) and validates the COPIED values,
+ * so no element is ever read twice from the original. Cost is linear in the
+ * array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+type DroppedLinesField =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'empty' }
+  | { readonly kind: 'malformed' }
+  | { readonly kind: 'present'; readonly droppedLines: unknown; readonly droppedLength: number };
+
+function readDroppedLinesField(read: object): DroppedLinesField {
+  const droppedDescriptor = Object.getOwnPropertyDescriptor(read, 'droppedLines');
+  // An accessor (or a missing) `droppedLines` is never read through a
+  // getter: an accessor fails closed, a missing field is treated as `[]`.
+  if (droppedDescriptor === undefined) {
+    return { kind: 'absent' };
+  }
+  if (droppedDescriptor.get !== undefined || droppedDescriptor.set !== undefined) {
+    return { kind: 'malformed' };
+  }
+  const droppedLines = droppedDescriptor.value;
+  if (droppedLines === undefined) {
+    return { kind: 'absent' };
+  }
+  const droppedLength = readOwnArrayShape(droppedLines);
+  if (droppedLength === null) {
+    return { kind: 'malformed' };
+  }
+  if (droppedLength === 0) {
+    return { kind: 'empty' };
+  }
+  return { kind: 'present', droppedLines, droppedLength };
+}
+
+/**
+ * OD7a3 fix round: whether any dropped (corrupt) `events.jsonl` line is
+ * bracketed inside `day`'s parsed records. Policy: `events.jsonl` holds the
+ * whole history, so a dropped line counts against a day ONLY when its file
+ * position lies between the first and the last successfully parsed record
+ * whose time is inside that day; a corrupt line outside every day's bracket
+ * affects no day. The input is the typed OK snapshot only (`EventsReadOk`):
+ * every event is the frozen plain copy `snapshotEvent` produced, the
+ * dropped-line positions are already validated non-negative safe integers,
+ * and the in-day positions were validated against `events.length` at
+ * snapshot time — so no raw read and no `unknown` ever reaches this helper,
+ * and a Proxy cannot disagree with the snapshot here. A non-empty
+ * `droppedLines` whose snapshot carries no positions (impossible by the
+ * snapshot invariant) fails closed. Cost is linear in the snapshot's capped
+ * `events` array (at most `SHADOW_MAX_HEALTH_ITEMS` entries).
+ */
+function corruptLineBracketedInDay(snapshot: EventsReadOk, day: string): boolean {
+  try {
+    if (snapshot.droppedLines.length === 0) {
+      return false;
+    }
+    const eventPositions = snapshot.eventPositions;
+    if (eventPositions === null) {
+      return true;
+    }
+    const bracket = inDayRecordBracket(snapshot.events, eventPositions, day);
+    if (bracket === null) {
+      return false;
+    }
+    if (bracket === 'malformed') {
+      return true;
+    }
+    return anyPositionWithin(snapshot.droppedLines, bracket);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * OD7a3 fix round: one own data property of a possibly hostile container,
+ * read through its descriptor inside a try/catch — a descriptor read that
+ * throws (a hostile Proxy trap) carries `undefined` instead of escaping.
+ * Cost is constant (one descriptor read).
+ */
+function ownElement(container: object, key: string): unknown {
+  try {
+    return Object.getOwnPropertyDescriptor(container, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * OD7a3 fix round: the ONE snapshot of an events read result. The raw read
+ * is inspected through own data descriptors ONLY — `ok`, `events`,
+ * `droppedLines` (and `eventPositions`, which the corrupt-line bracket needs
+ * whenever `droppedLines` is non-empty) are each read exactly ONCE, from
+ * their own data descriptor's `.value`, never through a getter, inside a
+ * try/catch — and every value is copied into a NEW frozen plain structure:
+ * a frozen `{ ok: true, events, droppedLines, eventPositions }` record whose
+ * `events` are frozen per-event snapshots (each the plain copy `snapshotEvent`
+ * produces) and whose `droppedLines`/`eventPositions` are frozen validated
+ * number-array copies. Every later read uses
+ * only this snapshot, so a Proxy whose descriptors and `get` trap disagree
+ * can only yield the descriptor's values (a `get` trap that lies about
+ * `events` is never consulted), and a throwing descriptor trap can never
+ * escape — it is caught and reported as `'malformed'`. The result is
+ * `'malformed'` when the raw is not a plain record object, when `events` is
+ * missing, an accessor, not a dense array within `SHADOW_MAX_HEALTH_ITEMS`,
+ * when ANY event fails to snapshot (OD7a3 fix round 6 — the whole read is
+ * malformed, never a shortened list), when
+ * `droppedLines`/`eventPositions` are malformed, when `ok` is missing,
+ * an accessor or not a boolean, or when anything throws; `{ ok: false }` only
+ * when `ok` is an own data property whose value is exactly `false`.
+ * Cost is linear in the
+ * capped `events` length (`SHADOW_MAX_HEALTH_ITEMS`) plus the capped
+ * `droppedLines`/`eventPositions` lengths.
+ */
+type EventsReadSnapshot =
+  | {
+      readonly ok: true;
+      readonly events: ReadonlyArray<DaemonEventSnapshot>;
+      readonly droppedLines: ReadonlyArray<number>;
+      readonly eventPositions: ReadonlyArray<number> | null;
+    }
+  | { readonly ok: false }
+  | 'malformed';
+
+/** The OK branch of `EventsReadSnapshot` — the only shape a downstream helper accepts. */
+type EventsReadOk = Extract<EventsReadSnapshot, { ok: true }>;
+
+/**
+ * The `ok` field of an events read, read through its own data descriptor
+ * only (never a getter, never a Proxy `get` trap): OD7a3 fix round — only an
+ * own DATA property `ok === false` means `{ ok: false }` (a failed read). A
+ * missing `ok`, an accessor, or a non-boolean value does not even answer the
+ * question, so it is `'malformed'` — `unknown` / `daemon-events-corrupt`
+ * with nothing written in both modes — never a silent `{ ok: false }`.
+ * Cost is constant (one descriptor read).
+ */
+function snapshotOkFlag(raw: object): { readonly ok: true } | { readonly ok: false } | 'malformed' {
+  const okDescriptor = Object.getOwnPropertyDescriptor(raw, 'ok');
+  if (okDescriptor === undefined || okDescriptor.get !== undefined) {
+    return 'malformed';
+  }
+  if (typeof okDescriptor.value !== 'boolean') {
+    return 'malformed';
+  }
+  if (okDescriptor.value === false) {
+    return { ok: false };
+  }
+  return { ok: true };
+}
+
+/**
+ * The snapshot of the raw `events` array: every event is snapshotted exactly
+ * ONCE, here, by `snapshotEvent` — the container is read once per element
+ * (through the element's own data descriptor) and each element's own keys
+ * are read once each by `snapshotEvent`. The snapshot array is the ONLY
+ * event list any downstream code (bracket, first-tick guard, S12 inputs,
+ * tick health, coverage) ever sees, so a Proxy event whose descriptors
+ * change between reads can never show one value to the bracket and another
+ * to the validator. An event that fails to snapshot (not a non-null object,
+ * or `kind`/`recordedAtIso` not strings) makes the WHOLE read `'malformed'`
+ * — fail closed — never a shortened list. Cost is linear in the capped
+ * `events` length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotEventList(raw: object): ReadonlyArray<DaemonEventSnapshot> | 'malformed' {
+  const events = ownDataProperty(raw, 'events');
+  const eventsLength = ownDenseArrayLengthWithinCap(events);
+  if (eventsLength === null) {
+    return 'malformed';
+  }
+  const eventsCopy: DaemonEventSnapshot[] = [];
+  for (let index = 0; index < eventsLength; index += 1) {
+    const eventSnapshot = snapshotEvent(ownElement(events as object, String(index)));
+    if (eventSnapshot === null) {
+      return 'malformed';
+    }
+    eventsCopy.push(eventSnapshot);
+  }
+  return Object.freeze(eventsCopy);
+}
+
+/**
+ * The snapshot of the raw `droppedLines` field: `{ kind: 'absent' }` when the
+ * field is absent or empty (treated as no dropped lines), `{ kind: 'present' }`
+ * with the frozen validated number-array copy when lines are present, and
+ * `'malformed'` when the field is an accessor or a sparse/oversized array or
+ * any element fails the non-negative safe-integer check. OD7a3 fix round:
+ * every element of `droppedLines` is read EXACTLY ONCE — from its own data
+ * descriptor's `.value` — into a new array, and the COPIED values are what
+ * is validated and used. A Proxy whose index descriptors change between
+ * reads (or whose `get` trap disagrees with them) can therefore never make
+ * the validator see one value and the snapshot another: there is only one
+ * read, and it is the snapshot's. Cost is linear in the capped
+ * `droppedLines` length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotDroppedLines(
+  raw: object,
+): { readonly kind: 'absent' } | { readonly kind: 'present'; readonly droppedLines: ReadonlyArray<number> } | 'malformed' {
+  const dropped = readDroppedLinesField(raw);
+  if (dropped.kind === 'malformed') {
+    return 'malformed';
+  }
+  if (dropped.kind !== 'present') {
+    // `absent` and `empty` both mean no dropped lines: the snapshot carries `[]`.
+    return { kind: 'absent' };
+  }
+  const droppedCopy = snapshotOwnArrayElements(dropped.droppedLines, dropped.droppedLength);
+  if (!isNonNegativeSafeIntegerArray(droppedCopy)) {
+    return 'malformed';
+  }
+  return { kind: 'present', droppedLines: Object.freeze(droppedCopy) };
+}
+
+/**
+ * The snapshot of the raw `eventPositions` field: the corrupt-line bracket
+ * needs the positions of the parsed records; they are read once here,
+ * through their own descriptors, and validated on the copy, so the snapshot
+ * alone answers every later read. The positions array must have exactly the
+ * `events` length. Cost is linear in the capped positions length
+ * (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotEventPositions(raw: object, eventsLength: number): ReadonlyArray<number> | 'malformed' {
+  const eventPositions = ownDataProperty(raw, 'eventPositions');
+  const positionsLength = readOwnArrayShape(eventPositions);
+  if (positionsLength !== eventsLength) {
+    return 'malformed';
+  }
+  const positionsCopy = snapshotOwnArrayElements(eventPositions, positionsLength);
+  if (!isNonNegativeSafeIntegerArray(positionsCopy)) {
+    return 'malformed';
+  }
+  return Object.freeze(positionsCopy);
+}
+
+/**
+ * The OK branch of `snapshotEventsRead`: the frozen
+ * `{ ok: true, events, droppedLines, eventPositions }` record, with
+ * `eventPositions: null` and an empty `droppedLines` when the read carries
+ * no dropped lines.
+ */
+function snapshotEventsReadOk(raw: object): EventsReadSnapshot {
+  const okFlag = snapshotOkFlag(raw);
+  if (okFlag === 'malformed') {
+    return 'malformed';
+  }
+  if (!okFlag.ok) {
+    return { ok: false };
+  }
+  const events = snapshotEventList(raw);
+  if (events === 'malformed') {
+    return 'malformed';
+  }
+  const dropped = snapshotDroppedLines(raw);
+  if (dropped === 'malformed') {
+    return 'malformed';
+  }
+  if (dropped.kind === 'absent') {
+    return Object.freeze({
+      ok: true,
+      events,
+      droppedLines: Object.freeze([]),
+      eventPositions: null,
+    });
+  }
+  const positions = snapshotEventPositions(raw, events.length);
+  if (positions === 'malformed') {
+    return 'malformed';
+  }
+  return Object.freeze({
+    ok: true,
+    events,
+    droppedLines: dropped.droppedLines,
+    eventPositions: positions,
+  });
+}
+
+function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
+  try {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      return 'malformed';
+    }
+    return snapshotEventsReadOk(raw as object);
+  } catch {
+    return 'malformed';
+  }
+}
+
+/**
+ * OD7a3: a manual-mode S12 guard that aborts the whole run with a typed
+ * result (a refusal or an unknown), writing nothing to the ledger. Thrown
+ * from `evaluateTickHealthCriterion` and caught in `run`.
+ */
+class S12GuardResult extends Error {
+  constructor(readonly result: RecordShadowDayResult) {
+    super('s12-guard');
+  }
+}
+
+/**
  * Read an outer `attestations.read` result as an EXACT plain record:
  * `status: 'missing'` must carry exactly the own data key `status`, and
  * `status: 'ok'` must carry exactly the own data keys `status` and `ledger`.
@@ -829,11 +1283,29 @@ function zipReleaseTests(paths: readonly string[], inspection: unknown): readonl
   }
 }
 
-function unknownResult(reason: 'ledger-unreadable' | 'ledger-unknown-version' | 'ledger-busy' | 'deadline-exceeded'): RecordShadowDayResult {
+function unknownResult(
+  reason:
+    | 'ledger-unreadable'
+    | 'ledger-unknown-version'
+    | 'ledger-busy'
+    | 'deadline-exceeded'
+    | 'daemon-events-corrupt',
+): RecordShadowDayResult {
   return { outcome: 'unknown', reason };
 }
 
-function refusedResult(reason: 'invalid-request' | 'too-early' | 'too-old' | 'day-out-of-order' | 'verdict-conflict' | 'release-conflict' | 'merges-conflict'): RecordShadowDayResult {
+function refusedResult(
+  reason:
+    | 'invalid-request'
+    | 'too-early'
+    | 'too-old'
+    | 'day-out-of-order'
+    | 'verdict-conflict'
+    | 'release-conflict'
+    | 'merges-conflict'
+    | 'late-last-tick'
+    | 'coverage-gap',
+): RecordShadowDayResult {
   return { outcome: 'refused', reason };
 }
 
@@ -976,13 +1448,32 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // reconcile against.
     const mergeSet = await this.evaluateMergeSetCriterion(context, journal, shell);
     const intake = await this.evaluateIntakeCriterion(context, journal);
+    // OD7a3: the S12 outcome is evaluated (or reused from the scheduled
+    // prechecks) OUTSIDE the outcomes literal, because the manual-mode guard
+    // in `evaluateTickHealthCriterion` can abort the whole run — a bracketed
+    // corrupt line is `unknown/daemon-events-corrupt`, and a coverage
+    // failure (`late-last-tick` / `coverage-gap`) is a refusal — each
+    // writing nothing.
+    let s12Outcome: CriterionOutcome;
+    if (scheduled !== null && scheduled.tickHealth !== undefined) {
+      s12Outcome = scheduled.tickHealth;
+    } else {
+      try {
+        s12Outcome = await this.evaluateTickHealthCriterion(context);
+      } catch (error) {
+        if (error instanceof S12GuardResult) {
+          return error.result;
+        }
+        throw error;
+      }
+    }
     const outcomes = [
       mergeSet,
       intake.outcome,
       await this.evaluateStateIntegrityCriterion(context, journal),
       // OD7a2: in scheduled mode the already-evaluated S12 outcome is reused
       // rather than re-reading the daemon events.
-      scheduled?.tickHealth ?? (await this.evaluateTickHealthCriterion(context)),
+      s12Outcome,
       await this.evaluateGateAgreementCriterion(context),
       await this.evaluateConformanceCriterion(context, shellFacts),
       await this.evaluateChainsRetiredCriterion(context, intake.chains),
@@ -998,6 +1489,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * is written. A held guard returns the typed `stop` result (nothing has
    * been written at that point); otherwise the already-evaluated S12 outcome
    * is carried out so `run` never reads the daemon events twice.
+   *
+   * OD7a3 fix round: the prechecks are split into ordered helpers —
+   * `precheckEventsRead`, `precheckFirstTick`, `precheckTickHealth` and
+   * `precheckCoverage` — each returning `stop: <result> | null` where
+   * `null` means "continue". The grant-coverage guard stays here because it
+   * must run before any daemon-event read. Behaviour is identical: the same
+   * guards run in the same order and the same reasons are returned.
    */
   private async runScheduledPrechecks(
     context: DayContext,
@@ -1025,31 +1523,93 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         ),
       };
     }
-    // 2. Events read and first-tick `job` guard: only `job` events count, and
-    // the earliest in-day one must fall within the first-tick grace window.
+    // 2. Events read: the whole successful read is snapshotted once and a
+    // dropped line bracketed inside the day stops the run before anything
+    // is evaluated or written.
+    const eventsRead = await this.precheckEventsRead(context);
+    if (eventsRead.stop !== null) {
+      return { stop: eventsRead.stop };
+    }
+    const snapshot = eventsRead.snapshot;
+    // 3. First-tick `job` guard: only `job` events count, and the earliest
+    // in-day one must fall within the first-tick grace window.
+    const firstTick = this.precheckFirstTick(context, snapshot);
+    if (firstTick.stop !== null) {
+      return { stop: firstTick.stop };
+    }
+    // 4. S12 evaluation over the windowed events: the evaluation is computed
+    // once here and the two S12 stop guards (`precheckTickHealth` and
+    // `precheckCoverage`) both see that single evaluation.
+    const windowed = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
+    const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
+    const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
+    const tickHealthStop = this.precheckTickHealth(evaluation);
+    if (tickHealthStop.stop !== null) {
+      return { stop: tickHealthStop.stop, tickHealth };
+    }
+    const coverageStop = this.precheckCoverage(evaluation);
+    if (coverageStop.stop !== null) {
+      return { stop: coverageStop.stop, tickHealth };
+    }
+    return { stop: null, tickHealth };
+  }
+
+  /**
+   * OD7a3 fix round: the events-read precheck — read the daemon events once,
+   * snapshot the result exactly once through own data descriptors, and stop
+   * on a failed/unavailable read, a malformed snapshot, or a dropped line
+   * bracketed inside the day's parsed records. Returns the OK snapshot on
+   * continuation.
+   */
+  private async precheckEventsRead(
+    context: DayContext,
+  ): Promise<
+    | { readonly stop: RecordShadowDayResult; readonly snapshot?: undefined }
+    | { readonly stop: null; readonly snapshot: EventsReadOk }
+  > {
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    if (read.kind === 'threw' || !read.value.ok) {
+    if (read.kind === 'threw') {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
-    // OD7a2 fix round: the raw events are validated and snapshotted exactly
-    // ONCE, here, by `snapshotEvent`; every later loop and filter below uses
-    // the snapshot array only and may dereference `kind`/`recordedAtIso`
-    // directly, never the original (which a Proxy could make disagree).
-    // OD7a2 fix round: a malformed event FAILS CLOSED. Dropping it silently
-    // would let S12 evaluate a shortened list (800 good ticks plus one null
-    // could pass), so any event whose snapshot is null stops the run as
-    // `s12-unknown` before anything is written.
-    const validatedEvents: DaemonEventSnapshot[] = [];
-    for (const event of read.value.events) {
-      const snapshot = snapshotEvent(event);
-      if (snapshot === null) {
-        return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
-      }
-      validatedEvents.push(snapshot);
+    // OD7a3 fix round: the read result is snapshotted EXACTLY ONCE by
+    // `snapshotEventsRead` — `ok`, `events`, `droppedLines` (and
+    // `eventPositions` when dropped lines are present) are each read a single
+    // time through their own data descriptors, so a Proxy can never disagree
+    // with itself and a throwing trap can never escape. Every later read in
+    // this precheck uses ONLY the snapshot.
+    const snapshot = snapshotEventsRead(read.value);
+    if (snapshot === 'malformed') {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
     }
+    if (!snapshot.ok) {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
+    }
+    // OD7a3: a dropped line bracketed inside the day's parsed records makes
+    // the day unknown before anything is evaluated or written. The bracket
+    // runs against the snapshot, never the raw read.
+    if (corruptLineBracketedInDay(snapshot, context.day)) {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
+    }
+    return { stop: null, snapshot };
+  }
+
+  /**
+   * OD7a3 fix round: the first-tick precheck — the earliest in-day `job`
+   * event in the (already-snapshotted) read must exist and fall within the
+   * first-tick grace window of the day start. The events are ALREADY frozen
+   * per-event snapshots (`snapshotEvent` ran once each inside
+   * `snapshotEventsRead`, and an event that failed to snapshot made the
+   * whole read malformed), so this loop and every later one use the
+   * snapshot array only and may dereference `kind`/`recordedAtIso`
+   * directly — never the raw read, which a Proxy could make disagree.
+   */
+  private precheckFirstTick(
+    context: DayContext,
+    snapshot: EventsReadOk,
+  ): { readonly stop: RecordShadowDayResult | null } {
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
-    for (const event of validatedEvents) {
+    for (const event of snapshot.events) {
       if (event.kind !== 'job') {
         continue;
       }
@@ -1068,18 +1628,43 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (earliestInDayMs === null || earliestInDayMs > dayStartMs + SHADOW_FIRST_TICK_GRACE_MS) {
       return { stop: skippedResult('partial-day') };
     }
-    // 3. S12 precheck over the windowed events: an unknown evaluation and a
-    // `too-few-ticks` failure each stop the run before anything is written.
-    const windowed = validatedEvents.filter((event: DaemonEventSnapshot) => this.inTickWindow(event.recordedAtIso, context.day));
-    const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
-    const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
+    return { stop: null };
+  }
+
+  /**
+   * OD7a3 fix round: the S12 tick-health precheck — an unknown evaluation
+   * (the events could not be trusted) and a `too-few-ticks` failure each
+   * stop the run before anything is written. The remaining S12 failure
+   * reasons (`late-last-tick`, `coverage-gap`) are the coverage guards in
+   * `precheckCoverage`.
+   */
+  private precheckTickHealth(evaluation: ShadowTickHealthEvaluation): {
+    readonly stop: RecordShadowDayResult | null;
+  } {
     if (evaluation.status === 'unknown') {
-      return { stop: { outcome: 'unknown', reason: 's12-unknown' }, tickHealth };
+      return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
     }
     if (evaluation.status === 'fail' && evaluation.reason === 'too-few-ticks') {
-      return { stop: skippedResult('too-few-ticks'), tickHealth };
+      return { stop: skippedResult(evaluation.reason) };
     }
-    return { stop: null, tickHealth };
+    return { stop: null };
+  }
+
+  /**
+   * OD7a3 fix round: the S12 coverage precheck — a `late-last-tick` or
+   * `coverage-gap` failure (OD7a3's coverage guards) stops the run as
+   * `skipped` before anything is written.
+   */
+  private precheckCoverage(evaluation: ShadowTickHealthEvaluation): {
+    readonly stop: RecordShadowDayResult | null;
+  } {
+    if (
+      evaluation.status === 'fail' &&
+      (evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')
+    ) {
+      return { stop: skippedResult(evaluation.reason) };
+    }
+    return { stop: null };
   }
 
   /** True once `deadlineIso` is reached; an unusable clock counts as reached (fail closed). */
@@ -1530,11 +2115,42 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   /** S12: daemon tick health over the whole day's window of projected events. */
   private async evaluateTickHealthCriterion(context: DayContext): Promise<CriterionOutcome> {
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    if (read.kind === 'threw' || !read.value.ok) {
+    if (read.kind === 'threw') {
       return unevaluatedOutcome('S12', 'daemon-events-unavailable');
     }
-    const events = read.value.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    // OD7a3 fix round: the read result is snapshotted EXACTLY ONCE by
+    // `snapshotEventsRead` — `ok`, `events`, `droppedLines` (and
+    // `eventPositions` when dropped lines are present) are each read a single
+    // time through their own data descriptors, so a Proxy can never disagree
+    // with itself and a throwing trap can never escape `execute()`. A
+    // malformed read (or anything that threw) fails closed as
+    // `daemon-events-corrupt`, writing nothing. Every later read in this
+    // criterion uses ONLY the snapshot.
+    const snapshot = snapshotEventsRead(read.value);
+    if (snapshot === 'malformed') {
+      throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
+    }
+    if (!snapshot.ok) {
+      return unevaluatedOutcome('S12', 'daemon-events-unavailable');
+    }
+    // OD7a3: a dropped line bracketed inside the day's parsed records makes
+    // the day unknown — writing nothing. The typed result is carried out of
+    // the outcomes evaluation by the `S12GuardResult` sentinel. The bracket
+    // runs against the snapshot, never the raw read.
+    if (corruptLineBracketedInDay(snapshot, context.day)) {
+      throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
+    }
+    // OD7a3 fix round 6: the snapshot's events are ALREADY frozen per-event
+    // snapshots (`snapshotEvent` ran once each inside `snapshotEventsRead`),
+    // so the filter below uses the snapshot only — no second snapshot pass
+    // and no raw event ever reaches S12.
+    const events = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events });
+    // OD7a3: manual mode refuses the two S12 coverage failures instead of
+    // recording a `fail` verdict — nothing is written to the ledger.
+    if (evaluation.status === 'fail' && (evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')) {
+      throw new S12GuardResult(refusedResult(evaluation.reason));
+    }
     return { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
   }
 

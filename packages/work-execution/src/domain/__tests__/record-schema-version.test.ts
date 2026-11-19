@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from '../plain-record-reads.js';
+import {
+  readExactPlainRecord,
+  readPlainRecordWithOptionalKeys,
+  snapshotPlainDataRecord,
+} from '../plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isAcceptedRecordSchemaVersion,
@@ -134,6 +138,19 @@ describe('isPlainRecordObject', () => {
   });
 });
 
+describe('readExactPlainRecord', () => {
+  it('reads exactly the given keys', () => {
+    expect(readExactPlainRecord({ a: 1, b: 'x' }, ['a', 'b'])).toEqual({ a: 1, b: 'x' });
+  });
+
+  it('refuses a non-enumerable own data property on an allowed key with null', () => {
+    const input: Record<string, unknown> = {};
+    Object.defineProperty(input, 'a', { value: 1, enumerable: false });
+    expect(readExactPlainRecord(input, ['a'])).toBeNull();
+    expect(readPlainRecordWithOptionalKeys(input, ['a'], [])).toBeNull();
+  });
+});
+
 describe('readPlainRecordWithOptionalKeys', () => {
   it('copies required keys and skips absent optional keys', () => {
     const read = readPlainRecordWithOptionalKeys({ a: 1, b: 'x' }, ['a'], ['b', 'c']);
@@ -157,6 +174,12 @@ describe('readPlainRecordWithOptionalKeys', () => {
   it('refuses a symbol key', () => {
     const symbol = Symbol('xyzzy');
     expect(readPlainRecordWithOptionalKeys({ [symbol]: 1, a: 1 }, ['a'], [])).toBeNull();
+  });
+
+  it('refuses a non-enumerable own data property on an optional key with null', () => {
+    const input: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(input, 'opt', { value: 2, enumerable: false });
+    expect(readPlainRecordWithOptionalKeys(input, ['a'], ['opt'])).toBeNull();
   });
 
   it('copies an enumerable getter on an optional key as undefined without running it', () => {
@@ -189,6 +212,12 @@ describe('snapshotPlainDataRecord', () => {
     // The top-level object is fresh; values are copied by reference (shallow copy).
     expect(snapshot).not.toBe(value);
     expect(snapshot?.b).toBe(value.b);
+  });
+
+  it('refuses a non-enumerable own data property with null', () => {
+    const input: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(input, 'b', { value: 2, enumerable: false });
+    expect(snapshotPlainDataRecord(input)).toBeNull();
   });
 
   it('refuses an enumerable getter with null (stricter than the optional-key reader)', () => {

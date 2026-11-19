@@ -838,39 +838,60 @@ function isNonNegativeSafeIntegerArray(copy: readonly unknown[]): copy is readon
  * a second time here. Cost is linear in the snapshot's capped `events` array
  * (at most `SHADOW_MAX_HEALTH_ITEMS` entries).
  */
+/** Whether the event's `recordedAtIso` falls inside `day`. */
+function eventFallsInDay(event: DaemonEventSnapshot, day: string): boolean {
+  return event.recordedAtIso.slice(0, 10) === day;
+}
+
+/**
+ * The validated file position of one in-day snapshot event, or null when the
+ * event is not in `day`, or `'malformed'` when the position fails the
+ * non-negative safe-integer check. The snapshot invariant (validated in
+ * `snapshotEventsRead`) makes every position a non-negative safe integer;
+ * the type checker enforces it, and the runtime check below only backs that
+ * invariant fail-closed.
+ */
+function inDayRecordPosition(event: DaemonEventSnapshot, position: unknown, day: string): number | 'malformed' | null {
+  if (!eventFallsInDay(event, day)) {
+    return null;
+  }
+  if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+    return 'malformed';
+  }
+  return position;
+}
+
+/** The bracket widened to include `position`. */
+function widenBracket(
+  bracket: { readonly first: number; readonly last: number } | null,
+  position: number,
+): { readonly first: number; readonly last: number } {
+  const first = bracket === null || position < bracket.first ? position : bracket.first;
+  const last = bracket === null || position > bracket.last ? position : bracket.last;
+  return { first, last };
+}
+
 function inDayRecordBracket(
   events: ReadonlyArray<DaemonEventSnapshot>,
   eventPositions: ReadonlyArray<number>,
   day: string,
 ): { readonly first: number; readonly last: number } | 'malformed' | null {
-  let firstPos: number | null = null;
-  let lastPos: number | null = null;
+  let bracket: { readonly first: number; readonly last: number } | null = null;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (event === undefined) {
       continue;
     }
-    if (event.recordedAtIso.slice(0, 10) !== day) {
-      continue;
-    }
-    // The snapshot invariant (validated in `snapshotEventsRead`) makes every
-    // position a non-negative safe integer; the type checker enforces it,
-    // and the runtime check below only backs that invariant fail-closed.
-    const position = eventPositions[index];
-    if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+    const position = inDayRecordPosition(event, eventPositions[index], day);
+    if (position === 'malformed') {
       return 'malformed';
     }
-    if (firstPos === null || position < firstPos) {
-      firstPos = position;
+    if (position === null) {
+      continue;
     }
-    if (lastPos === null || position > lastPos) {
-      lastPos = position;
-    }
+    bracket = widenBracket(bracket, position);
   }
-  if (firstPos === null || lastPos === null) {
-    return null;
-  }
-  return { first: firstPos, last: lastPos };
+  return bracket;
 }
 
 /**
@@ -1013,91 +1034,160 @@ type EventsReadSnapshot =
 /** The OK branch of `EventsReadSnapshot` — the only shape a downstream helper accepts. */
 type EventsReadOk = Extract<EventsReadSnapshot, { ok: true }>;
 
+/**
+ * The `ok` field of an events read, read through its own data descriptor
+ * only (never a getter, never a Proxy `get` trap): OD7a3 fix round — only an
+ * own DATA property `ok === false` means `{ ok: false }` (a failed read). A
+ * missing `ok`, an accessor, or a non-boolean value does not even answer the
+ * question, so it is `'malformed'` — `unknown` / `daemon-events-corrupt`
+ * with nothing written in both modes — never a silent `{ ok: false }`.
+ * Cost is constant (one descriptor read).
+ */
+function snapshotOkFlag(raw: object): { readonly ok: true } | { readonly ok: false } | 'malformed' {
+  const okDescriptor = Object.getOwnPropertyDescriptor(raw, 'ok');
+  if (okDescriptor === undefined || okDescriptor.get !== undefined) {
+    return 'malformed';
+  }
+  if (typeof okDescriptor.value !== 'boolean') {
+    return 'malformed';
+  }
+  if (okDescriptor.value === false) {
+    return { ok: false };
+  }
+  return { ok: true };
+}
+
+/**
+ * The snapshot of the raw `events` array: every event is snapshotted exactly
+ * ONCE, here, by `snapshotEvent` — the container is read once per element
+ * (through the element's own data descriptor) and each element's own keys
+ * are read once each by `snapshotEvent`. The snapshot array is the ONLY
+ * event list any downstream code (bracket, first-tick guard, S12 inputs,
+ * tick health, coverage) ever sees, so a Proxy event whose descriptors
+ * change between reads can never show one value to the bracket and another
+ * to the validator. An event that fails to snapshot (not a non-null object,
+ * or `kind`/`recordedAtIso` not strings) makes the WHOLE read `'malformed'`
+ * — fail closed — never a shortened list. Cost is linear in the capped
+ * `events` length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotEventList(raw: object): ReadonlyArray<DaemonEventSnapshot> | 'malformed' {
+  const events = ownDataProperty(raw, 'events');
+  const eventsLength = ownDenseArrayLengthWithinCap(events);
+  if (eventsLength === null) {
+    return 'malformed';
+  }
+  const eventsCopy: DaemonEventSnapshot[] = [];
+  for (let index = 0; index < eventsLength; index += 1) {
+    const eventSnapshot = snapshotEvent(ownElement(events as object, String(index)));
+    if (eventSnapshot === null) {
+      return 'malformed';
+    }
+    eventsCopy.push(eventSnapshot);
+  }
+  return Object.freeze(eventsCopy);
+}
+
+/**
+ * The snapshot of the raw `droppedLines` field: `{ kind: 'absent' }` when the
+ * field is absent or empty (treated as no dropped lines), `{ kind: 'present' }`
+ * with the frozen validated number-array copy when lines are present, and
+ * `'malformed'` when the field is an accessor or a sparse/oversized array or
+ * any element fails the non-negative safe-integer check. OD7a3 fix round:
+ * every element of `droppedLines` is read EXACTLY ONCE — from its own data
+ * descriptor's `.value` — into a new array, and the COPIED values are what
+ * is validated and used. A Proxy whose index descriptors change between
+ * reads (or whose `get` trap disagrees with them) can therefore never make
+ * the validator see one value and the snapshot another: there is only one
+ * read, and it is the snapshot's. Cost is linear in the capped
+ * `droppedLines` length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotDroppedLines(
+  raw: object,
+): { readonly kind: 'absent' } | { readonly kind: 'present'; readonly droppedLines: ReadonlyArray<number> } | 'malformed' {
+  const dropped = readDroppedLinesField(raw);
+  if (dropped.kind === 'malformed') {
+    return 'malformed';
+  }
+  if (dropped.kind !== 'present') {
+    // `absent` and `empty` both mean no dropped lines: the snapshot carries `[]`.
+    return { kind: 'absent' };
+  }
+  const droppedCopy = snapshotOwnArrayElements(dropped.droppedLines, dropped.droppedLength);
+  if (!isNonNegativeSafeIntegerArray(droppedCopy)) {
+    return 'malformed';
+  }
+  return { kind: 'present', droppedLines: Object.freeze(droppedCopy) };
+}
+
+/**
+ * The snapshot of the raw `eventPositions` field: the corrupt-line bracket
+ * needs the positions of the parsed records; they are read once here,
+ * through their own descriptors, and validated on the copy, so the snapshot
+ * alone answers every later read. The positions array must have exactly the
+ * `events` length. Cost is linear in the capped positions length
+ * (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotEventPositions(raw: object, eventsLength: number): ReadonlyArray<number> | 'malformed' {
+  const eventPositions = ownDataProperty(raw, 'eventPositions');
+  const positionsLength = readOwnArrayShape(eventPositions);
+  if (positionsLength !== eventsLength) {
+    return 'malformed';
+  }
+  const positionsCopy = snapshotOwnArrayElements(eventPositions, positionsLength);
+  if (!isNonNegativeSafeIntegerArray(positionsCopy)) {
+    return 'malformed';
+  }
+  return Object.freeze(positionsCopy);
+}
+
+/**
+ * The OK branch of `snapshotEventsRead`: the frozen
+ * `{ ok: true, events, droppedLines, eventPositions }` record, with
+ * `eventPositions: null` and an empty `droppedLines` when the read carries
+ * no dropped lines.
+ */
+function snapshotEventsReadOk(raw: object): EventsReadSnapshot {
+  const okFlag = snapshotOkFlag(raw);
+  if (okFlag === 'malformed') {
+    return 'malformed';
+  }
+  if (!okFlag.ok) {
+    return { ok: false };
+  }
+  const events = snapshotEventList(raw);
+  if (events === 'malformed') {
+    return 'malformed';
+  }
+  const dropped = snapshotDroppedLines(raw);
+  if (dropped === 'malformed') {
+    return 'malformed';
+  }
+  if (dropped.kind === 'absent') {
+    return Object.freeze({
+      ok: true,
+      events,
+      droppedLines: Object.freeze([]),
+      eventPositions: null,
+    });
+  }
+  const positions = snapshotEventPositions(raw, events.length);
+  if (positions === 'malformed') {
+    return 'malformed';
+  }
+  return Object.freeze({
+    ok: true,
+    events,
+    droppedLines: dropped.droppedLines,
+    eventPositions: positions,
+  });
+}
+
 function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
   try {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       return 'malformed';
     }
-    const okDescriptor = Object.getOwnPropertyDescriptor(raw, 'ok');
-    // OD7a3 fix round: only an own DATA property `ok === false` means
-    // `{ ok: false }` (a failed read). A missing `ok`, an accessor, or a
-    // non-boolean value does not even answer the question, so it is
-    // `'malformed'` — `unknown` / `daemon-events-corrupt` with nothing
-    // written in both modes — never a silent `{ ok: false }`.
-    if (okDescriptor === undefined || okDescriptor.get !== undefined) {
-      return 'malformed';
-    }
-    if (typeof okDescriptor.value !== 'boolean') {
-      return 'malformed';
-    }
-    if (okDescriptor.value === false) {
-      return { ok: false };
-    }
-    const events = ownDataProperty(raw, 'events');
-    const eventsLength = ownDenseArrayLengthWithinCap(events);
-    if (eventsLength === null) {
-      return 'malformed';
-    }
-    // OD7a3 fix round 6: EVERY event is snapshotted exactly ONCE, here, by
-    // `snapshotEvent` — the container is read once per element (through the
-    // element's own data descriptor) and each element's own keys are read
-    // once each by `snapshotEvent`. The snapshot array is the ONLY event
-    // list any downstream code (bracket, first-tick guard, S12 inputs, tick
-    // health, coverage) ever sees, so a Proxy event whose descriptors
-    // change between reads can never show one value to the bracket and
-    // another to the validator. An event that fails to snapshot (not a
-    // non-null object, or `kind`/`recordedAtIso` not strings) makes the
-    // WHOLE read `'malformed'` — fail closed — never a shortened list.
-    const eventsCopy: DaemonEventSnapshot[] = [];
-    for (let index = 0; index < eventsLength; index += 1) {
-      const eventSnapshot = snapshotEvent(ownElement(events as object, String(index)));
-      if (eventSnapshot === null) {
-        return 'malformed';
-      }
-      eventsCopy.push(eventSnapshot);
-    }
-    const dropped = readDroppedLinesField(raw);
-    if (dropped.kind === 'malformed') {
-      return 'malformed';
-    }
-    if (dropped.kind === 'present') {
-      // OD7a3 fix round: every element of `droppedLines` is read EXACTLY
-      // ONCE — from its own data descriptor's `.value` — into a new array,
-      // and the COPIED values are what is validated and used. A Proxy whose
-      // index descriptors change between reads (or whose `get` trap
-      // disagrees with them) can therefore never make the validator see one
-      // value and the snapshot another: there is only one read, and it is
-      // the snapshot's.
-      const droppedCopy = snapshotOwnArrayElements(dropped.droppedLines, dropped.droppedLength);
-      if (!isNonNegativeSafeIntegerArray(droppedCopy)) {
-        return 'malformed';
-      }
-      // The corrupt-line bracket needs the positions of the parsed records;
-      // they are read once here, through their own descriptors, and
-      // validated on the copy, so the snapshot alone answers every later
-      // read.
-      const eventPositions = ownDataProperty(raw, 'eventPositions');
-      const positionsLength = readOwnArrayShape(eventPositions);
-      if (positionsLength !== eventsLength) {
-        return 'malformed';
-      }
-      const positionsCopy = snapshotOwnArrayElements(eventPositions, positionsLength);
-      if (!isNonNegativeSafeIntegerArray(positionsCopy)) {
-        return 'malformed';
-      }
-      return Object.freeze({
-        ok: true,
-        events: Object.freeze(eventsCopy),
-        droppedLines: Object.freeze(droppedCopy),
-        eventPositions: Object.freeze(positionsCopy),
-      });
-    }
-    return Object.freeze({
-      ok: true,
-      events: Object.freeze(eventsCopy),
-      droppedLines: Object.freeze([]),
-      eventPositions: null,
-    });
+    return snapshotEventsReadOk(raw as object);
   } catch {
     return 'malformed';
   }

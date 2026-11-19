@@ -998,6 +998,58 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(requests).toEqual([]);
   });
 
+  it('reads list items by index descriptor only and refuses a sparse list before traversal', async () => {
+    const query = listQuery();
+
+    // A hostile `Symbol.iterator` (an array's own iterator) must never run:
+    // entries are read by index through own property descriptors.
+    let iteratorRuns = 0;
+    const iterableHostile: unknown[] = [projectEntry('tick-stale'), projectEntry('queue-too-large')];
+    Object.defineProperty(iterableHostile, Symbol.iterator, {
+      enumerable: false,
+      get() {
+        iteratorRuns += 1;
+        return function* hostileIterator() {
+          yield null;
+        };
+      },
+    });
+    const iterating = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: iterableHostile }),
+    });
+    expect(await iterating.listOpenTrainHealthAttention(query)).toEqual({
+      outcome: 'found',
+      items: [
+        { rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+        { rule: 'queue-too-large', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+      ],
+    });
+    expect(iteratorRuns).toBe(0);
+
+    // A hole is a malformed list: refused outright, never skipped.
+    const sparse: string[] = new Array(3);
+    sparse[0] = 'full';
+    sparse[2] = 'full';
+    expect(Object.keys(sparse).length).toBe(2);
+    const sparseAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: sparse }),
+    });
+    expect(await sparseAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+
+    // An extra own enumerable property planted beside the indices is refused too.
+    const accessorPolluted: unknown[] = ['zero', 'one'];
+    Object.defineProperty(accessorPolluted, 'hostile', {
+      value: null,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const polluted = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: accessorPolluted }),
+    });
+    expect(await polluted.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+  });
+
   it('refuses class-instance and custom-prototype commands, queries and delegate answers', async () => {
     class HostileCommand {
       projectId = PROJECT;

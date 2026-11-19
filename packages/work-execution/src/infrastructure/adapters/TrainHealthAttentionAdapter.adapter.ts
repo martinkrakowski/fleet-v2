@@ -516,22 +516,60 @@ function openItemOf(entry: unknown, projectId: string, repository: Repository): 
   }
 }
 
+/**
+ * The capped element list of a real, dense array, or null for any stand-in:
+ * a non-array, a subclassed or custom-prototype array, an array with an
+ * accessor `length`, an oversized array, a sparse array (a hole) or an array
+ * carrying an extra own enumerable property such as a getter planted beside
+ * the indices. `Object.keys` lists own enumerable string keys without
+ * reading any value, so comparing its count to the descriptor `length`
+ * refuses a hole or a planted extra key before a single element is read.
+ * The length is read from its own data descriptor, so no iterator, getter or
+ * `length` property read ever runs.
+ */
+function boundedEntryList(value: unknown): readonly unknown[] | null {
+  // `Array.isArray` follows a Proxy without running a trap.
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    lengthDescriptor.value > LIST_ITEM_CAP
+  ) {
+    return null;
+  }
+  if (Object.keys(value).length !== lengthDescriptor.value) {
+    return null;
+  }
+  return value as readonly unknown[];
+}
+
+/** The own enumerable data-property element at `index`; undefined for a hole or an accessor. */
+function ownEntryElement(array: readonly unknown[], index: number): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+  return descriptor !== undefined && descriptor.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+}
+
 function itemsFromAnswer(answer: unknown, projectId: string, repository: Repository): ListOpenTrainHealthAttentionResult {
   // Plain record object, not exact-key: the answer may carry additional own
   // fields; a class instance or custom prototype is unavailable.
   if (!isPlainRecordObject(answer)) {
     return { outcome: 'unavailable' };
   }
-  const entries = ownValue(answer, 'items');
-  if (!Array.isArray(entries)) {
-    return { outcome: 'unavailable' };
-  }
-  if (entries.length > LIST_ITEM_CAP) {
+  const entries = boundedEntryList(ownValue(answer, 'items'));
+  if (entries === null) {
     return { outcome: 'unavailable' };
   }
   const items: OpenTrainHealthAttentionItem[] = [];
-  for (const entry of entries) {
-    const parsed = openItemOf(entry, projectId, repository);
+  // Indexed descriptor reads, never `for...of`: no iterator is ever fetched,
+  // and the dense-array check above refuses holes instead of skipping them.
+  const entryCount = entries.length;
+  for (let index = 0; index < entryCount; index += 1) {
+    const parsed = openItemOf(ownEntryElement(entries, index), projectId, repository);
     if (parsed !== null) {
       items.push(parsed);
     }

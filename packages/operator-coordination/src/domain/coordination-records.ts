@@ -1009,6 +1009,14 @@ function snapshotDecisionBindingObject(raw: unknown): DecisionBindingSnapshot {
   if (typeof raw !== 'object' || raw === null) {
     return { ok: false };
   }
+  // Only plain objects are accepted: the prototype must be `Object.prototype`
+  // or `null`. A custom-prototype record or answer (a class instance, a
+  // `Proxy`-adjacent exotic object, or anything with a `get` trap) is refused
+  // before any descriptor is read, so a getter on the prototype can never run.
+  const proto = Object.getPrototypeOf(raw) as unknown;
+  if (proto !== Object.prototype && proto !== null) {
+    return { ok: false };
+  }
   let isArray: boolean;
   try {
     isArray = Array.isArray(raw);

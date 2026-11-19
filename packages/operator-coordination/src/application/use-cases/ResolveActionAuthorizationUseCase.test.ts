@@ -967,6 +967,26 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
     expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
   });
 
+  it('refuses an approved grant with no bound attempt and an invalid answer without persisting a binding', async () => {
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    const unbound = ownerRecord({
+      grantAttemptId: undefined,
+      grantRecordVersion: undefined,
+    } as Partial<CoordinationRequestRecord>);
+    const repo = repositoryWith(unbound);
+    const before = JSON.stringify((await repo.findRequestById('request-1')) ?? null);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': other.signApprovedAnswer(unbound),
+      }),
+    }).execute({ ...REQUEST, attemptId: 'attempt-1' });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    const after = JSON.stringify((await repo.findRequestById('request-1')) ?? null);
+    expect(after).toBe(before);
+  });
+
   it('refuses when answer grantId or decisionRevision mismatches stored record', async () => {
     const signer = createSignedDecisionFixture();
     for (const mismatched of [

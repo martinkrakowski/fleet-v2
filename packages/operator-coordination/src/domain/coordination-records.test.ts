@@ -257,6 +257,16 @@ describe('verifySignedDecisionBinding', () => {
     });
   });
 
+  it('refuses a custom-prototype record before any comparison', () => {
+    class HostileRecord {}
+    const record = Object.assign(new HostileRecord(), requestRecord());
+    const answer = Object.assign(new HostileRecord(), validAnswer());
+    expect(verifySignedDecisionBinding(record, answer)).toEqual({
+      ok: false,
+      code: 'decision-binding-invalid-input',
+    });
+  });
+
   it('refuses an array-like object { length: 1, 0: ... } with a typed refusal', () => {
     const arrayLike = { length: 1, 0: requestRecord() };
     // A plain array-like object is not an array, but it carries no bound

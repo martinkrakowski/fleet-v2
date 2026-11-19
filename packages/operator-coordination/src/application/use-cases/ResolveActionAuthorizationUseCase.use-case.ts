@@ -298,6 +298,13 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.getConsumptions().length > 0 && !resumable) {
       return blocked(`grant ${grantId} is already consumed by another action`);
     }
+    // KEY0c2 fix round: the owner-decision signature check runs before
+    // `bindAttempt`, because binding persists the attempt onto the grant —
+    // an invalid approval must never be able to alter the stored record.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, resumable);
+    if (signatureBlock !== null) {
+      return signatureBlock;
+    }
     const attemptBlock = await this.bindAttempt(candidate, refreshed, request, grantId);
     if (attemptBlock !== null) {
       return attemptBlock;
@@ -306,10 +313,6 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // answer when a decision transport is injected, before anything is
     // authorized. The check runs after every stored-coordinate refusal, so
     // origin/main's exact refusal reasons are preserved.
-    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, resumable);
-    if (signatureBlock !== null) {
-      return signatureBlock;
-    }
     return {
       outcome: 'authorized',
       grantId,

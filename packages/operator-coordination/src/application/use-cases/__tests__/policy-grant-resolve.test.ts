@@ -59,11 +59,11 @@ async function saveAll(
 function resolve(
   repository: CoordinationRequestRepositoryAdapter,
   request: ResolveActionAuthorizationRequest,
-  signer = createSignedDecisionFixture(),
+  signer?: ReturnType<typeof createSignedDecisionFixture>,
 ) {
   return new ResolveActionAuthorizationUseCase({
     requestRepo: repository,
-    ...signer.deps,
+    ...(signer ?? createSignedDecisionFixture()).deps,
   }).resolveActionAuthorization(
     request,
   );
@@ -118,7 +118,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD_B,
       attemptId: ATTEMPT,
-    });
+    }, signerB);
     expect(atB).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner-b' });
 
     const atHa = await resolve(repository, {
@@ -164,7 +164,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD,
       attemptId: ATTEMPT,
-    });
+    }, signerOwner);
     expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner' });
   });
 
@@ -271,7 +271,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD,
       attemptId: ATTEMPT,
-    });
+    }, signerNew);
     expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner-new' });
   });
 

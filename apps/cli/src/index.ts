@@ -768,7 +768,7 @@ Commands:
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
-  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding
+  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding|sign-decision
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   owner-items add|list|resolve
   help | --help

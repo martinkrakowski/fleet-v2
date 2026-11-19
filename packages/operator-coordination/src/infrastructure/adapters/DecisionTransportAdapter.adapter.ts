@@ -12,8 +12,8 @@
  * through this adapter.
  */
 
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
 import type {
   DecisionAnswer,
@@ -21,7 +21,13 @@ import type {
   DecisionState,
   DecisionTransportPort,
 } from '../../application/ports/out/DecisionTransportPort.out-port.js';
-import { verifyDecisionSignature } from './DecisionSignature.adapter.js';
+import {
+  readEd25519PrivateKeyFromFile,
+  signDecisionFields,
+  verifyDecisionSignature,
+  type CanonicalDecisionFields,
+} from './DecisionSignature.adapter.js';
+import { writeJsonAtomically } from './file-store.js';
 import type { WavesHttpClient } from './WavesHttpClient.adapter.js';
 
 export interface DecisionTransportAdapterOptions {
@@ -121,6 +127,108 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
       return null;
     }
     return join(decisionsDir, `${requestId}${this.options.fileExtension ?? DEFAULT_FILE_EXTENSION}`);
+  }
+
+  /**
+   * Sign one owner decision with the owner's Ed25519 private key and write
+   * the signed answer file the read path verifies against (KEY1a). The pinned
+   * owner public key (from `installation.owner.publicKey`, never ambient
+   * env) is the only authority the key file is checked against, and the
+   * written answer is self-verified through `readDecisionAnswer` before the
+   * call reports success.
+   *
+   * Refusals, in order, none of which write anything: an unset/blank
+   * decisions directory (`state-dir-required`); a pinned-key refusal from the
+   * composition root (returned as-is); an unset/blank pinned owner public key
+   * (`owner-public-key-not-configured`); an unsafe request id
+   * (`invalid-request-id`); surrounding whitespace in `grantId` or
+   * `decisionRevision` (`invalid-decision-field`); every private-key-file
+   * refusal from `readEd25519PrivateKeyFromFile`; a signature that does not
+   * re-verify (`signature-verification-failed`); a write failure
+   * (`decision-write-failed`); and a self-verification failure, which removes
+   * the written file and returns `self-verification-failed`.
+   */
+  async signAndWriteDecisionAnswer(input: {
+    fields: CanonicalDecisionFields;
+    keyPath: string;
+    stateDir?: string;
+  }): Promise<{ ok: true } | { ok: false; code: string }> {
+    const { decisionsDir } = this.options;
+    if (decisionsDir === undefined || decisionsDir.trim().length === 0) {
+      return { ok: false, code: 'state-dir-required' };
+    }
+    const ownerKeyRefusal = this.options.ownerKeyRefusal;
+    if (ownerKeyRefusal === 'owner-key-env-mismatch' || ownerKeyRefusal === 'owner-key-unpinned') {
+      return { ok: false, code: ownerKeyRefusal };
+    }
+    const ownerPublicKey = this.options.ownerPublicKey;
+    if (typeof ownerPublicKey !== 'string' || ownerPublicKey.trim().length === 0) {
+      return { ok: false, code: 'owner-public-key-not-configured' };
+    }
+    if (!isSafeRequestId(input.fields.requestId)) {
+      return { ok: false, code: 'invalid-request-id' };
+    }
+    if (
+      (input.fields.grantId !== null && input.fields.grantId !== input.fields.grantId?.trim()) ||
+      (input.fields.decisionRevision !== null &&
+        input.fields.decisionRevision !== input.fields.decisionRevision?.trim())
+    ) {
+      return { ok: false, code: 'invalid-decision-field' };
+    }
+    // The key-file boundary check always enforces the state directory: the
+    // decisions directory lives directly under it.
+    const stateDir = input.stateDir ?? dirname(decisionsDir);
+    const key = await readEd25519PrivateKeyFromFile(input.keyPath, ownerPublicKey.trim(), {
+      stateDir,
+    });
+    if (!key.ok) {
+      return key;
+    }
+    let signature: string;
+    try {
+      signature = signDecisionFields(input.fields, key.privateKey);
+    } catch {
+      return { ok: false, code: 'key-file-invalid' };
+    }
+    if (!verifyDecisionSignature(input.fields, signature, ownerPublicKey.trim())) {
+      return { ok: false, code: 'signature-verification-failed' };
+    }
+    const path = this.decisionPath(input.fields.requestId);
+    if (path === null) {
+      return { ok: false, code: 'state-dir-required' };
+    }
+    try {
+      await writeJsonAtomically(path, {
+        requestId: input.fields.requestId,
+        projectId: input.fields.projectId,
+        actionScope: input.fields.actionScope,
+        state: input.fields.state,
+        decisionRevision: input.fields.decisionRevision,
+        grantId: input.fields.grantId,
+        signature,
+      });
+    } catch {
+      return { ok: false, code: 'decision-write-failed' };
+    }
+    const answer = await this.readDecisionAnswer({
+      requestId: input.fields.requestId,
+      projectId: input.fields.projectId,
+      actionScope: input.fields.actionScope,
+      expectedHeadSha: input.fields.expectedHeadSha,
+    });
+    if (
+      answer.state !== input.fields.state ||
+      answer.grantId !== input.fields.grantId ||
+      answer.decisionRevision !== input.fields.decisionRevision
+    ) {
+      try {
+        await rm(path, { force: true });
+      } catch {
+        // A failed cleanup must not mask the refusal.
+      }
+      return { ok: false, code: 'self-verification-failed' };
+    }
+    return { ok: true };
   }
 }
 

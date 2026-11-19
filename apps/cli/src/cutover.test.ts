@@ -66,6 +66,10 @@ async function run(
 }
 
 async function seedSwitched(runtime: FleetCliRuntime, trainPauseSetByCutover: boolean): Promise<void> {
+  // A test may seed several runtimes against the same state directory; the
+  // seeded record is always revision 1, so a prior seed must be cleared first.
+  rmSync(join(stateDir, 'cutover.json'), { force: true });
+  rmSync(join(stateDir, 'killall-train-pause.json'), { force: true });
   const saved = await runtime.execution.cutoverRecordRepository.compareAndSet({
     expectedRevision: 0,
     next: switchedRecord(trainPauseSetByCutover),
@@ -116,11 +120,20 @@ async function expectRetireRefusal(
   runtime: FleetCliRuntime,
   expected: Record<string, unknown>,
 ): Promise<void> {
+  const cutoverPath = join(stateDir, 'cutover.json');
+  const journalPath = join(stateDir, 'cutover-journal.json');
+  const cutoverBefore = existsSync(cutoverPath) ? readFileSync(cutoverPath).toString() : null;
   const result = await retireAfterWindow(runtime);
   expect(result.code).toBe(1);
   expect(result.json).toEqual(expected);
-  expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
-  expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+  // The gate must not write: a seeded cutover record keeps its exact bytes and
+  // no journal file appears.
+  if (cutoverBefore === null) {
+    expect(existsSync(cutoverPath)).toBe(false);
+  } else {
+    expect(readFileSync(cutoverPath).toString()).toBe(cutoverBefore);
+  }
+  expect(existsSync(journalPath)).toBe(false);
   expect(result.out).not.toContain(stateDir);
   expect(result.err).not.toContain(stateDir);
 }

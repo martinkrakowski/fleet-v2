@@ -59,10 +59,12 @@ The complete arming sequence, in order:
 2. **Install and swap the release**:
    - `fleet-v2 release install --root <path> --sha <40 hex> --source <path> --apply --project <id>`
    - `fleet-v2 release swap --root <path> --sha <40 hex> --apply --project <id>`
-3. **Request, approve, and resolve the standing `merge:import-shadow` grant**:
-   - Request: `fleet-v2 coordination request-decision --kind action-decision --action-scope merge:import-shadow --project-id <id> --proposal-digest <digest> --policy-revision <rev> --repository <owner>/<repo> --expires-at-iso <iso>` (prints `<requestId>` = `shadow-import-<sha256>`).
-   - Approve: record the owner's Ed25519-signed decision answer for `<requestId>` through the decision transport (`<stateDir>/decisions/<requestId>.json` or Waves `/api/v1/decisions/<requestId>`) with `state: "approved"`, `grantId`, `decisionRevision`, and `signature` over `{ requestId, projectId, actionScope, expectedHeadSha: null, decisionRevision, grantId, state }`.
+3. **Request, pre-sign, and resolve the standing `merge:import-shadow` grant**:
+   - Pre-sign (the owner signs the standing grant's answer file from its coordinates, BEFORE `request-decision` records the awaiting request): `fleet-v2 coordination sign-decision --pre-sign --action-scope merge:import-shadow --repository <owner/repo> --project <id> --expires-at <iso> --key <path> --yes`.
+   - Request: `fleet-v2 coordination request-decision --kind action-decision --action-scope merge:import-shadow --project-id <id> --proposal-digest <digest> --policy-revision <rev> --repository <owner>/<repo> --expires-at-iso <iso>` (prints `<requestId>` = `shadow-import-<sha256>`; it MUST use the IDENTICAL `--expires-at-iso` ISO string the pre-sign step used, because the request id is the digest of those coordinates).
    - Resolve: `fleet-v2 coordination resolve-auth --project-id <id> --action-scope merge:import-shadow --authorization-grant-id <grantId> --repository <owner>/<repo>` (must resolve `authorized` **before** enabling `fleet-v2-daemon.timer`).
+
+   To revoke a pre-signed grant before `request-decision` has recorded its awaiting request, delete its answer file (`<stateDir>/decisions/<requestId>.json`); the recorded awaiting request is then never approved.
 4. **Install and enable the systemd user units and linger (only AFTER the grant resolves approved)**:
    - `fleet-v2 hosts daemon install --scheduler systemd --apply`
    - `loginctl enable-linger`

@@ -883,6 +883,278 @@ export function shadowImportDigestPayload(
   };
 }
 
+/** Bounded-input cap for one pre-sign plan object: at most 6 own keys. */
+export const MAX_PRE_SIGN_KEYS = 6 as const;
+
+/** Bounded-input cap for one pre-sign plan field (projectId, decisionRevision). */
+export const MAX_PRE_SIGN_FIELD_LENGTH = 256 as const;
+
+/** The decision revision a pre-signed answer carries when none is supplied. */
+export const DEFAULT_PRE_SIGN_DECISION_REVISION = '1' as const;
+
+/** Every typed way a pre-sign plan read can fail closed. */
+export type PreSignShadowImportErrorCode =
+  | 'pre-sign-not-object'
+  | 'pre-sign-invalid-input'
+  | 'pre-sign-accessor-forbidden'
+  | 'pre-sign-forbidden-key'
+  | 'pre-sign-unexpected-key'
+  | 'pre-sign-unsupported-scope'
+  | 'pre-sign-invalid-now'
+  | 'pre-sign-expired'
+  | 'pre-sign-ttl-exceeded'
+  | 'pre-sign-invalid-project'
+  | 'pre-sign-invalid-revision'
+  // The grant-coordinate refusals pass through from `parseShadowImportGrant`;
+  // its accessor code is mapped to `pre-sign-accessor-forbidden` so root and
+  // nested-repository accessors share ONE refusal code.
+  | Exclude<ShadowImportGrantErrorCode, 'shadow-import-grant-accessor-forbidden'>;
+
+/** The outcome of one pre-sign plan read: the plan, or a named refusal code. */
+export type PreSignShadowImportResult =
+  | { readonly ok: true; readonly value: PreSignShadowImportPlan }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode };
+
+/**
+ * The validated plan one pre-sign produces: the standing grant's exact
+ * coordinates, the project and revision the answer binds, the trusted-clock
+ * instant the TTL is measured from, and the canonical digest payload the
+ * request id is derived from. Never a credential or secret.
+ */
+export interface PreSignShadowImportPlan {
+  readonly repository: MergeGrantRepositoryRef;
+  readonly expiresAtIso: string;
+  readonly projectId: string;
+  readonly decisionRevision: string;
+  readonly nowIso: string;
+  readonly digestPayload: string;
+}
+
+const PRE_SIGN_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
+const PRE_SIGN_REQUIRED_KEYS = ['actionScope', 'repository', 'expiresAtIso', 'nowIso', 'projectId'] as const;
+const PRE_SIGN_ALLOWED_KEYS = [...PRE_SIGN_REQUIRED_KEYS, 'decisionRevision'] as const;
+
+/** Whether the string carries any control character, including tab and newline. */
+function hasPreSignControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+type PreSignSnapshot =
+  | { readonly ok: true; readonly values: Record<string, unknown>; readonly hasRevision: boolean }
+  | { readonly ok: false; readonly code: PreSignShadowImportErrorCode };
+
+/**
+ * Snapshot a pre-sign plan's own data properties through their descriptors
+ * only. Cost is linear in `MAX_PRE_SIGN_KEYS` plus the bounded values copied;
+ * accessors are never invoked, symbol keys and non-enumerable data keys are
+ * refused, and a prototype-polluting key is refused before any key-set
+ * comparison. Arrays and array-like objects (an own `length` key) are refused
+ * before any indexing.
+ */
+function readPreSignSnapshot(raw: object): PreSignSnapshot {
+  let ownKeys: PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(raw);
+  } catch {
+    return { ok: false, code: 'pre-sign-invalid-input' };
+  }
+  if (ownKeys.length > MAX_PRE_SIGN_KEYS) {
+    return { ok: false, code: 'pre-sign-unexpected-key' };
+  }
+  // An array-like object (`{ length: 1, 0: ... }`) is refused as a non-object
+  // before any key-set comparison or indexing can misread it.
+  if (ownKeys.some((key) => key === 'length')) {
+    return { ok: false, code: 'pre-sign-not-object' };
+  }
+  const values: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  let hasRevision = false;
+  let forbiddenCode: PreSignShadowImportErrorCode | undefined;
+  for (const key of ownKeys) {
+    if (typeof key !== 'string') {
+      return { ok: false, code: 'pre-sign-unexpected-key' };
+    }
+    if ((PRE_SIGN_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
+      forbiddenCode = 'pre-sign-forbidden-key';
+      continue;
+    }
+    if (key === 'length') {
+      // An array-like object (`{ length: 1, 0: ... }`) is refused as a
+      // non-object before any key-set comparison can misread it.
+      return { ok: false, code: 'pre-sign-not-object' };
+    }
+    if (!(PRE_SIGN_ALLOWED_KEYS as readonly string[]).includes(key)) {
+      return { ok: false, code: 'pre-sign-unexpected-key' };
+    }
+    if (key === 'decisionRevision') {
+      hasRevision = true;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    } catch {
+      return { ok: false, code: 'pre-sign-accessor-forbidden' };
+    }
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false, code: 'pre-sign-accessor-forbidden' };
+    }
+    if (descriptor.enumerable !== true) {
+      return { ok: false, code: 'pre-sign-unexpected-key' };
+    }
+    values[key] = descriptor.value;
+  }
+  if (forbiddenCode !== undefined) {
+    return { ok: false, code: forbiddenCode };
+  }
+  for (const required of PRE_SIGN_REQUIRED_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(values, required)) {
+      return { ok: false, code: 'pre-sign-unexpected-key' };
+    }
+  }
+  return { ok: true, values, hasRevision };
+}
+
+/**
+ * Build the plan one `sign-decision --pre-sign` run signs from: hostile
+ * `unknown` in, a typed plan or a named refusal out, and never a throw. Only
+ * own data-property descriptors are read (a getter never runs, a Proxy `get`
+ * trap is never invoked), arrays (including sparse ones) and array-like
+ * objects are refused before any indexing, a `__proto__`/`constructor`/
+ * `prototype` own key is refused before any field comparison, and the key set
+ * is exact: `actionScope`, `repository` (a plain `{ owner, repo }` object),
+ * `expiresAtIso`, `nowIso`, `projectId` and the optional `decisionRevision`.
+ *
+ * The grant coordinates are delegated to `parseShadowImportGrant` and the
+ * digest payload to `shadowImportDigestPayload` (never re-implemented here);
+ * their `shadow-import-grant-accessor-forbidden` code is mapped to
+ * `pre-sign-accessor-forbidden` so an accessor on the root or on the nested
+ * repository shares one refusal code. The expiry must parse after `nowIso`
+ * and stay within `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`; `projectId` is a
+ * bounded, control-character-free string without surrounding whitespace (a
+ * padded value would sign bytes `request-decision` never verifies, because it
+ * trims the project id). `grantId` is never an input: it is derived
+ * deterministically from the request id digest downstream.
+ *
+ * Cost is linear in the capped input: `MAX_PRE_SIGN_KEYS * 2` own descriptors
+ * plus `MAX_PRE_SIGN_FIELD_LENGTH * 2` characters of field text plus
+ * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
+ * MAX_EXPIRES_AT_ISO_LENGTH` of grant-coordinate validation; nothing else is
+ * read.
+ */
+export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportResult {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ok: false, code: 'pre-sign-not-object' };
+  }
+  let proto: unknown;
+  try {
+    proto = Object.getPrototypeOf(raw);
+  } catch {
+    return { ok: false, code: 'pre-sign-invalid-input' };
+  }
+  if (proto !== Object.prototype && proto !== null) {
+    return { ok: false, code: 'pre-sign-not-object' };
+  }
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(raw);
+  } catch {
+    return { ok: false, code: 'pre-sign-invalid-input' };
+  }
+  if (isArray) {
+    return { ok: false, code: 'pre-sign-not-object' };
+  }
+  const snapshot = readPreSignSnapshot(raw);
+  if (!snapshot.ok) {
+    return snapshot;
+  }
+  const values = snapshot.values;
+  if (values['actionScope'] !== SHADOW_IMPORT_ACTION_SCOPE) {
+    return { ok: false, code: 'pre-sign-unsupported-scope' };
+  }
+  // Delegate the grant coordinates to the standing grant parser: the fresh
+  // plain carrier is built from the snapshotted descriptor values, so no
+  // accessor of the hostile input can run through it.
+  const grant = parseShadowImportGrant({
+    repository: values['repository'],
+    expiresAtIso: values['expiresAtIso'],
+  });
+  if (!grant.ok) {
+    return {
+      ok: false,
+      code:
+        grant.code === 'shadow-import-grant-accessor-forbidden'
+          ? 'pre-sign-accessor-forbidden'
+          : grant.code,
+    };
+  }
+  const nowRaw = values['nowIso'];
+  if (
+    typeof nowRaw !== 'string' ||
+    nowRaw.length === 0 ||
+    nowRaw.length > MAX_EXPIRES_AT_ISO_LENGTH ||
+    !Number.isFinite(Date.parse(nowRaw))
+  ) {
+    return { ok: false, code: 'pre-sign-invalid-now' };
+  }
+  const nowMs = Date.parse(nowRaw);
+  const expiresMs = Date.parse(grant.value.expiresAtIso);
+  if (expiresMs <= nowMs) {
+    return { ok: false, code: 'pre-sign-expired' };
+  }
+  if (expiresMs - nowMs > SHADOW_IMPORT_GRANT_MAX_TTL_DAYS * 86_400_000) {
+    return { ok: false, code: 'pre-sign-ttl-exceeded' };
+  }
+  const projectId = values['projectId'];
+  if (
+    typeof projectId !== 'string' ||
+    projectId.length === 0 ||
+    projectId.length > MAX_PRE_SIGN_FIELD_LENGTH ||
+    hasPreSignControlCharacter(projectId) ||
+    projectId !== projectId.trim()
+  ) {
+    return { ok: false, code: 'pre-sign-invalid-project' };
+  }
+  let decisionRevision: string = DEFAULT_PRE_SIGN_DECISION_REVISION;
+  if (snapshot.hasRevision) {
+    const revisionRaw = values['decisionRevision'];
+    if (
+      typeof revisionRaw !== 'string' ||
+      revisionRaw.length === 0 ||
+      revisionRaw.length > MAX_PRE_SIGN_FIELD_LENGTH ||
+      hasPreSignControlCharacter(revisionRaw)
+    ) {
+      return { ok: false, code: 'pre-sign-invalid-revision' };
+    }
+    decisionRevision = revisionRaw;
+  }
+  const payloadResult = shadowImportDigestPayload(grant.value);
+  if (!payloadResult.ok) {
+    return {
+      ok: false,
+      code:
+        payloadResult.code === 'shadow-import-grant-accessor-forbidden'
+          ? 'pre-sign-accessor-forbidden'
+          : payloadResult.code,
+    };
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      repository: Object.freeze({ ...grant.value.repository }),
+      expiresAtIso: grant.value.expiresAtIso,
+      projectId,
+      decisionRevision,
+      nowIso: nowRaw,
+      digestPayload: payloadResult.value,
+    }),
+  };
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;

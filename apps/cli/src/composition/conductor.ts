@@ -601,63 +601,148 @@ export function unsealedWorktreeRemovalAuthorizer(
     if (request === null) {
       return { outcome: 'blocked', reason: 'invalid-request' };
     }
-    const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = request;
-    const scope: UnsealedRemovalScope = {
-      projectId,
-      actionId: unsealedWorktreeRemovalActionId(runId, attemptId),
-      actionScope: unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath)),
-      attemptId,
-      expectedHeadSha,
-      nowIso,
-    };
+    const scope = readUnsealedRemovalScope(request);
     try {
-      await coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
-      const listed = await coordination.listOwnerQuestions.listOwnerQuestions();
-      const questions: unknown = isRecordObject(listed) ? listed['questions'] : undefined;
-      if (!Array.isArray(questions)) {
-        return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
-      }
-      if (questions.length > MAX_OWNER_QUESTIONS_SCAN) {
-        return { outcome: 'unknown', reason: 'owner-question-list-too-large' };
-      }
-      for (let index = 0; index < questions.length; index += 1) {
-        // A sparse array's hole is skipped, never read as a question.
-        if (!Object.hasOwn(questions, index)) {
-          continue;
-        }
-        const question = readApprovedOneWayQuestion(questions[index]);
-        if (question === null) {
-          continue;
-        }
-        const coordReq = await coordinationRequestRepository.findRequestById(
-          question.linkedRequestId,
-        );
-        if (
-          coordReq === null ||
-          coordReq.projectId !== scope.projectId ||
-          coordReq.actionScope !== scope.actionScope ||
-          coordReq.expectedHeadSha !== scope.expectedHeadSha ||
-          coordReq.policyGrant !== undefined
-        ) {
-          continue;
-        }
-        if (isCrashRecoveryConsumption(coordReq, scope)) {
-          const recovered = await recoverConsumedGrant(coordination, scope, question, coordReq);
-          if (recovered !== null) {
-            return recovered;
-          }
-          continue;
-        }
-        const consumed = await consumeFreshGrant(coordination, scope, question, coordReq);
-        if (consumed !== null) {
-          return consumed;
-        }
-      }
-      return { outcome: 'blocked', reason: 'no-scoped-owner-approval' };
+      return await authorizeUnsealedRemovalWithScope(
+        coordination,
+        scope,
+        coordinationRequestRepository,
+      );
     } catch {
       return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
     }
   };
+}
+
+/** The scoped values one candidate question/consumer pairing is evaluated against. */
+function readUnsealedRemovalScope(
+  request: AuthorizeUnsealedWorktreeRemovalRequest,
+): UnsealedRemovalScope {
+  const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = request;
+  return {
+    projectId,
+    actionId: unsealedWorktreeRemovalActionId(runId, attemptId),
+    actionScope: unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath)),
+    attemptId,
+    expectedHeadSha,
+    nowIso,
+  };
+}
+
+/**
+ * The owner-approval scan for one removal request: sync the one-way owner
+ * questions, select the candidates bound to this exact scope, and authorize
+ * the first candidate that yields a verified approval.
+ */
+async function authorizeUnsealedRemovalWithScope(
+  coordination: UnsealedRemovalAuthorizerDeps['coordination'],
+  scope: UnsealedRemovalScope,
+  coordinationRequestRepository: CoordinationRequestRepositoryAdapter,
+): Promise<AuthorizeUnsealedWorktreeRemovalResult> {
+  const synced = await syncOwnerQuestions(coordination);
+  if (!synced.ok) {
+    return { outcome: 'unknown', reason: synced.reason };
+  }
+  const candidates = await selectOwnerQuestions(
+    synced.questions,
+    scope,
+    coordinationRequestRepository,
+  );
+  const result = await authorizeSelectedQuestions(coordination, scope, candidates);
+  if (result === null) {
+    return { outcome: 'blocked', reason: 'no-scoped-owner-approval' };
+  }
+  return result;
+}
+
+/** The synced question list, or the `unknown` reason it could not be read. */
+type SyncedOwnerQuestions =
+  | { readonly ok: true; readonly questions: readonly unknown[] }
+  | {
+      readonly ok: false;
+      readonly reason: 'owner-question-sync-failed' | 'owner-question-list-too-large';
+    };
+
+/**
+ * Sync the one-way owner questions and return the listed questions; `ok:
+ * false` when the listing is not a bounded array (the caller answers
+ * `unknown` with the same reason).
+ */
+async function syncOwnerQuestions(
+  coordination: UnsealedRemovalAuthorizerDeps['coordination'],
+): Promise<SyncedOwnerQuestions> {
+  await coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
+  const listed = await coordination.listOwnerQuestions.listOwnerQuestions();
+  const questions: unknown = isRecordObject(listed) ? listed['questions'] : undefined;
+  if (!Array.isArray(questions)) {
+    return { ok: false, reason: 'owner-question-sync-failed' };
+  }
+  if (questions.length > MAX_OWNER_QUESTIONS_SCAN) {
+    return { ok: false, reason: 'owner-question-list-too-large' };
+  }
+  return { ok: true, questions };
+}
+
+/** One matched question/request pairing the removal is authorized against. */
+interface SelectedOwnerQuestion {
+  readonly question: { readonly questionId: string; readonly linkedRequestId: string };
+  readonly coordReq: CoordinationRequestSnapshot;
+}
+
+/**
+ * The answered one-way owner questions whose linked coordination request is
+ * bound to this exact removal scope (project, action scope, head, no policy
+ * grant). A sparse array's hole is skipped, never read as a question.
+ */
+async function selectOwnerQuestions(
+  questions: readonly unknown[],
+  scope: UnsealedRemovalScope,
+  coordinationRequestRepository: CoordinationRequestRepositoryAdapter,
+): Promise<SelectedOwnerQuestion[]> {
+  const selected: SelectedOwnerQuestion[] = [];
+  for (let index = 0; index < questions.length; index += 1) {
+    if (!Object.hasOwn(questions, index)) {
+      continue;
+    }
+    const question = readApprovedOneWayQuestion(questions[index]);
+    if (question === null) {
+      continue;
+    }
+    const coordReq = await coordinationRequestRepository.findRequestById(question.linkedRequestId);
+    if (
+      coordReq === null ||
+      coordReq.projectId !== scope.projectId ||
+      coordReq.actionScope !== scope.actionScope ||
+      coordReq.expectedHeadSha !== scope.expectedHeadSha ||
+      coordReq.policyGrant !== undefined
+    ) {
+      continue;
+    }
+    selected.push({ question, coordReq });
+  }
+  return selected;
+}
+
+/**
+ * Authorize the selected candidates in order: a crash-recovery-shaped request
+ * recovers only through the verified consume replay, everything else goes
+ * through the fresh resolve-and-consume. Returns the first approved result,
+ * or null when no candidate yields one.
+ */
+async function authorizeSelectedQuestions(
+  coordination: UnsealedRemovalAuthorizerDeps['coordination'],
+  scope: UnsealedRemovalScope,
+  candidates: readonly SelectedOwnerQuestion[],
+): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
+  for (const candidate of candidates) {
+    const authorized = isCrashRecoveryConsumption(candidate.coordReq, scope)
+      ? await tryCrashRecovery(coordination, scope, candidate)
+      : await freshConsume(coordination, scope, candidate);
+    if (authorized !== null) {
+      return authorized;
+    }
+  }
+  return null;
 }
 
 /**
@@ -671,12 +756,12 @@ export function unsealedWorktreeRemovalAuthorizer(
  * is refused (the caller never falls back to a fresh authorization for the
  * same question).
  */
-async function recoverConsumedGrant(
+async function tryCrashRecovery(
   coordination: UnsealedRemovalAuthorizerDeps['coordination'],
   scope: UnsealedRemovalScope,
-  question: { readonly questionId: string; readonly linkedRequestId: string },
-  coordReq: CoordinationRequestSnapshot,
+  candidate: SelectedOwnerQuestion,
 ): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
+  const { question, coordReq } = candidate;
   const consumption = coordReq.consumptions[0];
   if (
     coordReq.consumptions.length !== 1 ||
@@ -713,12 +798,12 @@ async function recoverConsumedGrant(
  * resolve does not match this request (the caller moves on to the next
  * question); a resolve that matches but is refused to consume is blocked.
  */
-async function consumeFreshGrant(
+async function freshConsume(
   coordination: UnsealedRemovalAuthorizerDeps['coordination'],
   scope: UnsealedRemovalScope,
-  question: { readonly questionId: string; readonly linkedRequestId: string },
-  coordReq: CoordinationRequestSnapshot,
+  candidate: SelectedOwnerQuestion,
 ): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
+  const { question, coordReq } = candidate;
   const resolved = await coordination.resolveActionAuthorization.resolveActionAuthorization({
     projectId: scope.projectId,
     actionScope: scope.actionScope,

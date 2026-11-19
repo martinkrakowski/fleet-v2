@@ -1013,7 +1013,15 @@ function snapshotDecisionBindingObject(raw: unknown): DecisionBindingSnapshot {
   // or `null`. A custom-prototype record or answer (a class instance, a
   // `Proxy`-adjacent exotic object, or anything with a `get` trap) is refused
   // before any descriptor is read, so a getter on the prototype can never run.
-  const proto = Object.getPrototypeOf(raw) as unknown;
+  // Every reflective read, including `getPrototypeOf` (whose trap a revoked
+  // `Proxy` makes throw), runs inside try/catch: a throwing trap yields the
+  // same typed refusal as any other invalid input.
+  let proto: unknown;
+  try {
+    proto = Object.getPrototypeOf(raw) as unknown;
+  } catch {
+    return { ok: false };
+  }
   if (proto !== Object.prototype && proto !== null) {
     return { ok: false };
   }
@@ -1066,8 +1074,15 @@ function isBoundedDecisionField(value: unknown): value is string {
   );
 }
 
-function isUnboundField(value: unknown): boolean {
-  return value === undefined || value === null;
+/**
+ * Whether the snapshot carries the own key at all: every own data key present
+ * on the hostile input is copied into the snapshot, so a key whose value is
+ * `null` (or any other non-string) is PRESENT here, never absent. A present
+ * identity field must be a bounded non-empty string; absence is the only
+ * thing that permits omission.
+ */
+function snapshotHasOwnKey(values: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(values, key);
 }
 
 /**
@@ -1103,24 +1118,27 @@ export function verifySignedDecisionBinding(
     return { ok: false, code: 'decision-binding-not-approved' };
   }
   // The record id binds every answer; the answer's own requestId, when it
-  // carries one, must name the same request.
+  // carries one, must name the same request. A present field whose value is
+  // `null` or any other non-string is refused, never treated as absent.
   if (!isBoundedDecisionField(record.values['id'])) {
     return { ok: false, code: 'decision-binding-mismatch' };
   }
-  if (
-    !isUnboundField(answer.values['requestId']) &&
-    (!isBoundedDecisionField(answer.values['requestId']) ||
-      answer.values['requestId'] !== record.values['id'])
-  ) {
-    return { ok: false, code: 'decision-binding-mismatch' };
+  if (snapshotHasOwnKey(answer.values, 'requestId')) {
+    if (
+      !isBoundedDecisionField(answer.values['requestId']) ||
+      answer.values['requestId'] !== record.values['id']
+    ) {
+      return { ok: false, code: 'decision-binding-mismatch' };
+    }
   }
-  if (
-    !isUnboundField(answer.values['actionScope']) &&
-    (!isBoundedDecisionField(answer.values['actionScope']) ||
+  if (snapshotHasOwnKey(answer.values, 'actionScope')) {
+    if (
+      !isBoundedDecisionField(answer.values['actionScope']) ||
       !isBoundedDecisionField(record.values['actionScope']) ||
-      answer.values['actionScope'] !== record.values['actionScope'])
-  ) {
-    return { ok: false, code: 'decision-binding-mismatch' };
+      answer.values['actionScope'] !== record.values['actionScope']
+    ) {
+      return { ok: false, code: 'decision-binding-mismatch' };
+    }
   }
   if (
     !isBoundedDecisionField(answer.values['grantId']) ||

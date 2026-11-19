@@ -375,4 +375,56 @@ describe('verifySignedDecisionBinding', () => {
       verifySignedDecisionBinding(validAnswer(), validAnswer()),
     ).toEqual({ ok: false, code: 'decision-binding-mismatch' });
   });
+
+  it('refuses a revoked Proxy without throwing and reports it as invalid-input', () => {
+    const revoked = Proxy.revocable(validAnswer(), {});
+    revoked.revoke();
+    expect(() => verifySignedDecisionBinding(requestRecord(), revoked.proxy)).not.toThrow();
+    expect(verifySignedDecisionBinding(requestRecord(), revoked.proxy)).toEqual({
+      ok: false,
+      code: 'decision-binding-invalid-input',
+    });
+  });
+
+  it('refuses a throwing getPrototypeOf trap without throwing and reports it as invalid-input', () => {
+    const throwing = new Proxy(validAnswer(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf trap');
+      },
+    });
+    expect(() => verifySignedDecisionBinding(requestRecord(), throwing)).not.toThrow();
+    expect(verifySignedDecisionBinding(requestRecord(), throwing)).toEqual({
+      ok: false,
+      code: 'decision-binding-invalid-input',
+    });
+  });
+
+  it('refuses a present own requestId with value null instead of treating it as absent', () => {
+    const answer: Record<string, unknown> = { ...validAnswer(), requestId: null };
+    expect(verifySignedDecisionBinding(requestRecord(), answer)).toEqual({
+      ok: false,
+      code: 'decision-binding-mismatch',
+    });
+  });
+
+  it('refuses a present own actionScope with value null instead of treating it as absent', () => {
+    const answer: Record<string, unknown> = { ...validAnswer(), actionScope: null };
+    expect(verifySignedDecisionBinding(requestRecord(), answer)).toEqual({
+      ok: false,
+      code: 'decision-binding-mismatch',
+    });
+  });
+
+  it('refuses a present own identity field with any other non-string value', () => {
+    const answer: Record<string, unknown> = { ...validAnswer(), requestId: 42 };
+    expect(verifySignedDecisionBinding(requestRecord(), answer)).toEqual({
+      ok: false,
+      code: 'decision-binding-mismatch',
+    });
+    const blank: Record<string, unknown> = { ...validAnswer(), actionScope: '' };
+    expect(verifySignedDecisionBinding(requestRecord(), blank)).toEqual({
+      ok: false,
+      code: 'decision-binding-mismatch',
+    });
+  });
 });

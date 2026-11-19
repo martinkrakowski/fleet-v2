@@ -34,9 +34,13 @@ bytes; anything else is refused with exit 1.
 ## 2. Pin the public key in the trusted installation file
 
 Edit the trusted installation file directly — no `hosts` or `policy`
-subcommand writes the `owner` section. The file must live outside every git
-checkout or worktree, for example `~/.config/fleet-v2/fleet.json` (`0600` in a
-`0700` directory), pointed to by `FLEET_INSTALLATION_FILE` in the CLI shell
+subcommand writes the `owner` section. If the installation file
+`installation/fleet.json` currently lives inside a checkout, MOVE it out of
+the checkout to `~/.config/fleet-v2/fleet.json` (file `0600`, directory
+`0700`) and set `FLEET_INSTALLATION_FILE` to that path (see `cutover.md`).
+The file must live outside every git checkout or worktree —
+`~/.config/fleet-v2/fleet.json` (`0600` in a `0700` directory), pointed to by
+`FLEET_INSTALLATION_FILE` in the CLI shell
 profile and the systemd user `EnvironmentFile` drop-in (KEY0a). Merge the
 printed edit:
 
@@ -103,11 +107,18 @@ Rotation is a file edit plus a restart, not a command.
 ## 6. If the key is lost
 
 A pending one-way decision cannot be signed with a lost key: there is no
-recovery from the public key, and the pinned `owner.publicKey` will not accept
-any signature the lost key would have produced. Generate a new keypair
-(`owner-key init`), replace `owner.publicKey` in the trusted installation
-file, restart the API and the daemon so every consumer re-pins, and
-re-request and re-sign the affected decisions under the new key.
+recovery from the public key. The pinned `owner.publicKey` still accepts every
+signature the lost key would have produced — nobody can produce them any more,
+but the pin itself has not changed. If the private key is LOST (you believe no
+one else has it), generate a new keypair (`owner-key init`), re-pin
+`owner.publicKey` in the trusted installation file, restart the API and the
+daemon so every consumer re-pins, and re-request any pending decisions and
+sign them under the new key.
+
+If the key may be COMPROMISED (someone else may hold it), re-pin a new
+`owner.publicKey` immediately: the old key's signatures stay valid until the
+pin changes, so every hour the old pin stands is an hour a holder of the old
+key can sign accepted decisions.
 
 ## Not this runbook
 

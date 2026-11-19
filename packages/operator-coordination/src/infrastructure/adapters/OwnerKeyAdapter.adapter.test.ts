@@ -45,6 +45,11 @@ const failureFlags = vi.hoisted(() => ({
   // When set, every handle.stat() reports this size instead of the real
   // one: it stages a file that grows AFTER the adapter's fstat look.
   statSize: null as number | null,
+  // When set, every module-level fsPromises.stat() reports its real `ino`
+  // shifted by this amount: it stages a written file whose stat at its
+  // realpath no longer matches the open handle's fstat, exercising the REAL
+  // dev/ino comparison inside `verifyWrittenIdentity` (not a stand-in).
+  statInoShift: null as number | null,
 }));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -52,6 +57,15 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   const fs = await import('node:fs');
   return {
     ...actual,
+    async stat(...args: Parameters<typeof actual.stat>) {
+      const stat = await actual.stat(...args);
+      if (failureFlags.statInoShift !== null) {
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+          ino: stat.ino + failureFlags.statInoShift,
+        });
+      }
+      return stat;
+    },
     async open(...args: Parameters<typeof actual.open>) {
       const handle = await actual.open(...args);
       if (!failureFlags.write && !failureFlags.close && failureFlags.statSize === null) {
@@ -128,6 +142,7 @@ afterEach(() => {
   failureFlags.close = false;
   failureFlags.swapPath = null;
   failureFlags.statSize = null;
+  failureFlags.statInoShift = null;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -238,6 +253,30 @@ describe('generateOwnerKeyFile', () => {
       },
     }));
     expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
+  });
+
+  it('refuses with location-unverifiable when the START path lstat fails with EACCES (before the ancestor walk)', async () => {
+    // Only the FIRST lstat call — the start path itself, before any `.git`
+    // probe — fails, with EACCES. Every later probe answers from the real
+    // filesystem, so the walk's own `.git` checks stay healthy: the refusal
+    // must come from the start-path check, not from a later probe. If the
+    // start-path check failed open (swallowed the error and walked on),
+    // the healthy probes would prove "no marker" and the run would succeed,
+    // which this test forbids.
+    const keyPath = join(root, 'owner-key.pem');
+    let lstatCalls = 0;
+    const result = await generateOwnerKeyFile({ outPath: keyPath }, fakeDeps(async () => ({ ok: true }), {
+      lstat: async (path: string) => {
+        lstatCalls += 1;
+        if (lstatCalls === 1) {
+          throw Object.assign(new Error('simulated EACCES on the start path'), { code: 'EACCES' });
+        }
+        return fsPromises.lstat(path);
+      },
+    }));
+    expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
+    // Nothing was written: the refusal precedes the exclusive create.
+    expect(existsSync(keyPath)).toBe(false);
   });
 
   it('refuses with location-unverifiable when an ancestor lstat fails with ENOTDIR', async () => {
@@ -366,6 +405,22 @@ describe('generateOwnerKeyFile', () => {
     const result = await generateOwnerKeyFile({ outPath: keyPath });
     expect(spy).toHaveBeenCalled();
     expect(result).toMatchObject({ ok: false, code: 'unsafe-parent-directory' });
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('refuses with identity-changed and removes the file when the REAL post-write check finds stat(realpath(path)) reporting a different ino than the handle fstat', async () => {
+    const keyPath = join(root, 'owner-key.pem');
+    // No `verifyWrittenIdentity` stand-in here: the default (real) deps run,
+    // and the module-level `stat` the real check uses reports an `ino` one
+    // off from the handle's fstat — the mismatch a parent swap between the
+    // location checks and the write produces. Only the REAL dev/ino
+    // comparison inside `verifyWrittenIdentity` can catch this: a stand-in
+    // would bypass it, so this test fails if that comparison is removed.
+    failureFlags.statInoShift = 1;
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    // The file is not accepted: the refusal is typed, not a success.
+    expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
+    // Cleanup followed the guarded path: nothing this run created is left.
     expect(existsSync(keyPath)).toBe(false);
   });
 

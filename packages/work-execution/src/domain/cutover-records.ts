@@ -4,7 +4,7 @@
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,
@@ -325,7 +325,10 @@ function utcDayNumber(day: string): number | null {
  * value, so it reads no getter, and a Proxy stand-in for `days` (or for a day record inside it,
  * or for the document root) is refused by it without being accepted. A verdict getter is never
  * run at all: the walk reads descriptors only, so a throwing or uncloneable getter stays
- * unread and names only its own criterion. Never throws, never echoes the input.
+ * unread and names only its own criterion. Never throws, never echoes the input. Cost bound:
+ * linear in the capped input — `CUTOVER_SHADOW_CONSECUTIVE_DAYS` days with `CUTOVER_SHADOW_CRITERIA.length`
+ * criteria per day, every text bounded by `MAX_EVIDENCE_STRING_BYTES`, and a constant number of
+ * descriptor reads on the root (key counts are settled before any walk).
  */
 export function readCutoverShadowEvidence(raw: unknown, nowIso: string): CutoverShadowEvidenceRead {
   try {
@@ -463,5 +466,228 @@ function isCloneableData(raw: unknown): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+// BL14a: the §1 retirement ledger (plan §1, `docs/planning/2026-11-03_cutover-plan.md`).
+// A ledger records, for every pinned §1 script, that its replacement is verified.
+
+export const RETIREMENT_LEDGER_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+export const RETIREMENT_LEDGER_MAX_ROWS = 256;
+export const RETIREMENT_LEDGER_MAX_TEXT_BYTES = 256;
+/** Total serialized-size cap for a persisted ledger document. */
+export const RETIREMENT_LEDGER_MAX_BYTES = 65_536;
+
+/**
+ * Every §1 script in the cutover plan's Inventory tables (`### Train`, then
+ * `### Lane`), in the exact order the table rows appear. `lane/mk-brief-request.py`
+ * is listed twice in the plan (the table itself carries that note); the pinned
+ * set names it once.
+ */
+export const CUTOVER_RETIREMENT_SCRIPTS = [
+  'train/batch.sh',
+  'train/chain-land.sh',
+  'train/chain-refresh.sh',
+  'train/chain-review.sh',
+  'train/chain-start.sh',
+  'train/common.sh',
+  'train/conductor-adopt.sh',
+  'train/enqueue.sh',
+  'train/jev-shadow.sh',
+  'train/pass.sh',
+  'train/premerge.sh',
+  'train/tick.sh',
+  'lane/after-lane.sh',
+  'lane/agy-brief.sh',
+  'lane/auto-record.sh',
+  'lane/brief-lint.sh',
+  'lane/cf-gate-review.sh',
+  'lane/conducted-perf.py',
+  'lane/conductor-deploy.sh',
+  'lane/conductor-locked.sh',
+  'lane/deploy-train.sh',
+  'lane/dispatch.sh',
+  'lane/drive-runs.sh',
+  'lane/fix-round-agy.sh',
+  'lane/fleet-v2-gate.sh',
+  'lane/gate-review.sh',
+  'lane/gate-timeouts.sh',
+  'lane/lane-checks.sh',
+  'lane/lane-rebase.sh',
+  'lane/launch.sh',
+  'lane/luna-brief.sh',
+  'lane/merge-main.sh',
+  'lane/mk-agy-input.py',
+  'lane/mk-brief-request.py',
+  'lane/mkreview.py',
+  'lane/pr-ready.sh',
+  'lane/pr-wait.sh',
+  'lane/pr.sh',
+  'lane/premerge.sh',
+  'lane/prep-TEMPLATE.sh',
+  'lane/prep-other.sh',
+  'lane/record-merged.sh',
+  'lane/review-other.sh',
+  'lane/review.sh',
+  'lane/split-agy-brief.py',
+  'lane/verify-brief-prompt.md',
+  'lane/finish-lane.sh',
+  'lane/fv2-lane.sh',
+  'lane/grok-brief.sh',
+  'lane/hx-brief.sh',
+  'lane/hx-lane.sh',
+  'lane/hx-review.sh',
+  'lane/hx-sonar.sh',
+  'lane/land-mc.sh',
+  'lane/lane-pr.sh',
+  'lane/luna-fleet.sh',
+  'lane/luna-pass.sh',
+  'lane/mc-fix.sh',
+  'lane/mx-brief.sh',
+  'lane/push-fix.sh',
+  'lane/quality-track.py',
+  'lane/start-lanes.py',
+  'lane/tr-brief.sh',
+  'lane/tr-chain.sh',
+  'lane/tr-cont.sh',
+  'lane/tr-gemini.sh',
+  'lane/tr-lane.sh',
+  'lane/tr-review.sh',
+] as const;
+
+export interface RetirementLedgerRow {
+  readonly script: string;
+  readonly verified: boolean;
+  readonly evidenceLink: string;
+}
+
+export interface RetirementLedger {
+  readonly schemaVersion: typeof RETIREMENT_LEDGER_SCHEMA_VERSION;
+  readonly rows: readonly RetirementLedgerRow[];
+}
+
+export type RetirementLedgerRead =
+  | { readonly ok: true; readonly ledger: RetirementLedger }
+  | {
+      readonly ok: false;
+      readonly reason: 'unknown-version' | 'invalid-ledger' | 'empty-ledger' | 'row-unverified' | 'secret-shaped';
+    };
+
+const RETIREMENT_ROW_KEYS = ['script', 'verified', 'evidenceLink'] as const;
+const INVALID_LEDGER = { ok: false, reason: 'invalid-ledger' } as const;
+
+/** `isBoundedText` for the ledger's text fields: UTF-16 pre-check, then the UTF-8 byte bound. */
+function isBoundedLedgerText(value: unknown): value is string {
+  // The UTF-16 length is checked first: a string's UTF-8 byte length is never less than it, so
+  // this refuses nothing the byte check would accept, and an oversized string is never encoded.
+  return (
+    typeof value === 'string' &&
+    value.length <= RETIREMENT_LEDGER_MAX_TEXT_BYTES &&
+    new TextEncoder().encode(value).length <= RETIREMENT_LEDGER_MAX_TEXT_BYTES
+  );
+}
+
+/**
+ * A real, dense, bounded array whose own keys are exactly its indices and
+ * `length`: a hole, an extra property, a symbol key or an enormous `length`
+ * is refused without any traversal of the elements.
+ */
+function isBoundedRowArray(rows: unknown): rows is readonly unknown[] {
+  if (!Array.isArray(rows) || Object.getPrototypeOf(rows) !== Array.prototype) {
+    return false;
+  }
+  if (rows.length > RETIREMENT_LEDGER_MAX_ROWS) {
+    return false;
+  }
+  const ownKeys = Reflect.ownKeys(rows);
+  if (ownKeys.length !== rows.length + 1) {
+    return false;
+  }
+  for (const key of ownKeys) {
+    if (key === 'length') {
+      continue;
+    }
+    if (typeof key !== 'string' || !/^\d+$/.test(key) || Number(key) >= rows.length) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Read the §1 retirement ledger without running a single getter and never
+ * echoing the input. The root is a plain data record with exactly `rows` (plus
+ * the optional `schemaVersion`); each row is a plain data record with exactly
+ * `script`, `verified` and `evidenceLink`. The pinned script set must match
+ * exactly: `CUTOVER_RETIREMENT_SCRIPTS.length` unique rows, every `script` a
+ * pinned script, none missing, none extra. Cost bound: linear in the capped
+ * input — at most `RETIREMENT_LEDGER_MAX_ROWS` rows of 3 fixed keys each,
+ * every text bounded by `RETIREMENT_LEDGER_MAX_TEXT_BYTES`, and the shape
+ * bounds (array length, key counts) settled before any row is walked, so an
+ * oversized or sparse array is refused without a traversal. Never throws,
+ * never runs a getter, and always returns a freshly built `RetirementLedger`
+ * object, never the input itself.
+ */
+export function readRetirementLedger(raw: unknown): RetirementLedgerRead {
+  try {
+    const version = readRecordSchemaVersion(raw, RETIREMENT_LEDGER_SCHEMA_VERSION);
+    if (!version.ok) {
+      // Only an enumerable data property reaches here; a positive integer is a newer schema, anything else is garbage.
+      const value = (Object.getOwnPropertyDescriptor(raw, 'schemaVersion') as PropertyDescriptor | undefined)?.value as unknown;
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+        return { ok: false, reason: 'unknown-version' };
+      }
+      return INVALID_LEDGER;
+    }
+    const snapshot = readPlainRecordWithOptionalKeys(raw, ['rows'], ['schemaVersion']);
+    if (snapshot === null) {
+      return INVALID_LEDGER;
+    }
+    if (!isBoundedRowArray(snapshot.rows)) {
+      return INVALID_LEDGER;
+    }
+    if (snapshot.rows.length === 0) {
+      return { ok: false, reason: 'empty-ledger' };
+    }
+    if (snapshot.rows.length !== CUTOVER_RETIREMENT_SCRIPTS.length) {
+      return INVALID_LEDGER;
+    }
+    const pinned: ReadonlySet<string> = new Set<string>(CUTOVER_RETIREMENT_SCRIPTS);
+    const seen = new Set<string>();
+    const rows: RetirementLedgerRow[] = [];
+    for (const rowValue of snapshot.rows) {
+      const row = readExactPlainRecord(rowValue, RETIREMENT_ROW_KEYS);
+      if (row === null) {
+        return INVALID_LEDGER;
+      }
+      const { script, verified, evidenceLink } = row;
+      if (!isBoundedLedgerText(script) || !isBoundedLedgerText(evidenceLink) || typeof verified !== 'boolean') {
+        return INVALID_LEDGER;
+      }
+      if (isSecretShapedText(script) || isSecretShapedText(evidenceLink)) {
+        return { ok: false, reason: 'secret-shaped' };
+      }
+      if (!pinned.has(script) || seen.has(script)) {
+        return INVALID_LEDGER;
+      }
+      seen.add(script);
+      if (verified !== true || evidenceLink.trim() === '') {
+        return { ok: false, reason: 'row-unverified' };
+      }
+      rows.push({ script, verified, evidenceLink });
+    }
+    if (seen.size !== CUTOVER_RETIREMENT_SCRIPTS.length) {
+      // A duplicate was impossible (checked above), so this is a missing pinned script.
+      return INVALID_LEDGER;
+    }
+    if (!isCloneableData(raw)) {
+      // A transparent Proxy over valid data passes every descriptor check above; the
+      // structured-clone serializer refuses any Proxy exotic object. Every own property
+      // is by now a proved primitive data value, so the probe reads no getter.
+      return INVALID_LEDGER;
+    }
+    return { ok: true, ledger: { schemaVersion: RETIREMENT_LEDGER_SCHEMA_VERSION, rows } };
+  } catch {
+    return INVALID_LEDGER;
   }
 }

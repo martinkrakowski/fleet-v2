@@ -65,6 +65,7 @@ import { forgeCommands } from './commands/forge.js';
 import { evidenceCommands } from './commands/evidence.js';
 import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
+import { ownerKeyCommand } from './commands/owner-key.js';
 import { questionsCommands } from './commands/questions.js';
 import { ownerItemsCommands } from './commands/owner-items.js';
 import { mergeCommands } from './merge.js';
@@ -768,8 +769,9 @@ Commands:
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
-  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding|sign-decision
+  coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding|sign-decision|owner-key
     (sign-decision --pre-sign --action-scope merge:import-shadow --repository <owner/repo> --project <id> --expires-at <iso> --key <path> --yes pre-signs the standing grant before request-decision)
+    (owner-key init --out <path> generates a 0600 Ed25519 owner key file; owner-key public --key <path> derives the public key)
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   owner-items add|list|resolve
   help | --help
@@ -923,6 +925,12 @@ export async function runCli(
       // stripped here; leaving it in made every real invocation a usage error.
       const laneRest = restArgv[1] === 'diff-check' ? restArgv.slice(2) : restArgv.slice(1);
       return await laneCommand(laneRest, io);
+    }
+    // `coordination owner-key` (KEY1b) manages the owner's private key file
+    // directly; it never composes the runtime or loads the installation, so
+    // key generation works before any installation file exists.
+    if (group === 'coordination' && restArgv[1] === 'owner-key') {
+      return await ownerKeyCommand(restArgv.slice(2), io, stateDir);
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.

@@ -249,13 +249,29 @@ describe('coordination sign-decision --pre-sign (KEY1c)', () => {
     const requested = await requestShadowDecision(runtime, ws.stateDir, expiresAtIso);
     expect(requested.code).toBe(0);
 
+    // The key path does not exist: if the refusal were reached only after a
+    // key read, this run would fail with a key error instead of the typed
+    // already-recorded refusal — so this also proves the key is never read.
+    const missingKeyPath = join(ws.keyDir, 'owner-key-that-does-not-exist.pem');
     const refused = await runCoordination(
       runtime,
-      preSignArgs(expiresAtIso, ['--key', ws.keyPath, '--yes']),
+      preSignArgs(expiresAtIso, ['--key', missingKeyPath, '--yes']),
       ws.stateDir,
     );
     expect(refused.code).toBe(1);
     expect(parseDocument(refused.stdout)['reason']).toBe('shadow-request-already-recorded');
+    expect(decisionFiles(ws.stateDir)).toEqual([]);
+  });
+
+  it('refuses --decision-revision with --pre-sign as a usage error (exit 2), writing nothing', async () => {
+    const ws = workspace();
+    const runtime = runtimeFor(ws.stateDir, ws.publicBase64);
+    const refused = await runCoordination(
+      runtime,
+      [...preSignArgs(futureExpiry(), ['--key', ws.keyPath, '--yes']), '--decision-revision', 'decision-2'],
+      ws.stateDir,
+    );
+    expect(refused.code).toBe(2);
     expect(decisionFiles(ws.stateDir)).toEqual([]);
   });
 

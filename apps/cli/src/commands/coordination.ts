@@ -451,15 +451,21 @@ async function preSignShadowImportDecision(
   }
   // `--now-iso` is ignored for --pre-sign: the plan's moment is always the
   // trusted clock, never a caller-supplied one.
+  // `--decision-revision` is never forwarded for --pre-sign: the revision is
+  // the deterministic default `DEFAULT_PRE_SIGN_DECISION_REVISION` (`'1'`)
+  // the domain planner sets when the field is omitted — the same default
+  // `sign-decision` (KEY1a) falls back to (`decision-signing.ts`). Passing
+  // it would make the pre-signed answer bind a revision the deterministic
+  // coordinates never name, so it is a usage error.
+  if (optStr(p, 'decisionRevision') !== undefined) {
+    throw new CliUsageError('sign-decision: --decision-revision cannot be combined with --pre-sign');
+  }
   const plan = buildPreSignShadowImportPlan({
     actionScope,
     repository: { owner: segments[0]!, repo: segments[1]! },
     expiresAtIso,
     nowIso: new Date().toISOString(),
     projectId,
-    ...(optStr(p, 'decisionRevision') !== undefined
-      ? { decisionRevision: optStr(p, 'decisionRevision') }
-      : {}),
   });
   if (!plan.ok) {
     // A malformed repository or expiry is a usage error (exit 2); every other

@@ -220,6 +220,31 @@ describe('buildPreSignShadowImportPlan hostile inputs', () => {
     });
   });
 
+  it('refuses a locale date nowIso (11/19/2026) with pre-sign-invalid-now: only strict ISO-8601 UTC parses', () => {
+    // A bare finite `Date.parse` would accept `'11/19/2026'`; the planner uses
+    // the strict `parseShadowImportExpiry` validator instead, so it refuses.
+    expect(buildPreSignShadowImportPlan(validInput({ nowIso: '11/19/2026' }))).toEqual({
+      ok: false,
+      code: 'pre-sign-invalid-now',
+    });
+  });
+
+  it('refuses a revoked Proxy without ever throwing', () => {
+    const { proxy, revoke } = Proxy.revocable(validInput(), {});
+    revoke();
+    let outcome: { ok: boolean; code?: string };
+    try {
+      const result = buildPreSignShadowImportPlan(proxy);
+      outcome = { ok: result.ok, code: result.ok ? undefined : result.code };
+    } catch (thrown) {
+      outcome = { ok: true, code: `threw ${String(thrown)}` };
+    }
+    expect(outcome.ok).toBe(false);
+    expect(outcome.code === 'pre-sign-not-object' || outcome.code === 'pre-sign-invalid-input').toBe(
+      true,
+    );
+  });
+
   it('refuses an expiry at or before now with pre-sign-expired', () => {
     expect(
       buildPreSignShadowImportPlan(validInput({ expiresAtIso: '2026-11-19T00:00:00.000Z' })),

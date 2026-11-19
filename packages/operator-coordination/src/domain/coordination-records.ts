@@ -1033,8 +1033,10 @@ function readPreSignSnapshot(raw: object): PreSignSnapshot {
  * digest payload to `shadowImportDigestPayload` (never re-implemented here);
  * their `shadow-import-grant-accessor-forbidden` code is mapped to
  * `pre-sign-accessor-forbidden` so an accessor on the root or on the nested
- * repository shares one refusal code. The expiry must parse after `nowIso`
- * and stay within `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`; `projectId` is a
+ * repository shares one refusal code. `nowIso` is strict ISO-8601 UTC — the
+ * same `parseShadowImportExpiry` validator the codebase already uses for the
+ * grant's ISO timestamps — and the expiry must parse after it and stay within
+ * `SHADOW_IMPORT_GRANT_MAX_TTL_DAYS`; `projectId` is a
  * bounded, control-character-free string without surrounding whitespace (a
  * padded value would sign bytes `request-decision` never verifies, because it
  * trims the project id). `grantId` is never an input: it is derived
@@ -1092,16 +1094,18 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
           : grant.code,
     };
   }
+  // `nowIso` is strict ISO-8601 UTC: it goes through the SAME validator the
+  // codebase already uses for the grant's ISO timestamps
+  // (`parseShadowImportExpiry`, the bounded `SHADOW_IMPORT_EXPIRES_AT_PATTERN`
+  // check with real calendar fields and a canonical re-serialization), so a
+  // locale date like `'11/19/2026'` — which a bare finite `Date.parse`
+  // accepts — is refused.
   const nowRaw = values['nowIso'];
-  if (
-    typeof nowRaw !== 'string' ||
-    nowRaw.length === 0 ||
-    nowRaw.length > MAX_EXPIRES_AT_ISO_LENGTH ||
-    !Number.isFinite(Date.parse(nowRaw))
-  ) {
+  const nowExpiry = parseShadowImportExpiry(nowRaw);
+  if (!nowExpiry.ok) {
     return { ok: false, code: 'pre-sign-invalid-now' };
   }
-  const nowMs = Date.parse(nowRaw);
+  const nowMs = Date.parse(nowExpiry.expiresAtIso);
   const expiresMs = Date.parse(grant.value.expiresAtIso);
   if (expiresMs <= nowMs) {
     return { ok: false, code: 'pre-sign-expired' };
@@ -1149,7 +1153,7 @@ export function buildPreSignShadowImportPlan(raw: unknown): PreSignShadowImportR
       expiresAtIso: grant.value.expiresAtIso,
       projectId,
       decisionRevision,
-      nowIso: nowRaw,
+      nowIso: nowExpiry.expiresAtIso,
       digestPayload: payloadResult.value,
     }),
   };

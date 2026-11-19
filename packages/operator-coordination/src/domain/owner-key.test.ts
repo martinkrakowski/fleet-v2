@@ -42,6 +42,19 @@ describe('checkOwnerKeyPathSafety hostile input', () => {
     expect(checkOwnerKeyPathSafety([])).toEqual({ ok: false, code: 'invalid-input' });
   });
 
+  it('a revoked Proxy is a typed refusal, not a thrown error (the array probe included)', () => {
+    const { proxy: revocable, revoke } = Proxy.revocable(safeInput(), {});
+    revoke();
+    // The result is one specific typed refusal: either the guarded array
+    // probe (`hostile-input`) or the guarded record read (`invalid-input`),
+    // and nothing ever throws out of the function.
+    const result = checkOwnerKeyPathSafety(revocable);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(['invalid-input', 'hostile-input']).toContain(result.code);
+    }
+  });
+
   it('a non-plain object (class instance) where a record is due', () => {
     class Shape {
       targetPath = '/keys/k.pem';

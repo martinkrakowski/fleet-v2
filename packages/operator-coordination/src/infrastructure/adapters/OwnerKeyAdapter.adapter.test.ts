@@ -21,10 +21,11 @@ function mkdirPrivate(path: string, options: { recursive?: boolean } = {}): void
   chmodSync(path, 0o700);
 }
 
-const failureFlags = vi.hoisted(() => ({ write: false, close: false }));
+const failureFlags = vi.hoisted(() => ({ write: false, close: false, swapPath: null as string | null }));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const fs = await import('node:fs');
   return {
     ...actual,
     async open(...args: Parameters<typeof actual.open>) {
@@ -35,6 +36,12 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       const wrapped = {
         writeFile: failureFlags.write
           ? async () => {
+              if (failureFlags.swapPath !== null) {
+                // Replace the file at the target path BEFORE the cleanup
+                // runs: the swap a hostile racer would make mid-write.
+                fs.rmSync(failureFlags.swapPath);
+                fs.writeFileSync(failureFlags.swapPath, 'someone else\n', { mode: 0o600 });
+              }
               throw new Error('simulated write failure');
             }
           : handle.writeFile.bind(handle),
@@ -53,7 +60,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 import { canonicalDecisionBytes, verifyDecisionSignature } from './DecisionSignature.adapter.js';
-import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile, ownerKeyIdentitySeam } from './OwnerKey.adapter.js';
+import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile, ownerKeyIdentitySeam } from './OwnerKeyAdapter.adapter.js';
 
 let root: string;
 
@@ -64,6 +71,7 @@ beforeEach(() => {
 afterEach(() => {
   failureFlags.write = false;
   failureFlags.close = false;
+  failureFlags.swapPath = null;
   delete ownerKeyIdentitySeam.verify;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
@@ -167,6 +175,24 @@ describe('generateOwnerKeyFile', () => {
     const retry = await generateOwnerKeyFile({ outPath: keyPath });
     expect(retry).toMatchObject({ ok: true });
     expect(existsSync(keyPath)).toBe(true);
+  });
+
+  it('does not delete a file swapped in before the write-failure cleanup and reports the leftover path', async () => {
+    failureFlags.write = true;
+    const keyPath = join(root, 'owner-key.pem');
+    // The failing write first replaces the file at the target path with a
+    // DIFFERENT inode (the swap a real racer would leave behind), so the
+    // guarded cleanup must find a dev/ino mismatch and leave it alone.
+    failureFlags.swapPath = keyPath;
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'write-failed' });
+    // The dev/ino guard held: the swapped-in file is not ours to delete.
+    expect(readFileSync(keyPath, 'utf8')).toBe('someone else\n');
+    // The refusal reports the leftover path instead of claiming cleanup.
+    if (!result.ok) {
+      expect(result.message).toContain(keyPath);
+      expect(result.message).toContain('left in place');
+    }
   });
 
   it('returns a typed refusal when handle.close() rejects and removes the created key file', async () => {

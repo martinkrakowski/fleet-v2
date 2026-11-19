@@ -396,7 +396,19 @@ function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPat
  * the target's path, is refused. Never throws; linear in the capped input.
  */
 export function checkOwnerKeyPathSafety(raw: unknown): OwnerKeyPathSafetyResult {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ok: false, code: 'invalid-input' };
+  }
+  // `Array.isArray` throws on a revoked Proxy: even this array probe is
+  // untrusted input surface, so it runs inside the try and a revocation is
+  // a typed refusal, never a thrown error.
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(raw);
+  } catch {
+    return { ok: false, code: 'hostile-input' };
+  }
+  if (isArray) {
     return { ok: false, code: 'invalid-input' };
   }
   const recordRead = readPathInputRecord(raw);

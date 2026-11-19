@@ -60,9 +60,9 @@ Keep the private key file:
   or directory, direct or through a symlinked parent) — `init` refuses those
   too;
 - at mode `0600`, owned by the running user;
-- in a parent directory that is mode `0700` and owned by you — `init` refuses
-  a parent that is group- or world-writable or owned by another user.
-  `~/.config/fleet-v2` qualifies.
+- in a parent directory that is owned by you and not writable by group or
+  others (`0700` recommended) — `init` refuses a parent that is group- or
+  world-writable or owned by another user. `~/.config/fleet-v2` qualifies.
 
 These checks protect the key only against other *users* on the host: every
 process running as the same user — including any local agent the user starts —

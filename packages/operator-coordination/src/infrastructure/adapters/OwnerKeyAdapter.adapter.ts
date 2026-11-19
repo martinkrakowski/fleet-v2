@@ -181,21 +181,37 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
 }
 
 /**
- * Best-effort removal of the file `generateOwnerKeyFile` itself created:
+ * The ONE guarded cleanup for every file `generateOwnerKeyFile` created:
  * `writePath` is unlinked only when its `lstat` dev/ino still match the open
  * handle's `fstat`, so a swapped-in file (a different inode, or a symlink)
- * is never someone else's casualty. Every failure is swallowed: the refusal
- * that triggered the cleanup stands either way.
+ * is never someone else's casualty. If the handle could not be `fstat`ed
+ * (or `lstat`/`unlink` fails), NOTHING is unlinked and `unlinked: false` is
+ * returned so the caller's refusal can report the leftover path. Every
+ * failure is swallowed here: the refusal that triggered the cleanup stands.
  */
-async function removeCreatedFile(handle: FileHandle, writePath: string): Promise<void> {
+async function removeCreatedFile(handle: FileHandle, writePath: string): Promise<{ unlinked: boolean }> {
   try {
     const [handleStat, pathStat] = await Promise.all([handle.stat(), lstat(writePath)]);
     if (handleStat.dev === pathStat.dev && handleStat.ino === pathStat.ino) {
       await unlink(writePath);
+      return { unlinked: true };
     }
   } catch {
-    // Best effort only.
+    // The handle could not be fstated or the path could not be inspected:
+    // never unlink on a guess.
   }
+  return { unlinked: false };
+}
+
+/**
+ * The suffix a refusal carries when the guarded cleanup could not prove the
+ * file at `writePath` was the one this run created and therefore left it in
+ * place. Nothing when the cleanup unlinked the file.
+ */
+function leftoverNote(writePath: string, cleanup: { unlinked: boolean }): string {
+  return cleanup.unlinked
+    ? ''
+    : ` The file at ${writePath} could not be proven to be this run's creation and was left in place; remove it manually.`;
 }
 
 /**
@@ -225,7 +241,17 @@ async function verifyWrittenIdentity(
   if (handleStat.dev !== filePathStat.dev || handleStat.ino !== filePathStat.ino) {
     return { ok: false, code: 'identity-changed', message: 'owner-key: the written file changed identity after the write' };
   }
-  const location = await checkResolvedLocation(await realpath(filePath), stateDir);
+  let resolvedForLocation: string;
+  try {
+    resolvedForLocation = await realpath(filePath);
+  } catch {
+    return {
+      ok: false,
+      code: 'identity-changed',
+      message: 'owner-key: the written file could not be re-resolved after the write',
+    };
+  }
+  const location = await checkResolvedLocation(resolvedForLocation, stateDir);
   if (location !== null) {
     return location;
   }
@@ -324,25 +350,54 @@ async function writePrivateKeyAtomically(
     // Close the parent-swap race: while the handle is still open, verify
     // that the file just written is still the same inode at the resolved
     // path, and that the resolved path is still a safe location. A fake
-    // seam may stand in for the real check in tests.
-    const identity = ownerKeyIdentitySeam.verify !== undefined
-      ? await ownerKeyIdentitySeam.verify(handle, writePath)
-      : await verifyWrittenIdentity(handle, writePath, stateDir);
+    // seam may stand in for the real check in tests. The seam itself can
+    // also fail: the failure is a typed refusal, never a thrown error.
+    let identity: { ok: true } | GenerateRefusal;
+    try {
+      identity = ownerKeyIdentitySeam.verify !== undefined
+        ? await ownerKeyIdentitySeam.verify(handle, writePath)
+        : await verifyWrittenIdentity(handle, writePath, stateDir);
+    } catch {
+      identity = {
+        ok: false,
+        code: 'identity-changed',
+        message: 'owner-key: the post-write verification of the written file failed',
+      };
+    }
     if (!identity.ok) {
       // Nothing this run created may be left behind: after the write, ANY
       // refusal (`identity-changed`, `unsafe-path-state-dir`,
       // `unsafe-path-git-repo`, or any other) removes the newly created
-      // file. The removal is guarded: the file at `writePath` is unlinked
-      // only when its dev/ino still match the open handle's `fstat`, so the
-      // cleanup can never delete a file some other writer put there.
-      await removeCreatedFile(handle, writePath);
+      // file through the ONE guarded cleanup: the file at `writePath` is
+      // unlinked only when its dev/ino still match the open handle's
+      // `fstat`, so the cleanup can never delete a file some other writer
+      // put there; when the handle cannot be fstated the file stays and the
+      // refusal reports the leftover path.
+      const cleanup = await removeCreatedFile(handle, writePath);
       try {
         await handle.close();
       } catch {
         // The refusal below stands either way.
       }
-      return identity;
+      return { ...identity, message: identity.message + leftoverNote(writePath, cleanup) };
     }
+  }
+  if (writeFailed) {
+    // The ONE guarded cleanup runs while the handle is still open: a
+    // half-written key file must not survive, so a retry gets a fresh
+    // exclusive create instead of `already-exists`; a file the guard cannot
+    // prove is this run's creation is left in place and reported.
+    const cleanup = await removeCreatedFile(handle, writePath);
+    try {
+      await handle.close();
+    } catch {
+      // The refusal below stands either way.
+    }
+    return {
+      ok: false,
+      code: 'write-failed',
+      message: 'owner-key: the output file could not be written with 0600 permissions' + leftoverNote(writePath, cleanup),
+    };
   }
   let closeFailed = false;
   try {
@@ -350,25 +405,17 @@ async function writePrivateKeyAtomically(
   } catch {
     closeFailed = true;
   }
-  if (writeFailed) {
-    // Best-effort cleanup: a half-written key file must not survive, so a
-    // retry gets a fresh exclusive create instead of `already-exists`.
-    try {
-      await unlink(writePath);
-    } catch {
-      // Best effort only: the refusal below stands either way.
-    }
-    return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be written with 0600 permissions' };
-  }
   if (closeFailed) {
-    // Best-effort cleanup: the write "succeeded" but the handle could not be
-    // closed, so a refusal must not leave a newly created key file behind.
-    try {
-      await unlink(writePath);
-    } catch {
-      // Best effort only: the refusal below stands either way.
-    }
-    return { ok: false, code: 'write-failed', message: 'owner-key: the output file handle could not be closed' };
+    // The ONE guarded cleanup: the write "succeeded" but the handle could
+    // not be closed, so a refusal must not leave a newly created key file
+    // behind; if the failed handle cannot be fstated, the leftover path is
+    // reported instead of unlinking on a guess.
+    const cleanup = await removeCreatedFile(handle, writePath);
+    return {
+      ok: false,
+      code: 'write-failed',
+      message: 'owner-key: the output file handle could not be closed' + leftoverNote(writePath, cleanup),
+    };
   }
   return { ok: true };
 }

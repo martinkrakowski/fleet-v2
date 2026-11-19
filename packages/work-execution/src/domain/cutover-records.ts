@@ -655,8 +655,14 @@ export function readRetirementLedger(raw: unknown): RetirementLedgerRead {
     const pinned: ReadonlySet<string> = new Set<string>(CUTOVER_RETIREMENT_SCRIPTS);
     const seen = new Set<string>();
     const rows: RetirementLedgerRow[] = [];
-    for (const rowValue of snapshot.rows) {
-      const row = readExactPlainRecord(rowValue, RETIREMENT_ROW_KEYS);
+    for (let index = 0; index < snapshot.rows.length; index += 1) {
+      // Own data-property descriptors only: a getter at any index is never read,
+      // so it can never run, and the element is taken from the descriptor value.
+      const descriptor = Object.getOwnPropertyDescriptor(snapshot.rows, index);
+      if (descriptor === undefined || !('value' in descriptor) || 'get' in descriptor || 'set' in descriptor) {
+        return INVALID_LEDGER;
+      }
+      const row = readExactPlainRecord(descriptor.value, RETIREMENT_ROW_KEYS);
       if (row === null) {
         return INVALID_LEDGER;
       }

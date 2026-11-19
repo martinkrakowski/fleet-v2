@@ -15,7 +15,7 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:cry
 import { constants } from 'node:fs';
 import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { checkOwnerKeyPathSafety, formatOwnerInstallationEdit } from '../../domain/owner-key.js';
 
@@ -41,6 +41,9 @@ export interface DeriveOwnerPublicKeyOptions {
 export type DeriveOwnerPublicKeyResult =
   | { readonly ok: true; readonly publicKey: string }
   | { readonly ok: false; readonly code: OwnerKeyErrorCode; readonly message: string };
+
+/** The typed refusal shape of the derivation helper steps. */
+type DeriveOwnerPublicKeyRefusal = Extract<DeriveOwnerPublicKeyResult, { ok: false }>;
 
 /** Every typed way one owner-key operation can fail closed. */
 export type OwnerKeyErrorCode =
@@ -145,9 +148,14 @@ async function checkResolvedLocation(resolvedPath: string, stateDir: string | un
  */
 async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   Promise<{ ok: true; parentReal: string } | GenerateRefusal> {
+  // The domain only accepts ABSOLUTE paths: relative CLI paths (a relative
+  // `--out` or `--state-dir`) are resolved here, against the process working
+  // directory, before the pure domain check sees them.
+  const absoluteOutPath = resolve(options.outPath);
+  const absoluteStateDir = options.stateDir === undefined ? undefined : resolve(options.stateDir);
   const safety = checkOwnerKeyPathSafety({
-    targetPath: options.outPath,
-    ...(options.stateDir !== undefined ? { stateDir: options.stateDir } : {}),
+    targetPath: absoluteOutPath,
+    ...(absoluteStateDir !== undefined ? { stateDir: absoluteStateDir } : {}),
     ancestorGitMarkers: [],
   });
   if (!safety.ok) {
@@ -520,78 +528,21 @@ export async function deriveOwnerPublicKeyFromFile(options: DeriveOwnerPublicKey
   if (typeof keyPath !== 'string' || keyPath.length === 0 || keyPath.length > 4096 || keyPath.includes('\0')) {
     return { ok: false, code: 'invalid-input', message: 'owner-key: the key path is missing, too long or unsafe' };
   }
-  let handle: FileHandle;
-  try {
-    // O_NONBLOCK matters alongside O_NOFOLLOW: without it, opening a FIFO
-    // blocks until a writer appears, so a FIFO key path could hang the
-    // caller before the fstat below refuses the non-regular file. With
-    // O_NONBLOCK the open returns immediately and the refusal is prompt.
-    handle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'ELOOP'
-    ) {
-      return { ok: false, code: 'symlink-refused', message: 'owner-key: the key file is a symlink' };
-    }
-    return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file is missing or unreadable' };
+  const opened = await openKeyFile(keyPath);
+  if (!opened.ok) {
+    return opened;
   }
+  const handle = opened.handle;
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) {
-      return { ok: false, code: 'unreadable-key', message: 'owner-key: the key path is not a regular file' };
+    const statChecked = await statCheckKeyFile(handle);
+    if (!statChecked.ok) {
+      return statChecked;
     }
-    const perm = stat.mode & 0o777;
-    if (perm !== 0o600 && perm !== 0o400) {
-      return { ok: false, code: 'unsafe-key-permissions', message: 'owner-key: the key file permissions are too open (need 0600 or 0400)' };
+    const read = await readBoundedKeyFile(handle);
+    if (!read.ok) {
+      return read;
     }
-    if (process.getuid !== undefined && stat.uid !== process.getuid()) {
-      return { ok: false, code: 'unsafe-key-owner', message: 'owner-key: the key file is owned by another user' };
-    }
-    if (stat.size > MAX_KEY_FILE_BYTES) {
-      return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file is too large' };
-    }
-    // Bounded read from the open handle, not `readFile`: the file could
-    // grow between the `fstat` above and the read, so the byte cap is
-    // enforced on the bytes actually taken, at most cap + 1 of them. A
-    // handle-level read on a FIFO would block, but `fstat` above already
-    // refused every non-regular file on the same handle.
-    const capped = Buffer.alloc(MAX_KEY_FILE_BYTES + 1);
-    let taken = 0;
-    while (taken < capped.length) {
-      const { bytesRead } = await handle.read(capped, taken, capped.length - taken);
-      if (bytesRead === 0) {
-        break;
-      }
-      taken += bytesRead;
-    }
-    if (taken > MAX_KEY_FILE_BYTES) {
-      return { ok: false, code: 'key-too-large', message: 'owner-key: the key file is too large' };
-    }
-    const pem = capped.subarray(0, taken).toString('utf8');
-    let privateKey: ReturnType<typeof createPrivateKey>;
-    try {
-      privateKey = createPrivateKey(pem);
-    } catch {
-      return { ok: false, code: 'invalid-key', message: 'owner-key: the key file is not a readable private key' };
-    }
-    if (privateKey.asymmetricKeyType !== 'ed25519') {
-      return { ok: false, code: 'invalid-key', message: 'owner-key: the key file is not an Ed25519 private key' };
-    }
-    let spkiDer: Buffer;
-    try {
-      spkiDer = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }) as Buffer;
-    } catch {
-      return { ok: false, code: 'invalid-key', message: 'owner-key: the public key could not be derived' };
-    }
-    if (
-      !spkiDer.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX) ||
-      spkiDer.length !== ED25519_SPKI_PREFIX.length + 32
-    ) {
-      return { ok: false, code: 'invalid-key', message: 'owner-key: the derived public key is not a valid Ed25519 key' };
-    }
-    return { ok: true, publicKey: spkiDer.subarray(ED25519_SPKI_PREFIX.length).toString('base64') };
+    return parseOwnerPrivateKey(read.pem);
   } catch {
     return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file could not be read' };
   } finally {
@@ -606,4 +557,107 @@ export async function deriveOwnerPublicKeyFromFile(options: DeriveOwnerPublicKey
       // Swallowed on purpose: the body's result stands.
     }
   }
+}
+
+/**
+ * The OPEN step of `deriveOwnerPublicKeyFromFile`: opens the key path
+ * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`. O_NONBLOCK matters alongside
+ * O_NOFOLLOW: without it, opening a FIFO blocks until a writer appears, so
+ * a FIFO key path could hang the caller before the fstat refuses the
+ * non-regular file. With O_NONBLOCK the open returns immediately and the
+ * refusal is prompt. An `ELOOP` is a typed symlink refusal; any other
+ * failure is a typed unreadable-key refusal.
+ */
+async function openKeyFile(keyPath: string): Promise<{ ok: true; handle: FileHandle } | DeriveOwnerPublicKeyRefusal> {
+  try {
+    return { ok: true, handle: await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK) };
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'ELOOP'
+    ) {
+      return { ok: false, code: 'symlink-refused', message: 'owner-key: the key file is a symlink' };
+    }
+    return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file is missing or unreadable' };
+  }
+}
+
+/**
+ * The STAT-CHECK step of `deriveOwnerPublicKeyFromFile`: `fstat` on the
+ * opened handle and refuse anything that is not a regular file owned by the
+ * current uid with mode `0600` or `0400` and at most `MAX_KEY_FILE_BYTES`
+ * bytes.
+ */
+async function statCheckKeyFile(handle: FileHandle): Promise<{ ok: true; stat: Awaited<ReturnType<FileHandle['stat']>> } | DeriveOwnerPublicKeyRefusal> {
+  const stat = await handle.stat();
+  if (!stat.isFile()) {
+    return { ok: false, code: 'unreadable-key', message: 'owner-key: the key path is not a regular file' };
+  }
+  const perm = stat.mode & 0o777;
+  if (perm !== 0o600 && perm !== 0o400) {
+    return { ok: false, code: 'unsafe-key-permissions', message: 'owner-key: the key file permissions are too open (need 0600 or 0400)' };
+  }
+  if (process.getuid !== undefined && stat.uid !== process.getuid()) {
+    return { ok: false, code: 'unsafe-key-owner', message: 'owner-key: the key file is owned by another user' };
+  }
+  if (stat.size > MAX_KEY_FILE_BYTES) {
+    return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file is too large' };
+  }
+  return { ok: true, stat };
+}
+
+/**
+ * The BOUNDED-READ step of `deriveOwnerPublicKeyFromFile`: reads the PEM
+ * from the open handle, not `readFile`, because the file could grow between
+ * the `fstat` and the read, so the byte cap is enforced on the bytes
+ * actually taken, at most cap + 1 of them. A handle-level read on a FIFO
+ * would block, but the stat-check step already refused every non-regular
+ * file on the same handle.
+ */
+async function readBoundedKeyFile(handle: FileHandle): Promise<{ ok: true; pem: string } | DeriveOwnerPublicKeyRefusal> {
+  const capped = Buffer.alloc(MAX_KEY_FILE_BYTES + 1);
+  let taken = 0;
+  while (taken < capped.length) {
+    const { bytesRead } = await handle.read(capped, taken, capped.length - taken);
+    if (bytesRead === 0) {
+      break;
+    }
+    taken += bytesRead;
+  }
+  if (taken > MAX_KEY_FILE_BYTES) {
+    return { ok: false, code: 'key-too-large', message: 'owner-key: the key file is too large' };
+  }
+  return { ok: true, pem: capped.subarray(0, taken).toString('utf8') };
+}
+
+/**
+ * The PARSE step of `deriveOwnerPublicKeyFromFile`: parses the PEM as an
+ * Ed25519 private key, derives the public key, exports its SPKI DER, and
+ * verifies the `ED25519_SPKI_PREFIX` and the exact 32 raw bytes. The
+ * private key never appears in any return value, log, or error.
+ */
+function parseOwnerPrivateKey(pem: string): DeriveOwnerPublicKeyResult {
+  let privateKey: ReturnType<typeof createPrivateKey>;
+  try {
+    privateKey = createPrivateKey(pem);
+  } catch {
+    return { ok: false, code: 'invalid-key', message: 'owner-key: the key file is not a readable private key' };
+  }
+  if (privateKey.asymmetricKeyType !== 'ed25519') {
+    return { ok: false, code: 'invalid-key', message: 'owner-key: the key file is not an Ed25519 private key' };
+  }
+  let spkiDer: Buffer;
+  try {
+    spkiDer = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }) as Buffer;
+  } catch {
+    return { ok: false, code: 'invalid-key', message: 'owner-key: the public key could not be derived' };
+  }
+  if (
+    !spkiDer.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX) ||
+    spkiDer.length !== ED25519_SPKI_PREFIX.length + 32
+  ) {
+    return { ok: false, code: 'invalid-key', message: 'owner-key: the derived public key is not a valid Ed25519 key' };
+  }
+  return { ok: true, publicKey: spkiDer.subarray(ED25519_SPKI_PREFIX.length).toString('base64') };
 }

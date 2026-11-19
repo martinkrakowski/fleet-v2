@@ -32,6 +32,7 @@ export type OwnerKeyPathErrorCode =
   | 'hostile-input'
   | 'path-too-long'
   | 'too-many-segments'
+  | 'path-not-absolute'
   | 'unsafe-path-state-dir'
   | 'unsafe-path-git-repo';
 
@@ -364,13 +365,22 @@ function markerRefusesTarget(normalizedTarget: string, marker: string): boolean 
 function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPath: string } | { ok: false; code: OwnerKeyPathErrorCode } {
   const targetPath = values.get('targetPath') as string;
   const normalizedTarget = normalizePath(targetPath);
+  // The domain only ever reasons about ABSOLUTE paths: a relative input has
+  // no filesystem root, so it is refused rather than silently resolved
+  // against a process-dependent working directory.
+  if (!normalizedTarget.startsWith('/')) {
+    return { ok: false, code: 'path-not-absolute' };
+  }
   const markersRead = readMarkerArray(values.get('ancestorGitMarkers'));
   if (!markersRead.ok) {
     return markersRead;
   }
   if (values.has('stateDir')) {
     const normalizedStateDir = normalizePath(values.get('stateDir') as string);
-    if (normalizedStateDir === '' || isInside(normalizedStateDir, normalizedTarget)) {
+    if (!normalizedStateDir.startsWith('/')) {
+      return { ok: false, code: 'path-not-absolute' };
+    }
+    if (isInside(normalizedStateDir, normalizedTarget)) {
       return { ok: false, code: 'unsafe-path-state-dir' };
     }
   }
@@ -391,7 +401,10 @@ function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPat
  * `targetPath`. Only own enumerable data properties are read (a getter
  * never runs); a non-plain object, a symbol key, a prototype-polluting own
  * key, a Proxy whose traps throw, a sparse or over-long marker array, or an
- * over-long or NUL-carrying path is refused. `targetPath` inside
+ * over-long or NUL-carrying path is refused. Both `targetPath` and
+ * `stateDir` must be ABSOLUTE paths (a relative input is refused with
+ * `path-not-absolute`; the adapter resolves them first), and a `''`
+ * normalization is never treated as the filesystem root. `targetPath` inside
  * `stateDir`, or any normalized ancestor marker that is a `.git` entry on
  * the target's path, is refused. Never throws; linear in the capped input.
  */

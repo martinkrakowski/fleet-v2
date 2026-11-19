@@ -124,6 +124,19 @@ describe('generateOwnerKeyFile', () => {
     expect(derived).toEqual({ ok: true, publicKey: result.publicKey });
   });
 
+  it('resolves a relative CLI outPath and stateDir to absolute paths before the domain check', async () => {
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
+      const result = await generateOwnerKeyFile({ outPath: 'owner-key.pem', stateDir: 'state' });
+      expect(result.ok).toBe(true);
+      const stat = (await import('node:fs')).statSync(join(root, 'owner-key.pem'));
+      expect(stat.mode & 0o777).toBe(0o600);
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
   it('refuses an existing file and leaves it untouched', async () => {
     const keyPath = join(root, 'existing.pem');
     writeFileSync(keyPath, 'ORIGINAL\n', { mode: 0o600 });

@@ -297,6 +297,26 @@ describe('checkOwnerKeyPathSafety verdicts', () => {
       checkOwnerKeyPathSafety(safeInput({ targetPath: '/srv/a/b/owner-key.pem', stateDir: '/srv/a' })),
     ).toEqual({ ok: false, code: 'unsafe-path-state-dir' });
   });
+
+  it('refuses a relative target path with `path-not-absolute`', () => {
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ targetPath: 'keys/owner-key.pem' })),
+    ).toEqual({ ok: false, code: 'path-not-absolute' });
+  });
+
+  it('refuses a relative state dir with `path-not-absolute`', () => {
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ stateDir: 'state' })),
+    ).toEqual({ ok: false, code: 'path-not-absolute' });
+  });
+
+  it('never treats a `.`-normalizing path as the filesystem root', () => {
+    // `normalizePath('.')` used to yield `''`, which the state-dir check
+    // treated as the root; a non-absolute input is now refused outright.
+    expect(
+      checkOwnerKeyPathSafety(safeInput({ targetPath: '/keys/x', stateDir: '.' })),
+    ).toEqual({ ok: false, code: 'path-not-absolute' });
+  });
 });
 
 describe('formatOwnerInstallationEdit hostile input', () => {

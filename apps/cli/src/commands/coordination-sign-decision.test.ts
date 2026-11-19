@@ -8,6 +8,7 @@
  */
 
 import { generateKeyPairSync } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, chmodSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -159,6 +160,44 @@ describe('coordination sign-decision (KEY1a)', () => {
         ? readdirSync(join(ws.stateDir, 'decisions'))
         : [],
     ).toEqual([]);
+
+    // The same preview prints the optional details a request carries: a
+    // standing shadow import grant binds a repository and a capped expiry.
+    const expiresAtIso = '2026-12-01T00:00:00.000Z';
+    const shadow = await runCoordination(
+      runtime,
+      [
+        'request-decision',
+        '--projectId',
+        PROJECT_ID,
+        '--kind',
+        'action-decision',
+        '--actionScope',
+        'merge:import-shadow',
+        '--repository',
+        'octo/repo',
+        '--expiresAtIso',
+        expiresAtIso,
+        '--proposalDigest',
+        PROPOSAL_DIGEST,
+        '--policyRevision',
+        POLICY_REVISION,
+      ],
+      ws.stateDir,
+    );
+    expect(shadow.code).toBe(0);
+    const shadowRequestId =
+      (parseDocument(shadow.stdout)['request'] as Record<string, unknown>)['id'] as string;
+    const shadowPreview = await runCoordination(
+      runtime,
+      ['sign-decision', '--request', shadowRequestId, '--answer', 'approve'],
+      ws.stateDir,
+    );
+    expect(shadowPreview.code).toBe(0);
+    const shadowPreviewDoc = parseDocument(shadowPreview.stdout);
+    expect(shadowPreviewDoc['outcome']).toBe('preview');
+    expect(shadowPreviewDoc['repository']).toEqual({ owner: 'octo', repo: 'repo' });
+    expect(shadowPreviewDoc['expiresAtIso']).toBe(expiresAtIso);
   });
 
   it('round-trips an ordinary scoped request: sign --yes, then resolve-auth authorizes', async () => {
@@ -204,6 +243,9 @@ describe('coordination sign-decision (KEY1a)', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-v2-sign-cli-root-'));
     const releaseRoot = join(root, 'releases', 'current');
     mkdirSync(releaseRoot, { recursive: true });
+    // The request binds the realpath-normalized root, so the exact coordinate
+    // the preview and the signed result carry is the canonical one.
+    const canonicalRoot = realpathSync(releaseRoot);
     const runtime = runtimeFor(ws.stateDir, ws.publicBase64);
     const requested = await runCoordination(
       runtime,
@@ -231,6 +273,17 @@ describe('coordination sign-decision (KEY1a)', () => {
     const releaseRequestId = (requestedDoc['request'] as Record<string, unknown>)['id'] as string;
     expect(String(releaseRequestId)).toContain('release-grant-');
 
+    // The preview (no --yes) carries the exact releaseRoot the request binds.
+    const preview = await runCoordination(
+      runtime,
+      ['sign-decision', '--request', releaseRequestId, '--answer', 'approve'],
+      ws.stateDir,
+    );
+    expect(preview.code).toBe(0);
+    const previewDoc = parseDocument(preview.stdout);
+    expect(previewDoc['outcome']).toBe('preview');
+    expect(previewDoc['releaseRoot']).toBe(canonicalRoot);
+
     const signed = await runCoordination(
       runtime,
       [
@@ -246,7 +299,10 @@ describe('coordination sign-decision (KEY1a)', () => {
       ws.stateDir,
     );
     expect(signed.code).toBe(0);
-    expect(parseDocument(signed.stdout)['outcome']).toBe('signed');
+    const signedDoc = parseDocument(signed.stdout);
+    expect(signedDoc['outcome']).toBe('signed');
+    // The signed result carries the exact releaseRoot too.
+    expect(signedDoc['releaseRoot']).toBe(canonicalRoot);
 
     const resolved = await runCoordination(
       runtime,
@@ -357,37 +413,29 @@ describe('coordination sign-decision (KEY1a)', () => {
     expect(result.code).toBe(2);
   });
 
-  it('refuses the wrong key against the pinned public key, ignoring ambient env', async () => {
+  it('refuses the signing key against the pinned key when FLEET_OWNER_PUBLIC_KEY names it before composing', async () => {
     const ws = workspace();
-    const runtime = runtimeFor(ws.stateDir, ws.publicBase64);
-    await seedOrdinaryRequest(runtime, ws.stateDir);
-    const wrong = newKey();
-    const wrongPath = join(ws.keyDir, 'wrong-key.pem');
-    writeFileSync(wrongPath, wrong.privatePem);
-    chmodSync(wrongPath, 0o600);
-    // The ambient environment variable is never an authority: it disagrees
-    // with the pinned key and must not change the outcome.
+    // The pinned key is a DIFFERENT key from the one that will sign.
+    const pinned = newKey();
+    // The ambient env names the signing key's public key BEFORE the runtime is
+    // composed: if composition ever read it as an authority, the env value and
+    // the signing key would agree and the sign would slip through. It must not.
     const previous = process.env['FLEET_OWNER_PUBLIC_KEY'];
-    process.env['FLEET_OWNER_PUBLIC_KEY'] = wrong.publicBase64;
+    process.env['FLEET_OWNER_PUBLIC_KEY'] = ws.publicBase64;
     try {
+      const runtime = runtimeFor(ws.stateDir, pinned.publicBase64);
+      await seedOrdinaryRequest(runtime, ws.stateDir);
       const refused = await runCoordination(
         runtime,
-        ['sign-decision', '--request', REQUEST_ID, '--answer', 'approve', '--key', wrongPath, '--yes'],
+        ['sign-decision', '--request', REQUEST_ID, '--answer', 'approve', '--key', ws.keyPath, '--yes'],
         ws.stateDir,
       );
       expect(refused.code).toBe(1);
       expect(parseDocument(refused.stdout)).toEqual({
         outcome: 'refused',
-        reason: 'key-mismatch',
+        reason: 'owner-key-env-mismatch',
       });
       expect(existsSync(join(ws.stateDir, 'decisions', `${REQUEST_ID}.json`))).toBe(false);
-      // The pinned key still signs: the env value never replaced it.
-      const signed = await runCoordination(
-        runtime,
-        ['sign-decision', '--request', REQUEST_ID, '--answer', 'approve', '--key', ws.keyPath, '--yes'],
-        ws.stateDir,
-      );
-      expect(parseDocument(signed.stdout)['outcome']).toBe('signed');
     } finally {
       if (previous === undefined) {
         delete process.env['FLEET_OWNER_PUBLIC_KEY'];
@@ -465,30 +513,51 @@ describe('coordination sign-decision (KEY1a)', () => {
     });
   });
 
-  it('never prints or stores the private key material', async () => {
+  it('never prints or stores the private key material on refusal or on success', async () => {
     const ws = workspace();
     const runtime = runtimeFor(ws.stateDir, ws.publicBase64);
     await seedOrdinaryRequest(runtime, ws.stateDir);
+
+    // Refusal path: a wrong key refuses; the fragment of the ACTUAL key the
+    // command was handed never appears anywhere.
     const wrong = newKey();
     const wrongPath = join(ws.keyDir, 'wrong-key.pem');
     writeFileSync(wrongPath, wrong.privatePem);
     chmodSync(wrongPath, 0o600);
-    const result = await runCoordination(
+    const refused = await runCoordination(
       runtime,
       ['sign-decision', '--request', REQUEST_ID, '--answer', 'approve', '--key', wrongPath, '--yes'],
       ws.stateDir,
     );
+    expect(refused.code).toBe(1);
+    const wrongFragment = wrong.privatePem.slice(32, 64);
+    for (const line of [...refused.stdout, ...refused.stderr]) {
+      expect(line.includes('PRIVATE KEY')).toBe(false);
+      expect(line.includes(wrongFragment)).toBe(false);
+    }
+
+    // Success path: the RIGHT key signs, and the fragment of that actual
+    // private key appears in no output line and no file under the state dir.
+    const signed = await runCoordination(
+      runtime,
+      ['sign-decision', '--request', REQUEST_ID, '--answer', 'approve', '--key', ws.keyPath, '--yes'],
+      ws.stateDir,
+    );
+    expect(signed.code).toBe(0);
+    expect(parseDocument(signed.stdout)['outcome']).toBe('signed');
     const fragment = ws.privatePem.slice(32, 64);
-    for (const line of [...result.stdout, ...result.stderr]) {
+    for (const line of [...signed.stdout, ...signed.stderr]) {
       expect(line.includes('PRIVATE KEY')).toBe(false);
       expect(line.includes(fragment)).toBe(false);
     }
-    const decisionsDir = join(ws.stateDir, 'decisions');
-    if (existsSync(decisionsDir)) {
-      for (const name of readdirSync(decisionsDir)) {
-        const content = readFileSync(join(decisionsDir, name), 'utf8');
+    for (const name of readdirSync(ws.stateDir, { recursive: true }) as string[]) {
+      const full = join(ws.stateDir, name);
+      try {
+        const content = readFileSync(full, 'utf8');
         expect(content.includes('PRIVATE KEY')).toBe(false);
         expect(content.includes(fragment)).toBe(false);
+      } catch {
+        // A directory or binary entry carries no text to inspect.
       }
     }
   });

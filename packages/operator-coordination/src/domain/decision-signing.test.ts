@@ -107,15 +107,18 @@ describe('parseSignDecisionInput hostile inputs', () => {
     expect(getterRuns).toBe(0);
   });
 
-  it('never runs a getter on an item', () => {
+  it('refuses a getter on an optional field because of the getter (the call counter stays 0)', () => {
     let getterRuns = 0;
-    const inner = {
-      get answer() {
+    const input = {
+      requestId: REQUEST_ID,
+      answer: 'approve',
+      // A known, accepted key name carried as an accessor: the refusal is
+      // caused by the getter itself, never by an unknown key.
+      get grantId() {
         getterRuns += 1;
-        return 'approve';
+        return 'grant-1';
       },
     };
-    const input = { requestId: REQUEST_ID, extra: inner };
     expect(parseSignDecisionInput(input)).toEqual({
       ok: false,
       code: 'invalid-sign-decision-input',
@@ -123,7 +126,7 @@ describe('parseSignDecisionInput hostile inputs', () => {
     expect(getterRuns).toBe(0);
   });
 
-  it('refuses a Proxy over a valid input without running a get trap', () => {
+  it('accepts a transparent Proxy as plain data without running a get trap', () => {
     let getTraps = 0;
     const valid = validInput();
     const proxied = new Proxy(valid, {

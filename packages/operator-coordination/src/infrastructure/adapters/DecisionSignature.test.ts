@@ -379,6 +379,15 @@ describe('signAndWriteDecisionAnswer', () => {
     const result = await sabotaged.signAndWriteDecisionAnswer({ fields: FIELDS, keyPath });
     expect(result).toEqual({ ok: false, code: 'self-verification-failed' });
     expect(existsSync(answerPath)).toBe(false);
+    // Nothing is authorized: with the written file removed, a clean adapter
+    // (no injected answers) reads an awaiting request, never an approval.
+    const after = await adapter(decisionsDir, publicBase64).readDecisionAnswer({
+      requestId: REQUEST_ID,
+      projectId: PROJECT_ID,
+      actionScope: SCOPE,
+      expectedHeadSha: HEAD,
+    });
+    expect(after).toEqual({ state: 'awaiting-decision', decisionRevision: null, grantId: null });
   });
 
   it('never returns or stores the private key material', async () => {

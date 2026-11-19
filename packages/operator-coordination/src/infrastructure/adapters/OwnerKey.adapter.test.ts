@@ -42,7 +42,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 import { canonicalDecisionBytes, verifyDecisionSignature } from './DecisionSignature.adapter.js';
-import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile } from './OwnerKey.adapter.js';
+import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile, ownerKeyIdentitySeam } from './OwnerKey.adapter.js';
 
 let root: string;
 
@@ -53,6 +53,7 @@ beforeEach(() => {
 afterEach(() => {
   failureFlags.write = false;
   failureFlags.close = false;
+  delete ownerKeyIdentitySeam.verify;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -109,7 +110,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside the state directory through a symlinked parent', async () => {
     const stateDir = join(root, 'state');
-    mkdirSync(stateDir);
+    mkdirSync(stateDir, { mode: 0o750 });
     const link = join(root, 'state-link');
     symlinkSync(stateDir, link);
     const result = await generateOwnerKeyFile({ outPath: join(link, 'owner-key.pem'), stateDir });
@@ -121,7 +122,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside a git repository', async () => {
     const repo = join(root, 'repo');
-    mkdirSync(join(repo, '.git'), { recursive: true });
+    mkdirSync(join(repo, '.git'), { recursive: true, mode: 0o750 });
     const result = await generateOwnerKeyFile({ outPath: join(repo, 'owner-key.pem') });
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -131,7 +132,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside a git worktree (.git file)', async () => {
     const worktree = join(root, 'wt');
-    mkdirSync(worktree, { recursive: true });
+    mkdirSync(worktree, { recursive: true, mode: 0o750 });
     writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere\n');
     const result = await generateOwnerKeyFile({ outPath: join(worktree, 'owner-key.pem') });
     expect(result.ok).toBe(false);
@@ -186,6 +187,50 @@ describe('generateOwnerKeyFile', () => {
     const pem = readFileSync(keyPath, 'utf8');
     expect(JSON.stringify(result)).not.toContain('PRIVATE KEY');
     expect(JSON.stringify(result)).not.toContain(pem.trim());
+  });
+
+  it('refuses a group- or world-writable resolved parent directory', async () => {
+    const parent = join(root, 'shared');
+    mkdirSync(parent);
+    chmodSync(parent, 0o777);
+    const keyPath = join(parent, 'owner-key.pem');
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'unsafe-parent-directory' });
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('refuses a resolved parent directory owned by another uid', async () => {
+    const parent = join(root, 'foreign');
+    mkdirSync(parent);
+    const spy = vi.spyOn(process, 'getuid').mockReturnValue(12345);
+    const keyPath = join(parent, 'owner-key.pem');
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(spy).toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, code: 'unsafe-parent-directory' });
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('refuses with identity-changed and removes the file when a seam reports a different dev/ino after the write', async () => {
+    const keyPath = join(root, 'owner-key.pem');
+    // The seam stands in for the real dev/ino check: it reports the mismatch
+    // a parent swap between the location check and the write would produce.
+    ownerKeyIdentitySeam.verify = async () => ({
+      ok: false as const,
+      code: 'identity-changed' as const,
+      message: 'owner-key: the written file changed identity after the write',
+    });
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
+    // Nothing must be left behind.
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('succeeds when the seam reports the identity as unchanged', async () => {
+    const keyPath = join(root, 'owner-key.pem');
+    ownerKeyIdentitySeam.verify = async () => ({ ok: true as const });
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: true });
+    expect(existsSync(keyPath)).toBe(true);
   });
 });
 

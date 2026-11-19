@@ -13,9 +13,9 @@
 
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, realpath, unlink } from 'node:fs/promises';
+import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 
 import { checkOwnerKeyPathSafety, formatOwnerInstallationEdit } from '../../domain/owner-key.js';
 
@@ -49,6 +49,7 @@ export type OwnerKeyErrorCode =
   | 'path-too-long'
   | 'too-many-segments'
   | 'already-exists'
+  | 'unsafe-parent-directory'
   | 'unsafe-path-state-dir'
   | 'unsafe-path-git-repo'
   | 'write-failed'
@@ -56,7 +57,22 @@ export type OwnerKeyErrorCode =
   | 'invalid-key'
   | 'symlink-refused'
   | 'unsafe-key-permissions'
-  | 'unsafe-key-owner';
+  | 'unsafe-key-owner'
+  | 'identity-changed';
+
+/**
+ * Test seam for the post-write identity check: real parent-swap races are
+ * impractical to stage, so a test can install a fake `verify` here that
+ * reports the mismatch a race would produce (a different dev/ino pair after
+ * the write). Production code must leave this unset; when it is unset the
+ * real `verifyWrittenIdentity` runs.
+ */
+export const ownerKeyIdentitySeam: {
+  verify?: (
+    handle: FileHandle,
+    filePath: string,
+  ) => Promise<{ ok: true } | { ok: false; code: OwnerKeyErrorCode; message: string }>;
+} = {};
 
 /**
  * Whether `file` is `root` itself or lies inside it, decided from
@@ -97,10 +113,34 @@ async function insideGitWorktree(resolvedPath: string): Promise<boolean> {
 type GenerateRefusal = { ok: false; code: OwnerKeyErrorCode; message: string };
 
 /**
+ * Re-run the location checks (state directory, git repository/worktree) on
+ * one already-resolved path. Returns `null` when the location is safe.
+ */
+async function checkResolvedLocation(resolvedPath: string, stateDir: string | undefined): Promise<GenerateRefusal | null> {
+  if (stateDir !== undefined) {
+    try {
+      const stateReal = await realpath(stateDir);
+      if (isInside(stateReal, resolvedPath)) {
+        return { ok: false, code: 'unsafe-path-state-dir', message: 'owner-key: the output path is inside the state directory' };
+      }
+    } catch {
+      // An unresolvable state directory cannot contain the output path.
+    }
+  }
+  if (await insideGitWorktree(resolvedPath)) {
+    return { ok: false, code: 'unsafe-path-git-repo', message: 'owner-key: the output path is inside a git repository or worktree' };
+  }
+  return null;
+}
+
+/**
  * Check the requested output location against the domain path-safety rules,
  * resolve the parent directory's real path, and refuse a location inside the
- * state directory or any git repository or worktree. Returns the resolved
- * parent or a typed refusal.
+ * state directory or any git repository or worktree. The RESOLVED parent must
+ * be a directory owned by the process uid with no group or other write bit
+ * (`(mode & 0o022) === 0`), which rules out `/tmp`-style shared parents where
+ * a symlink could be swapped in between the check and the write. Returns the
+ * resolved parent or a typed refusal.
  */
 async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   Promise<{ ok: true; parentReal: string } | GenerateRefusal> {
@@ -118,20 +158,60 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   } catch {
     return { ok: false, code: 'write-failed', message: 'owner-key: the output parent directory does not exist' };
   }
-  if (options.stateDir !== undefined) {
-    try {
-      const stateReal = await realpath(options.stateDir);
-      if (isInside(stateReal, parentReal)) {
-        return { ok: false, code: 'unsafe-path-state-dir', message: 'owner-key: the output path is inside the state directory' };
-      }
-    } catch {
-      // An unresolvable state directory cannot contain the output path.
-    }
+  let parentStat;
+  try {
+    parentStat = await stat(parentReal);
+  } catch {
+    return { ok: false, code: 'write-failed', message: 'owner-key: the output parent directory could not be stat-ed' };
   }
-  if (await insideGitWorktree(parentReal)) {
-    return { ok: false, code: 'unsafe-path-git-repo', message: 'owner-key: the output path is inside a git repository or worktree' };
+  if (!parentStat.isDirectory()) {
+    return { ok: false, code: 'unsafe-parent-directory', message: 'owner-key: the resolved output parent is not a directory' };
+  }
+  if (process.getuid !== undefined && parentStat.uid !== process.getuid()) {
+    return { ok: false, code: 'unsafe-parent-directory', message: 'owner-key: the resolved output parent is owned by another user' };
+  }
+  if ((parentStat.mode & 0o022) !== 0) {
+    return { ok: false, code: 'unsafe-parent-directory', message: 'owner-key: the resolved output parent is group- or world-writable' };
+  }
+  const location = await checkResolvedLocation(parentReal, options.stateDir);
+  if (location !== null) {
+    return location;
   }
   return { ok: true, parentReal };
+}
+
+/**
+ * The real post-write identity check: `fstat` the still-open handle, then
+ * `stat(realpath(filePath))` and require that `dev` and `ino` match, and
+ * re-run the location checks (state dir, worktree, repo) on that realpath.
+ * A mismatch means the parent was swapped between the check and the write.
+ * Linear in the ancestor count of the resolved path.
+ */
+async function verifyWrittenIdentity(
+  handle: FileHandle,
+  filePath: string,
+  stateDir: string | undefined,
+): Promise<{ ok: true } | GenerateRefusal> {
+  let handleStat;
+  let filePathStat;
+  try {
+    handleStat = await handle.stat();
+    filePathStat = await stat(await realpath(filePath));
+  } catch {
+    return {
+      ok: false,
+      code: 'identity-changed',
+      message: 'owner-key: the written file could not be re-stat-ed after the write',
+    };
+  }
+  if (handleStat.dev !== filePathStat.dev || handleStat.ino !== filePathStat.ino) {
+    return { ok: false, code: 'identity-changed', message: 'owner-key: the written file changed identity after the write' };
+  }
+  const location = await checkResolvedLocation(await realpath(filePath), stateDir);
+  if (location !== null) {
+    return location;
+  }
+  return { ok: true };
 }
 
 /**
@@ -172,16 +252,26 @@ function createKeypairMaterial(): Promise<{ ok: true; publicKey: string; install
 }
 
 /**
- * Exclusively create `outPath` (`wx`, `0600`), write the private PEM into
- * it, and enforce the mode on the open handle (chmod on the handle, never
- * on the path). If the write or the permission enforcement fails, the
- * created file is removed best effort so a retry does not hit
- * `already-exists`; a rejecting `close()` is a typed refusal, never a
- * thrown error. Returns `ok` or a typed refusal.
+ * Exclusively create `writePath` (`wx`, `0600`), write the private PEM into
+ * it, enforce the mode on the open handle (chmod on the handle, never on the
+ * path), and then — while the handle is still open — verify that the file
+ * just written still has the same dev/ino at the `realpath` of `writePath`
+ * and that the resolved path is still outside the state directory and any
+ * git repository or worktree (closing the parent-swap race: `writePath` is
+ * built from the resolved parent, and the identity check catches a swap
+ * between the location checks and the open). If the write, the permission
+ * enforcement, or the identity check fails, the created file is removed
+ * best effort so a retry does not hit `already-exists`; a rejecting
+ * `close()` is a typed refusal, never a thrown error. Returns `ok` or a
+ * typed refusal.
  */
-async function writePrivateKeyAtomically(outPath: string, privatePem: string): Promise<{ ok: true } | GenerateRefusal> {
+async function writePrivateKeyAtomically(
+  writePath: string,
+  privatePem: string,
+  stateDir: string | undefined,
+): Promise<{ ok: true } | GenerateRefusal> {
   try {
-    await lstat(outPath);
+    await lstat(writePath);
     // The target already exists (file, directory or symlink): refuse and
     // leave it untouched.
     return { ok: false, code: 'already-exists', message: 'owner-key: the output path already exists' };
@@ -190,7 +280,7 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
   }
   let handle: FileHandle;
   try {
-    handle = await open(outPath, 'wx', 0o600);
+    handle = await open(writePath, 'wx', 0o600);
   } catch (error) {
     if (
       typeof error === 'object' &&
@@ -212,6 +302,32 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
   } catch {
     writeFailed = true;
   }
+  if (!writeFailed) {
+    // Close the parent-swap race: while the handle is still open, verify
+    // that the file just written is still the same inode at the resolved
+    // path, and that the resolved path is still a safe location. A fake
+    // seam may stand in for the real check in tests.
+    const identity = ownerKeyIdentitySeam.verify !== undefined
+      ? await ownerKeyIdentitySeam.verify(handle, writePath)
+      : await verifyWrittenIdentity(handle, writePath, stateDir);
+    if (!identity.ok) {
+      if (identity.code === 'identity-changed') {
+        // Nothing must be left behind: the written bytes are not the file
+        // we created at the checked location.
+        try {
+          await unlink(writePath);
+        } catch {
+          // Best effort only: the refusal below stands either way.
+        }
+      }
+      try {
+        await handle.close();
+      } catch {
+        // The refusal below stands either way.
+      }
+      return identity;
+    }
+  }
   let closeFailed = false;
   try {
     await handle.close();
@@ -222,7 +338,7 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
     // Best-effort cleanup: a half-written key file must not survive, so a
     // retry gets a fresh exclusive create instead of `already-exists`.
     try {
-      await unlink(outPath);
+      await unlink(writePath);
     } catch {
       // Best effort only: the refusal below stands either way.
     }
@@ -232,7 +348,7 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
     // Best-effort cleanup: the write "succeeded" but the handle could not be
     // closed, so a refusal must not leave a newly created key file behind.
     try {
-      await unlink(outPath);
+      await unlink(writePath);
     } catch {
       // Best effort only: the refusal below stands either way.
     }
@@ -246,10 +362,15 @@ async function writePrivateKeyAtomically(outPath: string, privatePem: string): P
  * a new `0600` file at `outPath`. The path is checked against the state
  * directory and git markers (domain `checkOwnerKeyPathSafety`), the parent
  * directory must exist and resolve outside the state directory and any git
- * repository or worktree, and the write is exclusive (`wx`) and atomic with
- * the mode verified on the open handle (chmod on the handle, never on the
- * path). Returns the canonical base64 public key and the installation edit;
- * never the private key. Every failure is a typed refusal.
+ * repository or worktree, and the RESOLVED parent must be a directory owned
+ * by the process uid with no group or other write bit. The file is opened at
+ * `join(resolvedParent, basename)` and the write is exclusive (`wx`) and
+ * atomic with the mode verified on the open handle (chmod on the handle,
+ * never on the path); after the write the file's dev/ino at its realpath is
+ * re-checked against the open handle and the location checks are re-run on
+ * that realpath, so a parent swapped in between check and write cannot
+ * survive. Returns the canonical base64 public key and the installation
+ * edit; never the private key. Every failure is a typed refusal.
  */
 export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions): Promise<GenerateOwnerKeyFileResult> {
   const location = await checkOutputLocation(options);
@@ -260,7 +381,11 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
   if (!material.ok) {
     return material;
   }
-  const written = await writePrivateKeyAtomically(options.outPath, material.privatePem);
+  // Open at `join(resolvedParent, basename)`, never at the original
+  // `outPath`: the resolved parent was just checked, so a symlink swapped
+  // into the original parent chain cannot redirect the write.
+  const writePath = join(location.parentReal, basename(options.outPath));
+  const written = await writePrivateKeyAtomically(writePath, material.privatePem, options.stateDir);
   if (!written.ok) {
     return written;
   }

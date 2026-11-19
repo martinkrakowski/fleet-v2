@@ -30,6 +30,9 @@ One line per store file reports ok, missing, unreadable or invalid record; each
 quarantine copy follows with `ok (N records)` when it validates fully. When a store
 is unreadable and copies exist, state check ends with how to restore one.
 
+For owner-gated decisions, the signed answer file and its signature are the
+authority; stored state in coordination-requests.json is not.
+
 ## Choose a copy
 
 Read the quarantine lines under the unreadable store. Choose one whose line

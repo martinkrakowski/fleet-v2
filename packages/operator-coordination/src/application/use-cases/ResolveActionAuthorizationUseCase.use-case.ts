@@ -339,11 +339,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     refreshed: CoordinationRequestRecord,
   ): Promise<ResolveActionAuthorizationResult | null> {
     const decisionTransport = this.deps?.decisionTransport;
-    if (decisionTransport === undefined) {
-      return null;
-    }
     if (!isSignedDecisionRequired(candidate.toRecord())) {
       return null;
+    }
+    // KEY0c3: the transport is mandatory for every owner-gated scope. A
+    // stored approved record with no transport fails closed — the stored
+    // state alone is never authority.
+    if (decisionTransport === undefined) {
+      return blocked('decision-signature-invalid');
     }
     const answer = await decisionTransport.readDecisionAnswer({
       requestId: refreshed.id,

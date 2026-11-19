@@ -307,8 +307,11 @@ export function createConfiguredOperatorComposition(
       ownerQuestionRepo,
       clock: systemClock,
     }),
-    checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo }),
-    recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({ requestRepo }),
+    checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo, decisionTransport }),
+    recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({
+      requestRepo,
+      decisionTransport,
+    }),
     readProjectAttention: new ReadProjectAttentionUseCase({ attentionPort }),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({
       requestRepo,

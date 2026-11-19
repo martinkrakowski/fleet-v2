@@ -46,10 +46,10 @@ export interface RecordAuthorizationConsumptionDependencies {
    */
   readonly computeDigest?: (payload: string) => string;
   /**
-   * KEY0c2: when injected, every owner-gated consumption re-reads the signed
-   * answer and binds the stored record to it before anything is recorded.
-   * Omitted, the origin/main behaviour is kept until KEY0c3 flips the
-   * mandatory switch.
+   * KEY0c3: mandatory for every owner-gated scope. Every owner-gated
+   * consumption re-reads the signed answer and binds the stored record to it
+   * before anything is recorded; without it a signed-decision record refuses
+   * with `decision-signature-invalid`.
    */
   readonly decisionTransport?: DecisionTransportPort;
 }
@@ -211,6 +211,12 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     // reach this point (the aggregate read above refuses it first), and the
     // closed-kind exemptions skip this check entirely.
     const decisionTransport = this.deps.decisionTransport;
+    // KEY0c3: the transport is mandatory for every owner-gated scope. A
+    // stored approved record with no transport fails closed — the stored
+    // state alone is never authority for a consumption.
+    if (decisionTransport === undefined && isSignedDecisionRequired(aggregate.toRecord())) {
+      return refused('decision-signature-invalid');
+    }
     if (decisionTransport !== undefined && isSignedDecisionRequired(aggregate.toRecord())) {
       const answer = await decisionTransport.readDecisionAnswer({
         requestId: aggregate.getId(),

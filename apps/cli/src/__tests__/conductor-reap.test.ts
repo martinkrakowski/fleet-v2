@@ -674,14 +674,53 @@ describe('conductor reap --worktrees against real git (C2\')', () => {
       nowIso: NOW,
     });
     expect(consumed.outcome).toBe('consumed');
-    // Remove the signed decision file: a second consumption would need a new signature.
-    const decisionsDir = path.join(tempStateDirs2[tempStateDirs2.length - 1]!, 'decisions');
-    await fs.rm(path.join(decisionsDir, 'req-unsealed-1.json'));
+    // KEY0c3: the signed answer file stays in place — the recovery replays
+    // the verified consume (the signature is re-checked), it is never
+    // bypassed by the stored consumption receipt alone.
     const result = await runConductor(s.runtime, ['reap', '--worktrees', '--yes', '--force-unsealed']);
     expect(result.code).toBe(0);
     const doc = JSON.parse(result.stdout[0]!) as { removed: { runId: string }[] };
     expect(doc.removed).toEqual([{ runId: RUN_ID, branchTip: expect.any(String) }]);
     await expect(fs.stat(s.worktreePath)).rejects.toBeTruthy();
+    const request = await s.runtime.coordination.coordinationRequestRepository.findRequestById('req-unsealed-1');
+    expect(request!.consumptions).toHaveLength(1);
+  });
+
+  it('refuses conductor crash recovery when signed answer is missing and keeps the worktree', async () => {
+    const s = await setupReal();
+    await seedScopedApproval(s);
+    const actionScope = unsealedWorktreeRemovalScope('attempt-example-1', sha256HexDigest(s.worktreePath));
+    const actionId = unsealedWorktreeRemovalActionId(RUN_ID, 'attempt-example-1');
+    await s.runtime.coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
+    const resolved = await s.runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'example-project',
+      actionScope,
+      expectedHeadSha: s.head,
+      attemptId: 'attempt-example-1',
+    });
+    expect(resolved.outcome).toBe('authorized');
+    const consumed = await s.runtime.coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({
+      consumptionId: consumptionId(actionId),
+      grantId: (resolved as { grantId: string }).grantId,
+      actionId,
+      actionScope,
+      attemptId: 'attempt-example-1',
+      expectedHeadSha: s.head,
+      nowIso: NOW,
+    });
+    expect(consumed.outcome).toBe('consumed');
+    // KEY0c3: the stored consumption receipt alone is never authority. With
+    // the signed answer file gone the verified replay refuses, the recovery
+    // never returns approved, and the worktree is kept.
+    const decisionsDir = path.join(tempStateDirs2[tempStateDirs2.length - 1]!, 'decisions');
+    await fs.rm(path.join(decisionsDir, 'req-unsealed-1.json'));
+    const result = await runConductor(s.runtime, ['reap', '--worktrees', '--yes', '--force-unsealed']);
+    expect(result.code).toBe(1);
+    const doc = JSON.parse(result.stdout[0]!) as {
+      refused: { runId: string; reason: string }[];
+    };
+    expect(doc.refused).toEqual([{ runId: RUN_ID, reason: 'unapproved-force-unsealed' }]);
+    await expect(fs.stat(s.worktreePath)).resolves.toBeTruthy();
     const request = await s.runtime.coordination.coordinationRequestRepository.findRequestById('req-unsealed-1');
     expect(request!.consumptions).toHaveLength(1);
   });
@@ -1040,7 +1079,14 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
       nowIso: NOW,
     };
 
-    function authorizerWith(listed: () => unknown) {
+    function authorizerWith(
+      listed: () => unknown,
+      options: {
+        coordinationRequest?: unknown;
+        consumeOutcome?: unknown;
+        findRequestById?: (linkedRequestId: string) => Promise<unknown>;
+      } = {},
+    ) {
       const calls = { sync: 0, list: 0, find: 0, resolve: 0, consume: 0 };
       const deps = {
         coordination: {
@@ -1064,14 +1110,17 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
           recordAuthorizationConsumption: {
             recordAuthorizationConsumption: async () => {
               calls.consume += 1;
-              return { outcome: 'refused' };
+              return options.consumeOutcome ?? { outcome: 'refused' };
             },
           },
         },
         coordinationRequestRepository: {
-          findRequestById: async () => {
+          findRequestById: async (linkedRequestId: string) => {
             calls.find += 1;
-            return null;
+            if (options.findRequestById) {
+              return options.findRequestById(linkedRequestId);
+            }
+            return options.coordinationRequest ?? null;
           },
         },
       };
@@ -1202,6 +1251,126 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
       });
       expect(accepted.calls.find).toBe(1);
       expect(accepted.calls.consume).toBe(0);
+    });
+
+    it('recovers a crash only through the verified consume replay (KEY0c3)', async () => {
+      const actionId = unsealedWorktreeRemovalActionId(RUN_ID, VALID_REQUEST.attemptId);
+      const actionScope = unsealedWorktreeRemovalScope(
+        VALID_REQUEST.attemptId,
+        sha256HexDigest(VALID_REQUEST.worktreePath),
+      );
+      const consumption = {
+        consumptionId: 'consumption-1',
+        grantId: 'grant-9',
+        requestId: 'req-9',
+        actionId,
+        attemptId: VALID_REQUEST.attemptId,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        consumedAtIso: NOW,
+      };
+      const coordReq = {
+        id: 'req-9',
+        projectId: VALID_REQUEST.projectId,
+        actionScope,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        policyGrant: undefined,
+        grantId: 'grant-9',
+        consumptions: [consumption],
+      };
+      const listed = () => ({
+        questions: [
+          {
+            doorKind: 'one-way',
+            state: 'answered',
+            questionId: 'oq-9',
+            linkedRequestId: 'req-9',
+            answer: { shape: 'accept', answeredVia: 'signed-decision' },
+          },
+        ],
+      });
+
+      // The verified consume replay consumes: approved with no second
+      // resolve and no second consumption.
+      const recovered = authorizerWith(listed, {
+        coordinationRequest: coordReq,
+        consumeOutcome: { outcome: 'consumed', consumption },
+      });
+      await expect(recovered.authorize(VALID_REQUEST)).resolves.toEqual({
+        outcome: 'approved',
+        approvalReference: 'oq-9:req-9:grant-9',
+      });
+      expect(recovered.calls).toEqual({ sync: 1, list: 1, find: 1, resolve: 0, consume: 1 });
+
+      // The replay refused (e.g. the signed answer is gone): never approved,
+      // and never a fallback to the stored receipt alone.
+      const refusedReplay = authorizerWith(listed, { coordinationRequest: coordReq });
+      await expect(refusedReplay.authorize(VALID_REQUEST)).resolves.toEqual({
+        outcome: 'blocked',
+        reason: 'no-scoped-owner-approval',
+      });
+      expect(refusedReplay.calls).toEqual({ sync: 1, list: 1, find: 1, resolve: 0, consume: 1 });
+    });
+
+    it('returns the first qualifying approval before a later question lookup rejects', async () => {
+      const actionId = unsealedWorktreeRemovalActionId(RUN_ID, VALID_REQUEST.attemptId);
+      const actionScope = unsealedWorktreeRemovalScope(
+        VALID_REQUEST.attemptId,
+        sha256HexDigest(VALID_REQUEST.worktreePath),
+      );
+      const consumption = {
+        consumptionId: 'consumption-1',
+        grantId: 'grant-9',
+        requestId: 'req-9',
+        actionId,
+        attemptId: VALID_REQUEST.attemptId,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        consumedAtIso: NOW,
+      };
+      const coordReq = {
+        id: 'req-9',
+        projectId: VALID_REQUEST.projectId,
+        actionScope,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        policyGrant: undefined,
+        grantId: 'grant-9',
+        consumptions: [consumption],
+      };
+      const listed = () => ({
+        questions: [
+          {
+            doorKind: 'one-way',
+            state: 'answered',
+            questionId: 'oq-9',
+            linkedRequestId: 'req-9',
+            answer: { shape: 'accept', answeredVia: 'signed-decision' },
+          },
+          {
+            doorKind: 'one-way',
+            state: 'answered',
+            questionId: 'oq-late',
+            linkedRequestId: 'req-late',
+            answer: { shape: 'accept', answeredVia: 'signed-decision' },
+          },
+        ],
+      });
+
+      // The first question's lookup qualifies and authorizes; the later
+      // question's lookup would reject, but the scan must already have
+      // returned on the first match, exactly as before the refactor.
+      const firstWins = authorizerWith(listed, {
+        findRequestById: async (linkedRequestId: string) => {
+          if (linkedRequestId === 'req-9') {
+            return coordReq;
+          }
+          throw new Error('later lookup exploded');
+        },
+        consumeOutcome: { outcome: 'consumed', consumption },
+      });
+      await expect(firstWins.authorize(VALID_REQUEST)).resolves.toEqual({
+        outcome: 'approved',
+        approvalReference: 'oq-9:req-9:grant-9',
+      });
+      expect(firstWins.calls.find).toBe(1);
     });
   });
 

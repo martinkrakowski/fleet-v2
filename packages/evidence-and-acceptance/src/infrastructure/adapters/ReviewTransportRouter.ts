@@ -57,42 +57,261 @@ export interface ReviewLocation {
   readDiff(fromSha: string, toSha: string): Promise<string | null>;
 }
 
-export function reviewerChainSeatIds(chains?: ReviewTransportChains): string[] {
+/**
+ * Hard caps on the untrusted shapes these boundary helpers accept. Every read
+ * below is linear in the capped input: a chain is at most
+ * `MAX_REVIEW_CHAIN_STEPS` steps, the seat list at most `MAX_REVIEW_SEATS`
+ * entries, a seat's roles at most `MAX_SEAT_ROLES` strings, and the reviewer
+ * model at most `MAX_REVIEWER_MODEL_BYTES` bytes. Anything over a cap is
+ * refused before any traversal, so no hostile length can drive a long loop.
+ */
+export const MAX_REVIEW_CHAIN_STEPS = 64;
+export const MAX_REVIEW_SEATS = 256;
+export const MAX_SEAT_ROLES = 32;
+export const MAX_REVIEWER_MODEL_BYTES = 256;
+
+/** Keys that must never travel as a seat id, whatever produced the object. */
+const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * A plain data object: prototype `Object.prototype` or `null`, never an array.
+ * A class instance, a Map, or anything exotic is refused rather than probed.
+ */
+function isPlainObject(value: unknown): value is Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  try {
+    const proto: unknown = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    return false;
+  }
+}
+
+/** One own data-property string, or null when absent, accessor-backed, or not a string. */
+function ownString(target: object, key: string): string | null {
+  const read = readOwn(target, key);
+  if (read.kind !== 'value' || typeof read.value !== 'string') {
+    return null;
+  }
+  return read.value;
+}
+
+/** A usable identifier: non-empty and not a prototype-polluting key. */
+function cleanIdentifier(value: string): string | null {
+  return value.length > 0 && !PROTOTYPE_POLLUTING_KEYS.has(value) ? value : null;
+}
+
+/**
+ * The items of an own-data array: dense, bounded, accessor-free. Sparse
+ * arrays (holes), accessor-backed indices, array-like objects, and any array
+ * whose own `length` exceeds `cap` are refused — the length is read from its
+ * own property descriptor and checked before any index is touched, so an
+ * enormous `length` never drives a traversal. No getter and no Proxy `get`
+ * trap is ever invoked.
+ */
+function ownArrayItems(value: unknown, cap: number): unknown[] | null {
+  let isArray = false;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return null;
+  }
+  if (!isArray) {
+    return null;
+  }
+  const arr = value as unknown[];
+  try {
+    const lengthRead = readOwn(arr, 'length');
+    if (lengthRead.kind !== 'value' || typeof lengthRead.value !== 'number') {
+      return null;
+    }
+    const length = lengthRead.value;
+    if (!Number.isSafeInteger(length) || length > cap) {
+      return null;
+    }
+    const items: unknown[] = [];
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(arr, index);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+        return null;
+      }
+      items.push(descriptor.value);
+    }
+    return items;
+  } catch {
+    return null;
+  }
+}
+
+/** A seat parsed down to its own data properties, or null when malformed. */
+interface ParsedSeat {
+  readonly id: string;
+  readonly tool: string;
+  readonly model: string;
+  readonly variant?: string;
+  readonly agent?: string;
+  readonly roles: string[];
+}
+
+function parseSeat(value: unknown): ParsedSeat | null {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const id = ownString(value, 'id');
+  const tool = ownString(value, 'tool');
+  const model = ownString(value, 'model');
+  if (id === null || tool === null || model === null) {
+    return null;
+  }
+  const cleanId = cleanIdentifier(id);
+  if (cleanId === null) {
+    return null;
+  }
+  const readOptionalString = (key: string): string | undefined | null => {
+    const read = readOwn(value, key);
+    if (read.kind === 'absent') {
+      return undefined;
+    }
+    return read.kind === 'value' && typeof read.value === 'string' ? read.value : null;
+  };
+  const variant = readOptionalString('variant');
+  if (variant === null) {
+    return null;
+  }
+  const agent = readOptionalString('agent');
+  if (agent === null) {
+    return null;
+  }
+  const rolesRead = readOwn(value, 'roles');
+  if (rolesRead.kind !== 'value') {
+    return null;
+  }
+  const roles = ownArrayItems(rolesRead.value, MAX_SEAT_ROLES);
+  if (roles === null) {
+    return null;
+  }
+  const roleStrings: string[] = [];
+  for (const role of roles) {
+    if (typeof role !== 'string') {
+      return null;
+    }
+    roleStrings.push(role);
+  }
+  return {
+    id: cleanId,
+    tool,
+    model,
+    ...(variant !== undefined ? { variant } : {}),
+    ...(agent !== undefined ? { agent } : {}),
+    roles: roleStrings,
+  };
+}
+
+/** The whole seat list, or null when it is not a dense bounded array of valid seats. */
+function parseSeats(seats: unknown): ParsedSeat[] | null {
+  const items = ownArrayItems(seats, MAX_REVIEW_SEATS);
+  if (items === null) {
+    return null;
+  }
+  const parsed: ParsedSeat[] = [];
+  for (const item of items) {
+    const seat = parseSeat(item);
+    if (seat === null) {
+      return null;
+    }
+    parsed.push(seat);
+  }
+  return parsed;
+}
+
+/** One chain step's seatId, or null when the step is malformed. */
+function chainStepSeatId(step: unknown): string | null {
+  if (!isPlainObject(step)) {
+    return null;
+  }
+  const seatId = ownString(step, 'seatId');
+  if (seatId === null) {
+    return null;
+  }
+  return cleanIdentifier(seatId);
+}
+
+/**
+ * The reviewer-chain seat ids, in order, duplicates dropped. Any malformed
+ * chain (non-plain object, accessor-backed chain entry, non-array or
+ * over-cap chain, sparse chain, malformed step) yields [].
+ */
+function parseReviewerChains(chains: unknown): string[] {
+  if (chains === undefined) {
+    return [];
+  }
+  if (!isPlainObject(chains)) {
+    return [];
+  }
   const ids: string[] = [];
   const seen = new Set<string>();
-
-  const reviewerChain = chains?.reviewer;
-  if (reviewerChain !== undefined) {
-    for (const step of reviewerChain) {
-      if (!seen.has(step.seatId)) {
-        seen.add(step.seatId);
-        ids.push(step.seatId);
+  for (const key of ['reviewer', 'high-risk-reviewer'] as const) {
+    const read = readOwn(chains, key);
+    if (read.kind === 'absent') {
+      continue;
+    }
+    if (read.kind !== 'value') {
+      return [];
+    }
+    const steps = ownArrayItems(read.value, MAX_REVIEW_CHAIN_STEPS);
+    if (steps === null) {
+      return [];
+    }
+    for (const step of steps) {
+      const seatId = chainStepSeatId(step);
+      if (seatId === null) {
+        return [];
+      }
+      if (!seen.has(seatId)) {
+        seen.add(seatId);
+        ids.push(seatId);
       }
     }
   }
-
-  const highRiskChain = chains?.['high-risk-reviewer'];
-  if (highRiskChain !== undefined) {
-    for (const step of highRiskChain) {
-      if (!seen.has(step.seatId)) {
-        seen.add(step.seatId);
-        ids.push(step.seatId);
-      }
-    }
-  }
-
   return ids;
 }
 
-export function hasReviewerSeat(
-  seats?: readonly ReviewTransportSeat[],
-  chains?: ReviewTransportChains,
-): boolean {
+/**
+ * The reviewer-chain seat ids, in order, duplicates dropped.
+ *
+ * Cost: linear in the capped chain input (`MAX_REVIEW_CHAIN_STEPS`); an
+ * over-cap length is refused before any traversal. Never throws: any
+ * malformed `unknown` input — null, a primitive, a sparse or over-cap array,
+ * an array-like object, a getter or Proxy `get` trap (which is never
+ * invoked), a prototype-polluting seat id — yields [].
+ */
+export function reviewerChainSeatIds(chains?: unknown): string[] {
+  if (chains === undefined) {
+    return [];
+  }
+  return parseReviewerChains(chains);
+}
+
+/**
+ * Whether any reviewer chain names a configured seat.
+ *
+ * Cost: linear in the capped inputs (`MAX_REVIEW_SEATS` seats plus
+ * `MAX_REVIEW_CHAIN_STEPS` steps). Never throws: any malformed `unknown`
+ * input yields false. No getter and no Proxy `get` trap is ever invoked: an
+ * accessor-backed field is reported by `readOwn` and refused.
+ */
+export function hasReviewerSeat(seats?: unknown, chains?: unknown): boolean {
   if (seats === undefined) {
     return false;
   }
-  const seatIds = new Set(seats.map((seat) => seat.id));
-  for (const id of reviewerChainSeatIds(chains)) {
+  const parsedSeats = parseSeats(seats);
+  if (parsedSeats === null) {
+    return false;
+  }
+  const seatIds = new Set(parsedSeats.map((seat) => seat.id));
+  for (const id of parseReviewerChains(chains)) {
     if (seatIds.has(id)) {
       return true;
     }
@@ -100,15 +319,33 @@ export function hasReviewerSeat(
   return false;
 }
 
+/**
+ * The one reviewer seat serving the requested model, or a typed refusal.
+ *
+ * Cost: linear in the capped inputs (`MAX_REVIEW_SEATS` seats, each with at
+ * most `MAX_SEAT_ROLES` roles, plus `MAX_REVIEW_CHAIN_STEPS` chain steps; the
+ * model is at most `MAX_REVIEWER_MODEL_BYTES` bytes). Never throws: any
+ * malformed `unknown` input is a refusal, never a crash.
+ */
 export function selectReviewerSeat(
-  seats: readonly ReviewTransportSeat[],
-  chains: ReviewTransportChains | undefined,
-  reviewerModel: string,
+  seats: unknown,
+  chains: unknown,
+  reviewerModel: unknown,
 ): { ok: true; seat: ReviewTransportSeat } | { ok: false; reason: string; code: ReviewUnavailableCode } {
+  if (typeof reviewerModel !== 'string') {
+    return { ok: false, reason: 'Reviewer model must be a string', code: 'seat-none' };
+  }
   const model = reviewerModel.trim();
-  const candidates: ReviewTransportSeat[] = [];
-  for (const id of reviewerChainSeatIds(chains)) {
-    const seat = seats.find((candidate) => candidate.id === id);
+  if (model.length === 0 || new TextEncoder().encode(model).length > MAX_REVIEWER_MODEL_BYTES) {
+    return { ok: false, reason: 'Reviewer model must be a non-empty string within the length cap', code: 'seat-none' };
+  }
+  const parsedSeats = parseSeats(seats);
+  if (parsedSeats === null) {
+    return { ok: false, reason: 'Reviewer seats must be a bounded array of seat objects', code: 'seat-none' };
+  }
+  const candidates: ParsedSeat[] = [];
+  for (const id of parseReviewerChains(chains)) {
+    const seat = parsedSeats.find((candidate) => candidate.id === id);
     if (seat !== undefined && seat.model === model) {
       candidates.push(seat);
     }
@@ -132,7 +369,18 @@ export function selectReviewerSeat(
     return { ok: false, reason: `Reviewer seat '${seat.id}' also holds the implementer role`, code: 'seat-implementer' };
   }
 
-  return { ok: true, seat };
+  // A normalized copy of the seat's own data properties: the input object is
+  // never echoed back, so an input shaped like a seat can never impersonate
+  // the answer by identity.
+  const normalized: ReviewTransportSeat = {
+    id: seat.id,
+    tool: seat.tool,
+    model: seat.model,
+    ...(seat.variant !== undefined ? { variant: seat.variant } : {}),
+    ...(seat.agent !== undefined ? { agent: seat.agent } : {}),
+    roles: [...seat.roles],
+  };
+  return { ok: true, seat: normalized };
 }
 
 export interface ReviewTransportRouterOptions {

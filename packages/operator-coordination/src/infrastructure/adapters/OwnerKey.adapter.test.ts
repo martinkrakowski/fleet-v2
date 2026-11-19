@@ -5,10 +5,40 @@
  */
 
 import { sign } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const failureFlags = vi.hoisted(() => ({ write: false, close: false }));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    async open(...args: Parameters<typeof actual.open>) {
+      const handle = await actual.open(...args);
+      if (!failureFlags.write && !failureFlags.close) {
+        return handle;
+      }
+      const wrapped = {
+        writeFile: failureFlags.write
+          ? async () => {
+              throw new Error('simulated write failure');
+            }
+          : handle.writeFile.bind(handle),
+        stat: handle.stat.bind(handle),
+        chmod: handle.chmod.bind(handle),
+        close: failureFlags.close
+          ? async () => {
+              throw new Error('simulated close failure');
+            }
+          : handle.close.bind(handle),
+      };
+      return wrapped as unknown as typeof handle;
+    },
+  };
+});
 
 import { canonicalDecisionBytes, verifyDecisionSignature } from './DecisionSignature.adapter.js';
 import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile } from './OwnerKey.adapter.js';
@@ -20,6 +50,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  failureFlags.write = false;
+  failureFlags.close = false;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -105,6 +137,27 @@ describe('generateOwnerKeyFile', () => {
     if (!result.ok) {
       expect(result.code).toBe('unsafe-path-git-repo');
     }
+  });
+
+  it('removes the created file when the write fails, so a retry does not hit already-exists', async () => {
+    failureFlags.write = true;
+    const keyPath = join(root, 'owner-key.pem');
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'write-failed' });
+    // Best-effort cleanup actually removed the half-written file...
+    expect(existsSync(keyPath)).toBe(false);
+    // ...so the retry gets a fresh exclusive create, not `already-exists`.
+    failureFlags.write = false;
+    const retry = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(retry).toMatchObject({ ok: true });
+    expect(existsSync(keyPath)).toBe(true);
+  });
+
+  it('returns a typed refusal when handle.close() rejects', async () => {
+    failureFlags.close = true;
+    const keyPath = join(root, 'owner-key.pem');
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'write-failed' });
   });
 
   it('refuses a missing parent directory', async () => {

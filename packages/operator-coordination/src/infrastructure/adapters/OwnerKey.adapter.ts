@@ -13,7 +13,7 @@
 
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 
@@ -87,17 +87,17 @@ async function insideGitWorktree(resolvedPath: string): Promise<boolean> {
   return true;
 }
 
+/** A refusal produced by one of the `generateOwnerKeyFile` helpers. */
+type GenerateRefusal = { ok: false; code: OwnerKeyErrorCode; message: string };
+
 /**
- * Generate one Ed25519 owner keypair and write its PKCS#8 PEM private key to
- * a new `0600` file at `outPath`. The path is checked against the state
- * directory and git markers (domain `checkOwnerKeyPathSafety`), the parent
- * directory must exist and resolve outside the state directory and any git
- * repository or worktree, and the write is exclusive (`wx`) and atomic with
- * the mode verified on the open handle (chmod on the handle, never on the
- * path). Returns the canonical base64 public key and the installation edit;
- * never the private key. Every failure is a typed refusal.
+ * Check the requested output location against the domain path-safety rules,
+ * resolve the parent directory's real path, and refuse a location inside the
+ * state directory or any git repository or worktree. Returns the resolved
+ * parent or a typed refusal.
  */
-export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions): Promise<GenerateOwnerKeyFileResult> {
+async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
+  Promise<{ ok: true; parentReal: string } | GenerateRefusal> {
   const safety = checkOwnerKeyPathSafety({
     targetPath: options.outPath,
     ...(options.stateDir !== undefined ? { stateDir: options.stateDir } : {}),
@@ -125,37 +125,57 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
   if (await insideGitWorktree(parentReal)) {
     return { ok: false, code: 'unsafe-path-git-repo', message: 'owner-key: the output path is inside a git repository or worktree' };
   }
+  return { ok: true, parentReal };
+}
+
+/**
+ * Generate one Ed25519 keypair and derive the canonical base64 public key
+ * and the installation edit from it. The private key is exported as PKCS#8
+ * PEM. Every failure is a typed refusal carrying no key material.
+ */
+function createKeypairMaterial(): Promise<{ ok: true; publicKey: string; installationEdit: string; privatePem: string } | GenerateRefusal> {
   let keypair: { publicKey: ReturnType<typeof createPublicKey>; privateKey: ReturnType<typeof createPrivateKey> };
   try {
     keypair = generateKeyPairSync('ed25519');
   } catch {
-    return { ok: false, code: 'invalid-key', message: 'owner-key: the keypair generation failed' };
+    return Promise.resolve({ ok: false, code: 'invalid-key', message: 'owner-key: the keypair generation failed' });
   }
   let spkiDer: Buffer;
   try {
     spkiDer = keypair.publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
   } catch {
-    return { ok: false, code: 'invalid-key', message: 'owner-key: the generated public key could not be encoded' };
+    return Promise.resolve({ ok: false, code: 'invalid-key', message: 'owner-key: the generated public key could not be encoded' });
   }
   if (
     !spkiDer.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX) ||
     spkiDer.length !== ED25519_SPKI_PREFIX.length + 32
   ) {
-    return { ok: false, code: 'invalid-key', message: 'owner-key: the generated public key is not a valid Ed25519 key' };
+    return Promise.resolve({ ok: false, code: 'invalid-key', message: 'owner-key: the generated public key is not a valid Ed25519 key' });
   }
   const publicKey = spkiDer.subarray(ED25519_SPKI_PREFIX.length).toString('base64');
   const formatted = formatOwnerInstallationEdit(publicKey);
   if (!formatted.ok) {
-    return { ok: false, code: 'invalid-key', message: 'owner-key: the generated public key is not canonical base64 of 32 bytes' };
+    return Promise.resolve({ ok: false, code: 'invalid-key', message: 'owner-key: the generated public key is not canonical base64 of 32 bytes' });
   }
-  let privatePem: string;
   try {
-    privatePem = keypair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    const privatePem = keypair.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    return Promise.resolve({ ok: true, publicKey: formatted.publicKey, installationEdit: formatted.installationEdit, privatePem });
   } catch {
-    return { ok: false, code: 'invalid-key', message: 'owner-key: the generated private key could not be encoded' };
+    return Promise.resolve({ ok: false, code: 'invalid-key', message: 'owner-key: the generated private key could not be encoded' });
   }
+}
+
+/**
+ * Exclusively create `outPath` (`wx`, `0600`), write the private PEM into
+ * it, and enforce the mode on the open handle (chmod on the handle, never
+ * on the path). If the write or the permission enforcement fails, the
+ * created file is removed best effort so a retry does not hit
+ * `already-exists`; a rejecting `close()` is a typed refusal, never a
+ * thrown error. Returns `ok` or a typed refusal.
+ */
+async function writePrivateKeyAtomically(outPath: string, privatePem: string): Promise<{ ok: true } | GenerateRefusal> {
   try {
-    await lstat(options.outPath);
+    await lstat(outPath);
     // The target already exists (file, directory or symlink): refuse and
     // leave it untouched.
     return { ok: false, code: 'already-exists', message: 'owner-key: the output path already exists' };
@@ -164,7 +184,7 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
   }
   let handle: FileHandle;
   try {
-    handle = await open(options.outPath, 'wx', 0o600);
+    handle = await open(outPath, 'wx', 0o600);
   } catch (error) {
     if (
       typeof error === 'object' &&
@@ -175,6 +195,7 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
     }
     return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be created' };
   }
+  let writeFailed = false;
   try {
     await handle.writeFile(privatePem, 'utf8');
     const stat = await handle.stat();
@@ -183,11 +204,54 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
       await handle.chmod(0o600);
     }
   } catch {
-    return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be written with 0600 permissions' };
-  } finally {
-    await handle.close();
+    writeFailed = true;
   }
-  return { ok: true, publicKey: formatted.publicKey, installationEdit: formatted.installationEdit };
+  let closeFailed = false;
+  try {
+    await handle.close();
+  } catch {
+    closeFailed = true;
+  }
+  if (writeFailed) {
+    // Best-effort cleanup: a half-written key file must not survive, so a
+    // retry gets a fresh exclusive create instead of `already-exists`.
+    try {
+      await unlink(outPath);
+    } catch {
+      // Best effort only: the refusal below stands either way.
+    }
+    return { ok: false, code: 'write-failed', message: 'owner-key: the output file could not be written with 0600 permissions' };
+  }
+  if (closeFailed) {
+    return { ok: false, code: 'write-failed', message: 'owner-key: the output file handle could not be closed' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Generate one Ed25519 owner keypair and write its PKCS#8 PEM private key to
+ * a new `0600` file at `outPath`. The path is checked against the state
+ * directory and git markers (domain `checkOwnerKeyPathSafety`), the parent
+ * directory must exist and resolve outside the state directory and any git
+ * repository or worktree, and the write is exclusive (`wx`) and atomic with
+ * the mode verified on the open handle (chmod on the handle, never on the
+ * path). Returns the canonical base64 public key and the installation edit;
+ * never the private key. Every failure is a typed refusal.
+ */
+export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions): Promise<GenerateOwnerKeyFileResult> {
+  const location = await checkOutputLocation(options);
+  if (!location.ok) {
+    return location;
+  }
+  const material = await createKeypairMaterial();
+  if (!material.ok) {
+    return material;
+  }
+  const written = await writePrivateKeyAtomically(options.outPath, material.privatePem);
+  if (!written.ok) {
+    return written;
+  }
+  return { ok: true, publicKey: material.publicKey, installationEdit: material.installationEdit };
 }
 
 /**

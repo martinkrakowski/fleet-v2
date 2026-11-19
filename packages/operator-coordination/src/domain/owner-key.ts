@@ -121,7 +121,17 @@ function readMarkerArray(value: unknown): { ok: true; markers: readonly string[]
     }
     prototype = Object.getPrototypeOf(value as object);
     ownKeys = Reflect.ownKeys(value as object);
-    length = (value as unknown[]).length;
+    // `length` is read from its own data descriptor only: a Proxy would
+    // otherwise run its `get` trap for `length`, and an accessor is never
+    // read.
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value as object, 'length');
+    if (lengthDescriptor === undefined) {
+      return { ok: false, code: 'hostile-input' };
+    }
+    if (lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined) {
+      return { ok: false, code: 'hostile-input' };
+    }
+    length = lengthDescriptor.value;
   } catch {
     return { ok: false, code: 'hostile-input' };
   }

@@ -133,6 +133,24 @@ describe('checkOwnerKeyPathSafety hostile input', () => {
     expect(getTraps).toBe(0);
   });
 
+  it('a Proxy over a valid marker array yields the plain-data result with no get trap run', () => {
+    let getTraps = 0;
+    const plainMarkers = ['/repo/.git'];
+    const proxyMarkers = new Proxy(plainMarkers, {
+      get(target, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const result = checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: proxyMarkers }));
+    expect(result).toEqual(
+      checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: plainMarkers })),
+    );
+    // `length` and the elements come from their own data descriptors only:
+    // no `get` trap ever runs, not even for `length`.
+    expect(getTraps).toBe(0);
+  });
+
   it('a prototype-polluting own key (__proto__ via JSON.parse)', () => {
     const parsed = JSON.parse(
       '{"__proto__":{"x":1},"targetPath":"/keys/k.pem","ancestorGitMarkers":[]}',

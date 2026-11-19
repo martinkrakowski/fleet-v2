@@ -61,6 +61,11 @@ Keep the private key file:
   too;
 - at mode `0600`, owned by the running user.
 
+These checks protect the key only against other *users* on the host: every
+process running as the same user — including any local agent the user starts —
+can read the key regardless of its mode. The follow-up is to run local agents
+under a separate system user, so the key file is not readable by them.
+
 ## 4. Sign a decision
 
 Sign a pending one-way decision with the key:

@@ -124,14 +124,8 @@ function collectSources(dir, root, out) {
   }
 }
 
-// State for a quote character opened in code: 3 single, 4 double, 5 template.
-function openState(quote) {
-  if (quote === "'") return 3;
-  if (quote === '"') return 4;
-  return 5;
-}
-
-// The character that closes the given string state.
+// The character that closes the given string state: 3 single, 4 double,
+// 5 template.
 function closeState(state) {
   if (state === 3) return "'";
   if (state === 4) return '"';
@@ -140,13 +134,27 @@ function closeState(state) {
 
 // Strip block and line comments from source while preserving every
 // character position (comments become spaces, newlines are kept), so
-// match indexes still map to the original line numbers. Strings are
-// tracked so a quote inside a comment or a comment marker inside a
-// string does not derail the scan.
+// match indexes still map to the original line numbers. String and
+// template-static-text contents are blanked to spaces (newlines kept,
+// character count preserved) while the quote and backtick delimiters are
+// kept, so an `import(...)` or `from '...'` written inside a string
+// literal or static template text is never matched by FROM_SPECIFIER.
+// The one exception: a quoted string that is itself the specifier of a
+// `from`/`import` (recognised by the collapsed code context before its
+// opening quote) keeps its content, so real findings stay matchable.
+// Template `${...}` interpolations stay code: `${` pushes a frame onto
+// ctx.templateStack and returns to the code state, and the matching `}`
+// (counted with brace depth, nested templates included) pops the frame
+// and returns to the template.
+//
+// Cost: O(n) time and O(n) space in the input length n — a single pass
+// building one output string; the interpolation stack holds at most one
+// frame per unclosed `${`.
 //
 // The scanner is split into one handler per lexer state (code, line
-// comment, block comment, string), each small enough to audit on its
-// own; stripComments only runs the state loop and dispatches.
+// comment, block comment, string, template), each small enough to audit
+// on its own; stripComments only runs the state loop and dispatches
+// through a lookup table indexed by state.
 //
 // Known limitation, accepted deliberately: this is a string-aware single
 // pass, not a parser. Comment markers (`//`, `/*`) that appear inside a
@@ -156,18 +164,40 @@ function closeState(state) {
 // still confuse the strip. Real source files that trip this would need a
 // real parser; the check prefers loud over silent either way.
 function stripComments(text) {
-  const ctx = { text, out: "", i: 0, state: 0 };
-  while (ctx.i < text.length) {
-    if (ctx.state === 3 || ctx.state === 4 || ctx.state === 5) handleString(ctx);
-    else if (ctx.state === 2) handleBlockComment(ctx);
-    else if (ctx.state === 1) handleLineComment(ctx);
-    else handleCode(ctx);
-  }
+  const ctx = { text, out: "", i: 0, state: 0, templateStack: [], buf: "", tail: "" };
+  const handlers = [
+    handleCode,
+    handleLineComment,
+    handleBlockComment,
+    handleString,
+    handleString,
+    handleTemplate,
+  ];
+  while (ctx.i < text.length) handlers[ctx.state](ctx);
   return ctx.out;
 }
 
+// Upper bound on the collapsed code-context tail kept in ctx.tail; the
+// longest token run a specifier can follow (`import (`) is far below it.
+const TAIL_LIMIT = 24;
+// A quoted string whose immediately preceding collapsed code context
+// ends like this is the specifier of a `from`/`import`: its content is
+// kept instead of blanked so real findings stay matchable. Whitespace
+// runs (real, or comment-blanked) have collapsed to one space.
+const SPECIFIER_BEFORE = /(?:\bfrom |\bimport \(|\bimport\(|\bimport )\s*$/;
+
+// Append emitted code text to the collapsed tail: whitespace runs become
+// one space and only the last TAIL_LIMIT characters are kept, so the
+// update is O(1) per emitted character.
+function pushTail(ctx, s) {
+  ctx.tail = (ctx.tail + s).replace(/\s+/g, " ").slice(-TAIL_LIMIT);
+}
+
 // Lexer state 0: code. A comment marker enters its state; a quote enters
-// the string state for that quote.
+// the string state for that quote. Inside a template interpolation
+// (ctx.templateStack non-empty) braces are counted: `{` deepens the
+// interpolation, and a `}` at depth 0 closes it and returns to the
+// template literal state.
 function handleCode(ctx) {
   const c = ctx.text[ctx.i];
   const d = ctx.i + 1 < ctx.text.length ? ctx.text[ctx.i + 1] : "";
@@ -175,17 +205,47 @@ function handleCode(ctx) {
     ctx.state = 1;
     ctx.out += "  ";
     ctx.i += 2;
-    return;
+    return; // a comment is whitespace to the tail: pushTail untouched
   }
   if (c === "/" && d === "*") {
     ctx.state = 2;
     ctx.out += "  ";
     ctx.i += 2;
+    return; // a comment is whitespace to the tail: pushTail untouched
+  }
+  if (c === "'") {
+    ctx.state = 3;
+    ctx.buf = "";
+    ctx.out += c;
+    ctx.i += 1;
+    return; // the opening quote never enters the tail: the specifier
+            // decision at close must see the context before it
+  }
+  if (c === '"') {
+    ctx.state = 4;
+    ctx.buf = "";
+    ctx.out += c;
+    ctx.i += 1;
     return;
   }
-  if (c === "'" || c === '"' || c === "`") {
-    ctx.state = openState(c);
+  if (c === "`") {
+    ctx.state = 5;
+    ctx.out += c;
+    ctx.i += 1;
+    return;
   }
+  if (ctx.templateStack.length > 0 && (c === "{" || c === "}")) {
+    const top = ctx.templateStack.length - 1;
+    if (c === "{") {
+      ctx.templateStack[top] += 1;
+    } else if (ctx.templateStack[top] === 0) {
+      ctx.templateStack.pop();
+      ctx.state = 5;
+    } else {
+      ctx.templateStack[top] -= 1;
+    }
+  }
+  pushTail(ctx, c);
   ctx.out += c;
   ctx.i += 1;
 }
@@ -221,20 +281,64 @@ function handleBlockComment(ctx) {
   ctx.i += 1;
 }
 
-// Lexer states 3–5: inside a string. Escapes skip the next character
-// verbatim; the closing quote returns to code.
+// Lexer states 3–4: inside a quoted string. The content is buffered;
+// escapes consume the escaped character so an escaped quote cannot close
+// the string. On the closing quote the buffered content is either kept
+// verbatim (the string is a from/import specifier, recognised by the
+// collapsed code context before its opening quote) or replaced with
+// spaces (newlines kept, character count preserved), so an `import(...)`
+// or `from '...'` written inside a string literal is never matched. The
+// closing quote is kept verbatim and returns to code.
 function handleString(ctx) {
   const c = ctx.text[ctx.i];
   const d = ctx.i + 1 < ctx.text.length ? ctx.text[ctx.i + 1] : "";
   if (c === "\\") {
-    ctx.out += c + d;
+    ctx.buf += c + d;
     ctx.i += 2;
     return;
   }
   if (c === closeState(ctx.state)) {
     ctx.state = 0;
+    ctx.out += SPECIFIER_BEFORE.test(ctx.tail) ? ctx.buf : ctx.buf.replace(/[^\n]/g, " ");
+    ctx.buf = "";
+    ctx.out += c;
+    ctx.tail = ""; // the code before the string is consumed by it
+    ctx.i += 1;
+    return;
   }
-  ctx.out += c;
+  ctx.buf += c;
+  ctx.i += 1;
+}
+
+// Lexer state 5: inside a template literal. Static text is replaced with
+// spaces (newlines kept); the closing backtick is kept verbatim and
+// returns to code; `${` opens an interpolation — it is kept, a 0 depth
+// frame is pushed onto ctx.templateStack, and the scan returns to the
+// code state until the matching `}` pops the frame (handleCode).
+function handleTemplate(ctx) {
+  const c = ctx.text[ctx.i];
+  const d = ctx.i + 1 < ctx.text.length ? ctx.text[ctx.i + 1] : "";
+  if (c === "\\") {
+    ctx.out += " " + (d === "\n" ? "\n" : " ");
+    ctx.i += 2;
+    return;
+  }
+  if (c === "`") {
+    ctx.state = 0;
+    ctx.out += c;
+    ctx.tail = ""; // the code before the template is consumed by it
+    ctx.i += 1;
+    return;
+  }
+  if (c === "$" && d === "{") {
+    ctx.templateStack.push(0);
+    ctx.state = 0;
+    ctx.out += "${";
+    pushTail(ctx, "${");
+    ctx.i += 2;
+    return;
+  }
+  ctx.out += c === "\n" ? "\n" : " ";
   ctx.i += 1;
 }
 
@@ -382,8 +486,10 @@ function collectCheckedSources(root, checked) {
     const src = path.join(root, workspace, "src");
     try {
       if (!statSync(src).isDirectory()) continue;
-    } catch {
-      continue; // no src directory in this workspace
+    } catch (error) {
+      if (error?.code === "ENOENT") continue; // no src directory in this workspace
+      console.error(`${NAME}: cannot read ${path.relative(root, src)}`);
+      process.exit(2);
     }
     // A listed workspace is checked regardless of its tsconfig: emission is
     // decided by the explicit list above, never inferred from tsconfig.

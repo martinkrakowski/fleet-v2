@@ -265,13 +265,19 @@ function checkMarkerOwnKeys(ownKeys: PropertyKey[], length: number): OwnerKeyPat
  * sparse array of length 2**32 - 1 costs O(1) to refuse.
  */
 function readMarkerArray(value: unknown): { ok: true; markers: readonly string[] } | { ok: false; code: OwnerKeyPathErrorCode } {
-  let isArray: boolean;
+  if (!Array.isArray(value)) {
+    return { ok: false, code: 'invalid-input' };
+  }
+  // Bounded-input guard: the declared `length` is read from the own DATA
+  // descriptor and refused before `Reflect.ownKeys` enumerates anything, so
+  // a huge dense array of length `MAX_PATH_SEGMENTS + 1` costs O(1) to
+  // refuse without traversing it.
+  const lengthRead = readMarkerLength(value as object);
+  if (!lengthRead.ok) {
+    return lengthRead;
+  }
   let ownKeys: PropertyKey[];
   try {
-    isArray = Array.isArray(value);
-    if (!isArray) {
-      return { ok: false, code: 'invalid-input' };
-    }
     // Residual #4v: `Reflect.ownKeys` necessarily invokes Proxy traps
     // (ownKeys, and getOwnPropertyDescriptor for each reported key), just as
     // `Object.getPrototypeOf` necessarily invokes the getPrototypeOf trap.
@@ -281,10 +287,6 @@ function readMarkerArray(value: unknown): { ok: true; markers: readonly string[]
     ownKeys = Reflect.ownKeys(value as object);
   } catch {
     return { ok: false, code: 'hostile-input' };
-  }
-  const lengthRead = readMarkerLength(value as object);
-  if (!lengthRead.ok) {
-    return lengthRead;
   }
   const entriesRead = readMarkerEntries(value as object, lengthRead.length);
   if (!entriesRead.ok) {

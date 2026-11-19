@@ -112,12 +112,15 @@ describe('checkOwnerKeyPathSafety hostile input', () => {
     expect(elapsedMs).toBeLessThan(100);
   });
 
-  it('an over-long marker array beyond MAX_PATH_SEGMENTS', () => {
+  it('a huge dense array of length MAX_PATH_SEGMENTS + 1 (refused before any key enumeration)', () => {
     const markers = Array.from({ length: MAX_PATH_SEGMENTS + 1 }, () => '/repo/.git');
-    expect(checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: markers }))).toEqual({
-      ok: false,
-      code: 'too-many-segments',
-    });
+    const start = process.hrtime.bigint();
+    const result = checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: markers }));
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    expect(result).toEqual({ ok: false, code: 'too-many-segments' });
+    // Refused from the own `length` data descriptor before `Reflect.ownKeys`
+    // enumerates anything: far under any traversal time.
+    expect(elapsedMs).toBeLessThan(100);
   });
 
   it('a getter on the root (the getter must never run)', () => {

@@ -51,6 +51,7 @@ export type OwnerKeyErrorCode =
   | 'hostile-input'
   | 'path-too-long'
   | 'too-many-segments'
+  | 'path-not-absolute'
   | 'already-exists'
   | 'unsafe-parent-directory'
   | 'unsafe-path-state-dir'

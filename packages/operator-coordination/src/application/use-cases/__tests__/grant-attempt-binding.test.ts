@@ -848,3 +848,54 @@ describe('grant attempt binding (CO24e)', () => {
     });
   });
 });
+
+describe('KEY0c2 fix round: a refusalReason blocks in every answer state', () => {
+  let dir: string;
+  let repo: CoordinationRequestRepositoryAdapter;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'co24e-oc-refusal-'));
+    repo = new CoordinationRequestRepositoryAdapter({ stateDir: dir });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * An injected transport returning an approved answer whose binding fields
+   * match the stored record, but which also carries a named refusal. Before
+   * the fix round the use cases honoured such a refusal only when the answer
+   * state was `awaiting-decision`, so this approved shape authorized.
+   */
+  const refusingTransport = () => ({
+    async readDecisionAnswer() {
+      return {
+        state: 'approved' as const,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-owner',
+        refusalReason: 'owner-key-unpinned' as const,
+      };
+    },
+  });
+
+  it('resolve blocks an approved answer carrying owner-key-unpinned despite matching binding', async () => {
+    await repo.saveRequest(ownerGrant());
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      decisionTransport: refusingTransport(),
+    }).resolveActionAuthorization({ projectId: 'project-1', actionScope: SCOPE, expectedHeadSha: HEAD });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+
+  it('consume refuses an approved answer carrying owner-key-unpinned despite matching binding and records nothing', async () => {
+    await repo.saveRequest(ownerGrant());
+    expect(
+      await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: repo,
+        decisionTransport: refusingTransport(),
+      }).recordAuthorizationConsumption(consume('grant-owner', 'att-A')),
+    ).toEqual({ outcome: 'refused', reason: 'owner-key-unpinned' });
+    expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(0);
+  });
+});

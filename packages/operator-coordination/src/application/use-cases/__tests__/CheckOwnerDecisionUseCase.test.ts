@@ -353,4 +353,27 @@ describe('CheckOwnerDecisionUseCase signed re-verification (KEY0c2)', () => {
       });
     }
   });
+
+  it('refuses an approved answer carrying owner-key-unpinned despite matching binding', async () => {
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+      decisionTransport: {
+        async readDecisionAnswer() {
+          return {
+            state: 'approved' as const,
+            decisionRevision: 'decision-3',
+            grantId: 'grant-9',
+            requestId: 'door-1',
+            actionScope: ownerDecisionActionScope('door-1'),
+            refusalReason: 'owner-key-unpinned' as const,
+          };
+        },
+      },
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'owner-key-unpinned',
+    });
+  });
 });

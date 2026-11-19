@@ -178,20 +178,18 @@ function inspectCandidateOwnKeys(candidate: unknown): PropertyKey[] | null {
 
 /**
  * Whether one own key is safe to skip. Returns `false` when the candidate
- * must be reported as awaiting: an accessor property, an own
+ * must be reported as awaiting: an accessor property (string OR symbol key —
+ * a symbol key never bypasses descriptor inspection), an own
  * `requestId`/`actionScope`/`projectId` value that is present but not a
  * non-empty string (malformed — `null` and other non-strings are refused,
  * never silently dropped), or such a string that names a different
- * request, scope or project than the query. A non-string key is skipped.
+ * request, scope or project than the query. A symbol data key is skipped.
  */
 function ownKeyIsBenign(
   candidate: object,
   key: PropertyKey,
   query: DecisionAnswerQuery,
 ): boolean {
-  if (typeof key !== 'string') {
-    return true;
-  }
   let descriptor: PropertyDescriptor | undefined;
   try {
     descriptor = Object.getOwnPropertyDescriptor(candidate, key);
@@ -200,6 +198,9 @@ function ownKeyIsBenign(
   }
   if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
     return false;
+  }
+  if (typeof key !== 'string') {
+    return true;
   }
   if (key !== 'requestId' && key !== 'actionScope' && key !== 'projectId') {
     return true;

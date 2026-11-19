@@ -351,7 +351,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       actionScope: refreshed.actionScope,
       expectedHeadSha: refreshed.expectedHeadSha,
     });
-    if (answer.state === 'awaiting-decision' && answer.refusalReason !== undefined) {
+    // Fix round: a refusal is honoured in EVERY answer state — an approved
+    // answer that carries a refusalReason must still block, not authorize.
+    if (answer.refusalReason !== undefined) {
       return blocked(answer.refusalReason);
     }
     if (!verifySignedDecisionBinding(refreshed, answer).ok) {

@@ -218,7 +218,9 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         actionScope: aggregate.getActionScope(),
         expectedHeadSha: aggregate.getExpectedHeadSha(),
       });
-      if (answer.state === 'awaiting-decision' && answer.refusalReason !== undefined) {
+      // Fix round: a refusal is honoured in EVERY answer state — an approved
+      // answer that carries a refusalReason must still refuse, not consume.
+      if (answer.refusalReason !== undefined) {
         return refused(answer.refusalReason);
       }
       if (!verifySignedDecisionBinding(recorded, answer).ok) {

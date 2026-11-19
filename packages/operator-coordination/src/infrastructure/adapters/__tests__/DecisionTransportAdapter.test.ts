@@ -8,7 +8,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { canonicalDecisionBytes } from '../DecisionSignature.adapter.js';
 import { DecisionTransportAdapter } from '../DecisionTransportAdapter.adapter.js';
 import { WavesHttpClient, type WavesRequestFn } from '../WavesHttpClient.adapter.js';
-import type { DecisionAnswerQuery } from '../../../application/ports/out/DecisionTransportPort.out-port.js';
+import type {
+  DecisionAnswer,
+  DecisionAnswerQuery,
+} from '../../../application/ports/out/DecisionTransportPort.out-port.js';
 
 function createOwnerKeyPair(): { publicKeyBase64: string; privateKey: KeyObject } {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -894,6 +897,86 @@ describe('DecisionTransportAdapter HTTP client transport', () => {
       state: 'awaiting-decision',
       decisionRevision: null,
       grantId: null,
+    });
+  });
+});
+
+describe('DecisionTransportAdapter symbol-key accessor inspection (KEY0c2 fix round)', () => {
+  const query: DecisionAnswerQuery = {
+    requestId: 'req-1',
+    projectId: 'proj-1',
+    actionScope: 'forge:merge-pr',
+    expectedHeadSha: 'sha-commit-1',
+  };
+
+  it('an own symbol getter is inspected like a string accessor: a signed approval never reads as approved and the getter never runs', async () => {
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        decisionRevision: 'rev-1',
+        grantId: 'grant-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+    let getterCalls = 0;
+    const answer: DecisionAnswer = {
+      state: 'approved',
+      decisionRevision: 'rev-1',
+      grantId: 'grant-1',
+      signature,
+    };
+    // An own symbol accessor: before the fix round, `ownKeyIsBenign` skipped
+    // non-string keys before descriptor inspection, so the getter bypassed
+    // the accessor refusal and the candidate could still be approved.
+    Object.defineProperty(answer, Symbol('hostile'), {
+      get() {
+        getterCalls += 1;
+        return 'owned';
+      },
+      enumerable: true,
+    });
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: { 'req-1': answer },
+    });
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('an own symbol data key is still skipped: the signed approval reads as approved', async () => {
+    const { publicKeyBase64, privateKey } = createOwnerKeyPair();
+    const signature = signDecision(
+      {
+        ...query,
+        decisionRevision: 'rev-1',
+        grantId: 'grant-1',
+        state: 'approved',
+      },
+      privateKey,
+    );
+    const answer: DecisionAnswer = {
+      state: 'approved',
+      decisionRevision: 'rev-1',
+      grantId: 'grant-1',
+      signature,
+    };
+    (answer as unknown as Record<symbol, string>)[Symbol('note')] = 'benign data';
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: { 'req-1': answer },
+    });
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'approved',
+      decisionRevision: 'rev-1',
+      grantId: 'grant-1',
     });
   });
 });

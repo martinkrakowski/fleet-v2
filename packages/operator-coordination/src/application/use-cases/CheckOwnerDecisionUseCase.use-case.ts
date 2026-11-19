@@ -126,7 +126,9 @@ export class CheckOwnerDecisionUseCase implements CheckOwnerDecisionPort {
         actionScope: candidate.getActionScope(),
         expectedHeadSha: candidate.getExpectedHeadSha(),
       });
-      if (answer.state === 'awaiting-decision' && answer.refusalReason !== undefined) {
+      // Fix round: a refusal is honoured in EVERY answer state — an approved
+      // answer that carries a refusalReason must still block, not authorize.
+      if (answer.refusalReason !== undefined) {
         return { outcome: 'not-approved', requestId, reason: answer.refusalReason };
       }
       if (!verifySignedDecisionBinding(recorded, answer).ok) {

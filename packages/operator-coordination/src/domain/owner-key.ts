@@ -180,6 +180,9 @@ function readMarkerLength(value: object): { ok: true; length: number } | { ok: f
   let prototype: unknown;
   let lengthDescriptor: PropertyDescriptor | undefined;
   try {
+    // As above (#4v): reading the prototype necessarily invokes a Proxy's
+    // getPrototypeOf trap; a Proxy is refused or treated as its plain-data
+    // snapshot, never guaranteed to run without traps.
     prototype = Object.getPrototypeOf(value);
     lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   } catch {
@@ -241,7 +244,11 @@ function checkMarkerOwnKeys(ownKeys: PropertyKey[], length: number): OwnerKeyPat
     if (typeof key !== 'string') {
       return 'invalid-input';
     }
-    const isIndex = /^\d+$/.test(key) && Number(key) < length;
+    // Only a CANONICAL array index counts: the decimal digits must be the
+    // canonical rendering of their numeric value (`String(Number(k)) === k`)
+    // and sit below the length, so `"00"`, `"01"`, `" 1"` and `"1.0"` are
+    // unexpected keys, not indexes.
+    const isIndex = /^\d+$/.test(key) && String(Number(key)) === key && Number(key) < length;
     if (!isIndex && key !== 'length') {
       return 'hostile-input';
     }
@@ -264,6 +271,12 @@ function readMarkerArray(value: unknown): { ok: true; markers: readonly string[]
     if (!isArray) {
       return { ok: false, code: 'invalid-input' };
     }
+    // Residual #4v: `Reflect.ownKeys` necessarily invokes Proxy traps
+    // (ownKeys, and getOwnPropertyDescriptor for each reported key), just as
+    // `Object.getPrototypeOf` necessarily invokes the getPrototypeOf trap.
+    // No JS mechanism detects a Proxy without invoking some trap. The
+    // contract is therefore that a Proxy is either refused or treated as its
+    // plain-data snapshot — never that its traps do not run.
     ownKeys = Reflect.ownKeys(value as object);
   } catch {
     return { ok: false, code: 'hostile-input' };

@@ -10,6 +10,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/**
+ * Create a directory that is exactly `0700`, whatever the umask is: the
+ * mkdir mode alone is masked by the umask, so an explicit `chmod` follows.
+ * Every key parent directory in this suite is created this way so the
+ * adapter's parent-ownership rule never refuses the tests' own fixtures.
+ */
+function mkdirPrivate(path: string, options: { recursive?: boolean } = {}): void {
+  mkdirSync(path, { mode: 0o700, ...options });
+  chmodSync(path, 0o700);
+}
+
 const failureFlags = vi.hoisted(() => ({ write: false, close: false }));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -100,7 +111,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside the state directory', async () => {
     const stateDir = join(root, 'state');
-    mkdirSync(stateDir);
+    mkdirPrivate(stateDir);
     const result = await generateOwnerKeyFile({ outPath: join(stateDir, 'owner-key.pem'), stateDir });
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -110,7 +121,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside the state directory through a symlinked parent', async () => {
     const stateDir = join(root, 'state');
-    mkdirSync(stateDir, { mode: 0o750 });
+    mkdirPrivate(stateDir);
     const link = join(root, 'state-link');
     symlinkSync(stateDir, link);
     const result = await generateOwnerKeyFile({ outPath: join(link, 'owner-key.pem'), stateDir });
@@ -122,7 +133,10 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside a git repository', async () => {
     const repo = join(root, 'repo');
-    mkdirSync(join(repo, '.git'), { recursive: true, mode: 0o750 });
+    // The repo directory itself (the key's parent) is 0700 and uid-owned, so
+    // the git check — not the parent-directory rule — is what fires.
+    mkdirPrivate(join(repo, '.git'), { recursive: true });
+    chmodSync(repo, 0o700);
     const result = await generateOwnerKeyFile({ outPath: join(repo, 'owner-key.pem') });
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -132,7 +146,7 @@ describe('generateOwnerKeyFile', () => {
 
   it('refuses a path inside a git worktree (.git file)', async () => {
     const worktree = join(root, 'wt');
-    mkdirSync(worktree, { recursive: true, mode: 0o750 });
+    mkdirPrivate(worktree, { recursive: true });
     writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere\n');
     const result = await generateOwnerKeyFile({ outPath: join(worktree, 'owner-key.pem') });
     expect(result.ok).toBe(false);
@@ -223,6 +237,43 @@ describe('generateOwnerKeyFile', () => {
     expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
     // Nothing must be left behind.
     expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('removes the created file when a seam reports the realpath moved into the state dir after the write', async () => {
+    const stateDir = join(root, 'state');
+    mkdirPrivate(stateDir);
+    const keyPath = join(root, 'owner-key.pem');
+    // The seam stands in for a post-write location check that now resolves
+    // the written file's realpath inside the state directory (the parent was
+    // moved there between the write and the check).
+    ownerKeyIdentitySeam.verify = async () => ({
+      ok: false as const,
+      code: 'unsafe-path-state-dir' as const,
+      message: 'owner-key: the output path is inside the state directory',
+    });
+    const result = await generateOwnerKeyFile({ outPath: keyPath, stateDir });
+    expect(result).toMatchObject({ ok: false, code: 'unsafe-path-state-dir' });
+    // The refusal removed the file this run created.
+    expect(existsSync(keyPath)).toBe(false);
+  });
+
+  it('does not delete a file some other writer swapped in when cleaning up after a refusal', async () => {
+    const keyPath = join(root, 'owner-key.pem');
+    // The seam first replaces the file at the path with a DIFFERENT inode
+    // (the move a real swap would leave behind), then reports the mismatch.
+    ownerKeyIdentitySeam.verify = async () => {
+      rmSync(keyPath);
+      writeFileSync(keyPath, 'someone else\n', { mode: 0o600 });
+      return {
+        ok: false as const,
+        code: 'identity-changed' as const,
+        message: 'owner-key: the written file changed identity after the write',
+      };
+    };
+    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
+    // The dev/ino guard held: the swapped-in file is not ours to delete.
+    expect(readFileSync(keyPath, 'utf8')).toBe('someone else\n');
   });
 
   it('succeeds when the seam reports the identity as unchanged', async () => {

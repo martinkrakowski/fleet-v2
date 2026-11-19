@@ -72,6 +72,23 @@ describe('checkOwnerKeyPathSafety hostile input', () => {
     ).toEqual({ ok: false, code: 'invalid-input' });
   });
 
+  it('a non-canonical array index key ("00") on the marker array', () => {
+    // `"00"` is digits below nothing, but it is not the canonical rendering
+    // of its numeric value (`String(Number("00")) === "0"`), so it is an
+    // unexpected own key, not the index `0`.
+    const markers = ['/repo/.git'];
+    Object.defineProperty(markers, '00', {
+      value: '/repo/.git',
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    expect(checkOwnerKeyPathSafety(safeInput({ ancestorGitMarkers: markers }))).toEqual({
+      ok: false,
+      code: 'hostile-input',
+    });
+  });
+
   it('an enormous length (sparse array of length 2**32 - 1, refused before traversal)', () => {
     const enormous: string[] = new Array(2 ** 32 - 1);
     const start = process.hrtime.bigint();

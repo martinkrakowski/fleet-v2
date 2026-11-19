@@ -181,6 +181,24 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
 }
 
 /**
+ * Best-effort removal of the file `generateOwnerKeyFile` itself created:
+ * `writePath` is unlinked only when its `lstat` dev/ino still match the open
+ * handle's `fstat`, so a swapped-in file (a different inode, or a symlink)
+ * is never someone else's casualty. Every failure is swallowed: the refusal
+ * that triggered the cleanup stands either way.
+ */
+async function removeCreatedFile(handle: FileHandle, writePath: string): Promise<void> {
+  try {
+    const [handleStat, pathStat] = await Promise.all([handle.stat(), lstat(writePath)]);
+    if (handleStat.dev === pathStat.dev && handleStat.ino === pathStat.ino) {
+      await unlink(writePath);
+    }
+  } catch {
+    // Best effort only.
+  }
+}
+
+/**
  * The real post-write identity check: `fstat` the still-open handle, then
  * `stat(realpath(filePath))` and require that `dev` and `ino` match, and
  * re-run the location checks (state dir, worktree, repo) on that realpath.
@@ -311,15 +329,13 @@ async function writePrivateKeyAtomically(
       ? await ownerKeyIdentitySeam.verify(handle, writePath)
       : await verifyWrittenIdentity(handle, writePath, stateDir);
     if (!identity.ok) {
-      if (identity.code === 'identity-changed') {
-        // Nothing must be left behind: the written bytes are not the file
-        // we created at the checked location.
-        try {
-          await unlink(writePath);
-        } catch {
-          // Best effort only: the refusal below stands either way.
-        }
-      }
+      // Nothing this run created may be left behind: after the write, ANY
+      // refusal (`identity-changed`, `unsafe-path-state-dir`,
+      // `unsafe-path-git-repo`, or any other) removes the newly created
+      // file. The removal is guarded: the file at `writePath` is unlinked
+      // only when its dev/ino still match the open handle's `fstat`, so the
+      // cleanup can never delete a file some other writer put there.
+      await removeCreatedFile(handle, writePath);
       try {
         await handle.close();
       } catch {

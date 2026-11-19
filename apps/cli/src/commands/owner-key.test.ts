@@ -9,6 +9,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+/**
+ * Create a directory that is exactly `0700`, whatever the umask is: the
+ * mkdir mode alone is masked by the umask, so an explicit `chmod` follows.
+ * Every key parent directory in this suite is created this way so the
+ * adapter's parent-ownership rule never refuses the tests' own fixtures.
+ */
+function mkdirPrivate(path: string, options: { recursive?: boolean } = {}): void {
+  mkdirSync(path, { mode: 0o700, ...options });
+  chmodSync(path, 0o700);
+}
+
 import { parseInstallation, parseOwnerPublicKey } from '@fleet/installation';
 import { resolvePinnedOwnerPublicKey } from '@fleet/operator-coordination';
 
@@ -40,7 +51,7 @@ let stateDir: string;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'fleet-v2-owner-key-cli-'));
   stateDir = join(root, 'state');
-  mkdirSync(stateDir);
+  mkdirPrivate(stateDir);
 });
 
 afterEach(() => {
@@ -58,7 +69,7 @@ async function runOwnerKey(
 describe('coordination owner-key init', () => {
   it('prints only the public key and the exact installation edit, and exits 0', async () => {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const { code, stdout, stderr } = await runOwnerKey(['init', '--out', keyPath]);
     expect(code).toBe(0);
     expect(stderr).toEqual([]);
@@ -84,7 +95,10 @@ describe('coordination owner-key init', () => {
 
   it('refuses a path inside a git repository with exit 1', async () => {
     const repo = join(root, 'repo');
-    mkdirSync(join(repo, '.git'), { recursive: true });
+    // The repo directory itself (the key's parent) is 0700 and uid-owned, so
+    // the git check — not the parent-directory rule — is what fires.
+    mkdirPrivate(join(repo, '.git'), { recursive: true });
+    chmodSync(repo, 0o700);
     const { code, stderr } = await runOwnerKey(['init', '--out', join(repo, 'owner-key.pem')]);
     expect(code).toBe(1);
     expect(stderr.join('')).toContain('unsafe-path-git-repo');
@@ -103,7 +117,7 @@ describe('coordination owner-key init', () => {
 
   it('refuses unexpected flags with exit 2', async () => {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const { code } = await runOwnerKey(['init', '--out', keyPath, '--force']);
     expect(code).toBe(2);
   });
@@ -116,7 +130,7 @@ describe('coordination owner-key init', () => {
 
   it('the printed public key passes parseOwnerPublicKey', async () => {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const { stdout } = await runOwnerKey(['init', '--out', keyPath]);
     const publicKey = stdout[0]!.replace(/\n$/, '');
     expect(parseOwnerPublicKey(publicKey)).toEqual({ ok: true, value: publicKey });
@@ -124,7 +138,7 @@ describe('coordination owner-key init', () => {
 
   it('the printed installation edit merges into a minimal v2 installation that parses, and the pinned key resolves', async () => {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const { stdout } = await runOwnerKey(['init', '--out', keyPath]);
     const publicKey = stdout[0]!.replace(/\n$/, '');
     const edit = JSON.parse(stdout[1]!) as Record<string, unknown>;
@@ -154,7 +168,7 @@ describe('coordination owner-key init', () => {
 describe('coordination owner-key public', () => {
   async function initKey(): Promise<{ keyPath: string; initPublicKey: string }> {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const { stdout } = await runOwnerKey(['init', '--out', keyPath]);
     return { keyPath, initPublicKey: stdout[0]!.replace(/\n$/, '') };
   }
@@ -193,7 +207,7 @@ describe('coordination owner-key public', () => {
 describe('private key secrecy', () => {
   it('the private key material never appears in stdout or stderr', async () => {
     const keyPath = join(root, 'keys', 'owner-key.pem');
-    mkdirSync(join(root, 'keys'));
+    mkdirPrivate(join(root, 'keys'));
     const init = await runOwnerKey(['init', '--out', keyPath]);
     const derived = await runOwnerKey(['public', '--key', keyPath]);
     const refused = await runOwnerKey(['init', '--out', keyPath]);

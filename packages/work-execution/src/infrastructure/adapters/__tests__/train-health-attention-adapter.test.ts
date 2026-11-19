@@ -997,6 +997,154 @@ describe('TrainHealthAttentionAdapter', () => {
     ).toEqual({ outcome: 'unavailable' });
     expect(requests).toEqual([]);
   });
+
+  it('refuses class-instance and custom-prototype commands, queries and delegate answers', async () => {
+    class HostileCommand {
+      projectId = PROJECT;
+      repository = { owner: OWNER, repo: REPO };
+      rule: TrainHealthAttentionCommand['rule'] = 'tick-stale';
+      pullRequest: null = null;
+      deadlineIso = DEADLINE;
+    }
+    class HostileQuery {
+      projectId = PROJECT;
+      repository = { owner: OWNER, repo: REPO };
+      deadlineIso = DEADLINE;
+    }
+    let calls = 0;
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => {
+        calls += 1;
+        return new HostileCommand();
+      },
+      clearAttentionItem: async () => {
+        calls += 1;
+        return new HostileCommand();
+      },
+      listAttentionItems: async () => new HostileQuery(),
+    });
+
+    const instance = new HostileCommand();
+    expect(await adapter.raiseTrainHealthAttention(instance as unknown as TrainHealthAttentionCommand)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.clearTrainHealthAttention(instance as unknown as TrainHealthAttentionCommand)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.listOpenTrainHealthAttention(new HostileQuery() as never)).toEqual({
+      outcome: 'unavailable',
+    });
+    expect(calls).toBe(0);
+
+    // A null-prototype object is still a plain record: it must pass.
+    const nullProto = Object.assign(Object.create(null), {
+      projectId: PROJECT,
+      repository: { owner: OWNER, repo: REPO },
+      rule: 'tick-stale',
+      pullRequest: null,
+      deadlineIso: DEADLINE,
+    }) as unknown as TrainHealthAttentionCommand;
+    const accepting = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'raised', previousRaisedAtIso: null }),
+      listAttentionItems: async () => ({ items: [] }),
+    });
+    expect(await accepting.raiseTrainHealthAttention(nullProto)).toEqual({
+      outcome: 'raised',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
+    expect(await accepting.listOpenTrainHealthAttention(listQuery())).toEqual({ outcome: 'found', items: [] });
+
+    // Delegate answers with a custom prototype are unreadable (raise/clear)
+    // and unavailable (list), even when the fields look right.
+    const customProto = Object.setPrototypeOf({ outcome: 'raised', previousRaisedAtIso: null }, class {});
+    const hostileAnswers = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => customProto,
+      clearAttentionItem: async () => customProto,
+      listAttentionItems: async () => customProto,
+    });
+    expect(await hostileAnswers.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(await hostileAnswers.clearTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(await hostileAnswers.listOpenTrainHealthAttention(listQuery())).toEqual({ outcome: 'unavailable' });
+  });
+
+  it('refuses a command, repository or query with an extra own key as invalid-request', async () => {
+    let calls = 0;
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => {
+        calls += 1;
+        return { outcome: 'raised', previousRaisedAtIso: null };
+      },
+      clearAttentionItem: async () => {
+        calls += 1;
+        return { outcome: 'cleared' };
+      },
+      listAttentionItems: async () => {
+        calls += 1;
+        return { items: [] };
+      },
+    });
+    const extra = { ...command(), actor: 'someone' };
+    expect(await adapter.raiseTrainHealthAttention(extra)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.clearTrainHealthAttention(extra)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(
+      await adapter.listOpenTrainHealthAttention({ ...listQuery(), state: 'open' } as never),
+    ).toEqual({ outcome: 'unavailable' });
+    expect(
+      await adapter.raiseTrainHealthAttention({
+        ...command(),
+        repository: { owner: OWNER, repo: REPO, host: 'example' },
+      } as unknown as TrainHealthAttentionCommand),
+    ).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('maps a concurrent-writer conflict refusal to reasonCode conflict', async () => {
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({
+        outcome: 'refused',
+        code: 'conflict',
+        reason: 'RecordAttentionItem another writer moved this item first',
+      }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'conflict',
+    });
+  });
+
+  it('skips list entries whose item is a class instance or custom-prototype object', async () => {
+    class HostileItem {
+      projectId = PROJECT;
+      kind = 'train-tick-stale';
+      subject = { kind: 'project', ref: PROJECT };
+      summary = `train-health:tick-stale repo=${OWNER}/${REPO}`;
+      lastRaisedAtIso = RAISED_AT;
+    }
+    const adapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({
+        items: [new HostileItem(), projectEntry('tick-stale'), Object.setPrototypeOf(projectEntry('tick-stale').item, class {})],
+      }),
+    });
+    expect(await adapter.listOpenTrainHealthAttention(listQuery())).toEqual({
+      outcome: 'found',
+      items: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: RAISED_AT }],
+    });
+  });
 });
 
 function projectEntry(rule: string, summaryRepo = `${OWNER}/${REPO}`, projectId = PROJECT) {

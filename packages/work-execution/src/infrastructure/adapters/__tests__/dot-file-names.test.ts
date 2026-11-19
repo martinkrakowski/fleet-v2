@@ -29,9 +29,9 @@ describe('state stores refuse dot file names', () => {
           'run-01JB0000000000000000000000',
         ),
       ).rejects.toThrow(/refuses unsafe state file name/);
-      await expect(
-        new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName }).list(),
-      ).rejects.toThrow(/refuses unsafe state file name/);
+      expect(
+        () => new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName }),
+      ).toThrow(/refuses unsafe state file name/);
     });
   }
 });

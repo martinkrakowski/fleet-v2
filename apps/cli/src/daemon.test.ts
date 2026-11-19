@@ -860,7 +860,40 @@ describe('daemon watchdog composition (CO-WD5a)', () => {
 
   it('with no state directory the composed watchdog is the documented in-memory one: durable false and a pass evaluates healthy touching no disk (fix-3 mutation: forcing the durable read-only queue fails here)', async () => {
     const nowIso = new Date().toISOString();
-    const gh = ghStub();
+    // A gh stub that reports the pull request as merged: the enqueued entry is
+    // then live on the queue with a merged forge state, the stale-entry rule.
+    const gh: GhStub = {
+      calls: [],
+      probe: async () => ({ exitCode: 0, stdout: '{"resources":{}}', stderr: '' }),
+      run: async (args, timeoutMs) => {
+        gh.calls.push({ args: [...args], timeoutMs });
+        if (args[0] === 'api' && args[1] === 'rate_limit') {
+          return { exitCode: 0, stdout: '{"resources":{}}', stderr: '' };
+        }
+        if (args[0] === 'api' && args[1] === 'graphql') {
+          return { exitCode: 0, stdout: JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  state: 'MERGED',
+                  headRefOid: HEAD,
+                  mergeStateStatus: 'CLEAN',
+                  baseRefName: 'main',
+                  statusCheckRollup: {
+                    contexts: {
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                      nodes: [],
+                    },
+                  },
+                  reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+                },
+              },
+            },
+          }), stderr: '' };
+        }
+        return { exitCode: 1, stdout: '', stderr: 'unexpected gh call' };
+      },
+    };
     const runtime = createFleetCliRuntime({
       installation: installation([REPO_A]),
       forgeGhRunner: gh.run,
@@ -868,13 +901,26 @@ describe('daemon watchdog composition (CO-WD5a)', () => {
     });
     expect(runtime.daemon.durable).toBe(false);
     await writeTickStatus({ stateDir: '', gh, runtime } as Harness, nowIso);
+    // The in-memory queue is live: enqueue a real entry and the watchdog
+    // observes it — the pass is no longer healthy because the queue is stale.
+    await enqueue(runtime, REPO_A, 7);
     const result = await (runtime.daemon.watchTrainHealth.watchTrainHealth({
       projectId: 'proj-alpha',
       repository: { owner: OWNER, repo: REPO_A },
       repoDigest: digestOf(REPO_A),
       deadlineIso: new Date(Date.now() + 60_000).toISOString(),
     }) as Promise<Record<string, unknown>>);
-    expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0, findings: [] });
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      healthy: false,
+      exitCode: 1,
+      unknownForgeStates: 0,
+    });
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({ rule: 'stale-queue-entry', pullRequest: 7 }),
+    );
+    // The forge state of the queued PR was read through gh, entirely in memory.
+    expect(gh.calls.some((call) => call.args[0] === 'api' && call.args[1] === 'graphql')).toBe(true);
   });
 });
 

@@ -202,6 +202,24 @@ describe('parseHostAudibleAlertRequest', () => {
     expect(parseHostAudibleAlertRequest(hostile)).toEqual(INVALID);
     expect(getTraps).toBe(0);
   });
+
+  it('refuses a Proxy over a valid request with zero getPrototypeOf traps (isProxy runs first)', () => {
+    let getTraps = 0;
+    let getPrototypeOfTraps = 0;
+    const hostile = new Proxy({ sentence: 'all clear' }, {
+      get() {
+        getTraps += 1;
+        return undefined;
+      },
+      getPrototypeOf() {
+        getPrototypeOfTraps += 1;
+        return Object.prototype;
+      },
+    });
+    expect(parseHostAudibleAlertRequest(hostile)).toEqual(INVALID);
+    expect(getTraps).toBe(0);
+    expect(getPrototypeOfTraps).toBe(0);
+  });
 });
 
 describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
@@ -277,6 +295,30 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
     } });
     expect(await adapter.speak(hostile)).toEqual(REFUSED);
     expect(getTraps).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a Proxy speak request with zero getPrototypeOf traps (isProxy runs first)', async () => {
+    let getTraps = 0;
+    let getPrototypeOfTraps = 0;
+    let runs = 0;
+    const hostile = new Proxy({ sentence: 'all clear' }, {
+      get() {
+        getTraps += 1;
+        return undefined;
+      },
+      getPrototypeOf() {
+        getPrototypeOfTraps += 1;
+        return Object.prototype;
+      },
+    });
+    const adapter = adapterWith({ run: async () => {
+      runs += 1;
+      return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+    } });
+    expect(await adapter.speak(hostile)).toEqual(REFUSED);
+    expect(getTraps).toBe(0);
+    expect(getPrototypeOfTraps).toBe(0);
     expect(runs).toBe(0);
   });
 

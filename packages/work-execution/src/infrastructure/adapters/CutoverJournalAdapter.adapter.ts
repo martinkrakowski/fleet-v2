@@ -52,6 +52,7 @@ export interface CutoverJournalAdapterOptions {
 
 const DEFAULT_FILE_NAME = 'cutover-journal.json';
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',

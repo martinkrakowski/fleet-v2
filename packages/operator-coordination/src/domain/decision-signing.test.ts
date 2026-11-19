@@ -208,6 +208,38 @@ describe('parseSignDecisionInput field validation', () => {
     });
   });
 
+  it('refuses a grantId getter (the accessor is never treated as absent and never runs)', () => {
+    const input: Record<string, unknown> = { requestId: REQUEST_ID, answer: 'approve' };
+    let getterRuns = 0;
+    Object.defineProperty(input, 'grantId', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return 'grant-1';
+      },
+    });
+    expect(parseSignDecisionInput(input)).toEqual({ ok: false, code: 'invalid-sign-decision-input' });
+    expect(getterRuns).toBe(0);
+  });
+
+  it('refuses a decisionRevision getter (the accessor is never treated as absent and never runs)', () => {
+    const input: Record<string, unknown> = {
+      requestId: REQUEST_ID,
+      answer: 'approve',
+      grantId: 'grant-1',
+    };
+    let getterRuns = 0;
+    Object.defineProperty(input, 'decisionRevision', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return '1';
+      },
+    });
+    expect(parseSignDecisionInput(input)).toEqual({ ok: false, code: 'invalid-sign-decision-input' });
+    expect(getterRuns).toBe(0);
+  });
+
   it('refuses surrounding whitespace in grantId and decisionRevision', () => {
     expect(parseSignDecisionInput(validInput({ grantId: ' grant-1' }))).toEqual({
       ok: false,

@@ -98,9 +98,14 @@ function isAcceptableOptionalField(value: unknown, maxLength: number): value is 
  * per inspected field.
  */
 export function parseSignDecisionInput(raw: unknown): ParsedSignDecisionInput {
-  const fields = readPlainObjectWithOptional(raw, ['requestId', 'answer'], [
-    ...SIGN_DECISION_KEYS,
-  ]);
+  const fields = readPlainObjectWithOptional(
+    raw,
+    ['requestId', 'answer'],
+    [...SIGN_DECISION_KEYS],
+    // An own accessor on ANY sign-decision field, optional or required, is a
+    // refusal, never a silent absence (and never a getter run).
+    { refuseOptionalAccessors: true },
+  );
   if (fields === null) {
     return { ok: false, code: 'invalid-sign-decision-input' };
   }

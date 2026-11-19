@@ -90,6 +90,7 @@ export function readPlainObjectWithOptional(
   value: unknown,
   required: readonly string[],
   allowed: readonly string[],
+  options?: { refuseOptionalAccessors?: boolean },
 ): Record<string, unknown> | null {
   // Every reflective read is wrapped: a revoked Proxy or a hostile trap can
   // make even `Array.isArray`, `Object.getPrototypeOf` or
@@ -131,6 +132,15 @@ export function readPlainObjectWithOptional(
       return null;
     }
     if (descriptor === undefined || !descriptor.enumerable) {
+      return null;
+    }
+    // Opt-in: an own ACCESSOR (getter or setter) on any field is refused, not
+    // treated as absent, and the getter is never run. Callers that must keep
+    // the older behaviour (an accessor reads as `undefined`) omit the flag.
+    if (
+      options?.refuseOptionalAccessors === true &&
+      (descriptor.get !== undefined || descriptor.set !== undefined)
+    ) {
       return null;
     }
     out[key] = descriptor.value;

@@ -173,14 +173,28 @@ function collectSide(side: 'fleet' | 'shell', input: unknown, validate: ItemVali
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }
+  // The length is read exactly once, through its own data descriptor, and
+  // captured in a local: a Proxy `get` trap can lie differently on every
+  // read (report `0` to pass the cap check, then a huge value in the loop
+  // condition), so no property read ever supplies the loop bound.
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(input, 'length');
+  if (
+    lengthDescriptor === undefined || !('value' in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0
+  ) {
+    divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
+    return [];
+  }
+  const length: number = lengthDescriptor.value;
   // Refused before any traversal: a sparse array of length 2**32 - 1 must
   // never walk its indices.
-  if (input.length > SHADOW_SIDE_MAX_ITEMS) {
+  if (length > SHADOW_SIDE_MAX_ITEMS) {
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }
   const entries: ValidatedEntry[] = [];
-  for (let index = 0; index < input.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     // Read through the own data descriptor only: an array hole, a prototype
     // index property, or a Proxy get trap yields no own data descriptor, so
     // the element is invalid and no getter or trap ever runs.

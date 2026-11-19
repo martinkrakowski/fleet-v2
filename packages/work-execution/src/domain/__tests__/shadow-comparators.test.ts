@@ -467,6 +467,55 @@ describe('shadow comparators', () => {
     expect(traps).toEqual([]);
   });
 
+  it('a Proxy over an array side cannot bypass the item cap with a lying length get trap', () => {
+    // The get trap reports length 0 during the cap check, then the real
+    // 2**32 - 1 length in the loop condition: without the fix collectSide
+    // walks the whole range accumulating divergences without bound.
+    const huge: unknown[] = [];
+    Object.defineProperty(huge, 'length', { value: 2 ** 32 - 1 });
+    huge[0] = { pullRequest: 1, headOid: FIRST_HEAD };
+    let lengthReads = 0;
+    const proxy = new Proxy(huge, {
+      get(target, key) {
+        if (key === 'length') {
+          lengthReads += 1;
+          return lengthReads === 1 ? 0 : Reflect.get(target, key);
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+    expect(result.shellCount).toBe(0);
+    expect(lengthReads).toBe(0);
+  });
+
+  it('a Proxy over an array side with a lying length trap yields exactly the plain-data result', () => {
+    const items = [
+      { pullRequest: 1, headOid: FIRST_HEAD },
+      { pullRequest: 2, headOid: SECOND_HEAD },
+    ];
+    const proxy = new Proxy(items, {
+      get(target, key) {
+        if (key === 'length') return 0;
+        return Reflect.get(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: items });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: true,
+      compared: 2,
+      fleetCount: 2,
+      shellCount: 2,
+      divergences: [],
+      truncated: false,
+    });
+  });
+
   it('a Proxy whose get trap would return a fake fleet list never runs the trap', () => {
     let calls = 0;
     const root = {};

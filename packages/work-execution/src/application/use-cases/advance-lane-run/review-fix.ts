@@ -610,7 +610,22 @@ export async function performReview(
   if (opened.outcome !== 'open') {
     return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
-  const briefText = decision.step === 'brief-check' && frozen.kind === 'verified' ? frozen.prose : undefined;
+  // BL04: a brief-check binds the digest-verified frozen brief — the prose,
+  // the raw manifest bytes and the attempt's recorded digest — so the adapter
+  // recomputes the package digest before any reviewer is called. A recorded
+  // digest that is missing or blank refuses `assessment-unavailable` before
+  // the request is made, in place of the former non-null assertion.
+  let briefText: string | undefined;
+  let briefManifestRaw: string | undefined;
+  let briefPackageDigest: string | undefined;
+  if (decision.step === 'brief-check' && frozen.kind === 'verified') {
+    if (typeof latest.briefDigest !== 'string' || latest.briefDigest.trim().length === 0) {
+      return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
+    }
+    briefText = frozen.prose;
+    briefManifestRaw = frozen.manifestRaw;
+    briefPackageDigest = latest.briefDigest;
+  }
   let outcome: ReviewRequestResult;
   try {
     outcome = await ctx.deps.reviewRequest!.requestReview({
@@ -622,7 +637,7 @@ export async function performReview(
       policyRevision: record.runPolicyRevision,
       implementerModel,
       reviewerModel,
-      ...(briefText !== undefined ? { briefText } : {}),
+      ...(briefText !== undefined ? { briefText, briefManifestRaw, briefPackageDigest } : {}),
       nowIso: request.nowIso,
     });
   } catch {

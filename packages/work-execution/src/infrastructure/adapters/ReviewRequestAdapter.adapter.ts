@@ -53,6 +53,7 @@ import type {
   ReviewReceiptSummary,
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
+import type { AttemptRepositoryPort } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 import { screenTransportText } from '../../domain/review-transport-screen.js';
@@ -405,6 +406,15 @@ export interface ReviewRequestDelegates {
    * mismatched, no fallback runs.
    */
   readonly primaryApiReviewerModel?: string;
+  /**
+   * BL04: the attempt repository read, used to bind a `brief-check` request's
+   * `briefText` to the attempt's recorded `briefDigest`. Optional: when
+   * absent, the binding falls back to the request's own `briefPackageDigest`.
+   * A throw, a null attempt, a non-object attempt, an accessor `briefDigest`,
+   * or a recorded digest that differs from the request's declared digest is an
+   * `invalid-request` refusal.
+   */
+  readonly findAttemptById?: AttemptRepositoryPort['findAttemptById'];
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -1368,6 +1378,76 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     }
   }
 
+  /**
+   * BL04: binds a `brief-check` request's brief text to the frozen brief
+   * package digest before anything is forwarded to a reviewer. The request
+   * must carry both digest parts (`briefText` and `briefManifestRaw`) plus a
+   * valid `briefPackageDigest`; the recomputed
+   * `computeBriefPackageDigest({ prose, manifestRaw })` — `prose + '\n' +
+   * manifestRaw` with the SHA-256 function the production composition root
+   * injects — must equal it, and when the attempt repository is bound, the
+   * attempt's recorded `briefDigest` must equal it too. The attempt record is
+   * read only through own data properties: an accessor `briefDigest` never
+   * runs its getter and is a refusal. Returns the typed `invalid-request`
+   * refusal, or null when the binding holds. Cost: linear in the capped
+   * inputs (one digest over at most `BRIEF_TEXT_MAX_BYTES` of prose plus
+   * `BRIEF_PACKAGE_MAX_MANIFEST_BYTES` of manifest, both caps enforced by the
+   * digest formula's own refusals) plus one repository read. Never throws.
+   */
+  private async bindBriefCheckDigest(
+    request: ReviewRequest,
+    briefText: string,
+    optional: Record<string, unknown>,
+  ): Promise<ReviewRequestResult | null> {
+    const refuse = (): ReviewRequestResult => ({ outcome: 'refused', reason: 'invalid-request', detail: null });
+    // Blank prose, over-size text and a non-string are the adapter's own
+    // budget refusals; the digest formula below adds the secret-shape refusals
+    // for prose and manifest and the 256 KiB manifest cap.
+    if (briefTextIsRefused(briefText)) {
+      return refuse();
+    }
+    const briefManifestRaw = optional.briefManifestRaw;
+    if (typeof briefManifestRaw !== 'string' || !isNonEmptyTrimmed(briefManifestRaw)) {
+      return refuse();
+    }
+    const briefPackageDigest = optional.briefPackageDigest;
+    if (!isValidBriefPackageDigest(briefPackageDigest)) {
+      return refuse();
+    }
+    const computed = computeBriefPackageDigest(
+      { prose: briefText, manifestRaw: briefManifestRaw },
+      sha256HexDigest,
+    );
+    if (!computed.ok || computed.briefDigest !== briefPackageDigest) {
+      return refuse();
+    }
+    const findAttemptById = this.delegates.findAttemptById;
+    if (findAttemptById === undefined) {
+      // No repository bound: the request's own declared digest is the binding
+      // anchor, already recomputed and matched above.
+      return null;
+    }
+    let attempt: unknown;
+    try {
+      attempt = await findAttemptById(request.attemptId);
+    } catch {
+      return refuse();
+    }
+    if (attempt === null || typeof attempt !== 'object' || Array.isArray(attempt)) {
+      return refuse();
+    }
+    const digestRead = ownProperty(attempt, 'briefDigest');
+    // Absent, an accessor (the getter never runs) or a non-string recorded
+    // digest cannot confirm the declared one.
+    if (digestRead === undefined || digestRead === 'unreadable' || typeof digestRead.value !== 'string') {
+      return refuse();
+    }
+    if (digestRead.value !== briefPackageDigest) {
+      return refuse();
+    }
+    return null;
+  }
+
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
     const subject = readSubject(request, { requireBriefProjectId: true });
     if (subject.kind === 'invalid') {
@@ -1382,7 +1462,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (subject.kind === 'chain') {
       return this.requestChainReview(request, subject.chain);
     }
-    const optional = snapshotOptionalFields(request, ['briefText', 'nowIso']);
+    const optional = snapshotOptionalFields(request, ['briefText', 'briefManifestRaw', 'briefPackageDigest', 'nowIso']);
     const briefText = optional?.briefText;
     const nowIso = optional?.nowIso;
     if (
@@ -1394,11 +1474,23 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     ) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
+    // isValidReviewRequest accepted the kind. brief-verify was refused above, so this is an attempt kind.
+    const kind = request.kind as ReviewKind;
+    // BL04: a brief-check that carries brief text binds it to the frozen
+    // brief's package digest before any reviewer is called. The binding runs
+    // before the `not-configured` check so an unbound brief is an
+    // `invalid-request`, never a configuration complaint. Cost: one digest
+    // over at most 64 KiB of prose plus 256 KiB of manifest, plus one
+    // repository read; every refusal below returns before the reviewer call.
+    if (kind === 'brief-check' && briefText !== undefined) {
+      const bound = await this.bindBriefCheckDigest(request, briefText as string, optional);
+      if (bound !== null) {
+        return bound;
+      }
+    }
     if (!this.delegates.requestIndependentReview) {
       return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
-    // isValidReviewRequest accepted the kind. brief-verify was refused above, so this is an attempt kind.
-    const kind = request.kind as ReviewKind;
     return this.dispatchReview(
       {
         assessmentId: assessmentIdForAttempt(request.attemptId),

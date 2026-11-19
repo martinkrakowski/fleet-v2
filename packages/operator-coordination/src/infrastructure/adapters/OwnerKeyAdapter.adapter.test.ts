@@ -240,6 +240,25 @@ describe('generateOwnerKeyFile', () => {
     expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
   });
 
+  it('refuses with location-unverifiable when an ancestor lstat fails with ENOTDIR', async () => {
+    // The fake lets the real filesystem answer every probe EXCEPT the
+    // `.git` marker probes on the ancestors, which fail with `ENOTDIR` (an
+    // ancestor of the probed path is a regular file). That is an UNKNOWN
+    // marker status, never a proof of absence, so the walk must stop and
+    // the caller must refuse with `location-unverifiable`.
+    const result = await generateOwnerKeyFile({ outPath: join(root, 'owner-key.pem') }, fakeDeps(async () => ({ ok: true }), {
+      lstat: async (path: string) => {
+        if (path.endsWith('/.git')) {
+          throw Object.assign(new Error('simulated ENOTDIR'), { code: 'ENOTDIR' });
+        }
+        return fsPromises.lstat(path);
+      },
+    }));
+    expect(result).toMatchObject({ ok: false, code: 'location-unverifiable' });
+    // Nothing was written: the refusal precedes the exclusive create.
+    expect(existsSync(join(root, 'owner-key.pem'))).toBe(false);
+  });
+
   it('refuses with location-unverifiable when the state-directory realpath fails with EIO', async () => {
     const stateDir = join(root, 'state');
     mkdirPrivate(stateDir);

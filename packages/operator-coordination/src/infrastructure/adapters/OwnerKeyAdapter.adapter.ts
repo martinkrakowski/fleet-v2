@@ -120,24 +120,47 @@ function isInside(root: string, file: string): boolean {
  * `MAX_PATH_SEGMENTS` ancestors. Linear in the ancestor count.
  *
  * Fail closed on unknown filesystem state: only `ENOENT` (no `.git` entry
- * here) lets the walk continue. Any other `lstat` error (`EACCES`, `EIO`, …)
- * means the repository status is UNKNOWN, so the answer is `'unknown'` and
- * the caller refuses with `location-unverifiable` instead of guessing.
+ * here) lets the walk continue. Any other `lstat` error (`ENOTDIR`,
+ * `EACCES`, `EIO`, …) means the repository status is UNKNOWN, so the answer
+ * is `'unknown'` and the caller refuses with `location-unverifiable`
+ * instead of guessing. `ENOTDIR` proves nothing: an ancestor of the probed
+ * path being a regular file means the marker check could not see that
+ * level, which is exactly an unverifiable location.
  */
 async function insideGitWorktree(resolvedPath: string, deps: OwnerKeyFsDeps): Promise<'yes' | 'no' | 'unknown'> {
   // Start at the resolved path itself: its own parent chain begins here.
   let current = resolvedPath;
+  // The start path may be a regular file (the just-written key file in the
+  // post-write check): a file cannot hold a `.git` marker, so step to its
+  // parent BEFORE probing, so the probe below never runs under a
+  // non-directory and can never see `ENOTDIR`. The resolved path comes from
+  // `realpath`, so only this final component can be a non-directory; every
+  // ancestor is a real directory. An error statting the start path other
+  // than `ENOENT` leaves the location unknown.
+  try {
+    const startStat = await deps.lstat(current);
+    if (!startStat.isDirectory()) {
+      const startParent = join(current, '..');
+      if (startParent === current) {
+        return 'no';
+      }
+      current = startParent;
+    }
+  } catch (error) {
+    if (!isErrno(error, 'ENOENT')) {
+      return 'unknown';
+    }
+  }
   for (let hops = 0; hops < 128; hops += 1) {
     try {
       await deps.lstat(join(current, '.git'));
       return 'yes';
     } catch (error) {
-      // ENOENT: no `.git` entry here. ENOTDIR: an ancestor of the probed
-      // path is a regular file (the start path is the just-written key file
-      // in the post-write check), so no `.git` marker can exist there
-      // either. Both prove the absence of a marker at this level; any other
-      // error is an unknown state.
-      if (!isErrno(error, 'ENOENT') && !isErrno(error, 'ENOTDIR')) {
+      // ENOENT: no `.git` entry here. ONLY `ENOENT` may continue the walk:
+      // it proves the marker's absence at this level. ENOTDIR (an ancestor
+      // of the probed path is a regular file) and every other error leave
+      // the marker status of this level unknown.
+      if (!isErrno(error, 'ENOENT')) {
         return 'unknown';
       }
     }

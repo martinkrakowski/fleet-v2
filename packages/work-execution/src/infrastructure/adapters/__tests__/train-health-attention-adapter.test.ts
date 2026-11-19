@@ -1050,6 +1050,40 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await polluted.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
   });
 
+  it('refuses a hole hidden by a planted extra key and an accessor-backed index even when the key count matches the length', async () => {
+    const query = listQuery();
+
+    // Deleting the sole index and adding an extra own key keeps
+    // `Object.keys(...).length === length`, so a key-count check alone would
+    // pass the malformed list through. The per-index check must refuse it.
+    const hiddenHole: string[] = ['full'];
+    delete hiddenHole[0];
+    (hiddenHole as unknown as { extra: number }).extra = 1;
+    expect(Object.keys(hiddenHole).length).toBe(1);
+    expect(hiddenHole.length).toBe(1);
+    const holedAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: hiddenHole }),
+    });
+    expect(await holedAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+
+    // An index backed by an accessor is not an own data property: refused
+    // before any element is read, never silently skipped.
+    let getterRuns = 0;
+    const accessorIndex: unknown[] = ['full'];
+    Object.defineProperty(accessorIndex, '0', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return projectEntry('tick-stale');
+      },
+    });
+    const accessorAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: accessorIndex }),
+    });
+    expect(await accessorAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+    expect(getterRuns).toBe(0);
+  });
+
   it('refuses class-instance and custom-prototype commands, queries and delegate answers', async () => {
     class HostileCommand {
       projectId = PROJECT;

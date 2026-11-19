@@ -521,11 +521,15 @@ function openItemOf(entry: unknown, projectId: string, repository: Repository): 
  * a non-array, a subclassed or custom-prototype array, an array with an
  * accessor `length`, an oversized array, a sparse array (a hole) or an array
  * carrying an extra own enumerable property such as a getter planted beside
- * the indices. `Object.keys` lists own enumerable string keys without
- * reading any value, so comparing its count to the descriptor `length`
- * refuses a hole or a planted extra key before a single element is read.
- * The length is read from its own data descriptor, so no iterator, getter or
- * `length` property read ever runs.
+ * the indices, an accessor-backed index or a missing index whose slot is
+ * replaced by an extra key. `Object.keys` lists own enumerable string keys
+ * without reading any value, so comparing its count to the descriptor
+ * `length` refuses an extra key before a single element is read; each index
+ * `0..length-1` is then required to be its own enumerable data property, so a
+ * hole is refused even when a planted extra key keeps the counts equal.
+ * The length and every index are read from own descriptors, so no iterator,
+ * getter, `length` property read or accessor ever runs. The cost is linear
+ * in the capped input (`LIST_ITEM_CAP`).
  */
 function boundedEntryList(value: unknown): readonly unknown[] | null {
   // `Array.isArray` follows a Proxy without running a trap.
@@ -542,8 +546,24 @@ function boundedEntryList(value: unknown): readonly unknown[] | null {
   ) {
     return null;
   }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
+  const entryCount = lengthDescriptor.value;
+  if (Object.keys(value).length !== entryCount) {
     return null;
+  }
+  // Every index must be present as an own enumerable data property: a hole
+  // is a malformed list, not something to skip, even when a planted extra
+  // key keeps the key count equal to `length`.
+  for (let index = 0; index < entryCount; index += 1) {
+    const indexDescriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      indexDescriptor === undefined ||
+      !indexDescriptor.enumerable ||
+      indexDescriptor.get !== undefined ||
+      indexDescriptor.set !== undefined ||
+      !('value' in indexDescriptor)
+    ) {
+      return null;
+    }
   }
   return value as readonly unknown[];
 }

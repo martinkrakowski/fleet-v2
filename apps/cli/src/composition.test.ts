@@ -22,6 +22,13 @@ import {
 } from './composition/work-execution-hosts.js';
 import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './__tests__/signed-decision-fixture.js';
+import { coordinationCommands } from './commands/coordination.js';
 import type {
   AttemptRecord,
   PreparePullRequestFeedbackFixRequest,
@@ -151,6 +158,42 @@ function makeOwnerDecisionRequest(
 }
 
 describe('apps/cli composition', () => {
+  // KEY0c1b: every runtime in this file that seeds an approved owner grant
+  // pins this ephemeral in-process key and reads its signed answers through
+  // the runtime's own decision transport. The KEY0b section below pins its
+  // own keys and is untouched.
+  const ownerKey = ephemeralOwnerKey();
+  const fixtureStateDir = mkdtempSync(path.join(tmpdir(), 'fleet-comp-fixtures-'));
+  afterAll(() => {
+    rmSync(fixtureStateDir, { recursive: true, force: true });
+  });
+
+  /** Pins the ephemeral owner key on a runtime under test. */
+  function pinnedRuntime(
+    options: Omit<Parameters<typeof createFleetCliRuntime>[0], 'ownerPublicKey'> = {},
+  ): ReturnType<typeof createFleetCliRuntime> {
+    return createFleetCliRuntime({ ...options, ownerPublicKey: ownerKey.ownerPublicKey });
+  }
+
+  /**
+   * Saves one coordination request and, for an `approved` owner grant, writes
+   * its correctly signed answer under the pinned ephemeral key, then reads it
+   * back through the runtime's own decision transport.
+   */
+  async function seedRequest(
+    rt: ReturnType<typeof createFleetCliRuntime>,
+    record: CoordinationRequestRecord,
+    stateDir: string = fixtureStateDir,
+  ): Promise<void> {
+    await rt.coordination.coordinationRequestRepository.saveRequest(record);
+    if (record.state !== 'approved' || record.policyGrant || record.shadowImportGrant) {
+      return;
+    }
+    const fields = approvedAnswerFields(record);
+    writeSignedAnswer(stateDir, fields, ownerKey);
+    await expectApprovedAnswerReadableThrough(rt.coordination.decisionTransport, fields);
+  }
+
   describe('M6: shared coordination key formats', () => {
     it('produces the standard forgeActionScope, consumptionId, and observationEventKind', () => {
       expect(forgeActionScope('push-and-open-pr')).toBe('forge:push-and-open-pr');
@@ -162,7 +205,7 @@ describe('apps/cli composition', () => {
 
   describe('WB5b: the merge path saves a merge record', () => {
     it('the composed forge use case is wired with the merge-record and lane-plan stores', () => {
-      const rt = createFleetCliRuntime();
+      const rt = pinnedRuntime({ stateDir: fixtureStateDir });
       const forgeDeps = (rt.execution.executeAuthorizedForgeAction as unknown as {
         deps?: { mergeRecordRepo?: unknown; lanePlanRepo?: unknown };
       }).deps;
@@ -173,7 +216,7 @@ describe('apps/cli composition', () => {
 
   describe('H7: end-to-end grant action scope check at consumption', () => {
     it('a grant for push-and-open-pr at head H cannot be consumed for merge-pr at H', async () => {
-      const rt = createFleetCliRuntime();
+      const rt = pinnedRuntime({ stateDir: fixtureStateDir });
       const headH = makeHeadH();
       const workOrderId = 'wo-e2e-1';
       const attemptId = 'att-e2e-1';
@@ -187,7 +230,7 @@ describe('apps/cli composition', () => {
 
       // Save an approved grant for push-and-open-pr at head H
       const pushGrant = makeApprovedGrant(grantId, forgeActionScope('push-and-open-pr'), headH);
-      await rt.coordination.coordinationRequestRepository.saveRequest(pushGrant);
+      await seedRequest(rt, pushGrant);
 
       // Register acceptance assessment and receipt for head H so merge-pr preconditions pass
       await rt.evidence.evidenceAssessmentRepository.saveAssessment({
@@ -277,7 +320,7 @@ baseRef: 'main',
 
   describe('M12: acceptance evidence verification before merge-pr in composition root', () => {
     it('stale assessment with a receipt in the map -> merge refused', async () => {
-      const rt = createFleetCliRuntime();
+      const rt = pinnedRuntime({ stateDir: fixtureStateDir });
       const headH = makeHeadH();
       const workOrderId = 'wo-m12-stale';
       const attemptId = 'att-m12-stale';
@@ -289,7 +332,7 @@ baseRef: 'main',
       );
 
       const mergeGrant = makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH);
-      await rt.coordination.coordinationRequestRepository.saveRequest(mergeGrant);
+      await seedRequest(rt, mergeGrant);
 
       // Save a stale assessment in evidence repository
       await rt.evidence.evidenceAssessmentRepository.saveAssessment({
@@ -335,7 +378,7 @@ baseRef: 'main',
     });
 
     it('policy moved -> merge refused', async () => {
-      const rt = createFleetCliRuntime();
+      const rt = pinnedRuntime({ stateDir: fixtureStateDir });
       const headH = makeHeadH();
       const workOrderId = 'wo-m12-pol';
       const attemptId = 'att-m12-pol';
@@ -349,7 +392,7 @@ baseRef: 'main',
       );
 
       const mergeGrant = makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH);
-      await rt.coordination.coordinationRequestRepository.saveRequest(mergeGrant);
+      await seedRequest(rt, mergeGrant);
 
       // Assessment was accepted under old policy 'pol-1'
       await rt.evidence.evidenceAssessmentRepository.saveAssessment({
@@ -399,7 +442,7 @@ baseRef: 'main',
         state?: 'pending' | 'accepted';
       } = {},
     ) {
-      const rt = createFleetCliRuntime();
+      const rt = pinnedRuntime({ stateDir: fixtureStateDir });
       const assessmentId = assessmentIdForAttempt(attemptId);
       const workOrderId = `wo-${attemptId}`;
       await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(workOrderId, HEAD));
@@ -407,7 +450,7 @@ baseRef: 'main',
         makeAttempt(attemptId, workOrderId, HEAD, options.doors === null ? undefined : (options.doors ?? [])),
       );
       if (options.decision !== undefined) {
-        await rt.coordination.coordinationRequestRepository.saveRequest(options.decision);
+        await seedRequest(rt, options.decision);
       }
       await rt.evidence.evidenceAssessmentRepository.saveAssessment({
         id: assessmentId,
@@ -602,9 +645,7 @@ baseRef: 'main',
       revision: nextAttemptRevision(storedAttempt!),
     });
     const grantId = 'grant-door-e2e';
-    await rt.coordination.coordinationRequestRepository.saveRequest(
-      makeApprovedGrant(grantId, forgeActionScope('merge-pr'), HEAD),
-    );
+    await seedRequest(rt, makeApprovedGrant(grantId, forgeActionScope('merge-pr'), HEAD));
 
     // The owner decision is withdrawn while the attempt keeps its door.
     await rt.coordination.coordinationRequestRepository.saveRequest(
@@ -1064,8 +1105,11 @@ baseRef: 'main',
 
     it('pushes the fixed head through ExecuteAuthorizedForgeActionUseCase, consumes the push-to-pr grant, journals completion, and returns already-pushed on replay', async () => {
       const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-comp-co24-push-'));
       const rt = createFleetCliRuntime({
+        stateDir,
         installation: co24Installation,
+        ownerPublicKey: ownerKey.ownerPublicKey,
         forgeGhRunner: co24GhStub(gh),
         forgeActionDelegate: {
           verifyCurrentHeadSha: async () => {
@@ -1084,11 +1128,11 @@ baseRef: 'main',
         fixNumber: 1,
         priorAttemptId: PRIOR_ATTEMPT_ID,
       });
-      await rt.coordination.coordinationRequestRepository.saveRequest({
+      await seedRequest(rt, {
         ...makeApprovedGrant(GRANT_ID, forgeActionScope('push-to-pr'), FIXED_HEAD),
         grantRecordVersion: 2,
         grantAttemptId: FIX_ATTEMPT_ID,
-      });
+      }, stateDir);
 
       const first = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(pushRequest());
       expect(first).toEqual({ outcome: 'pushed', key: KEY, headSha: FIXED_HEAD });
@@ -1206,8 +1250,11 @@ baseRef: 'main',
 
     it('refuses push with grant-refused and leaves the grant unconsumed when the grant scope or head does not match push-to-pr', async () => {
       const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-comp-co24-refuse-'));
       const rt = createFleetCliRuntime({
+        stateDir,
         installation: co24Installation,
+        ownerPublicKey: ownerKey.ownerPublicKey,
         forgeGhRunner: co24GhStub(gh),
         forgeActionDelegate: {
           verifyCurrentHeadSha: async () => {
@@ -1230,11 +1277,11 @@ baseRef: 'main',
         // A push-to-pr grant scoped to another head.
         { grantId: 'grant-co24-wrong-head', actionScope: forgeActionScope('push-to-pr'), head: HEAD },
       ]) {
-        await rt.coordination.coordinationRequestRepository.saveRequest({
+        await seedRequest(rt, {
           ...makeApprovedGrant(variant.grantId, variant.actionScope, variant.head),
           grantRecordVersion: 2,
           grantAttemptId: FIX_ATTEMPT_ID,
-        });
+        }, stateDir);
         const result = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(
           pushRequest({ grantId: variant.grantId }),
         );
@@ -2491,5 +2538,85 @@ describe('KEY0b: pinned owner public key in the CLI composition root', () => {
       pullRequestNumber: 7,
     });
     expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+});
+
+describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
+  it('a forged signature byte keeps the owner grant awaiting-decision; the valid answer authorizes', async () => {
+    const HEAD = makeHeadH();
+    const key = ephemeralOwnerKey();
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-comp-tamper-'));
+    try {
+      const rt = createFleetCliRuntime({ stateDir, ownerPublicKey: key.ownerPublicKey, env: {} });
+
+      // Request an owner-gated forge grant through the real runtime.
+      const requested = await coordinationCommands['request-decision'](
+        {
+          requestId: 'req-tamper',
+          projectId: 'proj-cli-test',
+          kind: 'action-decision',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          proposalDigest: 'prop-tamper',
+          policyRevision: 'pol-1',
+          attemptId: 'att-tamper',
+        },
+        rt,
+      );
+      expect(requested).toMatchObject({ outcome: 'requested' });
+      const record = await rt.coordination.coordinationRequestRepository.findRequestById('req-tamper');
+      if (record === null) throw new Error('expected the requested decision to be recorded');
+      expect(record).toMatchObject({ state: 'awaiting-decision', grantId: null, decisionRevision: null });
+
+      // The owner's correctly signed answer, read back through the runtime's own transport.
+      const fields = {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-tamper',
+        grantId: 'grant-tamper',
+        state: 'approved' as const,
+      };
+      writeSignedAnswer(stateDir, fields, key);
+      await expectApprovedAnswerReadableThrough(rt.coordination.decisionTransport, fields);
+
+      // Corrupt exactly one byte of the signature on disk.
+      const answerPath = path.join(stateDir, 'decisions', `${fields.requestId}.json`);
+      const answer = JSON.parse(await fs.readFile(answerPath, 'utf8')) as { signature: string };
+      answer.signature = (answer.signature[0] === 'A' ? 'B' : 'A') + answer.signature.slice(1);
+      await fs.writeFile(answerPath, `${JSON.stringify(answer, null, 2)}\n`);
+      const tamperedRead = await rt.coordination.decisionTransport.readDecisionAnswer({
+        requestId: fields.requestId,
+        projectId: fields.projectId,
+        actionScope: fields.actionScope,
+        expectedHeadSha: fields.expectedHeadSha,
+      });
+      expect(tamperedRead.state).toBe('awaiting-decision');
+
+      // Resolving while the tampered answer is present: a typed block, never authorized.
+      const resolveRequest = {
+        projectId: 'proj-cli-test',
+        actionScope: forgeActionScope('push-and-open-pr'),
+        expectedHeadSha: HEAD,
+        attemptId: 'att-tamper',
+      };
+      const tampered = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(tampered).toEqual({
+        outcome: 'blocked',
+        reason: 'recorded request req-tamper is awaiting-decision, which does not authorize an action',
+      });
+      expect(await rt.coordination.coordinationRequestRepository.findRequestById('req-tamper')).toMatchObject({
+        state: 'awaiting-decision',
+        grantId: null,
+      });
+
+      // The untouched valid answer authorizes the same grant.
+      writeSignedAnswer(stateDir, fields, key);
+      const restored = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(restored).toMatchObject({ outcome: 'authorized', grantId: fields.grantId });
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });

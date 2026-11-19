@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, afterAll } from 'vitest';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import {
   configureFleetApiRuntime,
@@ -18,6 +18,60 @@ import {
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
+
+// KEY0c1b: every runtime in this file that seeds an approved owner grant
+// pins this ephemeral in-process key and reads its signed answers through
+// the runtime's own decision transport. The KEY0b section below pins its
+// own keys and is untouched.
+const ownerKey = ephemeralOwnerKey();
+const fixtureStateDir = mkdtempSync(join(tmpdir(), 'fleet-api-fixtures-'));
+
+/** The runtime configuration that pins the ephemeral owner key. */
+function pinnedRuntimeConfig(stateDir: string = fixtureStateDir) {
+  return {
+    stateDir,
+    installation: { owner: { publicKey: ownerKey.ownerPublicKey } } as never,
+  };
+}
+
+/** The decision transport in the deps of the operator composition's resolve use case. */
+function decisionTransportOf(operator: ReturnType<typeof getOperatorComposition>) {
+  const transport = (
+    operator.resolveActionAuthorization as unknown as {
+      deps?: { decisionTransport?: { readDecisionAnswer(query: {
+        requestId: string;
+        projectId: string;
+        actionScope: string;
+        expectedHeadSha: string | null;
+      }): Promise<{ state: string; grantId: string | null; decisionRevision: string | null }> } };
+    }
+  ).deps?.decisionTransport;
+  if (!transport) {
+    throw new Error('signed-decision-fixture self-check: the operator composition carries no decisionTransport');
+  }
+  return transport;
+}
+
+/** Saves one coordination request and, for an `approved` owner grant, writes its correctly signed answer. */
+async function seedApproved(
+  reqRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> },
+  record: CoordinationRequestRecord,
+  stateDir: string = fixtureStateDir,
+): Promise<void> {
+  await reqRepo.saveRequest(record);
+  if (record.state !== 'approved') {
+    return;
+  }
+  const fields = approvedAnswerFields(record);
+  writeSignedAnswer(stateDir, fields, ownerKey);
+  await expectApprovedAnswerReadableThrough(decisionTransportOf(getOperatorComposition()), fields);
+}
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './__tests__/signed-decision-fixture.js';
 
 function makeHeadH(): string {
   return '2222222222222222222222222222222222222222';
@@ -100,6 +154,11 @@ function makeApprovedGrant(
 }
 
 describe('apps/api runtime wiring', () => {
+  afterAll(() => {
+    rmSync(fixtureStateDir, { recursive: true, force: true });
+    configureFleetApiRuntime(null);
+  });
+
   describe('M6: shared coordination keys', () => {
     it('produces identical coordination keys to CLI root for the same inputs', () => {
       // Both roots import the pure functions from @fleet/work-execution.
@@ -114,7 +173,7 @@ describe('apps/api runtime wiring', () => {
 
   describe('M10: unconfigured forge delegate leaves grant unconsumed', () => {
     it('API-style composition with no forge delegate refuses with unavailable WITHOUT consuming the grant', async () => {
-      configureFleetApiRuntime();
+      configureFleetApiRuntime(pinnedRuntimeConfig());
 
       const work = workComposition();
       const operator = getOperatorComposition();
@@ -152,7 +211,7 @@ describe('apps/api runtime wiring', () => {
         };
       }).deps?.requestRepo;
       expect(reqRepo).toBeDefined();
-      await reqRepo!.saveRequest(grantRecord);
+      await seedApproved(reqRepo!, grantRecord);
 
       // Try to execute forge action through work composition
       const result = await work.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
@@ -197,7 +256,7 @@ describe('apps/api runtime wiring', () => {
         );
 
         // Build a fresh API runtime on the same stateDir
-        configureFleetApiRuntime({ stateDir });
+        configureFleetApiRuntime(pinnedRuntimeConfig(stateDir));
 
         const operator = getOperatorComposition();
         const work = workComposition();
@@ -217,7 +276,7 @@ describe('apps/api runtime wiring', () => {
           };
         }).deps?.requestRepo;
         expect(reqRepo).toBeDefined();
-        await reqRepo!.saveRequest(grantRecord);
+        await seedApproved(reqRepo!, grantRecord, stateDir);
 
         // Access authorization delegate/port from work composition
         const authPort = (work.executeAuthorizedForgeAction as unknown as {
@@ -296,7 +355,7 @@ describe('apps/api runtime wiring', () => {
       doors: readonly string[] | null,
       decision?: CoordinationRequestRecord,
     ) {
-      configureFleetApiRuntime();
+      configureFleetApiRuntime(pinnedRuntimeConfig());
       const work = workComposition();
       const operator = getOperatorComposition();
       const evidence = getEvidenceUseCases();
@@ -316,7 +375,7 @@ describe('apps/api runtime wiring', () => {
         deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
       }).deps?.requestRepo;
       if (decision && reqRepo) {
-        await reqRepo.saveRequest(decision);
+        await seedApproved(reqRepo, decision);
       }
       const assessmentRepo = (evidence.assessHeadAcceptance as unknown as {
         deps?: {
@@ -420,7 +479,7 @@ describe('apps/api runtime wiring', () => {
     });
 
     it('withdrawn door: attempt accept is blocked and merge-pr refuses without consuming the grant', async () => {
-      configureFleetApiRuntime();
+      configureFleetApiRuntime(pinnedRuntimeConfig());
       const work = workComposition();
       const operator = getOperatorComposition();
       const evidence = getEvidenceUseCases();
@@ -451,8 +510,8 @@ describe('apps/api runtime wiring', () => {
         deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
       }).deps?.requestRepo;
       if (reqRepo) {
-        await reqRepo.saveRequest(ownerDecision(doorRef, {}));
-        await reqRepo.saveRequest(makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH));
+        await seedApproved(reqRepo, ownerDecision(doorRef, {}));
+        await seedApproved(reqRepo, makeApprovedGrant(grantId, forgeActionScope('merge-pr'), headH));
       }
       const assessmentRepo = (evidence.assessHeadAcceptance as unknown as {
         deps?: { repo: { saveAssessment: (a: EvidenceAssessmentRecord) => Promise<void> } };
@@ -548,7 +607,7 @@ describe('CO24d: the API composition binds a grant to its resolved attempt', () 
       ),
       'utf8',
     );
-    configureFleetApiRuntime({ stateDir });
+    configureFleetApiRuntime(pinnedRuntimeConfig(stateDir));
     const operator = getOperatorComposition();
     const work = workComposition();
     const reqRepo = (operator.recordAuthorizationConsumption as unknown as {
@@ -560,7 +619,7 @@ describe('CO24d: the API composition binds a grant to its resolved attempt', () 
       };
     }).deps.requestRepo;
     for (const id of grantIds) {
-      await reqRepo.saveRequest(makeApprovedGrant(id, forgeActionScope('push-and-open-pr'), headH));
+      await seedApproved(reqRepo, makeApprovedGrant(id, forgeActionScope('push-and-open-pr'), headH), stateDir);
     }
     const authPort = (work.executeAuthorizedForgeAction as unknown as { deps: { authorizationPort: AuthPort } })
       .deps.authorizationPort;
@@ -970,6 +1029,86 @@ describe('KEY0b: pinned owner public key in the API composition root', () => {
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
       configureFleetApiRuntime(null);
+    }
+  });
+});
+
+describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
+  it('a forged signature byte keeps the owner grant awaiting-decision; the valid answer authorizes', async () => {
+    const HEAD = makeHeadH();
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-tamper-'));
+    try {
+      configureFleetApiRuntime({ ...pinnedRuntimeConfig(stateDir), env: {} });
+      const operator = getOperatorComposition();
+      try {
+        // Request an owner-gated forge grant through the runtime's own use case.
+        const requested = await operator.requestScopedDecision.requestScopedDecision({
+          requestId: 'req-api-tamper',
+          projectId: 'proj-api-test',
+          kind: 'action-decision',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          proposalDigest: 'prop-api-tamper',
+          policyRevision: 'pol-1',
+          attemptId: 'att-api-tamper',
+        });
+        expect(requested).toMatchObject({ outcome: 'requested' });
+        const record = await operator.coordinationRequestRepository.findRequestById('req-api-tamper');
+        if (record === null) throw new Error('expected the requested decision to be recorded');
+        expect(record).toMatchObject({ state: 'awaiting-decision', grantId: null, decisionRevision: null });
+
+        // The owner's correctly signed answer, read back through the runtime's own transport.
+        const fields = {
+          requestId: record.id,
+          projectId: record.projectId,
+          actionScope: record.actionScope,
+          expectedHeadSha: record.expectedHeadSha,
+          decisionRevision: 'dec-tamper',
+          grantId: 'grant-api-tamper',
+          state: 'approved' as const,
+        };
+        writeSignedAnswer(stateDir, fields, ownerKey);
+        await expectApprovedAnswerReadableThrough(decisionTransportOf(operator), fields);
+
+        // Corrupt exactly one byte of the signature on disk.
+        const answerPath = join(stateDir, 'decisions', `${fields.requestId}.json`);
+        const answer = JSON.parse(readFileSync(answerPath, 'utf8')) as { signature: string };
+        answer.signature = (answer.signature[0] === 'A' ? 'B' : 'A') + answer.signature.slice(1);
+        writeFileSync(answerPath, `${JSON.stringify(answer, null, 2)}\n`);
+        const tamperedRead = await decisionTransportOf(operator).readDecisionAnswer({
+          requestId: fields.requestId,
+          projectId: fields.projectId,
+          actionScope: fields.actionScope,
+          expectedHeadSha: fields.expectedHeadSha,
+        });
+        expect(tamperedRead.state).toBe('awaiting-decision');
+
+        // Resolving while the tampered answer is present: a typed block, never authorized.
+        const resolveRequest = {
+          projectId: 'proj-api-test',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          attemptId: 'att-api-tamper',
+        };
+        const tampered = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+        expect(tampered).toEqual({
+          outcome: 'blocked',
+          reason: 'recorded request req-api-tamper is awaiting-decision, which does not authorize an action',
+        });
+        expect(await operator.coordinationRequestRepository.findRequestById('req-api-tamper')).toMatchObject({
+          state: 'awaiting-decision',
+          grantId: null,
+        });
+
+        // The untouched valid answer authorizes the same grant.
+        writeSignedAnswer(stateDir, fields, ownerKey);
+        const restored = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+        expect(restored).toMatchObject({ outcome: 'authorized', grantId: fields.grantId });
+      } finally {
+        configureFleetApiRuntime(null);
+      }
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

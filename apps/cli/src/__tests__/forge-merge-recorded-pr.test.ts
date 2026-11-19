@@ -6,12 +6,21 @@
 // the one `gh pr merge` receives.
 
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
 
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { FleetInstallation } from '@fleet/installation';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
 
 import { assessmentIdForAttempt, createFleetCliRuntime, forgeActionScope } from '../composition.js';
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './signed-decision-fixture.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const BRANCH = 'feat/lane-cli-test';
@@ -58,9 +67,15 @@ function prView(number: number, headRefName: string): string {
 }
 
 async function seed(options: { readNumberBranch: string }) {
+  // KEY0c1b: the runtime pins an ephemeral in-process owner key and the
+  // seeded approved owner grant carries its correctly signed answer on disk.
+  const ownerKey = ephemeralOwnerKey();
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-wb5b2-'));
   const reads: string[][] = [];
   const merges: string[][] = [];
   const rt = createFleetCliRuntime({
+    stateDir,
+    ownerPublicKey: ownerKey.ownerPublicKey,
     installation: installation(),
     forgeGhRunner: async (args) => {
       reads.push([...args]);
@@ -137,6 +152,12 @@ async function seed(options: { readNumberBranch: string }) {
     updatedAtIso: '2026-10-15T10:00:00Z',
   };
   await rt.coordination.coordinationRequestRepository.saveRequest(grant);
+  // KEY0c1b: the approved owner grant carries its correctly signed answer
+  // under the pinned ephemeral key, read back through the runtime's own
+  // decision transport.
+  const fields = approvedAnswerFields(grant);
+  writeSignedAnswer(stateDir, fields, ownerKey);
+  await expectApprovedAnswerReadableThrough(rt.coordination.decisionTransport, fields);
   await rt.evidence.evidenceAssessmentRepository.saveAssessment({
     id: assessmentIdForAttempt(attempt.id),
     projectId: 'proj-cli-test',

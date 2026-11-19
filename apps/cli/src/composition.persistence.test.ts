@@ -7,6 +7,12 @@ import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord } from '@fleet/work-execution';
 import { assessmentIdForAttempt, createFleetCliRuntime } from './composition.js';
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './__tests__/signed-decision-fixture.js';
 
 /**
  * A collected attempt whose frozen brief named no one-way doors, so acceptance
@@ -41,6 +47,8 @@ function collectedAttempt(attemptId: string, headSha: string): AttemptRecord {
 
 describe('Fleet CLI composition root cross-process safe persistence', () => {
   let tempDir: string;
+  // KEY0c1b: the ephemeral owner key every runtime in this file pins and signs against.
+  const ownerKey = ephemeralOwnerKey();
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-composition-test-'));
@@ -159,7 +167,7 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
     expect(receipts['head-sha-b']).toBeDefined();
 
     // A fresh third runtime sees both receipts on disk
-    const runtimeC = createFleetCliRuntime({ stateDir: tempDir });
+    const runtimeC = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
     const freshRaw = await fs.readFile(receiptsPath, 'utf8');
     const freshReceipts = JSON.parse(freshRaw) as Record<string, string>;
     expect(freshReceipts['head-sha-a']).toBe(receipts['head-sha-a']);
@@ -168,8 +176,8 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
   });
 
   it('preserves authorization coordinates across multiple runtime instances on the same stateDir', async () => {
-    const runtimeA = createFleetCliRuntime({ stateDir: tempDir });
-    const runtimeB = createFleetCliRuntime({ stateDir: tempDir });
+    const runtimeA = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
+    const runtimeB = createFleetCliRuntime({ stateDir: tempDir, ownerPublicKey: ownerKey.ownerPublicKey });
 
     const reqA: CoordinationRequestRecord = {
       id: 'req-a',
@@ -217,6 +225,15 @@ describe('Fleet CLI composition root cross-process safe persistence', () => {
 
     await runtimeA.coordination.coordinationRequestRepository.saveRequest(reqA);
     await runtimeB.coordination.coordinationRequestRepository.saveRequest(reqB);
+
+    // KEY0c1b: each seeded approved owner grant carries its correctly signed
+    // answer under the pinned ephemeral key, read back through the runtime's
+    // own transport.
+    for (const record of [reqA, reqB]) {
+      const fields = approvedAnswerFields(record);
+      writeSignedAnswer(tempDir, fields, ownerKey);
+      await expectApprovedAnswerReadableThrough(runtimeA.coordination.decisionTransport, fields);
+    }
 
     // Concurrently resolve grants across two runtime instances
     const [grantA, grantB] = await Promise.all([

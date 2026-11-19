@@ -6,12 +6,19 @@ import * as path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { SHADOW_IMPORT_DIGEST_PREFIX, shadowImportDigestPayload } from '@fleet/operator-coordination';
+import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import { sha256HexDigest } from '@fleet/work-execution';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import { parseMergeImportFlags } from '../merge.js';
 import { CliUsageError } from '../commands/payload.js';
+import {
+  approvedAnswerFields,
+  ephemeralOwnerKey,
+  expectApprovedAnswerReadableThrough,
+  writeSignedAnswer,
+} from './signed-decision-fixture.js';
 
 const HEAD_A = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
@@ -506,7 +513,10 @@ describe('merge import (GR1b)', () => {
   it('a real grant-backed apply journals into shadow-intake-journal.json, never cutover-journal.json', async () => {
     const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-import-'));
     tempStateDirs.push(stateDir);
-    const runtime = createFleetCliRuntime({ stateDir });
+    // KEY0c1b: the runtime pins the ephemeral owner key and the approved
+    // grant carries its correctly signed answer in the same stateDir.
+    const ownerKey = ephemeralOwnerKey();
+    const runtime = createFleetCliRuntime({ stateDir, ownerPublicKey: ownerKey.ownerPublicKey });
     const legacyStateDir = path.join(stateDir, 'legacy');
     await fs.mkdir(legacyStateDir, { recursive: true });
     await fs.writeFile(path.join(legacyStateDir, 'queue'), `42 ${HEAD_A} main\n`, 'utf8');
@@ -521,7 +531,7 @@ describe('merge import (GR1b)', () => {
       throw new Error('fixture grant coordinates must be valid');
     }
     const requestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${sha256HexDigest(payload.value)}`;
-    await runtime.coordination.coordinationRequestRepository.saveRequest({
+    const shadowRecord: CoordinationRequestRecord = {
       id: requestId,
       projectId: 'project-1',
       kind: 'action-decision',
@@ -540,7 +550,14 @@ describe('merge import (GR1b)', () => {
       createdAtIso: new Date().toISOString(),
       updatedAtIso: new Date().toISOString(),
       shadowImportGrant,
-    });
+    };
+    await runtime.coordination.coordinationRequestRepository.saveRequest(shadowRecord);
+    // KEY0c1b: the approved standing grant carries its correctly signed
+    // answer under the pinned ephemeral key, read back through the runtime's
+    // own decision transport.
+    const fields = approvedAnswerFields(shadowRecord);
+    writeSignedAnswer(stateDir, fields, ownerKey);
+    await expectApprovedAnswerReadableThrough(runtime.coordination.decisionTransport, fields);
 
     const result = await cli(runtime, [
       'merge',

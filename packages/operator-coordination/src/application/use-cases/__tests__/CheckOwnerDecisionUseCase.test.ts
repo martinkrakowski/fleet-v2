@@ -10,6 +10,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { CoordinationRequestRecord } from '../../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type {
+  DecisionAnswer,
+  DecisionTransportPort,
+} from '../../ports/out/DecisionTransportPort.out-port.js';
+import { DecisionTransportAdapter } from '../../../infrastructure/adapters/DecisionTransportAdapter.adapter.js';
 import {
   CheckOwnerDecisionUseCase,
   ownerDecisionActionScope,
@@ -213,5 +218,162 @@ describe('CheckOwnerDecisionUseCase', () => {
     await expect(
       useCase.checkOwnerDecision({ requestId: 'door-1', candidateHeadSha: '' }),
     ).rejects.toThrow('Not implemented: CheckOwnerDecisionUseCase');
+  });
+});
+describe('CheckOwnerDecisionUseCase signed re-verification (KEY0c2)', () => {
+  const REQUEST = { requestId: 'door-1', candidateHeadSha: HEAD };
+
+  function repositoryWith(...records: CoordinationRequestRecord[]): StubRequestRepository {
+    return new StubRequestRepository(records);
+  }
+
+  function transportWith(
+    ownerPublicKey: string,
+    answers: Record<string, DecisionAnswer>,
+    ownerKeyRefusal?: 'owner-key-unpinned' | 'owner-key-env-mismatch',
+  ): DecisionTransportPort {
+    return new DecisionTransportAdapter({
+      ownerPublicKey,
+      answers,
+      ...(ownerKeyRefusal === undefined ? {} : { ownerKeyRefusal }),
+    });
+  }
+
+  it('approves owner decision with valid signed answer', async () => {
+    const signer = createSignedDecisionFixture();
+    const record = requestRecord();
+    await signer.writeApprovedAnswer(record);
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(record),
+      decisionTransport: signer.deps.decisionTransport,
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({ outcome: 'approved', requestId: 'door-1', grantId: 'grant-9' });
+  });
+
+  it('refuses hand-written approved record with no answer file', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'decision-signature-invalid',
+    });
+  });
+
+  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({ outcome: 'approved', requestId: 'door-1', grantId: 'grant-9' });
+  });
+
+  it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {
+    const signer = createSignedDecisionFixture();
+    const answer = signer.signApprovedAnswer(requestRecord());
+    for (const refusal of ['owner-key-unpinned', 'owner-key-env-mismatch'] as const) {
+      const result = await new CheckOwnerDecisionUseCase({
+        requestRepo: repositoryWith(requestRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, { 'door-1': answer }, refusal),
+      }).checkOwnerDecision(REQUEST);
+      expect(result).toEqual({ outcome: 'not-approved', requestId: 'door-1', reason: refusal });
+    }
+  });
+
+  it('refuses approved record when answer is signed by a different key', async () => {
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'door-1': other.signApprovedAnswer(requestRecord()),
+      }),
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'decision-signature-invalid',
+    });
+  });
+
+  it('refuses approved record when answer is for a different request', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'door-1': signer.signApprovedAnswer(requestRecord({ id: 'door-2' })),
+      }),
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'decision-signature-invalid',
+    });
+  });
+
+  it('refuses when answer grantId or decisionRevision mismatches stored record', async () => {
+    const signer = createSignedDecisionFixture();
+    for (const mismatched of [
+      requestRecord({ grantId: 'grant-8' }),
+      requestRecord({ decisionRevision: 'decision-4' }),
+    ]) {
+      const result = await new CheckOwnerDecisionUseCase({
+        requestRepo: repositoryWith(requestRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, {
+          'door-1': signer.signApprovedAnswer(mismatched),
+        }),
+      }).checkOwnerDecision(REQUEST);
+      expect(result).toEqual({
+        outcome: 'not-approved',
+        requestId: 'door-1',
+        reason: 'decision-signature-invalid',
+      });
+    }
+  });
+
+  it('refuses when decisionTransport reports awaiting-decision or declined', async () => {
+    for (const answer of [
+      { state: 'awaiting-decision' as const, decisionRevision: null, grantId: null },
+      { state: 'declined' as const, decisionRevision: 'decision-3', grantId: 'grant-9' },
+    ]) {
+      const result = await new CheckOwnerDecisionUseCase({
+        requestRepo: repositoryWith(requestRecord()),
+        decisionTransport: {
+          async readDecisionAnswer() {
+            return answer;
+          },
+        },
+      }).checkOwnerDecision(REQUEST);
+      expect(result).toEqual({
+        outcome: 'not-approved',
+        requestId: 'door-1',
+        reason: 'decision-signature-invalid',
+      });
+    }
+  });
+
+  it('refuses an approved answer carrying owner-key-unpinned despite matching binding', async () => {
+    const result = await new CheckOwnerDecisionUseCase({
+      requestRepo: repositoryWith(requestRecord()),
+      decisionTransport: {
+        async readDecisionAnswer() {
+          return {
+            state: 'approved' as const,
+            decisionRevision: 'decision-3',
+            grantId: 'grant-9',
+            requestId: 'door-1',
+            actionScope: ownerDecisionActionScope('door-1'),
+            refusalReason: 'owner-key-unpinned' as const,
+          };
+        },
+      },
+    }).checkOwnerDecision(REQUEST);
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'owner-key-unpinned',
+    });
   });
 });

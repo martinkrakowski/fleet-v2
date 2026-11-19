@@ -1649,7 +1649,68 @@ describe('ResolveActionAuthorizationUseCase', () => {
       decisionTransport: transport,
     }).execute(request);
     expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
-    expect(transport.reads).toEqual(['request-1']);
+    // KEY0c2: the resolve re-reads the signed answer once more for the
+    // refreshed approved record (a second `readDecisionAnswer` call), so the
+    // transport is consulted twice for the same request in one execute.
+    expect(transport.reads).toEqual(['request-1', 'request-1']);
+    expect(repo.saves).toHaveLength(1);
+    expect(repo.saves[0]?.state).toBe('approved');
+  });
+
+  it('stores nothing when the refreshed answer carries a refusalReason, then re-verifies afresh', async () => {
+    // KEY0c2 fix round: an approved answer carrying `owner-key-unpinned` must
+    // refuse the resolve AND persist nothing — the record stays awaiting so a
+    // later read without the refusal verifies afresh.
+    class QueuedDecisionTransport implements DecisionTransportPort {
+      readonly reads: string[] = [];
+      constructor(answers: readonly DecisionAnswer[]) {
+        this.queue = [...answers];
+      }
+      private readonly queue: DecisionAnswer[];
+      async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
+        this.reads.push(query.requestId);
+        return this.queue.shift() ?? {
+          state: 'awaiting-decision' as const,
+          decisionRevision: null,
+          grantId: null,
+        };
+      }
+    }
+
+    const record = requestRecord({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantRecordVersion: 2,
+      grantAttemptId: 'attempt-1',
+    });
+    const repo = new StubRequestRepository([record]);
+    const transport = new QueuedDecisionTransport([
+      {
+        state: 'approved',
+        decisionRevision: 'decision-3',
+        grantId: 'grant-9',
+        refusalReason: 'owner-key-unpinned',
+      },
+      { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+      { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },
+    ]);
+    const useCase = new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      decisionTransport: transport,
+    });
+
+    const first = await useCase.execute(request);
+    expect(first.outcome === 'blocked' && first.reason).toBe('owner-key-unpinned');
+    expect(repo.saves).toHaveLength(0);
+    const stored = await repo.findRequestById('request-1');
+    expect(stored).not.toBeNull();
+    expect(stored?.state).toBe('awaiting-decision');
+    expect(stored?.decisionRevision).toBeNull();
+    expect(stored?.grantId).toBe('grant-9'); // unchanged from the seeded record
+
+    const second = await useCase.execute(request);
+    expect(second.outcome === 'authorized' && second.grantId).toBe('grant-9');
+    expect(transport.reads).toEqual(['request-1', 'request-1', 'request-1']);
     expect(repo.saves).toHaveLength(1);
     expect(repo.saves[0]?.state).toBe('approved');
   });
@@ -2684,6 +2745,37 @@ describe('DecisionTransportAdapter', () => {
     ).resolves.toEqual({
       state: 'awaiting-decision',
       decisionRevision: null,
+      grantId: null,
+    });
+  });
+
+  it('refuses a validly signed answer whose own requestId is null', async () => {
+    const { publicKeyBase64, privateKey } = testKeyPair();
+    const signature = testSignature(
+      {
+        ...query,
+        decisionRevision: 'decision-3',
+        grantId: 'grant-9',
+        state: 'approved',
+      },
+      privateKey,
+    );
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: {
+        'request-1': {
+          state: 'approved',
+          // Present but not a non-empty string: refused as malformed, never
+          // silently dropped during normalization.
+          requestId: null,
+          decisionRevision: 'decision-3',
+          grantId: 'grant-9',
+          signature,
+        },
+      },
+    } as never);
+    await expect(adapter.readDecisionAnswer(query)).resolves.toMatchObject({
+      state: 'awaiting-decision',
       grantId: null,
     });
   });

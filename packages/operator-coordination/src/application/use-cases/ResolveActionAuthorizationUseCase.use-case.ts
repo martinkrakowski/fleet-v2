@@ -21,11 +21,13 @@ import {
   readReleaseNonce,
   releaseRootsAgree,
   isShadowImportActionScope,
+  isSignedDecisionRequired,
   releaseGrantDigestPayload,
   RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   shadowImportDigestPayload,
+  verifySignedDecisionBinding,
 } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { readPlainObjectLoose } from '../../domain/record-input.js';
@@ -296,10 +298,21 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.getConsumptions().length > 0 && !resumable) {
       return blocked(`grant ${grantId} is already consumed by another action`);
     }
+    // KEY0c2 fix round: the owner-decision signature check runs before
+    // `bindAttempt`, because binding persists the attempt onto the grant —
+    // an invalid approval must never be able to alter the stored record.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
+    if (signatureBlock !== null) {
+      return signatureBlock;
+    }
     const attemptBlock = await this.bindAttempt(candidate, refreshed, request, grantId);
     if (attemptBlock !== null) {
       return attemptBlock;
     }
+    // KEY0c2: every owner-gated approval is re-bound to a verified signed
+    // answer when a decision transport is injected, before anything is
+    // authorized. The check runs after every stored-coordinate refusal, so
+    // origin/main's exact refusal reasons are preserved.
     return {
       outcome: 'authorized',
       grantId,
@@ -308,6 +321,45 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       policyRevision: candidate.getPolicyRevision(),
       ...(recordedRoot.state === 'valid' ? { releaseRoot: recordedRoot.value } : {}),
     };
+  }
+
+  /**
+   * KEY0c2: when a decision transport is injected, an owner-gated record whose
+   * scope is not a closed-kind policy or merge grant is re-read through the
+   * transport and bound to the signed answer on EVERY path — including a
+   * resumable `completed` release record and any other non-approved state
+   * reached through resume — so no stored state can authorize without a
+   * signature. Anything the transport reports as awaiting or declined, an
+   * owner-key refusal, or a mismatching binding blocks; when no transport is
+   * injected the origin/main behaviour is kept exactly. Returns the block, or
+   * null when the record may authorize.
+   */
+  private async verifyOwnerDecisionForRecord(
+    candidate: CoordinationRequest,
+    refreshed: CoordinationRequestRecord,
+  ): Promise<ResolveActionAuthorizationResult | null> {
+    const decisionTransport = this.deps?.decisionTransport;
+    if (decisionTransport === undefined) {
+      return null;
+    }
+    if (!isSignedDecisionRequired(candidate.toRecord())) {
+      return null;
+    }
+    const answer = await decisionTransport.readDecisionAnswer({
+      requestId: refreshed.id,
+      projectId: refreshed.projectId,
+      actionScope: refreshed.actionScope,
+      expectedHeadSha: refreshed.expectedHeadSha,
+    });
+    // Fix round: a refusal is honoured in EVERY answer state — an approved
+    // answer that carries a refusalReason must still block, not authorize.
+    if (answer.refusalReason !== undefined) {
+      return blocked(answer.refusalReason);
+    }
+    if (!verifySignedDecisionBinding(refreshed, answer).ok) {
+      return blocked('decision-signature-invalid');
+    }
+    return null;
   }
 
   /**
@@ -398,6 +450,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // `nowIso` can never revive an expired grant.
     if (Date.parse(nowIso) >= Date.parse(shadowGrant.expiresAtIso)) {
       return blocked('grant-expired');
+    }
+    // KEY0c2: a standing shadow import grant is also re-bound to a verified
+    // signed answer when a decision transport is injected.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
+    if (signatureBlock !== null) {
+      return signatureBlock;
     }
     return {
       outcome: 'authorized',
@@ -569,11 +627,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       actionScope: record.actionScope,
       expectedHeadSha: record.expectedHeadSha,
     });
+    // A refusalReason on the answer (regardless of its state) means the
+    // answer must not be persisted: return the refusal and keep the stored
+    // record byte-identical so a later read re-verifies afresh.
+    if (answer.refusalReason !== undefined) {
+      return { record, refusalReason: answer.refusalReason };
+    }
     if (answer.state === 'awaiting-decision') {
-      return {
-        record,
-        ...(answer.refusalReason !== undefined ? { refusalReason: answer.refusalReason } : {}),
-      };
+      return { record };
     }
     if (answer.state === 'declined') {
       return { record };

@@ -34,6 +34,8 @@ import type {
   RecordAuthorizationConsumptionResult,
 } from '../ports/in/RecordAuthorizationConsumptionPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
+import { isSignedDecisionRequired, verifySignedDecisionBinding } from '../../domain/coordination-records.js';
 
 export interface RecordAuthorizationConsumptionDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
@@ -43,6 +45,13 @@ export interface RecordAuthorizationConsumptionDependencies {
    * release consumption without it is a typed refusal, never a silent skip.
    */
   readonly computeDigest?: (payload: string) => string;
+  /**
+   * KEY0c2: when injected, every owner-gated consumption re-reads the signed
+   * answer and binds the stored record to it before anything is recorded.
+   * Omitted, the origin/main behaviour is kept until KEY0c3 flips the
+   * mandatory switch.
+   */
+  readonly decisionTransport?: DecisionTransportPort;
 }
 
 const REQUIRED_TEXT_FIELDS = [
@@ -112,6 +121,23 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (suppliedScope === SHADOW_IMPORT_ACTION_SCOPE || recorded.actionScope === SHADOW_IMPORT_ACTION_SCOPE) {
       return refused('shadow-import-grant-not-consumable');
     }
+    // A malformed stored release root is refused with its own named reason
+    // before the aggregate is re-read, so an accessor-carrying or malformed
+    // `releaseRoot` keeps origin/main's typed refusal (the full root and
+    // digest checks still run below, in their original order).
+    if (readReleaseRoot(recorded).state === 'invalid') {
+      return refused('release-grant-root-mismatch');
+    }
+    // KEY0c2: the aggregate is re-read before any replay or exemption check,
+    // so a forged `policyGrant` on a `release:*` record (or any other
+    // unreadable record) is refused here and can never bypass verification
+    // through the replay return or a grant-kind exemption.
+    let aggregate: CoordinationRequest;
+    try {
+      aggregate = CoordinationRequest.fromRecord(recorded);
+    } catch {
+      return refused('invalid-coordination-request');
+    }
     const existing = recorded.consumptions[0];
     if (existing !== undefined) {
       // One grant, one action: a second, unrelated action is never recorded,
@@ -178,6 +204,29 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         return refused('release-grant-digest-mismatch');
       }
     }
+    // KEY0c2: when a decision transport is injected, every owner-gated
+    // consumption re-reads the signed answer and binds the stored record to
+    // it — before the idempotent replay return and before anything is
+    // recorded. A forged `policyGrant` on a `release:*` record can never
+    // reach this point (the aggregate read above refuses it first), and the
+    // closed-kind exemptions skip this check entirely.
+    const decisionTransport = this.deps.decisionTransport;
+    if (decisionTransport !== undefined && isSignedDecisionRequired(aggregate.toRecord())) {
+      const answer = await decisionTransport.readDecisionAnswer({
+        requestId: aggregate.getId(),
+        projectId: recorded.projectId,
+        actionScope: aggregate.getActionScope(),
+        expectedHeadSha: aggregate.getExpectedHeadSha(),
+      });
+      // Fix round: a refusal is honoured in EVERY answer state — an approved
+      // answer that carries a refusalReason must still refuse, not consume.
+      if (answer.refusalReason !== undefined) {
+        return refused(answer.refusalReason);
+      }
+      if (!verifySignedDecisionBinding(recorded, answer).ok) {
+        return refused('decision-signature-invalid');
+      }
+    }
     // Idempotent replay of the same action: the durable receipt is returned
     // unchanged and nothing is recorded twice, so a release that crashed
     // between its consumption and its own write can complete on the next pass.
@@ -194,7 +243,6 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     // the consumption records the deterministic action id as its attempt
     // coordinate; an unknown `release:*` scope is an owner grant and stays
     // under the recorded-attempt check.
-    const aggregate = CoordinationRequest.fromRecord(recorded);
     if (!isReleaseActionScope(recorded.actionScope) && aggregate.isMissingRecordedAttempt()) {
       return refused('grant-attempt-unrecorded');
     }

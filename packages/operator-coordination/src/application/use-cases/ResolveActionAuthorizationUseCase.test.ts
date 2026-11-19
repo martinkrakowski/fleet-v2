@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { SHADOW_IMPORT_ACTION_SCOPE } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { DecisionAnswer, DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 import { ResolveActionAuthorizationUseCase } from './ResolveActionAuthorizationUseCase.use-case.js';
 import type { ResolveActionAuthorizationResult } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
+import { createSignedDecisionFixture, explicitAnswerTransport } from './__tests__/signed-decision-fixture.js';
 
 class InMemoryCoordinationRequestRepository implements CoordinationRequestRepositoryPort {
   private readonly records = new Map<string, CoordinationRequestRecord>();
@@ -831,5 +833,308 @@ describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
       { releaseRoot: requested },
     );
     expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
+});
+
+describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', () => {
+  const REQUEST = {
+    projectId: 'project-atlas',
+    actionScope: 'forge:merge',
+    expectedHeadSha: 'abc123',
+    authorizationGrantId: 'grant-9',
+    attemptId: 'attempt-1',
+  };
+
+  function ownerRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
+    return {
+      id: 'request-1',
+      projectId: 'project-atlas',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'forge:merge',
+      expectedHeadSha: 'abc123',
+      proposalDigest: 'digest-1',
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-9',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'pending',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-18T00:00:00.000Z',
+      updatedAtIso: '2026-11-18T00:00:00.000Z',
+      grantRecordVersion: 2,
+      grantAttemptId: 'attempt-1',
+      ...overrides,
+    };
+  }
+
+  function repositoryWith(...records: CoordinationRequestRecord[]): InMemoryCoordinationRequestRepository {
+    const repo = new InMemoryCoordinationRequestRepository();
+    for (const record of records) {
+      void repo.saveRequest(record);
+    }
+    return repo;
+  }
+
+  function stubTransport(answers: Record<string, DecisionAnswer>): DecisionTransportPort {
+    return {
+      async readDecisionAnswer(query) {
+        return (
+          answers[query.requestId] ?? {
+            state: 'awaiting-decision' as const,
+            decisionRevision: null,
+            grantId: null,
+          }
+        );
+      },
+    };
+  }
+
+  function transportWith(
+    ownerPublicKey: string,
+    answers: Record<string, DecisionAnswer>,
+    ownerKeyRefusal?: 'owner-key-unpinned' | 'owner-key-env-mismatch',
+  ): DecisionTransportPort {
+    return explicitAnswerTransport(ownerPublicKey, answers, ownerKeyRefusal);
+  }
+
+  async function resolveWith(transport: DecisionTransportPort | undefined): Promise<ResolveActionAuthorizationResult> {
+    const signer = createSignedDecisionFixture();
+    const record = ownerRecord();
+    await signer.writeApprovedAnswer(record);
+    return new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(record),
+      decisionTransport: transport ?? signer.deps.decisionTransport,
+    }).execute(REQUEST);
+  }
+
+  it('authorizes with valid signed answer', async () => {
+    const result = await resolveWith(undefined);
+    expect(result.outcome).toBe('authorized');
+    expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
+  });
+
+  it('refuses hand-written approved record with no answer file', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).execute(REQUEST);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+  });
+
+  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+    }).execute(REQUEST);
+    expect(result.outcome).toBe('authorized');
+  });
+
+  it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {
+    const signer = createSignedDecisionFixture();
+    const answer = signer.signApprovedAnswer(ownerRecord());
+    for (const refusal of ['owner-key-unpinned', 'owner-key-env-mismatch'] as const) {
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, { 'request-1': answer }, refusal),
+      }).execute(REQUEST);
+      expect(result).toEqual({ outcome: 'blocked', reason: refusal });
+    }
+  });
+
+  it('refuses approved record when answer is signed by a different key', async () => {
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': other.signApprovedAnswer(ownerRecord()),
+      }),
+    }).execute(REQUEST);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+  });
+
+  it('refuses approved record when answer is for a different request', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': signer.signApprovedAnswer(ownerRecord({ id: 'request-2' })),
+      }),
+    }).execute(REQUEST);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+  });
+
+  it('refuses an approved grant with no bound attempt and an invalid answer without persisting a binding', async () => {
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    const unbound = ownerRecord({
+      grantAttemptId: undefined,
+      grantRecordVersion: undefined,
+    } as Partial<CoordinationRequestRecord>);
+    const repo = repositoryWith(unbound);
+    const before = JSON.stringify((await repo.findRequestById('request-1')) ?? null);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': other.signApprovedAnswer(unbound),
+      }),
+    }).execute({ ...REQUEST, attemptId: 'attempt-1' });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    const after = JSON.stringify((await repo.findRequestById('request-1')) ?? null);
+    expect(after).toBe(before);
+  });
+
+  it('refuses when answer grantId or decisionRevision mismatches stored record', async () => {
+    const signer = createSignedDecisionFixture();
+    for (const mismatched of [
+      ownerRecord({ grantId: 'grant-8' }),
+      ownerRecord({ decisionRevision: 'decision-4' }),
+    ]) {
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, {
+          'request-1': signer.signApprovedAnswer(mismatched),
+        }),
+      }).execute(REQUEST);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    }
+  });
+
+  it('refuses when decisionTransport reports awaiting-decision or declined', async () => {
+    for (const answer of [
+      { state: 'awaiting-decision' as const, decisionRevision: null, grantId: null },
+      { state: 'declined' as const, decisionRevision: 'decision-3', grantId: 'grant-9' },
+    ]) {
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: stubTransport({ 'request-1': answer }),
+      }).execute(REQUEST);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    }
+  });
+
+  it('keeps policy and merge grants unchanged without decisionTransport and exempts them with one', async () => {
+    const mergeGrant = ownerRecord({
+      actionScope: 'forge:merge-pr',
+      decisionRevision: 'policy:merge@0123456789ab',
+      mergeGrant: { repository: { owner: 'o', repo: 'r' }, pullRequestNumber: 1 },
+      grantRecordVersion: undefined,
+      grantAttemptId: undefined,
+    });
+    const signer = createSignedDecisionFixture();
+    // No answer is seeded for the merge grant: the closed-kind exemption
+    // keeps origin/main behaviour even with a transport injected.
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(mergeGrant),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).execute({
+      projectId: 'project-atlas',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: 'abc123',
+      authorizationGrantId: 'grant-9',
+      repository: { owner: 'o', repo: 'r' },
+      pullRequestNumber: 1,
+    });
+    expect(result.outcome).toBe('authorized');
+  });
+
+  // KEY0c2 fix round 4: the resume path must not escape signature
+  // re-verification. A non-approved record (cancelled, declined or
+  // awaiting-decision) carrying a consumption whose action id matches the
+  // named `resumeActionId` resolves only through the transport's signed
+  // answer; with no answer file every such resume is blocked.
+  function digestBoundReleaseRecord(
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    const coordinates = {
+      scope: 'release:install',
+      projectId: 'project-atlas',
+      expectedHeadSha: 'abc123',
+      releaseRoot: '/srv/fleet/releases',
+      nonce: '0123456789abcdef0123456789abcdef',
+    };
+    return {
+      id: `release-grant-${createHash('sha256').update(JSON.stringify(coordinates)).digest('hex')}`,
+      projectId: 'project-atlas',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: 'abc123',
+      proposalDigest: 'digest-1',
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-9',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-18T00:00:00.000Z',
+      updatedAtIso: '2026-11-18T00:00:00.000Z',
+      releaseRoot: coordinates.releaseRoot,
+      releaseNonce: coordinates.nonce,
+      ...overrides,
+    };
+  }
+
+  function resumeConsumption(actionId: string): CoordinationRequestRecord['consumptions'][number] {
+    return {
+      consumptionId: 'consumption-1',
+      grantId: 'grant-9',
+      requestId: 'request-1',
+      actionId,
+      attemptId: 'attempt-1',
+      expectedHeadSha: 'abc123',
+      consumedAtIso: '2026-11-18T00:30:00.000Z',
+    };
+  }
+
+  const RESUME_REQUEST = {
+    projectId: 'project-atlas',
+    actionScope: 'release:install',
+    expectedHeadSha: 'abc123',
+    releaseRoot: '/srv/fleet/releases',
+    authorizationGrantId: 'grant-9',
+    resumeActionId: 'action-1',
+  };
+
+  // RR1: the digest-bound release record's id is re-verified on every
+  // release resolve, so the digest must be wired in these tests too.
+  const computeDigest = (payload: string): string =>
+    createHash('sha256').update(payload).digest('hex');
+
+  it.each(['cancelled', 'declined', 'awaiting-decision'] as const)(
+    'refuses a %s release record resumed by its own consumption with no answer file',
+    async (state) => {
+      const signer = createSignedDecisionFixture();
+      const record = digestBoundReleaseRecord({
+        state,
+        consumptions: [resumeConsumption('action-1')],
+      });
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repositoryWith(record),
+        decisionTransport: transportWith(signer.ownerPublicKey, {}),
+        computeDigest,
+      }).execute(RESUME_REQUEST);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    },
+  );
+
+  it('resumes a valid signed approved-completed release record with a real consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const record = digestBoundReleaseRecord({
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(record),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RESUME_REQUEST);
+    expect(result.outcome).toBe('authorized');
   });
 });

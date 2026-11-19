@@ -131,12 +131,127 @@ function normalizeAnswer(
   ownerPublicKey?: string,
   ownerKeyRefusal?: 'owner-key-env-mismatch' | 'owner-key-unpinned',
 ): DecisionAnswer {
-  if (typeof candidate !== 'object' || candidate === null) {
+  // 1. Hostile-input inspection: own keys only, through descriptors.
+  const ownKeys = inspectCandidateOwnKeys(candidate);
+  if (ownKeys === null) {
     return { ...AWAITING };
   }
-  const answer = candidate as Partial<DecisionAnswer> & { signature?: unknown };
-  if (typeof answer.state !== 'string' || !DECISION_STATES.includes(answer.state)) {
+  if (candidateOwnFieldsAreAmbiguous(candidate as object, ownKeys, query)) {
     return { ...AWAITING };
+  }
+  // 2. Field parsing: state and the bounded optional fields.
+  const answer = candidate as Partial<DecisionAnswer> & { signature?: unknown };
+  const fields = parseAnswerFields(answer);
+  if (fields === null) {
+    return { ...AWAITING };
+  }
+  if (fields.state === 'declined') {
+    return { state: fields.state, decisionRevision: fields.decisionRevision, grantId: null };
+  }
+  if (fields.state === 'approved') {
+    // 3. Approval handling: refusal reason, grant, signature verification.
+    return approveAnswer(fields, answer, query, ownerPublicKey, ownerKeyRefusal);
+  }
+  return { state: fields.state, decisionRevision: fields.decisionRevision, grantId: fields.grantId };
+}
+
+/**
+ * Read a hostile candidate's own keys through `Reflect.ownKeys`, refusing
+ * non-objects, arrays, and throwing traps. Returns `null` when the candidate
+ * must be reported as awaiting. KEY0c2: a hostile candidate is inspected
+ * through its own property descriptors before any field is read, so an
+ * accessor never runs and a proxy trap is never invoked here.
+ */
+function inspectCandidateOwnKeys(candidate: unknown): PropertyKey[] | null {
+  if (typeof candidate !== 'object' || candidate === null) {
+    return null;
+  }
+  try {
+    if (Array.isArray(candidate)) {
+      return null;
+    }
+    return Reflect.ownKeys(candidate);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether one own key is safe to skip. Returns `false` when the candidate
+ * must be reported as awaiting: an accessor property (string OR symbol key —
+ * a symbol key never bypasses descriptor inspection), an own
+ * `requestId`/`actionScope`/`projectId` value that is present but not a
+ * non-empty string (malformed — `null` and other non-strings are refused,
+ * never silently dropped), or such a string that names a different
+ * request, scope or project than the query. A symbol data key is skipped.
+ */
+function ownKeyIsBenign(
+  candidate: object,
+  key: PropertyKey,
+  query: DecisionAnswerQuery,
+): boolean {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+  } catch {
+    return false;
+  }
+  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    return false;
+  }
+  if (typeof key !== 'string') {
+    return true;
+  }
+  if (key !== 'requestId' && key !== 'actionScope' && key !== 'projectId') {
+    return true;
+  }
+  // A present identity field must be a bounded non-empty string; `null` or
+  // any other non-string is refused as malformed, not treated as absent.
+  if (typeof descriptor.value !== 'string' || descriptor.value.length === 0) {
+    return false;
+  }
+  const expected =
+    key === 'requestId'
+      ? query.requestId
+      : key === 'actionScope'
+        ? query.actionScope
+        : key === 'projectId'
+          ? query.projectId
+          : undefined;
+  return expected === undefined || descriptor.value === expected;
+}
+
+/**
+ * Whether any of the candidate's own string identity fields names a different
+ * request, scope or project than the query: such an answer is ambiguous and
+ * is reported as awaiting, never upgraded to an approval.
+ */
+function candidateOwnFieldsAreAmbiguous(
+  candidate: object,
+  ownKeys: PropertyKey[],
+  query: DecisionAnswerQuery,
+): boolean {
+  for (const key of ownKeys) {
+    if (!ownKeyIsBenign(candidate, key, query)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The recognised state and the bounded optional fields parsed from one answer. */
+interface ParsedAnswerFields {
+  readonly state: DecisionState;
+  readonly decisionRevision: string | null;
+  readonly grantId: string | null;
+}
+
+/** Parse `state`, `decisionRevision` and `grantId`, or return `null` to await. */
+function parseAnswerFields(
+  answer: Partial<DecisionAnswer> & { signature?: unknown },
+): ParsedAnswerFields | null {
+  if (typeof answer.state !== 'string' || !DECISION_STATES.includes(answer.state)) {
+    return null;
   }
   const state = answer.state as DecisionState;
   const decisionRevision =
@@ -147,51 +262,60 @@ function normalizeAnswer(
     typeof answer.grantId === 'string' && answer.grantId.trim().length > 0
       ? answer.grantId.trim()
       : null;
-  if (state === 'declined') {
-    return { state, decisionRevision, grantId: null };
-  }
-  if (state === 'approved') {
-    // The pinned-key refusal is checked before the grantless-answer
-    // fallback so its named reason is surfaced, not lost to AWAITING.
-    if (
-      ownerKeyRefusal === 'owner-key-env-mismatch' ||
-      ownerKeyRefusal === 'owner-key-unpinned'
-    ) {
-      return {
-        state: 'awaiting-decision',
-        decisionRevision: null,
-        grantId: null,
-        refusalReason: ownerKeyRefusal,
-      };
-    }
-    if (grantId === null) {
-      // An approval without a recorded grant authorizes nothing.
-      return { ...AWAITING };
-    }
-    if (
-      ownerPublicKey === undefined ||
-      ownerPublicKey.trim().length === 0 ||
-      typeof answer.signature !== 'string' ||
-      answer.signature.trim().length === 0
-    ) {
-      return { ...AWAITING };
-    }
-    const verified = verifyDecisionSignature(
-      {
-        requestId: query.requestId,
-        projectId: query.projectId,
-        actionScope: query.actionScope,
-        expectedHeadSha: query.expectedHeadSha,
-        decisionRevision,
-        grantId,
-        state,
-      },
-      answer.signature.trim(),
-      ownerPublicKey.trim(),
-    );
-    if (!verified) {
-      return { ...AWAITING };
-    }
-  }
   return { state, decisionRevision, grantId };
+}
+
+/**
+ * Handle one `approved` answer: the pinned-key refusal is checked before the
+ * grantless-answer fallback so its named reason is surfaced, not lost to
+ * AWAITING; an approval without a recorded grant authorizes nothing; and only
+ * a signature that verifies against the pinned owner key is returned as
+ * `approved`.
+ */
+function approveAnswer(
+  fields: ParsedAnswerFields,
+  answer: Partial<DecisionAnswer> & { signature?: unknown },
+  query: DecisionAnswerQuery,
+  ownerPublicKey: string | undefined,
+  ownerKeyRefusal: 'owner-key-env-mismatch' | 'owner-key-unpinned' | undefined,
+): DecisionAnswer {
+  if (
+    ownerKeyRefusal === 'owner-key-env-mismatch' ||
+    ownerKeyRefusal === 'owner-key-unpinned'
+  ) {
+    return {
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+      refusalReason: ownerKeyRefusal,
+    };
+  }
+  if (fields.grantId === null) {
+    return { ...AWAITING };
+  }
+  if (
+    ownerPublicKey === undefined ||
+    ownerPublicKey.trim().length === 0 ||
+    typeof answer.signature !== 'string' ||
+    answer.signature.trim().length === 0
+  ) {
+    return { ...AWAITING };
+  }
+  const verified = verifyDecisionSignature(
+    {
+      requestId: query.requestId,
+      projectId: query.projectId,
+      actionScope: query.actionScope,
+      expectedHeadSha: query.expectedHeadSha,
+      decisionRevision: fields.decisionRevision,
+      grantId: fields.grantId,
+      state: fields.state,
+    },
+    answer.signature.trim(),
+    ownerPublicKey.trim(),
+  );
+  if (!verified) {
+    return { ...AWAITING };
+  }
+  return { state: fields.state, decisionRevision: fields.decisionRevision, grantId: fields.grantId };
 }

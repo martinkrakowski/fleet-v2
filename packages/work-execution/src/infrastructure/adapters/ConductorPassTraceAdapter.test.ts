@@ -135,7 +135,7 @@ describe('ConductorPassTraceAdapter', () => {
     }
   });
 
-  it('f: a stateDir that is a regular file never throws; a colliding fileName writes failed', async () => {
+  it('f: a stateDir that is a regular file never throws; a colliding or unsafe fileName is refused at construction', async () => {
     const container = makeTempDir();
     const filePath = path.join(container, 'not-a-dir');
     await fs.writeFile(filePath, 'plain file');
@@ -148,19 +148,13 @@ describe('ConductorPassTraceAdapter', () => {
     await expect(adapter.list()).resolves.toMatchObject({ outcome: 'unreadable', reason: 'store-unreadable' });
 
     const tempDir = makeTempDir();
-    const colliding = new ConductorPassTraceAdapter({ stateDir: tempDir, limits: LIMITS, fileName: 'lane-runs.json' });
-    await expect(colliding.append(trace(1))).resolves.toMatchObject({
-      outcome: 'not-recorded',
-      reason: 'write-failed',
-    });
-    await expect(colliding.list()).resolves.toMatchObject({ outcome: 'unreadable', reason: 'store-unreadable' });
+    expect(
+      () => new ConductorPassTraceAdapter({ stateDir: tempDir, limits: LIMITS, fileName: 'lane-runs.json' }),
+    ).toThrow(/collides with another store/);
 
-    const unsafe = new ConductorPassTraceAdapter({ stateDir: makeTempDir(), limits: LIMITS, fileName: '../x.json' });
-    await expect(unsafe.append(trace(1))).resolves.toMatchObject({
-      outcome: 'not-recorded',
-      reason: 'write-failed',
-    });
-    await expect(unsafe.list()).resolves.toMatchObject({ outcome: 'unreadable', reason: 'store-unreadable' });
+    expect(
+      () => new ConductorPassTraceAdapter({ stateDir: makeTempDir(), limits: LIMITS, fileName: '../x.json' }),
+    ).toThrow(/unsafe state file name/);
   });
 
   it('g: a held lock times out with write-failed and creates no data file', async () => {

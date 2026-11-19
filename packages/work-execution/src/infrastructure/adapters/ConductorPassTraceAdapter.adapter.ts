@@ -41,6 +41,7 @@ export interface ConductorPassTraceAdapterOptions {
 const DEFAULT_FILE_NAME = 'conductor-passes.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -80,7 +81,17 @@ function copyTrace(trace: ConductorPassTraceRecord): ConductorPassTraceRecord {
 export class ConductorPassTraceAdapter implements ConductorPassTracePort {
   private readonly inMemoryRing: ConductorPassTraceRecord[] = [];
 
-  constructor(private readonly options: ConductorPassTraceAdapterOptions = {}) {}
+  constructor(private readonly options: ConductorPassTraceAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error('ConductorPassTraceAdapter refuses a fileName that collides with another store');
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('ConductorPassTraceAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async list(): Promise<ConductorPassTraceListResult> {
     try {

@@ -38,6 +38,7 @@ export interface KillallTrainPauseAdapterOptions {
 const DEFAULT_FILE_NAME = 'killall-train-pause.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -95,7 +96,17 @@ function statusOfRecord(record: KillallTrainPauseStoreRecord | null): KillallTra
 export class KillallTrainPauseAdapter implements KillallTrainPausePort {
   private inMemoryRecord: KillallTrainPauseStoreRecord | null = null;
 
-  constructor(private readonly options: KillallTrainPauseAdapterOptions = {}) {}
+  constructor(private readonly options: KillallTrainPauseAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error('KillallTrainPauseAdapter refuses a fileName that collides with another store');
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('KillallTrainPauseAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async read(): Promise<KillallTrainPauseRead> {
     const target = this.statePath;

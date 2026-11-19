@@ -460,6 +460,13 @@ async function preSignShadowImportDecision(
   if (optStr(p, 'decisionRevision') !== undefined) {
     throw new CliUsageError('sign-decision: --decision-revision cannot be combined with --pre-sign');
   }
+  // `--grant-id` is dropped for --pre-sign: the grant id is always derived
+  // deterministically from the coordinates' digest, so a caller-supplied one
+  // can only name a grant the plan does not sign — it is a usage error, not
+  // an ignored flag.
+  if (optStr(p, 'grantId') !== undefined || optStr(p, 'grant-id') !== undefined) {
+    throw new CliUsageError('sign-decision: --grant-id cannot be combined with --pre-sign');
+  }
   const plan = buildPreSignShadowImportPlan({
     actionScope,
     repository: { owner: segments[0]!, repo: segments[1]! },

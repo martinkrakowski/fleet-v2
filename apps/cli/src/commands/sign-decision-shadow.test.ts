@@ -275,6 +275,18 @@ describe('coordination sign-decision --pre-sign (KEY1c)', () => {
     expect(decisionFiles(ws.stateDir)).toEqual([]);
   });
 
+  it('refuses --grant-id with --pre-sign as a usage error (exit 2), writing nothing', async () => {
+    const ws = workspace();
+    const runtime = runtimeFor(ws.stateDir, ws.publicBase64);
+    const refused = await runCoordination(
+      runtime,
+      [...preSignArgs(futureExpiry(), ['--key', ws.keyPath, '--yes']), '--grant-id', 'shadow-import-grant-0123456789abcdef'],
+      ws.stateDir,
+    );
+    expect(refused.code).toBe(2);
+    expect(decisionFiles(ws.stateDir)).toEqual([]);
+  });
+
   it('refuses a projectId with surrounding whitespace before reading any key or writing', async () => {
     const ws = workspace();
     const runtime = runtimeFor(ws.stateDir, ws.publicBase64);

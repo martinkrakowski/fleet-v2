@@ -769,6 +769,7 @@ Commands:
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
   coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding|sign-decision
+    (sign-decision --pre-sign --action-scope merge:import-shadow --repository <owner/repo> --project <id> --expires-at <iso> --key <path> --yes pre-signs the standing grant before request-decision)
   questions ask|list|show|answer|sync|expire|acknowledge|wait
   owner-items add|list|resolve
   help | --help

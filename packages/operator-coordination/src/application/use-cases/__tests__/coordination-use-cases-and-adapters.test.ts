@@ -1698,7 +1698,8 @@ describe('ResolveActionAuthorizationUseCase', () => {
 describe('RecordAuthorizationConsumptionUseCase', () => {
   // KEY0c1a: every owner-grant consumption construction carries the signed
   // decision transport the mandatory-transport switch (KEY0c3) will require.
-  const signedDeps = createSignedDecisionFixture().deps;
+  const signedSigner = createSignedDecisionFixture();
+  const signedDeps = signedSigner.deps;
   const consumptionRequest = {
     consumptionId: 'consumption-1',
     grantId: 'grant-9',
@@ -1713,6 +1714,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('binds a grant to one action and attempt and completes the request', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
+    // KEY0c1a fix round: the consumed owner grant carries its signed answer
+    // under the same signer the consumer reads, self-checked first.
+    await signedSigner.writeApprovedAnswer(requestRecord());
+    await signedSigner.assertApprovedAnswerReadsBackApproved(requestRecord());
     const result = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: repo,
       ...signedDeps,
@@ -1740,6 +1745,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('never lets one grant authorize a second, unrelated action', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
+    // KEY0c1a fix round: the first consumption succeeds, so the consumed owner
+    // grant carries its signed answer under the same signer, self-checked first.
+    await signedSigner.writeApprovedAnswer(requestRecord());
+    await signedSigner.assertApprovedAnswerReadsBackApproved(requestRecord());
     const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signedDeps });
     await useCase.execute(consumptionRequest);
     const second = await useCase.execute({
@@ -1757,6 +1766,12 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     const repo = new StubRequestRepository([
       requestRecord({ consumptions: [consumptionRecord()] }),
     ]);
+    // KEY0c1a fix round: the replayed consumption observes a consumed grant,
+    // so that grant carries its signed answer under the same signer, self-checked.
+    await signedSigner.writeApprovedAnswer(requestRecord({ consumptions: [consumptionRecord()] }));
+    await signedSigner.assertApprovedAnswerReadsBackApproved(
+      requestRecord({ consumptions: [consumptionRecord()] }),
+    );
     const result = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: repo,
       ...signedDeps,

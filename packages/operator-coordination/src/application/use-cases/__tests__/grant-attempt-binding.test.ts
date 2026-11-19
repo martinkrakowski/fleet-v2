@@ -696,8 +696,8 @@ describe('grant attempt binding (CO24e)', () => {
         actionScope: awaiting.actionScope,
         expectedHeadSha: awaiting.expectedHeadSha,
       })).toEqual({ state: 'awaiting-decision', decisionRevision: null, grantId: null });
-      await signer.writeApprovedAnswer(awaiting);
-      // A tampered fixture never authorizes the resolve either.
+      // KEY0c1a fix round: the resolver is invoked while the TAMPERED answer
+      // is still in place — the valid answer is written only afterwards.
       expect(await new ResolveActionAuthorizationUseCase({
         requestRepo: repo,
         ...signer.deps,
@@ -709,6 +709,22 @@ describe('grant attempt binding (CO24e)', () => {
       })).toEqual({
         outcome: 'blocked',
         reason: 'recorded request req-owner is awaiting-decision, which does not authorize an action',
+      });
+      // Only the valid signed answer authorizes the resolve. It is derived
+      // from the granted record: a grantless approval authorizes nothing.
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
+      expect(await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        attemptId: 'att-A',
+      })).toEqual({
+        outcome: 'authorized',
+        grantId: 'grant-owner',
+        requestId: awaiting.id,
+        expectedHeadSha: HEAD,
+        policyRevision: 'pol-1',
       });
     });
 
@@ -749,7 +765,12 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('consumes an owner grant for its own attempt and records that attempt', async () => {
-      await repo.saveRequest(ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      // KEY0c1a fix round: the consumed owner grant carries its signed answer
+      // under the same signer the consumer reads, self-checked first.
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       const result = await consumer().recordAuthorizationConsumption(consume('grant-owner', 'att-A'));
       expect(result.outcome).toBe('consumed');
       expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions[0]?.attemptId).toBe('att-A');
@@ -765,7 +786,12 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('still consumes a legacy grant with no attempt, whatever attempt the composition validated (CO24d rule)', async () => {
-      await repo.saveRequest(ownerGrant());
+      const legacyGrant = ownerGrant();
+      await repo.saveRequest(legacyGrant);
+      // KEY0c1a fix round: the consumed owner grant carries its signed answer
+      // under the same signer the consumer reads, self-checked first.
+      await signer.writeApprovedAnswer(legacyGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(legacyGrant);
       const result = await consumer().recordAuthorizationConsumption(consume('grant-owner', 'att-B'));
       expect(result.outcome).toBe('consumed');
     });

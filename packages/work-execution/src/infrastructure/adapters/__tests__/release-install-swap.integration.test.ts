@@ -205,16 +205,17 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     h = await harness();
   });
 
-  /** KEY0c1a: seeds the grant and its signed answer under the ephemeral test signer. */
+  /** KEY0c1a: seeds the grant, its signed answer, and self-checks the answer. */
   const seedGrant = async (record: CoordinationRequestRecord): Promise<void> => {
     await h.grants.saveRequest(record);
     await h.signer.writeApprovedAnswer(record);
+    // KEY0c1a self-check: the seeded answer verifies back as `approved` with
+    // the record's own grant id and decision revision.
+    await h.signer.assertApprovedAnswerReadsBackApproved(record);
   };
 
   it('install stages the build and leaves current unmoved; swap repoints current atomically', async () => {
     await seedGrant(releaseGrant('grant-a', 'release:install', shaA, h.root));
-    // KEY0c1a self-check: the seeded answer verifies back as `approved`.
-    await h.signer.assertApprovedAnswerReadsBackApproved(releaseGrant('grant-a', 'release:install', shaA, h.root));
     const installA = await h.useCase.manageRelease({
       action: 'install',
       root: h.root,
@@ -326,8 +327,6 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     for (const sha of shas) {
       const grant = releaseGrant(`grant-install-${sha[0]}`, 'release:install', sha, h.root);
       await seedGrant(grant);
-      // KEY0c1a self-check: the seeded answer reads back as `approved`.
-      await h.signer.assertApprovedAnswerReadsBackApproved(grant);
       expect((await apply('install', sha)).outcome).toBe('applied');
     }
   }

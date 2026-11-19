@@ -180,6 +180,10 @@ describe('release grant root binding (CO14 follow-up)', () => {
 
   it('a grant for one root cannot authorize another root', async () => {
     await grants.saveRequest(grantFor(rootA));
+    // KEY0c1a fix round: the seeded approved release grant carries its signed
+    // answer under the ephemeral test signer, self-checked, before any resolve.
+    await signer.writeApprovedAnswer(grantFor(rootA));
+    await signer.assertApprovedAnswerReadsBackApproved(grantFor(rootA));
     const result = await releaseUseCase(grants, signer).manageRelease({
       action: 'install',
       root: rootB,

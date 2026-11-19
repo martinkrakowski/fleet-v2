@@ -1193,4 +1193,126 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
     }).execute(RESUME_REQUEST);
     expect(result.outcome).toBe('authorized');
   });
+
+  // #4g: a retry after a crash between the consumption and the release's
+  // write must resolve through the resumable grant even when a second,
+  // unrelated approved grant sits at the same coordinates, so the second
+  // grant is never spent by the retry.
+  function digestBoundReleaseRecordWithNonce(
+    nonce: string,
+    grantId: string,
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    const coordinates = {
+      scope: 'release:install',
+      projectId: 'project-atlas',
+      expectedHeadSha: 'abc123',
+      releaseRoot: '/srv/fleet/releases',
+      nonce,
+    };
+    return digestBoundReleaseRecord({
+      grantId,
+      releaseNonce: nonce,
+      id: `release-grant-${createHash('sha256').update(JSON.stringify(coordinates)).digest('hex')}`,
+      ...overrides,
+    });
+  }
+
+  const RETRY_REQUEST = {
+    projectId: 'project-atlas',
+    actionScope: 'release:install',
+    expectedHeadSha: 'abc123',
+    releaseRoot: '/srv/fleet/releases',
+    resumeActionId: 'action-1',
+  };
+
+  it('prefers the matching resumable release grant over a second approved grant on retry', async () => {
+    const signer = createSignedDecisionFixture();
+    const resumable = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    await signer.writeApprovedAnswer(resumable);
+    const second = digestBoundReleaseRecordWithNonce('fedcba9876543210fedcba9876543210', 'grant-10');
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(resumable, second),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RETRY_REQUEST);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-9', requestId: resumable.id });
+  });
+
+  it('still prefers a second approved grant when the retry names no resumable consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    const second = digestBoundReleaseRecordWithNonce('fedcba9876543210fedcba9876543210', 'grant-10');
+    await signer.writeApprovedAnswer(second);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed, second),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute({ ...RETRY_REQUEST, resumeActionId: 'action-2' });
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-10' });
+  });
+
+  it('blocks a release retry whose resume action id matches no recorded consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('other-action')],
+    });
+    await signer.writeApprovedAnswer(consumed);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RETRY_REQUEST);
+    expect(result).toEqual({
+      outcome: 'blocked',
+      reason: 'no recorded decision authorizes release:install for project-atlas',
+    });
+  });
+
+  it('refuses a wrong-primitive resumeActionId (a number where a string is due) without authorizing', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute({ ...RETRY_REQUEST, resumeActionId: 7 });
+    expect(result).toEqual({
+      outcome: 'blocked',
+      reason: 'no recorded decision authorizes release:install for project-atlas',
+    });
+  });
+
+  it('refuses a getter-carrying actionScope on a release retry as invalid-request without running the getter', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    let getterCalls = 0;
+    const request = {
+      ...RETRY_REQUEST,
+      get actionScope(): string {
+        getterCalls += 1;
+        return 'release:install';
+      },
+    };
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(request);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(getterCalls).toBe(0);
+  });
 });

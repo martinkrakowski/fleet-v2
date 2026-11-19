@@ -491,23 +491,25 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         !isPolicyGrantRecord(candidate) &&
         this.matchesMergeGrantCoordinates(candidate, request),
     );
-    const approved = matching.filter((candidate) => candidate.state === 'approved');
-    if (approved.length > 0) {
-      return approved[approved.length - 1];
-    }
-    if (resumeActionId !== undefined) {
-      // CO14 follow-up: a release grant consumed by exactly the resuming
-      // action id is still the grant that authorizes this resolve, so the
-      // retry after a crash between consumption and write finds it again.
+    // CO14 follow-up (#4g): when the resolve is a release retry naming the
+    // resuming action id, the matching resumable grant is preferred BEFORE
+    // any unrelated approved/unconsumed grant, so a crash between the
+    // consumption and the release's write can never spend a second grant.
+    if (resumeActionId !== undefined && isReleaseActionScope(request.actionScope.trim())) {
       const resumable = matching.filter(
         (candidate) =>
           candidate.state === 'completed' &&
+          isReleaseActionScope(candidate.actionScope) &&
           candidate.consumptions.length === 1 &&
           candidate.consumptions[0].actionId === resumeActionId,
       );
       if (resumable.length > 0) {
         return resumable[resumable.length - 1];
       }
+    }
+    const approved = matching.filter((candidate) => candidate.state === 'approved');
+    if (approved.length > 0) {
+      return approved[approved.length - 1];
     }
     const awaiting = matching.filter((candidate) => candidate.state === 'awaiting-decision');
     return awaiting.length > 0 ? awaiting[awaiting.length - 1] : null;

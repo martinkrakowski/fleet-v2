@@ -946,7 +946,11 @@ export interface CoordinationRequestRecord {
  *    equal to the parsed source.
  * 2. An attempt-less merge grant whose `decisionRevision` matches
  *    `policy:merge@<12-hex>` and whose `actionScope` is `forge:<kind>` for one
- *    of `MERGE_GRANT_FORGE_KINDS`.
+ *    of `MERGE_GRANT_FORGE_KINDS`. The exemption requires the record to carry
+ *    no attempt binding at all (`grantAttemptId` and `grantRecordVersion` both
+ *    absent): policy merge grants are never attempt-bound, so a record that
+ *    does carry an attempt binding is not the attempt-less grant kind and
+ *    stays under signed re-verification.
  *
  * Every other record — `release:*`, `merge:import-shadow`, `owner-decision:*`
  * and any other owner-approved scoped grant, including a record carrying
@@ -966,6 +970,8 @@ export function isSignedDecisionRequired(record: CoordinationRequestRecord): boo
   if (record.mergeGrant !== undefined) {
     const MERGE_GRANT_REVISION_PATTERN = /^policy:merge@[0-9a-f]{12}$/;
     const matches =
+      record.grantAttemptId === undefined &&
+      record.grantRecordVersion === undefined &&
       typeof record.decisionRevision === 'string' &&
       MERGE_GRANT_REVISION_PATTERN.test(record.decisionRevision) &&
       typeof record.actionScope === 'string' &&

@@ -1040,4 +1040,101 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
     });
     expect(result.outcome).toBe('authorized');
   });
+
+  // KEY0c2 fix round 4: the resume path must not escape signature
+  // re-verification. A non-approved record (cancelled, declined or
+  // awaiting-decision) carrying a consumption whose action id matches the
+  // named `resumeActionId` resolves only through the transport's signed
+  // answer; with no answer file every such resume is blocked.
+  function digestBoundReleaseRecord(
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    const coordinates = {
+      scope: 'release:install',
+      projectId: 'project-atlas',
+      expectedHeadSha: 'abc123',
+      releaseRoot: '/srv/fleet/releases',
+      nonce: '0123456789abcdef0123456789abcdef',
+    };
+    return {
+      id: `release-grant-${createHash('sha256').update(JSON.stringify(coordinates)).digest('hex')}`,
+      projectId: 'project-atlas',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: 'abc123',
+      proposalDigest: 'digest-1',
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-9',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-18T00:00:00.000Z',
+      updatedAtIso: '2026-11-18T00:00:00.000Z',
+      releaseRoot: coordinates.releaseRoot,
+      releaseNonce: coordinates.nonce,
+      ...overrides,
+    };
+  }
+
+  function resumeConsumption(actionId: string): CoordinationRequestRecord['consumptions'][number] {
+    return {
+      consumptionId: 'consumption-1',
+      grantId: 'grant-9',
+      requestId: 'request-1',
+      actionId,
+      attemptId: 'attempt-1',
+      expectedHeadSha: 'abc123',
+      consumedAtIso: '2026-11-18T00:30:00.000Z',
+    };
+  }
+
+  const RESUME_REQUEST = {
+    projectId: 'project-atlas',
+    actionScope: 'release:install',
+    expectedHeadSha: 'abc123',
+    releaseRoot: '/srv/fleet/releases',
+    authorizationGrantId: 'grant-9',
+    resumeActionId: 'action-1',
+  };
+
+  // RR1: the digest-bound release record's id is re-verified on every
+  // release resolve, so the digest must be wired in these tests too.
+  const computeDigest = (payload: string): string =>
+    createHash('sha256').update(payload).digest('hex');
+
+  it.each(['cancelled', 'declined', 'awaiting-decision'] as const)(
+    'refuses a %s release record resumed by its own consumption with no answer file',
+    async (state) => {
+      const signer = createSignedDecisionFixture();
+      const record = digestBoundReleaseRecord({
+        state,
+        consumptions: [resumeConsumption('action-1')],
+      });
+      const result = await new ResolveActionAuthorizationUseCase({
+        requestRepo: repositoryWith(record),
+        decisionTransport: transportWith(signer.ownerPublicKey, {}),
+        computeDigest,
+      }).execute(RESUME_REQUEST);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    },
+  );
+
+  it('resumes a valid signed approved-completed release record with a real consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const record = digestBoundReleaseRecord({
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(record),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RESUME_REQUEST);
+    expect(result.outcome).toBe('authorized');
+  });
 });

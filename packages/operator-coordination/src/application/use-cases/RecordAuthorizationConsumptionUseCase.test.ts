@@ -735,6 +735,33 @@ describe('RecordAuthorizationConsumptionUseCase signed re-verification (KEY0c2)'
     expect(result).toEqual({ outcome: 'refused', reason: 'invalid-coordination-request' });
   });
 
+  // KEY0c2 fix round 4 mutation gap: moving the idempotent replay return
+  // before signature re-verification must be caught. A record that already
+  // carries a consumption for exactly the replayed action id is still
+  // refused on the replay when no signed answer backs it — the replay return
+  // sits after verification.
+  it('refuses a replayed consume of an unsigned record that already carries a consumption for the same actionId', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = ownerRecord({
+      consumptions: [
+        {
+          consumptionId: 'consumption-1',
+          grantId: 'grant-9',
+          requestId: 'request-1',
+          actionId: 'action-1',
+          attemptId: 'attempt-1',
+          expectedHeadSha: 'abc123',
+          consumedAtIso: '2026-11-18T00:30:00.000Z',
+        },
+      ],
+    });
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+  });
+
   it('keeps policy and merge grants unchanged with decisionTransport injected', async () => {
     const policyHead = 'a'.repeat(40);
     const policyGrant = ownerRecord({

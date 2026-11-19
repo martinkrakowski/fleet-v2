@@ -301,7 +301,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // KEY0c2 fix round: the owner-decision signature check runs before
     // `bindAttempt`, because binding persists the attempt onto the grant —
     // an invalid approval must never be able to alter the stored record.
-    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, resumable);
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
     if (signatureBlock !== null) {
       return signatureBlock;
     }
@@ -324,24 +324,22 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
   }
 
   /**
-   * KEY0c2: when a decision transport is injected, an owner-gated approval —
-   * a stored `approved` record (or a resumable `completed` release record) whose
-   * scope is not a closed-kind policy or merge grant — is re-read through the
-   * transport and bound to the signed answer. Anything the transport reports
-   * as awaiting or declined, an owner-key refusal, or a mismatching binding
-   * blocks; when no transport is injected the origin/main behaviour is kept
-   * exactly. Returns the block, or null when the record may authorize.
+   * KEY0c2: when a decision transport is injected, an owner-gated record whose
+   * scope is not a closed-kind policy or merge grant is re-read through the
+   * transport and bound to the signed answer on EVERY path — including a
+   * resumable `completed` release record and any other non-approved state
+   * reached through resume — so no stored state can authorize without a
+   * signature. Anything the transport reports as awaiting or declined, an
+   * owner-key refusal, or a mismatching binding blocks; when no transport is
+   * injected the origin/main behaviour is kept exactly. Returns the block, or
+   * null when the record may authorize.
    */
   private async verifyOwnerDecisionForRecord(
     candidate: CoordinationRequest,
     refreshed: CoordinationRequestRecord,
-    resumable: boolean,
   ): Promise<ResolveActionAuthorizationResult | null> {
     const decisionTransport = this.deps?.decisionTransport;
     if (decisionTransport === undefined) {
-      return null;
-    }
-    if (refreshed.state !== 'approved' && !(refreshed.state === 'completed' && resumable)) {
       return null;
     }
     if (!isSignedDecisionRequired(candidate.toRecord())) {
@@ -453,7 +451,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     // KEY0c2: a standing shadow import grant is also re-bound to a verified
     // signed answer when a decision transport is injected.
-    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, false);
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
     if (signatureBlock !== null) {
       return signatureBlock;
     }

@@ -120,6 +120,35 @@ describe('isSignedDecisionRequired', () => {
       ),
     ).toBe(true);
   });
+
+  // KEY0c2 fix round 4: the merge-grant exemption is for the attempt-less
+  // grant kind only. A record shaped like a merge grant but bound to an
+  // attempt (or carrying the version-2 attempt binding) is not exempt.
+  it.each([
+    {
+      name: 'a bound attempt id',
+      overrides: { grantAttemptId: 'attempt-1' },
+    },
+    {
+      name: 'a version-2 attempt binding without an attempt id',
+      overrides: { grantRecordVersion: 2 },
+    },
+    {
+      name: 'both attempt fields',
+      overrides: { grantRecordVersion: 2, grantAttemptId: 'attempt-1' },
+    },
+  ] as const)('never exempts an attempt-bound merge-grant-shaped record carrying $name', ({ overrides }) => {
+    expect(
+      isSignedDecisionRequired(
+        requestRecord({
+          actionScope: 'forge:merge-pr',
+          decisionRevision: 'policy:merge@0123456789ab',
+          mergeGrant: { repository: { owner: 'o', repo: 'r' }, pullRequestNumber: 1 },
+          ...overrides,
+        }),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('verifySignedDecisionBinding', () => {
@@ -437,5 +466,30 @@ describe('verifySignedDecisionBinding', () => {
       ok: false,
       code: 'decision-binding-mismatch',
     });
+  });
+
+  // KEY0c2 fix round 4 mutation gap: the try around `Reflect.ownKeys` in the
+  // binding snapshot must be load-bearing. A Proxy whose `ownKeys` trap
+  // throws is refused as a typed invalid-input result, never thrown.
+  it('refuses a Proxy whose ownKeys trap throws without throwing and reports it as invalid-input', () => {
+    let trapCalls = 0;
+    const hostile = new Proxy(
+      { ...validAnswer() },
+      {
+        ownKeys() {
+          trapCalls += 1;
+          throw new Error('hostile ownKeys trap');
+        },
+      },
+    );
+    let result: unknown;
+    expect(() => {
+      result = verifySignedDecisionBinding(requestRecord(), hostile);
+    }).not.toThrow();
+    expect(result).toEqual({
+      ok: false,
+      code: 'decision-binding-invalid-input',
+    });
+    expect(trapCalls).toBe(1);
   });
 });

@@ -135,6 +135,48 @@ function normalizeAnswer(
     return { ...AWAITING };
   }
   const answer = candidate as Partial<DecisionAnswer> & { signature?: unknown };
+  // KEY0c2: a hostile candidate is inspected through its own property
+  // descriptors before any field is read, so an accessor never runs and a
+  // proxy trap is never invoked here. An array, an accessor property, or an
+  // own requestId/actionScope/projectId string that names a different
+  // request, scope or project than the query is an ambiguous answer: it is
+  // reported as awaiting and is never upgraded to an approval.
+  let ownKeys: PropertyKey[];
+  try {
+    if (Array.isArray(candidate)) {
+      return { ...AWAITING };
+    }
+    ownKeys = Reflect.ownKeys(candidate);
+  } catch {
+    return { ...AWAITING };
+  }
+  for (const key of ownKeys) {
+    if (typeof key !== 'string') {
+      continue;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    } catch {
+      return { ...AWAITING };
+    }
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ...AWAITING };
+    }
+    if (typeof descriptor.value === 'string') {
+      const expected =
+        key === 'requestId'
+          ? query.requestId
+          : key === 'actionScope'
+            ? query.actionScope
+            : key === 'projectId'
+              ? query.projectId
+              : undefined;
+      if (expected !== undefined && descriptor.value !== expected) {
+        return { ...AWAITING };
+      }
+    }
+  }
   if (typeof answer.state !== 'string' || !DECISION_STATES.includes(answer.state)) {
     return { ...AWAITING };
   }

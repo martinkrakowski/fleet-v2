@@ -8,6 +8,12 @@
 
 import type { CoordinationKindValue } from './value-objects/CoordinationKind.vo.js';
 import type { CoordinationStateValue } from './value-objects/CoordinationState.vo.js';
+import {
+  MERGE_GRANT_FORGE_KINDS,
+  POLICY_GRANT_SOURCE_FOR_KIND,
+  parsePolicyDecisionRevision,
+  policyGrantForgeKindOf,
+} from './policy-grants.js';
 
 /**
  * One clone of a project's repository on an installation host. `path` is the
@@ -927,6 +933,202 @@ export interface CoordinationRequestRecord {
    * required there. Bound to the request id by a digest of its coordinates.
    */
   readonly shadowImportGrant?: ShadowImportGrantRecord;
+}
+
+/**
+ * True when a record's authorization may only be exercised through a
+ * re-verified signed owner decision. The two exemptions are closed by kind,
+ * never by a prefix or by the mere presence of a grant field:
+ *
+ * 1. A policy grant whose `decisionRevision` parses as
+ *    `policy:<source>@<12-hex>` and whose `actionScope` is a valid
+ *    `forge:<kind>` for that grant kind with `POLICY_GRANT_SOURCE_FOR_KIND[kind]`
+ *    equal to the parsed source.
+ * 2. An attempt-less merge grant whose `decisionRevision` matches
+ *    `policy:merge@<12-hex>` and whose `actionScope` is `forge:<kind>` for one
+ *    of `MERGE_GRANT_FORGE_KINDS`.
+ *
+ * Every other record — `release:*`, `merge:import-shadow`, `owner-decision:*`
+ * and any other owner-approved scoped grant, including a record carrying
+ * `policyGrant` or `mergeGrant` on an unrelated scope — requires a signed
+ * decision. Pure and total: never throws.
+ */
+export function isSignedDecisionRequired(record: CoordinationRequestRecord): boolean {
+  if (record.policyGrant !== undefined) {
+    const parsed = parsePolicyDecisionRevision(record.decisionRevision);
+    const kind =
+      typeof record.actionScope === 'string' ? policyGrantForgeKindOf(record.actionScope) : null;
+    if (parsed === null || kind === null || POLICY_GRANT_SOURCE_FOR_KIND[kind] !== parsed.source) {
+      return true;
+    }
+    return false;
+  }
+  if (record.mergeGrant !== undefined) {
+    const MERGE_GRANT_REVISION_PATTERN = /^policy:merge@[0-9a-f]{12}$/;
+    const matches =
+      typeof record.decisionRevision === 'string' &&
+      MERGE_GRANT_REVISION_PATTERN.test(record.decisionRevision) &&
+      typeof record.actionScope === 'string' &&
+      (MERGE_GRANT_FORGE_KINDS as readonly string[]).some((kind) => record.actionScope === `forge:${kind}`);
+    return !matches;
+  }
+  return true;
+}
+
+/** Bounded-input cap for one bound decision field: at most 512 characters. */
+export const MAX_DECISION_FIELD_LENGTH = 512 as const;
+
+/** Bounded-input cap for one bound decision object: at most 32 own keys. */
+export const MAX_DECISION_OBJECT_KEYS = 32 as const;
+
+/** Every typed way a signed-decision binding read can fail closed. */
+export type SignedDecisionBindingErrorCode =
+  | 'decision-binding-invalid-input'
+  | 'decision-binding-not-approved'
+  | 'decision-binding-mismatch';
+
+/** The outcome of one signed-decision binding check: bound, or a named refusal code. */
+export type SignedDecisionBindingCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly code: SignedDecisionBindingErrorCode };
+
+const DECISION_BINDING_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
+
+type DecisionBindingSnapshot =
+  | { readonly ok: true; readonly values: Record<string, unknown> }
+  | { readonly ok: false };
+
+/**
+ * Snapshot one plain object's own data properties through their descriptors.
+ * Cost is linear in `MAX_DECISION_OBJECT_KEYS` plus the bounded values copied
+ * (`MAX_DECISION_FIELD_LENGTH` per compared field): accessors are never
+ * invoked, arrays and sparse/array-like objects are refused, and a
+ * prototype-polluting key is refused before any field comparison.
+ */
+function snapshotDecisionBindingObject(raw: unknown): DecisionBindingSnapshot {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ok: false };
+  }
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(raw);
+  } catch {
+    return { ok: false };
+  }
+  if (isArray) {
+    return { ok: false };
+  }
+  let ownKeys: PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(raw);
+  } catch {
+    return { ok: false };
+  }
+  if (ownKeys.length > MAX_DECISION_OBJECT_KEYS) {
+    return { ok: false };
+  }
+  const values: Record<string, unknown> = {};
+  for (const key of ownKeys) {
+    if (typeof key !== 'string') {
+      return { ok: false };
+    }
+    if ((DECISION_BINDING_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
+      return { ok: false };
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    } catch {
+      return { ok: false };
+    }
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false };
+    }
+    values[key] = descriptor.value;
+  }
+  return { ok: true, values };
+}
+
+/** A bounded non-empty string of at most MAX_DECISION_FIELD_LENGTH characters. */
+function isBoundedDecisionField(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_DECISION_FIELD_LENGTH
+  );
+}
+
+function isUnboundField(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+/**
+ * Bind a stored coordination record to one signed owner answer (KEY0c2):
+ * both inputs are read as hostile `unknown` data through their own
+ * data-property descriptors only — a getter never runs, a `Proxy` `get` trap
+ * is never invoked, arrays (including sparse and array-like ones) are refused
+ * before any indexing, and a `__proto__`/`constructor`/`prototype` own key is
+ * refused before any field comparison — and the function never throws.
+ *
+ * The binding holds only when the answer is `approved` and every bound field
+ * is a bounded non-empty string equal on both sides: the record id against
+ * the answer's `requestId` when the answer carries one, the `actionScope`
+ * likewise, the `grantId` and the `decisionRevision` (required on both).
+ *
+ * Cost is linear in the capped input: at most `MAX_DECISION_OBJECT_KEYS * 2`
+ * own descriptors plus at most `MAX_DECISION_FIELD_LENGTH` characters per
+ * compared field; nothing else is read.
+ */
+export function verifySignedDecisionBinding(
+  recordInput: unknown,
+  answerInput: unknown,
+): SignedDecisionBindingCheck {
+  const record = snapshotDecisionBindingObject(recordInput);
+  if (!record.ok) {
+    return { ok: false, code: 'decision-binding-invalid-input' };
+  }
+  const answer = snapshotDecisionBindingObject(answerInput);
+  if (!answer.ok) {
+    return { ok: false, code: 'decision-binding-invalid-input' };
+  }
+  if (answer.values['state'] !== 'approved') {
+    return { ok: false, code: 'decision-binding-not-approved' };
+  }
+  // The record id binds every answer; the answer's own requestId, when it
+  // carries one, must name the same request.
+  if (!isBoundedDecisionField(record.values['id'])) {
+    return { ok: false, code: 'decision-binding-mismatch' };
+  }
+  if (
+    !isUnboundField(answer.values['requestId']) &&
+    (!isBoundedDecisionField(answer.values['requestId']) ||
+      answer.values['requestId'] !== record.values['id'])
+  ) {
+    return { ok: false, code: 'decision-binding-mismatch' };
+  }
+  if (
+    !isUnboundField(answer.values['actionScope']) &&
+    (!isBoundedDecisionField(answer.values['actionScope']) ||
+      !isBoundedDecisionField(record.values['actionScope']) ||
+      answer.values['actionScope'] !== record.values['actionScope'])
+  ) {
+    return { ok: false, code: 'decision-binding-mismatch' };
+  }
+  if (
+    !isBoundedDecisionField(answer.values['grantId']) ||
+    !isBoundedDecisionField(record.values['grantId']) ||
+    answer.values['grantId'] !== record.values['grantId']
+  ) {
+    return { ok: false, code: 'decision-binding-mismatch' };
+  }
+  if (
+    !isBoundedDecisionField(answer.values['decisionRevision']) ||
+    !isBoundedDecisionField(record.values['decisionRevision']) ||
+    answer.values['decisionRevision'] !== record.values['decisionRevision']
+  ) {
+    return { ok: false, code: 'decision-binding-mismatch' };
+  }
+  return { ok: true };
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

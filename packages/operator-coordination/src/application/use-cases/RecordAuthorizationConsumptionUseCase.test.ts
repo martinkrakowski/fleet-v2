@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { DecisionAnswer, DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 import type { RecordAuthorizationConsumptionResult } from '../ports/in/RecordAuthorizationConsumptionPort.in-port.js';
 import { RecordAuthorizationConsumptionUseCase } from './RecordAuthorizationConsumptionUseCase.use-case.js';
+import { createSignedDecisionFixture, explicitAnswerTransport } from './__tests__/signed-decision-fixture.js';
 
 class InMemoryCoordinationRequestRepo implements CoordinationRequestRepositoryPort {
   private requests = new Map<string, CoordinationRequestRecord>();
@@ -546,5 +548,210 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
       new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+});
+
+describe('RecordAuthorizationConsumptionUseCase signed re-verification (KEY0c2)', () => {
+  const REQUEST = {
+    consumptionId: 'consumption-1',
+    grantId: 'grant-9',
+    actionId: 'action-1',
+    actionScope: 'forge:merge',
+    attemptId: 'attempt-1',
+    expectedHeadSha: 'abc123',
+    nowIso: '2026-11-18T01:00:00.000Z',
+  };
+
+  function ownerRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
+    return {
+      id: 'request-1',
+      projectId: 'project-atlas',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'forge:merge',
+      expectedHeadSha: 'abc123',
+      proposalDigest: 'digest-1',
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-9',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-18T00:00:00.000Z',
+      updatedAtIso: '2026-11-18T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function repositoryWith(...records: CoordinationRequestRecord[]): InMemoryCoordinationRequestRepo {
+    const repo = new InMemoryCoordinationRequestRepo();
+    for (const record of records) {
+      void repo.saveRequest(record);
+    }
+    return repo;
+  }
+
+  function refuseStub(
+    answers: Record<
+      string,
+      { state: 'awaiting-decision' | 'declined'; decisionRevision: string | null; grantId: string | null }
+    >,
+  ): DecisionTransportPort {
+    return {
+      async readDecisionAnswer(query) {
+        return (
+          answers[query.requestId] ?? {
+            state: 'awaiting-decision' as const,
+            decisionRevision: null,
+            grantId: null,
+          }
+        );
+      },
+    };
+  }
+
+  function transportWith(
+    ownerPublicKey: string,
+    answers: Record<string, DecisionAnswer>,
+    ownerKeyRefusal?: 'owner-key-unpinned' | 'owner-key-env-mismatch',
+  ): DecisionTransportPort {
+    return explicitAnswerTransport(ownerPublicKey, answers, ownerKeyRefusal);
+  }
+
+  it('consumes with valid signed answer', async () => {
+    const signer = createSignedDecisionFixture();
+    const record = ownerRecord();
+    await signer.writeApprovedAnswer(record);
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(record),
+      decisionTransport: signer.deps.decisionTransport,
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result.outcome).toBe('consumed');
+  });
+
+  it('refuses hand-written approved record with no answer file', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+  });
+
+  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result.outcome).toBe('consumed');
+  });
+
+  it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {
+    const signer = createSignedDecisionFixture();
+    const answer = signer.signApprovedAnswer(ownerRecord());
+    for (const refusal of ['owner-key-unpinned', 'owner-key-env-mismatch'] as const) {
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, { 'request-1': answer }, refusal),
+      }).recordAuthorizationConsumption(REQUEST);
+      expect(result).toEqual({ outcome: 'refused', reason: refusal });
+    }
+  });
+
+  it('refuses approved record when answer is signed by a different key', async () => {
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': other.signApprovedAnswer(ownerRecord()),
+      }),
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+  });
+
+  it('refuses approved record when answer is for a different request', async () => {
+    const signer = createSignedDecisionFixture();
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(ownerRecord()),
+      decisionTransport: transportWith(signer.ownerPublicKey, {
+        'request-1': signer.signApprovedAnswer(ownerRecord({ id: 'request-2' })),
+      }),
+    }).recordAuthorizationConsumption(REQUEST);
+    expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+  });
+
+  it('refuses when answer grantId or decisionRevision mismatches stored record', async () => {
+    const signer = createSignedDecisionFixture();
+    for (const mismatched of [
+      ownerRecord({ grantId: 'grant-8' }),
+      ownerRecord({ decisionRevision: 'decision-4' }),
+    ]) {
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: transportWith(signer.ownerPublicKey, {
+          'request-1': signer.signApprovedAnswer(mismatched),
+        }),
+      }).recordAuthorizationConsumption(REQUEST);
+      expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+    }
+  });
+
+  it('refuses when decisionTransport reports awaiting-decision or declined', async () => {
+    for (const answer of [
+      { state: 'awaiting-decision' as const, decisionRevision: null, grantId: null },
+      { state: 'declined' as const, decisionRevision: 'decision-3', grantId: 'grant-9' },
+    ]) {
+      const result = await new RecordAuthorizationConsumptionUseCase({
+        requestRepo: repositoryWith(ownerRecord()),
+        decisionTransport: refuseStub({ 'request-1': answer }),
+      }).recordAuthorizationConsumption(REQUEST);
+      expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+    }
+  });
+
+  it('refuses forged policyGrant on release record before replay or exemption', async () => {
+    const forged = ownerRecord({
+      actionScope: 'release:install',
+      policyGrant: { workOrderId: 'wo-1', attemptId: 'attempt-1', acceptanceReceiptId: 'r-1' },
+      consumptions: [
+        {
+          consumptionId: 'consumption-1',
+          grantId: 'grant-9',
+          requestId: 'request-1',
+          actionId: 'action-1',
+          attemptId: 'attempt-1',
+          expectedHeadSha: 'abc123',
+          consumedAtIso: '2026-11-18T00:30:00.000Z',
+        },
+      ],
+    });
+    const signer = createSignedDecisionFixture();
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(forged),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).recordAuthorizationConsumption({ ...REQUEST, actionScope: 'release:install' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-coordination-request' });
+  });
+
+  it('keeps policy and merge grants unchanged with decisionTransport injected', async () => {
+    const policyHead = 'a'.repeat(40);
+    const policyGrant = ownerRecord({
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: policyHead,
+      decisionRevision: 'policy:autoMerge@0123456789ab',
+      policyGrant: { workOrderId: 'wo-1', attemptId: 'attempt-1', acceptanceReceiptId: 'r-1' },
+    });
+    const signer = createSignedDecisionFixture();
+    const result = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(policyGrant),
+      decisionTransport: transportWith(signer.ownerPublicKey, {}),
+    }).recordAuthorizationConsumption({
+      ...REQUEST,
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: policyHead,
+    });
+    expect(result.outcome).toBe('consumed');
   });
 });

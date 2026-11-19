@@ -21,11 +21,13 @@ import {
   readReleaseNonce,
   releaseRootsAgree,
   isShadowImportActionScope,
+  isSignedDecisionRequired,
   releaseGrantDigestPayload,
   RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   shadowImportDigestPayload,
+  verifySignedDecisionBinding,
 } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { readPlainObjectLoose } from '../../domain/record-input.js';
@@ -300,6 +302,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (attemptBlock !== null) {
       return attemptBlock;
     }
+    // KEY0c2: every owner-gated approval is re-bound to a verified signed
+    // answer when a decision transport is injected, before anything is
+    // authorized. The check runs after every stored-coordinate refusal, so
+    // origin/main's exact refusal reasons are preserved.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, resumable);
+    if (signatureBlock !== null) {
+      return signatureBlock;
+    }
     return {
       outcome: 'authorized',
       grantId,
@@ -308,6 +318,45 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       policyRevision: candidate.getPolicyRevision(),
       ...(recordedRoot.state === 'valid' ? { releaseRoot: recordedRoot.value } : {}),
     };
+  }
+
+  /**
+   * KEY0c2: when a decision transport is injected, an owner-gated approval —
+   * a stored `approved` record (or a resumable `completed` release record) whose
+   * scope is not a closed-kind policy or merge grant — is re-read through the
+   * transport and bound to the signed answer. Anything the transport reports
+   * as awaiting or declined, an owner-key refusal, or a mismatching binding
+   * blocks; when no transport is injected the origin/main behaviour is kept
+   * exactly. Returns the block, or null when the record may authorize.
+   */
+  private async verifyOwnerDecisionForRecord(
+    candidate: CoordinationRequest,
+    refreshed: CoordinationRequestRecord,
+    resumable: boolean,
+  ): Promise<ResolveActionAuthorizationResult | null> {
+    const decisionTransport = this.deps?.decisionTransport;
+    if (decisionTransport === undefined) {
+      return null;
+    }
+    if (refreshed.state !== 'approved' && !(refreshed.state === 'completed' && resumable)) {
+      return null;
+    }
+    if (!isSignedDecisionRequired(candidate.toRecord())) {
+      return null;
+    }
+    const answer = await decisionTransport.readDecisionAnswer({
+      requestId: refreshed.id,
+      projectId: refreshed.projectId,
+      actionScope: refreshed.actionScope,
+      expectedHeadSha: refreshed.expectedHeadSha,
+    });
+    if (answer.state === 'awaiting-decision' && answer.refusalReason !== undefined) {
+      return blocked(answer.refusalReason);
+    }
+    if (!verifySignedDecisionBinding(refreshed, answer).ok) {
+      return blocked('decision-signature-invalid');
+    }
+    return null;
   }
 
   /**
@@ -398,6 +447,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // `nowIso` can never revive an expired grant.
     if (Date.parse(nowIso) >= Date.parse(shadowGrant.expiresAtIso)) {
       return blocked('grant-expired');
+    }
+    // KEY0c2: a standing shadow import grant is also re-bound to a verified
+    // signed answer when a decision transport is injected.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed, false);
+    if (signatureBlock !== null) {
+      return signatureBlock;
     }
     return {
       outcome: 'authorized',

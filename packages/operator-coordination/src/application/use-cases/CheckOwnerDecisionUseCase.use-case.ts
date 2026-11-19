@@ -12,15 +12,23 @@
  */
 
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { verifySignedDecisionBinding } from '../../domain/coordination-records.js';
 import type {
   CheckOwnerDecisionPort,
   CheckOwnerDecisionRequest,
   CheckOwnerDecisionResult,
 } from '../ports/in/CheckOwnerDecisionPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 
 export interface CheckOwnerDecisionDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
+  /**
+   * KEY0c2: when injected, an authorizing owner decision is re-read through
+   * the transport and bound to the signed answer before `approved` is
+   * reported. Omitted, the origin/main behaviour is kept until KEY0c3.
+   */
+  readonly decisionTransport?: DecisionTransportPort;
 }
 
 /** The only action scope a request may carry to authorize its own decision. */
@@ -105,6 +113,29 @@ export class CheckOwnerDecisionUseCase implements CheckOwnerDecisionPort {
         requestId,
         reason: `coordination request ${requestId} carries no grant`,
       };
+    }
+    // KEY0c2: when a decision transport is injected, an authorizing owner
+    // decision is re-read from the transport and bound to the signed answer.
+    // An owner-key refusal, an ambiguous or unverifiable answer, or a
+    // mismatching binding is not-approved, never approved. Without a
+    // transport the origin/main behaviour is kept.
+    if (this.deps.decisionTransport !== undefined) {
+      const answer = await this.deps.decisionTransport.readDecisionAnswer({
+        requestId: candidate.getId(),
+        projectId: recorded.projectId,
+        actionScope: candidate.getActionScope(),
+        expectedHeadSha: candidate.getExpectedHeadSha(),
+      });
+      if (answer.state === 'awaiting-decision' && answer.refusalReason !== undefined) {
+        return { outcome: 'not-approved', requestId, reason: answer.refusalReason };
+      }
+      if (!verifySignedDecisionBinding(recorded, answer).ok) {
+        return {
+          outcome: 'not-approved',
+          requestId,
+          reason: 'decision-signature-invalid',
+        };
+      }
     }
     return { outcome: 'approved', requestId, grantId };
   }

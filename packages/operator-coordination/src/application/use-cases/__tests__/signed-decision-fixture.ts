@@ -140,3 +140,22 @@ export function createSignedDecisionFixture(
     assertApprovedAnswerReadsBackApproved,
   };
 }
+
+/**
+ * KEY0c2: a real `DecisionTransportAdapter` over explicitly supplied answers,
+ * with an optional owner-key refusal, for tests that must drive the adapter
+ * directly (a different signing key, a wrong request, or a named owner-key
+ * refusal). Application-layer test files import this helper instead of the
+ * adapter so the layer boundary stays clean.
+ */
+export function explicitAnswerTransport(
+  ownerPublicKey: string,
+  answers: Record<string, DecisionAnswer>,
+  ownerKeyRefusal?: 'owner-key-unpinned' | 'owner-key-env-mismatch',
+): DecisionTransportPort {
+  return new DecisionTransportAdapter({
+    ownerPublicKey,
+    answers,
+    ...(ownerKeyRefusal === undefined ? {} : { ownerKeyRefusal }),
+  });
+}

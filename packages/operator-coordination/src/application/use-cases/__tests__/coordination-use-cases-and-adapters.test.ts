@@ -1649,7 +1649,10 @@ describe('ResolveActionAuthorizationUseCase', () => {
       decisionTransport: transport,
     }).execute(request);
     expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
-    expect(transport.reads).toEqual(['request-1']);
+    // KEY0c2: the resolve re-reads the signed answer once more for the
+    // refreshed approved record (a second `readDecisionAnswer` call), so the
+    // transport is consulted twice for the same request in one execute.
+    expect(transport.reads).toEqual(['request-1', 'request-1']);
     expect(repo.saves).toHaveLength(1);
     expect(repo.saves[0]?.state).toBe('approved');
   });

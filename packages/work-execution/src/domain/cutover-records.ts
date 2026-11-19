@@ -449,6 +449,200 @@ function readEvidenceDay(element: unknown, failed: Set<string>): number | null {
 }
 
 /**
+ * The retirement ledger (owner decision 2026-11-18): the retirement gate reads
+ * a record of every cutover-plan §1 inventory row — the shell scripts the
+ * cutover replaces — and refuses unless each row carries an evidence link and
+ * is verified. The script list is exactly the §1 inventory (train and lane
+ * tables) of `docs/planning/2026-11-03_cutover-plan.md`; a ledger that names
+ * anything else is not a ledger of this plan.
+ */
+export const CUTOVER_RETIREMENT_SCRIPTS = [
+  'lane/after-lane.sh',
+  'lane/agy-brief.sh',
+  'lane/auto-record.sh',
+  'lane/brief-lint.sh',
+  'lane/cf-gate-review.sh',
+  'lane/conducted-perf.py',
+  'lane/conductor-deploy.sh',
+  'lane/conductor-locked.sh',
+  'lane/deploy-train.sh',
+  'lane/dispatch.sh',
+  'lane/drive-runs.sh',
+  'lane/finish-lane.sh',
+  'lane/fix-round-agy.sh',
+  'lane/fleet-v2-gate.sh',
+  'lane/fv2-lane.sh',
+  'lane/gate-review.sh',
+  'lane/gate-timeouts.sh',
+  'lane/grok-brief.sh',
+  'lane/hx-brief.sh',
+  'lane/hx-lane.sh',
+  'lane/hx-review.sh',
+  'lane/hx-sonar.sh',
+  'lane/land-mc.sh',
+  'lane/lane-checks.sh',
+  'lane/lane-pr.sh',
+  'lane/lane-rebase.sh',
+  'lane/launch.sh',
+  'lane/luna-brief.sh',
+  'lane/luna-fleet.sh',
+  'lane/luna-pass.sh',
+  'lane/mc-fix.sh',
+  'lane/merge-main.sh',
+  'lane/mk-agy-input.py',
+  'lane/mk-brief-request.py',
+  'lane/mkreview.py',
+  'lane/mx-brief.sh',
+  'lane/pr-ready.sh',
+  'lane/pr-wait.sh',
+  'lane/pr.sh',
+  'lane/premerge.sh',
+  'lane/prep-TEMPLATE.sh',
+  'lane/prep-other.sh',
+  'lane/push-fix.sh',
+  'lane/quality-track.py',
+  'lane/record-merged.sh',
+  'lane/review-other.sh',
+  'lane/review.sh',
+  'lane/split-agy-brief.py',
+  'lane/start-lanes.py',
+  'lane/tr-brief.sh',
+  'lane/tr-chain.sh',
+  'lane/tr-cont.sh',
+  'lane/tr-gemini.sh',
+  'lane/tr-lane.sh',
+  'lane/tr-review.sh',
+  'lane/verify-brief-prompt.md',
+  'train/batch.sh',
+  'train/chain-land.sh',
+  'train/chain-refresh.sh',
+  'train/chain-review.sh',
+  'train/chain-start.sh',
+  'train/common.sh',
+  'train/conductor-adopt.sh',
+  'train/enqueue.sh',
+  'train/jev-shadow.sh',
+  'train/pass.sh',
+  'train/premerge.sh',
+  'train/tick.sh',
+] as const;
+
+export type CutoverRetirementScript = (typeof CUTOVER_RETIREMENT_SCRIPTS)[number];
+
+export const RETIREMENT_LEDGER_SCHEMA_VERSION = 1;
+/** The stored `cutover-retirement-ledger.json` file is refused past this size. */
+export const RETIREMENT_LEDGER_MAX_BYTES = 65_536;
+
+export type RetirementLedgerRead =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | 'empty-ledger'
+        | 'row-unverified'
+        | 'invalid-ledger'
+        | 'secret-shaped'
+        | 'unknown-version';
+    };
+
+const RETIREMENT_SCRIPT_MAX_BYTES = 64;
+const RETIREMENT_EVIDENCE_MAX_BYTES = 256;
+
+/** The own enumerable data-property value of `key`; a getter is never run. */
+function retirementOwnValue(record: unknown, key: string): unknown {
+  if (typeof record !== 'object' || record === null) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+    return undefined;
+  }
+  return descriptor.value;
+}
+
+/**
+ * Read one retirement ledger without running a single getter and never
+ * echoing an input value. The root is a plain record whose only own keys are
+ * `schemaVersion` (exactly 1; a newer safe integer is `unknown-version`) and
+ * `rows`: a real array holding exactly one row per §1 script, each row a plain
+ * record with the own keys `script`, `verified` and `evidence`. A missing,
+ * extra or duplicated script row, or any over-long or secret-shaped text, is
+ * refused. Every failure path is a typed reason, never a throw.
+ */
+export function readRetirementLedger(raw: unknown): RetirementLedgerRead {
+  try {
+    const version = readRecordSchemaVersion(raw, RETIREMENT_LEDGER_SCHEMA_VERSION);
+    if (!version.ok) {
+      const value = retirementOwnValue(raw, 'schemaVersion');
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value > 1) {
+        return { ok: false, reason: 'unknown-version' };
+      }
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    if (!isPlainRecordObject(raw) || Reflect.ownKeys(raw).length !== 2) {
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    return readRetirementRows(retirementOwnValue(raw, 'rows'));
+  } catch {
+    return { ok: false, reason: 'invalid-ledger' };
+  }
+}
+
+function readRetirementRows(rows: unknown): RetirementLedgerRead {
+  if (!Array.isArray(rows) || Object.getPrototypeOf(rows) !== Array.prototype) {
+    return { ok: false, reason: 'invalid-ledger' };
+  }
+  if (rows.length === 0) {
+    return { ok: false, reason: 'empty-ledger' };
+  }
+  // More rows than the inventory can never be one row per script; refuse
+  // before walking them.
+  if (rows.length > CUTOVER_RETIREMENT_SCRIPTS.length) {
+    return { ok: false, reason: 'invalid-ledger' };
+  }
+  const seen = new Set<string>();
+  let unverified = false;
+  for (const row of rows) {
+    if (!isPlainRecordObject(row) || Reflect.ownKeys(row).length !== 3) {
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    const script = retirementOwnValue(row, 'script');
+    const evidence = retirementOwnValue(row, 'evidence');
+    const verified = retirementOwnValue(row, 'verified');
+    if (!isBoundedLedgerText(script, RETIREMENT_SCRIPT_MAX_BYTES) || !isBoundedLedgerText(evidence, RETIREMENT_EVIDENCE_MAX_BYTES)) {
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    if (isSecretShapedText(script) || isSecretShapedText(evidence)) {
+      return { ok: false, reason: 'secret-shaped' };
+    }
+    if (!(CUTOVER_RETIREMENT_SCRIPTS as readonly string[]).includes(script)) {
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    if (seen.has(script)) {
+      return { ok: false, reason: 'invalid-ledger' };
+    }
+    seen.add(script);
+    // A row without an evidence link is unverified whatever its flag says (S13:
+    // every row has an evidence link and is verified).
+    if (verified !== true || evidence.length === 0) {
+      unverified = true;
+    }
+  }
+  // A duplicate or unknown row never reaches here; a row count above the
+  // inventory therefore means an extra row the script check could not name.
+  if (rows.length !== CUTOVER_RETIREMENT_SCRIPTS.length || seen.size !== CUTOVER_RETIREMENT_SCRIPTS.length) {
+    return { ok: false, reason: 'invalid-ledger' };
+  }
+  return unverified ? { ok: false, reason: 'row-unverified' } : { ok: true };
+}
+
+function isBoundedLedgerText(value: unknown, maxBytes: number): value is string {
+  // The UTF-16 length is checked first: a string's UTF-8 byte length is never
+  // less than it, so an oversized string is never encoded.
+  return typeof value === 'string' && value.length <= maxBytes && new TextEncoder().encode(value).length <= maxBytes;
+}
+
+/**
  * A transparent Proxy over the document answers every prototype, key and
  * descriptor read exactly as its target would, so the checks above cannot
  * tell it from data. The structured-clone serializer refuses any Proxy

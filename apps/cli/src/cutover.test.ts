@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_SHADOW_CRITERIA,
   ShadowEvidenceAdapter,
   buildMergeKey,
@@ -71,6 +72,57 @@ async function seedSwitched(runtime: FleetCliRuntime, trainPauseSetByCutover: bo
   });
   expect(saved.outcome).toBe('saved');
   await runtime.execution.killallTrainPause.set({ paused: true, nowIso: SWITCHED_AT });
+}
+
+interface LedgerRow {
+  readonly script: string;
+  readonly verified: boolean;
+  readonly evidence: string;
+}
+
+/** One verified row with an evidence link for every §1 cutover-plan script. */
+function validRetirementLedger(
+  rowOverrides: Record<number, Partial<LedgerRow>> = {},
+): { readonly schemaVersion: number; readonly rows: LedgerRow[] } {
+  const rows: LedgerRow[] = CUTOVER_RETIREMENT_SCRIPTS.map((script) => ({
+    script,
+    verified: true,
+    evidence: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
+  }));
+  for (const [index, override] of Object.entries(rowOverrides)) {
+    rows[Number(index)] = { ...rows[Number(index)], ...override };
+  }
+  return { schemaVersion: 1, rows };
+}
+
+function writeRetirementLedger(text: string): void {
+  writeFileSync(join(stateDir, 'cutover-retirement-ledger.json'), text);
+}
+
+/** Retire the seeded switched record after the 14-day window. */
+async function retireAfterWindow(runtime: FleetCliRuntime): Promise<{
+  readonly code: number;
+  readonly out: string;
+  readonly err: string;
+  readonly json: Record<string, unknown> | null;
+}> {
+  return run(runtime, [
+    'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
+  ]);
+}
+
+/** A retire failure exits 1, writes nothing, and never echoes the state directory. */
+async function expectRetireRefusal(
+  runtime: FleetCliRuntime,
+  expected: Record<string, unknown>,
+): Promise<void> {
+  const result = await retireAfterWindow(runtime);
+  expect(result.code).toBe(1);
+  expect(result.json).toEqual(expected);
+  expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
+  expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+  expect(result.out).not.toContain(stateDir);
+  expect(result.err).not.toContain(stateDir);
 }
 
 const DEFAULT_RELEASE_SHA = 'a'.repeat(40);
@@ -293,6 +345,7 @@ describe('fleet-v2 cutover status and rollback', () => {
   it('cutover retire after the window saves retired and does not print the state directory', async () => {
     const runtime = runtimeFor();
     await seedSwitched(runtime, true);
+    writeRetirementLedger(JSON.stringify(validRetirementLedger()));
     const result = await run(runtime, [
       'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
     ]);
@@ -333,10 +386,76 @@ describe('fleet-v2 cutover status and rollback', () => {
   it('a completed retire prints its keys in the first release order', async () => {
     const runtime = runtimeFor();
     await seedSwitched(runtime, true);
+    writeRetirementLedger(JSON.stringify(validRetirementLedger()));
     const result = await run(runtime, [
       'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
     ]);
     expect(Object.keys(result.json ?? {})).toEqual(['outcome', 'move', 'key', 'replayed', 'state', 'revision', 'record']);
+  });
+
+  it('cutover retire refuses retirement-ledger-absent when the ledger file is missing', async () => {
+    const runtime = runtimeFor();
+    await seedSwitched(runtime, true);
+    await expectRetireRefusal(runtime, { outcome: 'refused', reason: 'retirement-ledger-absent' });
+  });
+
+  it('cutover retire refuses retirement-ledger-failed on an empty or unverified ledger', async () => {
+    const empty = runtimeFor();
+    await seedSwitched(empty, true);
+    writeRetirementLedger(JSON.stringify({ schemaVersion: 1, rows: [] }));
+    await expectRetireRefusal(empty, { outcome: 'refused', reason: 'retirement-ledger-failed' });
+
+    const unverified = runtimeFor();
+    await seedSwitched(unverified, true);
+    writeRetirementLedger(JSON.stringify(validRetirementLedger({ 0: { verified: false } })));
+    await expectRetireRefusal(unverified, { outcome: 'refused', reason: 'retirement-ledger-failed' });
+  });
+
+  it('cutover retire refuses retirement-ledger-failed on an incomplete or extra-row ledger', async () => {
+    const incomplete = runtimeFor();
+    await seedSwitched(incomplete, true);
+    writeRetirementLedger(JSON.stringify({ schemaVersion: 1, rows: validRetirementLedger().rows.slice(1) }));
+    await expectRetireRefusal(incomplete, { outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+
+    const extra = runtimeFor();
+    await seedSwitched(extra, true);
+    writeRetirementLedger(
+      JSON.stringify({
+        schemaVersion: 1,
+        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidence: 'e' }],
+      }),
+    );
+    await expectRetireRefusal(extra, { outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+
+    const duplicate = runtimeFor();
+    await seedSwitched(duplicate, true);
+    writeRetirementLedger(
+      JSON.stringify({
+        schemaVersion: 1,
+        rows: [...validRetirementLedger().rows.slice(0, -1), validRetirementLedger().rows[0]],
+      }),
+    );
+    await expectRetireRefusal(duplicate, { outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+  });
+
+  it('cutover retire refuses on an unreadable or unknown-version ledger', async () => {
+    const unreadable = runtimeFor();
+    await seedSwitched(unreadable, true);
+    writeRetirementLedger('{ not json');
+    await expectRetireRefusal(unreadable, { outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+
+    const unknownVersion = runtimeFor();
+    await seedSwitched(unknownVersion, true);
+    writeRetirementLedger(JSON.stringify({ schemaVersion: 2, rows: validRetirementLedger().rows }));
+    await expectRetireRefusal(unknownVersion, { outcome: 'unknown', reason: 'retirement-ledger-unknown-version' });
+  });
+
+  it('cutover retire in memory mode refuses retirement-ledger-absent', async () => {
+    const runtime = runtimeFor(undefined);
+    await seedSwitched(runtime, true);
+    const result = await retireAfterWindow(runtime);
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'retirement-ledger-absent' });
   });
 });
 

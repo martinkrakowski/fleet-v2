@@ -14,10 +14,12 @@ import { KillallTrainPauseAdapter } from '../../../infrastructure/adapters/Killa
 import { WORK_EXECUTION_STATE_FILES } from '../../../infrastructure/adapters/state-files.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_SHADOW_CRITERIA,
   CUTOVER_SHADOW_MIN_MERGES,
   canonicalCutoverSwitchPayload,
+  readRetirementLedger,
   type CutoverRecord,
 } from '../../../domain/cutover-records.js';
 import { ManageCutoverUseCase, type ManageCutoverDependencies } from '../ManageCutoverUseCase.use-case.js';
@@ -242,6 +244,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     computeDigest: sha256HexDigest,
     mintEntryId: () => ulid((sequence += 1)),
     nowIso: () => clock.now,
+    readRetirementLedger: async () => ({ status: 'ok', ledger: validRetirementLedger() }),
   };
   const spies = {
     daemonPauseWrite: vi.spyOn(daemonPause, 'write'),
@@ -327,14 +330,42 @@ function expectNoSwitchWrites(h: Harness): void {
 
 type ShadowEvidenceReader = NonNullable<ManageCutoverDependencies['readShadowEvidence']>;
 type UnrecordedLanesCounter = NonNullable<ManageCutoverDependencies['countUnrecordedLanes']>;
+type RetirementLedgerReader = NonNullable<ManageCutoverDependencies['readRetirementLedger']>;
 
-function readers(overrides: { readShadowEvidence?: ShadowEvidenceReader; countUnrecordedLanes?: UnrecordedLanesCounter } = {}): {
+interface LedgerRow {
+  readonly script: string;
+  readonly verified: boolean;
+  readonly evidence: string;
+}
+
+/** One verified row with an evidence link for every §1 cutover-plan script. */
+function validRetirementLedger(
+  rowOverrides: Record<number, Partial<LedgerRow>> = {},
+): { readonly schemaVersion: number; readonly rows: LedgerRow[] } {
+  const rows: LedgerRow[] = CUTOVER_RETIREMENT_SCRIPTS.map((script) => ({
+    script,
+    verified: true,
+    evidence: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
+  }));
+  for (const [index, override] of Object.entries(rowOverrides)) {
+    rows[Number(index)] = { ...rows[Number(index)], ...override };
+  }
+  return { schemaVersion: 1, rows };
+}
+
+function readers(overrides: {
+  readShadowEvidence?: ShadowEvidenceReader;
+  countUnrecordedLanes?: UnrecordedLanesCounter;
+  readRetirementLedger?: RetirementLedgerReader;
+} = {}): {
   readShadowEvidence: ShadowEvidenceReader;
   countUnrecordedLanes: UnrecordedLanesCounter;
+  readRetirementLedger: RetirementLedgerReader;
 } {
   return {
     readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW) }),
     countUnrecordedLanes: async () => ({ status: 'ok', unrecorded: 0, unknownListings: 0 }),
+    readRetirementLedger: async () => ({ status: 'ok', ledger: validRetirementLedger() }),
     ...overrides,
   };
 }
@@ -1265,6 +1296,154 @@ describe('ManageCutoverUseCase retire', () => {
     });
     expect(totalWriteCalls(h)).toBe(0);
     expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+  });
+
+  it('retire refuses retirement-ledger-absent when readRetirementLedger is omitted', async () => {
+    const h = await harness();
+    const { readRetirementLedger: _omitted, ...rest } = h.deps;
+    void _omitted;
+    const useCase = new ManageCutoverUseCase(rest);
+    resetSpies(h);
+    expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'retirement-ledger-absent',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('retire refuses retirement-ledger-absent when ledger is absent', async () => {
+    const h = await harness();
+    const useCase = useCaseWithReaders(h, {
+      readRetirementLedger: async () => ({ status: 'absent' }),
+    });
+    expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'retirement-ledger-absent',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(await journalEntries(h, 'cutover/retire@1')).toHaveLength(0);
+  });
+
+  it('retire refuses retirement-ledger-failed on empty or unverified ledger', async () => {
+    for (const ledger of [
+      { schemaVersion: 1, rows: [] },
+      validRetirementLedger({ 0: { verified: false } }),
+      validRetirementLedger({ 0: { evidence: '' } }),
+    ]) {
+      const h = await harness();
+      const useCase = useCaseWithReaders(h, { readRetirementLedger: async () => ({ status: 'ok', ledger }) });
+      expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+        outcome: 'refused',
+        reason: 'retirement-ledger-failed',
+      });
+      expect(totalWriteCalls(h)).toBe(0);
+      expect(await journalEntries(h, 'cutover/retire@1')).toHaveLength(0);
+    }
+  });
+
+  it('retire returns unknown retirement-ledger-unreadable on malformed, incomplete, or secret-shaped ledger', async () => {
+    for (const ledger of [
+      { schemaVersion: 1, rows: ['nope'] },
+      // Missing one §1 script row.
+      { schemaVersion: 1, rows: validRetirementLedger().rows.slice(1) },
+      // An extra script row that is not part of the inventory.
+      {
+        schemaVersion: 1,
+        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidence: 'e' }],
+      },
+      // A duplicated row.
+      {
+        schemaVersion: 1,
+        rows: [...validRetirementLedger().rows.slice(0, -1), validRetirementLedger().rows[0]],
+      },
+      // Over-long text.
+      validRetirementLedger({ 0: { evidence: 'e'.repeat(257) } }),
+      // Secret-shaped text.
+      validRetirementLedger({ 0: { evidence: LANE_ONLY_SECRET } }),
+    ]) {
+      const h = await harness();
+      const useCase = useCaseWithReaders(h, { readRetirementLedger: async () => ({ status: 'ok', ledger }) });
+      expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+        outcome: 'unknown',
+        reason: 'retirement-ledger-unreadable',
+      });
+      expect(totalWriteCalls(h)).toBe(0);
+      expect(await journalEntries(h, 'cutover/retire@1')).toHaveLength(0);
+    }
+  });
+
+  it('retire returns unknown retirement-ledger-unreadable when reader reports unreadable or throws', async () => {
+    const unreadable = await harness();
+    expect(
+      await useCaseWithReaders(unreadable, { readRetirementLedger: async () => ({ status: 'unreadable' }) }).execute(
+        retireRequest({ nowIso: AFTER_WINDOW_NOW }),
+      ),
+    ).toEqual({ outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+    const threw = await harness();
+    expect(
+      await useCaseWithReaders(threw, {
+        readRetirementLedger: async () => {
+          throw new Error('boom');
+        },
+      }).execute(retireRequest({ nowIso: AFTER_WINDOW_NOW })),
+    ).toEqual({ outcome: 'unknown', reason: 'retirement-ledger-unreadable' });
+    expect(totalWriteCalls(unreadable)).toBe(0);
+    expect(totalWriteCalls(threw)).toBe(0);
+  });
+
+  it('retire returns unknown retirement-ledger-unknown-version on newer schemaVersion', async () => {
+    const h = await harness();
+    const useCase = useCaseWithReaders(h, {
+      readRetirementLedger: async () => ({ status: 'unknown-version' }),
+    });
+    expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'retirement-ledger-unknown-version',
+    });
+    const domain = useCaseWithReaders(h, {
+      readRetirementLedger: async () => ({ status: 'ok', ledger: { schemaVersion: 2, rows: [] } }),
+    });
+    expect(await domain.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'retirement-ledger-unknown-version',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(await journalEntries(h, 'cutover/retire@1')).toHaveLength(0);
+  });
+
+  it('retire returns unknown deadline-exceeded before reading retirement ledger when deadline is past', async () => {
+    const h = await harness();
+    let read = 0;
+    const useCase = useCaseWithReaders(h, {
+      readRetirementLedger: async () => {
+        read += 1;
+        return { status: 'ok', ledger: validRetirementLedger() };
+      },
+    });
+    expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW, deadlineIso: EARLIER_DEADLINE }))).toEqual({
+      outcome: 'unknown',
+      reason: 'deadline-exceeded',
+    });
+    expect(read).toBe(0);
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('readRetirementLedger refuses every malformed ledger shape', () => {
+    const valid = validRetirementLedger();
+    expect(readRetirementLedger(valid)).toEqual({ ok: true });
+    expect(readRetirementLedger({ schemaVersion: 1, rows: [] })).toEqual({ ok: false, reason: 'empty-ledger' });
+    expect(readRetirementLedger({ schemaVersion: 1, rows: valid.rows.slice(1) })).toEqual({ ok: false, reason: 'invalid-ledger' });
+    expect(readRetirementLedger({ schemaVersion: 2, rows: [] })).toEqual({ ok: false, reason: 'unknown-version' });
+    expect(readRetirementLedger({ schemaVersion: 1, rows: [] , extra: 1 })).toEqual({ ok: false, reason: 'invalid-ledger' });
+    expect(readRetirementLedger('nope')).toEqual({ ok: false, reason: 'invalid-ledger' });
+    expect(readRetirementLedger({ schemaVersion: 1, rows: valid.rows.map((row) => ({ ...row, verified: false })) })).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+    expect(readRetirementLedger({ schemaVersion: 1, rows: [{ ...valid.rows[0], evidence: LANE_ONLY_SECRET }] })).toEqual({
+      ok: false,
+      reason: 'secret-shaped',
+    });
   });
 });
 

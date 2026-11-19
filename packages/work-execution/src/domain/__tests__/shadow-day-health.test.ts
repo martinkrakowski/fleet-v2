@@ -503,22 +503,48 @@ describe('evaluateShadowTickHealth (S12)', () => {
     });
   });
 
-  it('fails coverage-gap 1 ms beyond the boundary', () => {
-    const gapStart = 540 * 60_000;
-    const events = cleanDay(1440).filter((event) => {
-      const offset = Date.parse(event.recordedAtIso as string) - DAY_START_MS;
-      return offset <= gapStart || offset >= gapStart + SHADOW_MAX_TICK_GAP_MS + 60_000;
+  it('pins the max-gap boundary: a hole of exactly the limit passes, the limit + 1 ms fails', () => {
+    // OD7a3 fix round: builds the events array ITSELF — a full day of regular
+    // one-minute ticks with exactly ONE hole — so the S12 verdict is pinned to
+    // the millisecond on both sides of `SHADOW_MAX_TICK_GAP_MS`. Changing the
+    // limit by even 1 ms in either direction fails one of the two assertions.
+    const gapStartOffset = 540 * 60_000;
+    const dayWithOneGap = (gapMs: number): Record<string, unknown>[] => {
+      // Ticks every minute up to and including the last before the hole, then
+      // the first tick AFTER the hole, then every minute to 23:59Z. The single
+      // consecutive gap is exactly `gapMs`.
+      const gapEndOffset = gapStartOffset + gapMs;
+      const offsets: number[] = [];
+      for (let offset = 0; offset <= gapStartOffset; offset += 60_000) offsets.push(offset);
+      for (let offset = gapEndOffset; offset < 86_400_000; offset += 60_000) offsets.push(offset);
+      return offsets.map((offset, index) => jobEvent({
+        eventId: eventId(index + 1),
+        tickId: tickId(index + 1),
+        recordedAtIso: isoAtOffsetMs(offset),
+      }));
+    };
+
+    // (a) A gap of EXACTLY `SHADOW_MAX_TICK_GAP_MS` passes.
+    const exact = dayWithOneGap(SHADOW_MAX_TICK_GAP_MS);
+    // Sanity: the hole is the single consecutive-pair concern — the last
+    // pre-gap tick (index 540) and the first post-gap tick (index 541) are
+    // exactly `gapMs` apart.
+    expect(Date.parse((exact[541] as { recordedAtIso: string }).recordedAtIso) - Date.parse((exact[540] as { recordedAtIso: string }).recordedAtIso)).toBe(SHADOW_MAX_TICK_GAP_MS);
+    expect(s12(dayInput(exact))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: exact.length,
+      budgetOverruns: 0,
+      starvedJobs: 0,
     });
-    // Close the hole to exactly one millisecond over the limit.
-    const tail = events.filter((event) => Date.parse(event.recordedAtIso as string) - DAY_START_MS >= gapStart + SHADOW_MAX_TICK_GAP_MS + 60_000);
-    tail[0] = jobEvent({
-      ...tail[0],
-      recordedAtIso: isoAtOffsetMs(gapStart + SHADOW_MAX_TICK_GAP_MS + 1),
-    });
-    expect(s12(dayInput(events))).toEqual({
+
+    // (b) A gap of the limit + 1 ms fails with `coverage-gap`.
+    const beyond = dayWithOneGap(SHADOW_MAX_TICK_GAP_MS + 1);
+    expect(Date.parse((beyond[541] as { recordedAtIso: string }).recordedAtIso) - Date.parse((beyond[540] as { recordedAtIso: string }).recordedAtIso)).toBe(SHADOW_MAX_TICK_GAP_MS + 1);
+    expect(s12(dayInput(beyond))).toEqual({
       status: 'fail',
       reason: 'coverage-gap',
-      totalTicks: events.length,
+      totalTicks: beyond.length,
       budgetOverruns: 0,
       starvedJobs: 0,
     });

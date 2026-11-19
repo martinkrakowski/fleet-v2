@@ -4958,6 +4958,19 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     expect(guarded.evidence.stored).toBeNull();
   });
 
+  // OD7a3 fix round: the same bracketed corrupt line makes SCHEDULED mode
+  // unknown too — scheduled prechecks must not turn a bracketed corrupt line
+  // into a skip or a write.
+  it('scheduled mode answers unknown daemon-events-corrupt for a valid bracketed droppedLines, writing nothing', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const read = dayRead(cleanFixture(DAY).daemonEvents, [700]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
   it('reads a Proxy event whose recordedAtIso descriptor changes between reads exactly once, and a bracketed corrupt line still makes the day unknown', async () => {
     // OD7a3 fix round 6 (structural): `snapshotEventsRead` snapshots EVERY
     // event exactly once, immediately after the port returns, and every

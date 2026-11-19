@@ -3,6 +3,7 @@
 export * from "./attention-compaction.js";
 export * from "./attention-item-records.js";
 export * from "./coordination-records.js";
+export * from "./decision-signing.js";
 export * from "./entities/index.js";
 export * from "./orchestrator-request-records.js";
 export * from "./orchestrator-session-records.js";

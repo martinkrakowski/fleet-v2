@@ -90,22 +90,57 @@ export function readPlainObjectWithOptional(
   value: unknown,
   required: readonly string[],
   allowed: readonly string[],
+  options?: { refuseOptionalAccessors?: boolean },
 ): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  // Every reflective read is wrapped: a revoked Proxy or a hostile trap can
+  // make even `Array.isArray`, `Object.getPrototypeOf` or
+  // `Object.getOwnPropertyDescriptor` throw, and every such throw is a typed
+  // refusal (null), never an exception escaping the caller.
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
     return null;
   }
-  const prototype = Object.getPrototypeOf(value);
+  if (typeof value !== 'object' || value === null || isArray) {
+    return null;
+  }
+  let prototype: unknown;
+  try {
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    return null;
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     return null;
   }
-  const ownKeys = Reflect.ownKeys(value);
+  let ownKeys: PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(value);
+  } catch {
+    return null;
+  }
   const out: Record<string, unknown> = {};
   for (const key of ownKeys) {
     if (typeof key !== 'string' || !allowed.includes(key)) {
       return null;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return null;
+    }
     if (descriptor === undefined || !descriptor.enumerable) {
+      return null;
+    }
+    // Opt-in: an own ACCESSOR (getter or setter) on any field is refused, not
+    // treated as absent, and the getter is never run. Callers that must keep
+    // the older behaviour (an accessor reads as `undefined`) omit the flag.
+    if (
+      options?.refuseOptionalAccessors === true &&
+      (descriptor.get !== undefined || descriptor.set !== undefined)
+    ) {
       return null;
     }
     out[key] = descriptor.value;

@@ -12,6 +12,8 @@ import {
   isReleaseRootCoordinate,
   releaseGrantDigestPayload,
   shadowImportDigestPayload,
+  buildSignableDecisionFields,
+  parseSignDecisionInput,
 } from '@fleet/operator-coordination';
 import { forgeActionScope } from '@fleet/work-execution';
 import type { AttentionItemState, RequestScopedDecisionResult } from '@fleet/operator-coordination';
@@ -186,6 +188,77 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
       rt.coordination.requestScopedDecision.revokeOwnerGrant({
         grantId: optStr(p, 'grantId') ?? str(p, 'grant-id'),
       }),
+    'sign-decision': async (p, rt) => {
+      const requestId = str(p, 'request');
+      const answer = optStr(p, 'answer');
+      const grantId = optStr(p, 'grantId');
+      const decisionRevision = optStr(p, 'decisionRevision');
+      const keyPath = optStr(p, 'key');
+      const yes = p.yes === true || p.yes === 'true';
+      // Input validation happens before any key is read or any file is
+      // touched: an invalid flag is a usage error even without --yes.
+      const parsed = parseSignDecisionInput({
+        requestId,
+        ...(answer !== undefined ? { answer } : {}),
+        ...(grantId !== undefined ? { grantId } : {}),
+        ...(decisionRevision !== undefined ? { decisionRevision } : {}),
+      });
+      if (!parsed.ok) {
+        throw new CliUsageError('sign-decision: invalid or unsafe sign-decision input');
+      }
+      const record = await rt.coordination.coordinationRequestRepository.findRequestById(
+        parsed.input.requestId,
+      );
+      if (record === null) {
+        return { outcome: 'refused', reason: 'request-not-found' };
+      }
+      const built = buildSignableDecisionFields(record, parsed.input);
+      if (!built.ok) {
+        return { outcome: 'refused', reason: built.code };
+      }
+      const scope = record.actionScope;
+      const head = record.expectedHeadSha;
+      const project = record.projectId;
+      const repository = record.shadowImportGrant?.repository ?? record.mergeGrant?.repository;
+      const releaseRoot = record.releaseRoot;
+      const expiresAtIso = record.shadowImportGrant?.expiresAtIso;
+      if (!yes) {
+        // Preview only: no key is read, no decision file is written.
+        return {
+          outcome: 'preview',
+          requestId: parsed.input.requestId,
+          scope,
+          head,
+          project,
+          ...(repository !== undefined ? { repository } : {}),
+          ...(releaseRoot !== undefined ? { releaseRoot } : {}),
+          ...(expiresAtIso !== undefined ? { expiresAtIso } : {}),
+        };
+      }
+      if (keyPath === undefined) {
+        throw new CliUsageError("sign-decision: --key is required with --yes");
+      }
+      const written = await rt.coordination.decisionTransport.signAndWriteDecisionAnswer({
+        fields: built.fields,
+        keyPath,
+      });
+      if (!written.ok) {
+        return { outcome: 'refused', reason: written.code };
+      }
+      return {
+        outcome: 'signed',
+        requestId: built.fields.requestId,
+        answer: parsed.input.answer,
+        grantId: built.fields.grantId,
+        decisionRevision: built.fields.decisionRevision,
+        scope,
+        head,
+        project,
+        ...(repository !== undefined ? { repository } : {}),
+        ...(releaseRoot !== undefined ? { releaseRoot } : {}),
+        ...(expiresAtIso !== undefined ? { expiresAtIso } : {}),
+      };
+    },
 };
 
 /**

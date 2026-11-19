@@ -182,7 +182,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (readReleaseRoot(recorded).state === 'invalid') {
       return blocked('release-grant-root-mismatch');
     }
-    const refreshed = await this.refreshFromVerifiedAnswer(recorded);
+    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshedResult.refusalReason !== undefined) {
+      // A pinned owner-key refusal blocks before any grant state is checked.
+      return blocked(refreshedResult.refusalReason);
+    }
+    const refreshed = refreshedResult.record;
     const candidate = CoordinationRequest.fromRecord(refreshed);
     // CO14 follow-up: a release grant already durably consumed by exactly the
     // deterministic action id this resolve names resolves again idempotently,
@@ -345,7 +350,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (recorded === null) {
       return blocked('grant-missing');
     }
-    const refreshed = await this.refreshFromVerifiedAnswer(recorded);
+    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshedResult.refusalReason !== undefined) {
+      // A pinned owner-key refusal blocks before any grant state is checked.
+      return blocked(refreshedResult.refusalReason);
+    }
+    const refreshed = refreshedResult.record;
     if (refreshed.state === 'cancelled') {
       return blocked('grant-revoked');
     }
@@ -540,13 +550,18 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     return null;
   }
 
-  /** A pending request may have an answer recorded since it was last read. */
+  /**
+   * A pending request may have an answer recorded since it was last read.
+   * Returns the (possibly refreshed) record plus the answer's named
+   * owner-key refusal, if any: the caller blocks on it before any grant
+   * state is consulted.
+   */
   private async refreshFromVerifiedAnswer(
     record: CoordinationRequestRecord,
-  ): Promise<CoordinationRequestRecord> {
+  ): Promise<{ readonly record: CoordinationRequestRecord; readonly refusalReason?: string }> {
     const decisionTransport = this.deps?.decisionTransport;
     if (decisionTransport === undefined || record.state !== 'awaiting-decision') {
-      return record;
+      return { record };
     }
     const answer = await decisionTransport.readDecisionAnswer({
       requestId: record.id,
@@ -554,12 +569,18 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       actionScope: record.actionScope,
       expectedHeadSha: record.expectedHeadSha,
     });
-    if (answer.state === 'awaiting-decision' || answer.state === 'declined') {
-      return record;
+    if (answer.state === 'awaiting-decision') {
+      return {
+        record,
+        ...(answer.refusalReason !== undefined ? { refusalReason: answer.refusalReason } : {}),
+      };
+    }
+    if (answer.state === 'declined') {
+      return { record };
     }
     if (answer.state === 'approved' && answer.grantId === null) {
       // An approval without a recorded grant authorizes nothing.
-      return record;
+      return { record };
     }
     const refreshed: CoordinationRequestRecord = {
       ...record,
@@ -570,7 +591,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       updatedAtIso: new Date().toISOString(),
     };
     await (this.deps?.requestRepo.saveRequest(refreshed) ?? Promise.resolve());
-    return refreshed;
+    return { record: refreshed };
   }
 
   private resolveTargetRepository(

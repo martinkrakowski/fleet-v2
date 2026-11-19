@@ -13,6 +13,12 @@ export interface DecisionAnswer {
   readonly decisionRevision: string | null;
   readonly grantId: string | null;
   readonly signature?: string | null;
+  /**
+   * A named owner-key refusal (`owner-key-env-mismatch` or
+   * `owner-key-unpinned`) reported on an otherwise approving answer. A
+   * refusal keeps the state `awaiting-decision` and authorizes nothing.
+   */
+  readonly refusalReason?: string;
 }
 
 export interface DecisionAnswerQuery {

@@ -70,8 +70,9 @@ import { readAcceptanceForAttempt } from "@fleet/work-execution";
 export interface FleetApiRuntimeOptions {
   /** Shared persistence directory for every context's file-backed adapters. */
   readonly stateDir?: string;
-  readonly ownerPublicKey?: string;
   readonly installation?: FleetInstallation;
+  /** The runtime's own environment object; the owner key is resolved from it against the pinned installation key. */
+  readonly env?: Record<string, string | undefined>;
   /** Spy transport for the review subprocess (tests only); production runs ocm-run. */
   readonly reviewSpawn?: OcmReviewTransportSpawn;
 }
@@ -394,7 +395,6 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   snapshotProjectionStore = new SnapshotProjectionStore();
 
   const stateDir = options?.stateDir;
-  const ownerPublicKey = options?.ownerPublicKey;
   const installation = options?.installation;
 
   if (stateDir !== undefined) {
@@ -403,8 +403,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   const operator = createConfiguredOperatorComposition({
     stateDir,
-    ownerPublicKey,
     installation,
+    ...(options?.env !== undefined ? { env: options.env } : {}),
     ...(changeFeed !== null ? { changeSignal: changeFeed } : {}),
   });
   const knowledge = createConfiguredKnowledgeComposition({

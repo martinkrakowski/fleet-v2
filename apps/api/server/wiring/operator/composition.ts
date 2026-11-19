@@ -14,6 +14,7 @@ import {
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
   hashOrchestratorRequestDigest,
+  resolvePinnedOwnerPublicKey,
   type ChangeSignalPort,
 } from "@fleet/operator-coordination";
 
@@ -107,8 +108,9 @@ export interface OperatorComposition {
 
 export interface OperatorCompositionOptions {
   readonly stateDir?: string;
-  readonly ownerPublicKey?: string;
   readonly installation?: FleetInstallation;
+  /** The runtime's own environment object (tests inject a record here); defaults to `process.env`. */
+  readonly env?: Record<string, string | undefined>;
   /** Emitter for post-save change signals; the API runtime wires the change feed. */
   readonly changeSignal?: ChangeSignalPort;
   /** The explicit-deny deadline for tool-permission requests, in ms (default 540 000). */
@@ -174,8 +176,20 @@ export function createConfiguredOperatorComposition(
   options?: OperatorCompositionOptions,
 ): OperatorComposition {
   const stateDir = options?.stateDir;
+  // KEY0b: the owner public key is read ONLY from the pinned
+  // installation.owner.publicKey. FLEET_OWNER_PUBLIC_KEY is never an
+  // authority: a mismatching value refuses, an equal value only warns once.
+  const resolvedOwnerKey = resolvePinnedOwnerPublicKey(
+    options?.installation?.owner?.publicKey,
+    options?.env ?? process.env,
+  );
   const ownerPublicKey =
-    options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
+    resolvedOwnerKey.status === "pinned" ? resolvedOwnerKey.publicKey : undefined;
+  const ownerKeyRefusal =
+    resolvedOwnerKey.status === "pinned" ? undefined : resolvedOwnerKey.code;
+  if (resolvedOwnerKey.status === "pinned" && resolvedOwnerKey.deprecationWarning !== undefined) {
+    process.stderr.write(`${resolvedOwnerKey.deprecationWarning}\n`);
+  }
 
   const profileRepo = new ProjectProfileRepositoryAdapter({
     stateDir,
@@ -185,6 +199,7 @@ export function createConfiguredOperatorComposition(
   const decisionTransport = new DecisionTransportAdapter({
     decisionsDir: stateDir === undefined ? undefined : join(stateDir, "decisions"),
     ownerPublicKey,
+    ...(ownerKeyRefusal !== undefined ? { ownerKeyRefusal } : {}),
   });
   const publicationPort = new ObservationPublicationAdapter(
     stateDir === undefined ? {} : { outboxDir: join(stateDir, "observation-outbox") },

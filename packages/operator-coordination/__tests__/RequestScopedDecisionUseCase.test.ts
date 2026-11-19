@@ -5,6 +5,7 @@ import type { CoordinationRequestRepositoryPort } from '../src/application/ports
 import { RequestScopedDecisionUseCase } from '../src/application/use-cases/RequestScopedDecisionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import { RecordAuthorizationConsumptionUseCase } from '../src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
+import { createSignedDecisionFixture } from '../src/application/use-cases/__tests__/signed-decision-fixture.js';
 
 function digest(payload: string): string {
   return createHash('sha256').update(payload).digest('hex');
@@ -110,6 +111,10 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     // root the decision named. RR1: the request id is the digest of the
     // grant's exact coordinates, and the digest is supplied to every use case.
     const repo = new InMemoryCoordinationRequestRepo();
+    // KEY0c1a: the decision the request reads is a signed answer under the
+    // ephemeral test signer, not an unsigned stub; the recorded grant carries
+    // the answer's own verified revision and grant id.
+    const signer = createSignedDecisionFixture();
     const head = '3333333333333333333333333333333333333333';
     const root = '/srv/fleet/releases';
     const requestId = `release-grant-${createHash('sha256')
@@ -117,15 +122,17 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
         JSON.stringify({ scope: 'release:install', projectId: 'proj-1', expectedHeadSha: head, releaseRoot: root, nonce: '0123456789abcdef0123456789abcdef' }),
       )
       .digest('hex')}`;
+    await signer.writeApprovedAnswer({
+      id: requestId,
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: head,
+      decisionRevision: 'dec-root-1',
+      grantId: 'grant-root-1',
+    });
     const useCase = new RequestScopedDecisionUseCase({
       requestRepo: repo,
-      decisionTransport: {
-        readDecisionAnswer: async () => ({
-          state: 'approved',
-          decisionRevision: 'dec-root-1',
-          grantId: 'grant-root-1',
-        }),
-      },
+      decisionTransport: signer.deps.decisionTransport,
       computeDigest: digest,
     });
     const requested = await useCase.requestScopedDecision({
@@ -144,8 +151,22 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     expect(recorded?.releaseRoot).toBe(root);
     expect(recorded?.state).toBe('approved');
     expect(recorded?.grantId).toBe('grant-root-1');
+    // KEY0c1a self-check: the answer the recorded decision came from verifies
+    // back to `approved` with the record's own grant id and decision revision.
+    await signer.assertApprovedAnswerReadsBackApproved({
+      id: requestId,
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: head,
+      decisionRevision: recorded?.decisionRevision ?? null,
+      grantId: recorded?.grantId ?? null,
+    });
     // The recorded grant resolves for the root it names and for no other.
-    const resolver = new ResolveActionAuthorizationUseCase({ requestRepo: repo, computeDigest: digest });
+    const resolver = new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...signer.deps,
+      computeDigest: digest,
+    });
     const resolve = await resolver.resolveActionAuthorization({
       projectId: 'proj-1',
       actionScope: 'release:install',
@@ -165,7 +186,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
   it('refuses, never throws, when the request carries a throwing own releaseRoot getter', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     const head = '4444444444444444444444444444444444444444';
-    await repo.saveRequest({
+    const hostileGrant = {
       id: 'req-hostile-1',
       projectId: 'proj-1',
       kind: 'action-decision',
@@ -183,7 +204,13 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
       revision: 1,
       createdAtIso: '2026-11-10T10:00:00.000Z',
       updatedAtIso: '2026-11-10T10:00:00.000Z',
-    } as CoordinationRequestRecord);
+    } as CoordinationRequestRecord;
+    await repo.saveRequest(hostileGrant);
+    // KEY0c1a fix round: the seeded approved release grant carries its signed
+    // answer under the one ephemeral signer both use cases read, self-checked.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(hostileGrant);
+    await signer.assertApprovedAnswerReadsBackApproved(hostileGrant);
     const hostile = <T extends object>(base: T): T =>
       Object.defineProperty({ ...base }, 'releaseRoot', {
         enumerable: true,
@@ -191,12 +218,16 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
           throw new Error('hostile getter ran');
         },
       }) as T;
-    const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization(
+    const resolved = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repo,
+      ...signer.deps,
+    }).resolveActionAuthorization(
       hostile({ projectId: 'proj-1', actionScope: 'release:install', expectedHeadSha: head }),
     );
     expect(resolved).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
     const consumed = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: repo,
+      ...signer.deps,
     }).recordAuthorizationConsumption(
       hostile({
         consumptionId: 'cons-1',
@@ -233,6 +264,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     for (const [label, corruption] of corruptions) {
       for (const requested of [undefined, '/srv/fleet/releases']) {
         const repo = new InMemoryCoordinationRequestRepo();
+        const signer = createSignedDecisionFixture();
         const grantId = `grant-corrupt-${label.replaceAll(' ', '-')}`;
         const base = {
           id: `req-${grantId}`,
@@ -258,8 +290,16 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
           Object.getOwnPropertyDescriptors(corruption),
         ) as unknown as CoordinationRequestRecord;
         await repo.saveRequest(stored);
+        // KEY0c1a fix round: the seeded approved release grant carries its
+        // signed answer under the same signer the use cases read, self-checked
+        // against the record's uncorrupted answer fields.
+        await signer.writeApprovedAnswer(base);
+        await signer.assertApprovedAnswerReadsBackApproved(base);
         const root = requested === undefined ? {} : { releaseRoot: requested };
-        const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization({
+        const resolved = await new ResolveActionAuthorizationUseCase({
+          requestRepo: repo,
+          ...signer.deps,
+        }).resolveActionAuthorization({
           projectId: 'proj-1',
           actionScope: 'release:install',
           expectedHeadSha: head,
@@ -271,6 +311,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
         });
         const consumed = await new RecordAuthorizationConsumptionUseCase({
           requestRepo: repo,
+          ...signer.deps,
         }).recordAuthorizationConsumption({
           consumptionId: 'cons-1',
           grantId,

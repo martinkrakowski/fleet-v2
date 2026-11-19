@@ -14,6 +14,7 @@ import {
   CheckOwnerDecisionUseCase,
   ownerDecisionActionScope,
 } from '../CheckOwnerDecisionUseCase.use-case.js';
+import { createSignedDecisionFixture } from './signed-decision-fixture.js';
 
 const HEAD = 'abc123';
 const OTHER_HEAD = 'def456';
@@ -93,6 +94,12 @@ describe('CheckOwnerDecisionUseCase', () => {
 
   it('approves a request that authorizes its own scope at the candidate head', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
+    // KEY0c1a: the seeded approved owner grant is paired with a signed answer
+    // under the ephemeral test signer, and the answer self-check verifies the
+    // record's own grant id and decision revision read back as `approved`.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(requestRecord());
+    await signer.assertApprovedAnswerReadsBackApproved(requestRecord());
     const useCase = new CheckOwnerDecisionUseCase({ requestRepo: repo });
 
     const result = await useCase.checkOwnerDecision(request);

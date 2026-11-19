@@ -43,12 +43,11 @@ export function bootstrapFleetApiFromEnv(env: NodeJS.ProcessEnv = process.env): 
     return refuse(stateDir);
   }
 
-  const ownerPublicKey = env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined;
   setActiveApiToken(token);
   configureFleetApiRuntime({
     stateDir,
-    ownerPublicKey,
     installation: loadResult.installation,
+    env: env as Record<string, string | undefined>,
   });
   // A null return means the login stays closed; the API still serves reads.
   issueWebLoginCode(stateDir);

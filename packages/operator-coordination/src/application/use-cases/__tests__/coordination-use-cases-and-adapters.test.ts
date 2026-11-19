@@ -1579,9 +1579,18 @@ describe('ResolveActionAuthorizationUseCase', () => {
     ];
     for (const [name, overrides, expected] of cases) {
       const repo = new StubRequestRepository([requestRecord(overrides)]);
+      // KEY0c1a fix round: an approved record engaged by the resolve carries
+      // its signed answer under the same signer the use case reads,
+      // self-checked; non-approved states stay unanswered.
+      const signer = createSignedDecisionFixture();
+      const seeded = requestRecord(overrides);
+      if (seeded.state === 'approved') {
+        await signer.writeApprovedAnswer(seeded);
+        await signer.assertApprovedAnswerReadsBackApproved(seeded);
+      }
       const result = await new ResolveActionAuthorizationUseCase({
         requestRepo: repo,
-        ...createSignedDecisionFixture().deps,
+        ...signer.deps,
       }).execute(
         request,
       );
@@ -1821,6 +1830,10 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
 
   it('refuses an incomplete consumption and refuses to run without dependencies', async () => {
     const repo = new StubRequestRepository([requestRecord()]);
+    // KEY0c1a fix round: the seeded approved owner grant carries its signed
+    // answer under the same signer the consumer reads, self-checked.
+    await signedSigner.writeApprovedAnswer(requestRecord());
+    await signedSigner.assertApprovedAnswerReadsBackApproved(requestRecord());
     const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signedDeps });
     const incomplete = await useCase.execute({ ...consumptionRequest, actionId: ' ' });
     expect(incomplete.outcome === 'refused' && incomplete.reason).toContain('actionId');

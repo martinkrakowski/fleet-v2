@@ -326,7 +326,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('refuses an already-bound owner grant resolved without an attempt too (CO24g)', async () => {
-      await repo.saveRequest(ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       expect(await resolver().resolveActionAuthorization(resolveFor())).toEqual({
         outcome: 'blocked',
         reason: 'attempt-required',
@@ -355,11 +358,16 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('blocks a blank attempt and a version-2 grant that records none', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       expect(await resolver().resolveActionAuthorization(resolveFor('  '))).toEqual({
         outcome: 'blocked',
         reason: 'grant-attempt-invalid',
       });
-      await repo.saveRequest(ownerGrant({ revision: 2, grantRecordVersion: 2 }));
+      const unrecorded = ownerGrant({ revision: 2, grantRecordVersion: 2 });
+      await repo.saveRequest(unrecorded);
+      await signer.writeApprovedAnswer(unrecorded);
+      await signer.assertApprovedAnswerReadsBackApproved(unrecorded);
       expect(await resolver().resolveActionAuthorization(resolveFor('att-A'))).toEqual({
         outcome: 'blocked',
         reason: 'grant-attempt-unrecorded',
@@ -404,6 +412,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('refuses a foreign attempt and an attempt not collected at the expected head (CO24f)', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       const foreignFacts = attemptFacts({ attemptId: 'att-A', projectId: 'project-2', collectedHeadSha: HEAD });
       expect(await resolver(foreignFacts).resolveActionAuthorization(resolveFor('att-A'))).toEqual({
         outcome: 'blocked',
@@ -428,6 +438,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('binds nothing when the attempt-facts port is not configured (CO24f fail-closed)', async () => {
       await repo.saveRequest(ownerGrant());
+      await signer.writeApprovedAnswer(ownerGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(ownerGrant());
       const result = await new ResolveActionAuthorizationUseCase({
         requestRepo: repo,
         ...signer.deps,
@@ -535,6 +547,8 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('still refuses a release grant at another head or scope', async () => {
       await repo.saveRequest(releaseGrant());
+      await signer.writeApprovedAnswer(releaseGrant());
+      await signer.assertApprovedAnswerReadsBackApproved(releaseGrant());
       expect(
         await releaseResolver().resolveActionAuthorization({ ...resolveRelease(), expectedHeadSha: 'd'.repeat(40) }),
       ).toMatchObject({ outcome: 'blocked' });
@@ -546,7 +560,10 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('does not exempt an unknown release:* scope from the attempt-required default', async () => {
       const UNKNOWN_RELEASE_SCOPE = 'release:promote';
-      await repo.saveRequest(releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE }));
+      const unknownScopeGrant = releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE });
+      await repo.saveRequest(unknownScopeGrant);
+      await signer.writeApprovedAnswer(unknownScopeGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(unknownScopeGrant);
       expect(
         await resolver().resolveActionAuthorization({
           projectId: 'project-1',
@@ -562,7 +579,10 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('does not exempt an unknown release:* scope from the recorded-attempt consumption check', async () => {
       const UNKNOWN_RELEASE_SCOPE = 'release:promote';
-      await repo.saveRequest(releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE, grantRecordVersion: 2 }));
+      const unknownScopeGrant = releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE, grantRecordVersion: 2 });
+      await repo.saveRequest(unknownScopeGrant);
+      await signer.writeApprovedAnswer(unknownScopeGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(unknownScopeGrant);
       expect(
         await consumer().recordAuthorizationConsumption({
           consumptionId: `c-${ACTION_ID}`,
@@ -577,7 +597,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('consumes a release grant once for its deterministic action id', async () => {
-      await repo.saveRequest(releaseGrant());
+      const grant = releaseGrant();
+      await repo.saveRequest(grant);
+      await signer.writeApprovedAnswer(grant);
+      await signer.assertApprovedAnswerReadsBackApproved(grant);
       const result = await releaseConsumer().recordAuthorizationConsumption({
         ...consume('grant-owner', ACTION_ID),
         actionScope: RELEASE_SCOPE,
@@ -590,7 +613,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('keeps refusing a version-2 forge owner grant that records no attempt at consumption', async () => {
-      await repo.saveRequest(releaseGrant({ actionScope: SCOPE, grantRecordVersion: 2 }));
+      const forgeGrant = releaseGrant({ actionScope: SCOPE, grantRecordVersion: 2 });
+      await repo.saveRequest(forgeGrant);
+      await signer.writeApprovedAnswer(forgeGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(forgeGrant);
       expect(
         await consumer().recordAuthorizationConsumption({ ...consume('grant-owner', ACTION_ID) }),
       ).toEqual({ outcome: 'refused', reason: 'grant-attempt-unrecorded' });
@@ -598,7 +624,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('refuses a release:swap grant bound to attempt A when resolved with attempt B', async () => {
-      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
@@ -609,7 +638,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('refuses a release:swap grant bound to attempt A when resolved with no attempt', async () => {
-      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
@@ -753,7 +785,10 @@ describe('grant attempt binding (CO24e)', () => {
 
   describe('consumption', () => {
     it('refuses an owner grant recorded for attempt A when consumed with B, recording nothing', async () => {
-      await repo.saveRequest(ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      const boundGrant = ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' });
+      await repo.saveRequest(boundGrant);
+      await signer.writeApprovedAnswer(boundGrant);
+      await signer.assertApprovedAnswerReadsBackApproved(boundGrant);
       expect(await consumer().recordAuthorizationConsumption(consume('grant-owner', 'att-B'))).toEqual({
         outcome: 'refused',
         reason: 'grant-attempt-mismatch',
@@ -777,7 +812,10 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('refuses a version-2 grant that records no attempt', async () => {
-      await repo.saveRequest(ownerGrant({ grantRecordVersion: 2 }));
+      const unrecorded = ownerGrant({ grantRecordVersion: 2 });
+      await repo.saveRequest(unrecorded);
+      await signer.writeApprovedAnswer(unrecorded);
+      await signer.assertApprovedAnswerReadsBackApproved(unrecorded);
       expect(await consumer().recordAuthorizationConsumption(consume('grant-owner', 'att-A'))).toEqual({
         outcome: 'refused',
         reason: 'grant-attempt-unrecorded',

@@ -76,12 +76,18 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
 
   it('refuses an unbound owner grant resolved without an attempt (CO24g)', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
-    await saveAll(repository, [requestRecord()]);
+    const owner = requestRecord();
+    await saveAll(repository, [owner]);
+    // KEY0c1a fix round: the seeded approved owner grant carries a signed
+    // answer under the ephemeral test signer, self-checked, before the resolve.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(owner);
+    await signer.assertApprovedAnswerReadsBackApproved(owner);
     const result = await resolve(repository, {
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD,
-    });
+    }, signer);
     expect(result).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
   });
 

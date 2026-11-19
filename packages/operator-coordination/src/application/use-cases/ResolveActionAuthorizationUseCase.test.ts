@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { SHADOW_IMPORT_ACTION_SCOPE } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
@@ -155,7 +155,11 @@ describe('ResolveActionAuthorizationUseCase', () => {
     const grant = createStandardGrantRecord({ grantRecordVersion: 2, grantAttemptId: 'att-2' });
     await requestRepo.saveRequest(grant);
 
-    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
+    // KEY0c3: the transport is mandatory for owner-gated scopes, so the
+    // owner grant is seeded with its own signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(grant);
+    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo, ...signer.deps });
     const result = await useCase.resolveActionAuthorization({
       projectId: 'proj-1',
       actionScope: 'forge:merge-pr',
@@ -172,9 +176,14 @@ describe('ResolveActionAuthorizationUseCase', () => {
 
   it('refuses an unbound owner grant resolved by its id without an attempt (CO24g)', async () => {
     const requestRepo = new InMemoryCoordinationRequestRepository();
-    await requestRepo.saveRequest(createStandardGrantRecord());
+    const grant = createStandardGrantRecord();
+    await requestRepo.saveRequest(grant);
 
-    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
+    // KEY0c3: with the mandatory transport and a valid signed answer, the
+    // signature check passes and the attempt rule refuses on its own terms.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(grant);
+    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo, ...signer.deps });
     const result = await useCase.resolveActionAuthorization({
       projectId: 'proj-1',
       actionScope: 'forge:merge-pr',
@@ -238,6 +247,9 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
   const REPO = 'hello';
   const GRANT_ID = 'grant-shadow';
 
+  // KEY0c3: the transport is wired per test; no describe-level signer is
+  // shared, so answers never leak between tests.
+
   function digest(payload: string): string {
     return createHash('sha256').update(payload).digest('hex');
   }
@@ -270,17 +282,21 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
     };
   }
 
+  // KEY0c3: `shadowUseCase` wires the decision transport only when a test
+  // passes one, so each test owns its own signed answers.
   function shadowUseCase(
     requestRepo: InMemoryCoordinationRequestRepository,
     overrides: {
       computeDigest?: ((payload: string) => string) | null;
       clock?: { readonly nowIso: () => string } | null;
+      transport?: DecisionTransportPort;
     } = {},
   ): ResolveActionAuthorizationUseCase {
     // Defaults are the wired composition: the digest and the trusted clock.
     // `null` unwires either, for the fail-closed tests.
     return new ResolveActionAuthorizationUseCase({
       requestRepo,
+      ...(overrides.transport !== undefined ? { decisionTransport: overrides.transport } : {}),
       ...(overrides.computeDigest === null ? {} : { computeDigest: overrides.computeDigest ?? digest }),
       ...(overrides.clock === null ? {} : { shadowImportClock: overrides.clock ?? { nowIso: () => NOW_ISO } }),
     });
@@ -301,8 +317,13 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
 
   it('authorizes a standing grant head-free and never binds an attempt', async () => {
     const requestRepo = new InMemoryCoordinationRequestRepository();
-    await requestRepo.saveRequest(createShadowGrantRecord());
-    const result = await resolve(shadowUseCase(requestRepo));
+    const record = createShadowGrantRecord();
+    await requestRepo.saveRequest(record);
+    // KEY0c3: the transport is mandatory, so the authorized resolve is wired
+    // with a signer whose approved answer is seeded for this record.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const result = await resolve(shadowUseCase(requestRepo, { transport: signer.deps.decisionTransport }));
     expect(result).toEqual({
       outcome: 'authorized',
       grantId: GRANT_ID,
@@ -496,6 +517,22 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
   const NOW_ISO = '2026-11-18T00:00:00Z';
   const EXPIRES_AT_ISO = '2026-12-16T00:00:00Z';
   const GRANT_ID = 'grant-shadow';
+
+  // KEY0c3: the ephemeral signer whose transport the use case is wired with;
+  // the approved answer for the standing grant is seeded in `beforeAll`.
+  const hostileShadowSigner = createSignedDecisionFixture();
+
+  beforeAll(async () => {
+    await hostileShadowSigner.writeApprovedAnswer({
+      id: REQUEST_ID,
+      projectId: 'proj-1',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      expectedHeadSha: null,
+      decisionRevision: 'dec-rev-1',
+      grantId: GRANT_ID,
+    });
+  });
+
   function digest(payload: string): string {
     return createHash('sha256').update(payload).digest('hex');
   }
@@ -531,6 +568,7 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
   function useCase(requestRepo: InMemoryCoordinationRequestRepository): ResolveActionAuthorizationUseCase {
     return new ResolveActionAuthorizationUseCase({
       requestRepo,
+      ...hostileShadowSigner.deps,
       computeDigest: digest,
       shadowImportClock: { nowIso: () => NOW_ISO },
     });
@@ -746,9 +784,14 @@ describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
 
   it('authorizes a digest-bound release record whose root matches', async () => {
     const requestRepo = new InMemoryCoordinationRequestRepository();
-    await requestRepo.saveRequest(createReleaseRecord());
+    const record = createReleaseRecord();
+    await requestRepo.saveRequest(record);
+    // KEY0c3: release grants are owner-gated, so the signature check needs
+    // the transport and a seeded signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
     const result = await resolveRelease(
-      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+      new ResolveActionAuthorizationUseCase({ requestRepo, ...signer.deps, computeDigest: digest }),
     );
     expect(result).toMatchObject({ outcome: 'authorized', grantId: GRANT_ID, releaseRoot: ROOT });
   });
@@ -925,11 +968,11 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
     expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
   });
 
-  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+  it('refuses approved owner record when decisionTransport is absent', async () => {
     const result = await new ResolveActionAuthorizationUseCase({
       requestRepo: repositoryWith(ownerRecord()),
     }).execute(REQUEST);
-    expect(result.outcome).toBe('authorized');
+    expect(result).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
   });
 
   it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {
@@ -1039,6 +1082,19 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
       pullRequestNumber: 1,
     });
     expect(result.outcome).toBe('authorized');
+    // KEY0c3: a non-signed scope keeps origin/main behaviour even when the
+    // transport is omitted entirely.
+    const withoutTransport = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(mergeGrant),
+    }).execute({
+      projectId: 'project-atlas',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: 'abc123',
+      authorizationGrantId: 'grant-9',
+      repository: { owner: 'o', repo: 'r' },
+      pullRequestNumber: 1,
+    });
+    expect(withoutTransport.outcome).toBe('authorized');
   });
 
   // KEY0c2 fix round 4: the resume path must not escape signature

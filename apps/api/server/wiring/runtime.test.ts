@@ -1033,6 +1033,186 @@ describe('KEY0b: pinned owner public key in the API composition root', () => {
   });
 });
 
+// KEY0c3: the API composition's consume and check use cases re-verify the
+// signed answer on every owner-gated scope. A stored `approved` record alone
+// is never authority: with the signed answer file missing both refuse, and
+// with the owner key unpinned even a seeded approving answer refuses.
+describe('KEY0c3: unsigned owner grants refuse through the API wiring', () => {
+  const headH = makeHeadH();
+
+  function withStateDir(body: (stateDir: string) => Promise<void>): () => Promise<void> {
+    return async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-key0c3-'));
+      try {
+        await body(stateDir);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        configureFleetApiRuntime(null);
+      }
+    };
+  }
+
+  function consumeRequest(record: CoordinationRequestRecord) {
+    return {
+      consumptionId: `consumption-${record.grantId}`,
+      grantId: record.grantId!,
+      actionId: 'action-key0c3-1',
+      actionScope: record.actionScope,
+      attemptId: 'attempt-key0c3-1',
+      expectedHeadSha: record.expectedHeadSha!,
+    };
+  }
+
+  it('refuses API consumption for unsigned stored owner grant', withStateDir(async (stateDir) => {
+    configureFleetApiRuntime(pinnedRuntimeConfig(stateDir));
+    const operator = getOperatorComposition();
+    const record = {
+      ...makeApprovedGrant('grant-key0c3-unsigned', forgeActionScope('push-and-open-pr'), headH),
+      grantAttemptId: 'attempt-key0c3-1',
+      grantRecordVersion: 2 as const,
+    };
+    await operator.coordinationRequestRepository.saveRequest(record);
+
+    // No answer file exists for the request: the stored approval alone
+    // refuses the consumption.
+    const refused = await operator.recordAuthorizationConsumption.recordAuthorizationConsumption(
+      consumeRequest(record),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
+    const untouched = await operator.coordinationRequestRepository.findRequestByGrantId(
+      record.grantId!,
+    );
+    expect(untouched?.consumptions).toHaveLength(0);
+    expect(untouched?.state).toBe('approved');
+  }));
+
+  it('refuses API consumption for an approving answer when ownerPublicKey is unpinned', withStateDir(async (stateDir) => {
+    // No pinned key and no env key: the transport answers every approved
+    // file with the named owner-key refusal.
+    configureFleetApiRuntime({ stateDir });
+    const operator = getOperatorComposition();
+    const record = {
+      ...makeApprovedGrant('grant-key0c3-unpinned', forgeActionScope('push-and-open-pr'), headH),
+      grantAttemptId: 'attempt-key0c3-1',
+      grantRecordVersion: 2 as const,
+    };
+    await operator.coordinationRequestRepository.saveRequest(record);
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
+    writeFileSync(
+      join(stateDir, 'decisions', `${record.id}.json`),
+      `${JSON.stringify({
+        state: 'approved',
+        decisionRevision: record.decisionRevision,
+        grantId: record.grantId,
+      })}\n`,
+    );
+
+    const refused = await operator.recordAuthorizationConsumption.recordAuthorizationConsumption(
+      consumeRequest(record),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'owner-key-unpinned' });
+    const untouched = await operator.coordinationRequestRepository.findRequestByGrantId(
+      record.grantId!,
+    );
+    expect(untouched?.consumptions).toHaveLength(0);
+  }));
+
+  it('blocks acceptance when owner decision lacks signed answer', withStateDir(async (stateDir) => {
+    configureFleetApiRuntime(pinnedRuntimeConfig(stateDir));
+    const work = workComposition();
+    const operator = getOperatorComposition();
+    const evidence = getEvidenceUseCases();
+    const attemptId = 'att-api-door-unsigned';
+    const requestId = 'req-door-unsigned';
+
+    const attemptRepo = (work.executeAuthorizedForgeAction as unknown as {
+      deps?: { attemptRepo: { saveAttempt: (a: AttemptRecord) => Promise<void> } };
+    }).deps?.attemptRepo;
+    expect(attemptRepo).toBeDefined();
+    await attemptRepo!.saveAttempt(
+      makeAttempt(attemptId, `wo-${attemptId}`, headH, [requestId]),
+    );
+
+    // Seed the approved owner-decision record WITHOUT its signed answer.
+    const reqRepo = (operator.checkOwnerDecision as unknown as {
+      deps?: { requestRepo: { saveRequest: (r: CoordinationRequestRecord) => Promise<void> } };
+    }).deps?.requestRepo;
+    expect(reqRepo).toBeDefined();
+    await reqRepo!.saveRequest({
+      ...makeApprovedGrant(`grant-${requestId}`, `owner-decision:${requestId}`, headH),
+      id: requestId,
+      proposalDigest: `digest-${requestId}`,
+      decisionRevision: `dec-${requestId}`,
+    });
+
+    // The door check itself is not-approved with the typed reason.
+    const checked = await operator.checkOwnerDecision.checkOwnerDecision({
+      requestId,
+      candidateHeadSha: headH,
+    });
+    expect(checked).toEqual({
+      outcome: 'not-approved',
+      requestId,
+      reason: 'decision-signature-invalid',
+    });
+
+    // And the acceptance assessment blocks on that door.
+    const assessmentRepo = (evidence.assessHeadAcceptance as unknown as {
+      deps?: { repo: { saveAssessment: (a: EvidenceAssessmentRecord) => Promise<void> } };
+    }).deps?.repo;
+    expect(assessmentRepo).toBeDefined();
+    const assessmentId = `assessment-${attemptId}`;
+    await assessmentRepo!.saveAssessment({
+      id: assessmentId,
+      projectId: 'proj-api-test',
+      attemptId,
+      candidateHeadSha: headH,
+      policyRevision: 'pol-1',
+      implementerModel: 'seat/implementer',
+      requiredChecks: [],
+      state: 'pending',
+      verificationReceipts: [],
+      reviewReceipts: [
+        {
+          id: `review-${attemptId}`,
+          assessmentId,
+          projectId: 'proj-api-test',
+          attemptId,
+          candidateHeadSha: headH,
+          reviewerModel: 'seat/reviewer',
+          implementerModel: 'seat/implementer',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: `ev-${attemptId}`,
+          policyRevision: 'pol-1',
+          completedAtIso: '2026-10-15T10:00:00Z',
+        },
+      ],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 1,
+      updatedAtIso: '2026-10-15T10:00:00Z',
+    });
+    const result = await evidence.assessHeadAcceptance.assessHeadAcceptance({
+      assessmentId,
+      candidateHeadSha: headH,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes(`owner decision '${requestId}' is not approved`),
+        ),
+      ).toBe(true);
+    }
+  }));
+});
+
 describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
   it('a forged signature byte keeps the owner grant awaiting-decision; the valid answer authorizes', async () => {
     const HEAD = makeHeadH();

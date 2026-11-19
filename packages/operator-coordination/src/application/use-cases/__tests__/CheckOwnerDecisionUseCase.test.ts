@@ -105,7 +105,9 @@ describe('CheckOwnerDecisionUseCase', () => {
     const signer = createSignedDecisionFixture();
     await signer.writeApprovedAnswer(requestRecord());
     await signer.assertApprovedAnswerReadsBackApproved(requestRecord());
-    const useCase = new CheckOwnerDecisionUseCase({ requestRepo: repo });
+    // KEY0c3: the transport is mandatory, so the approving check is wired
+    // with the signer's transport.
+    const useCase = new CheckOwnerDecisionUseCase({ requestRepo: repo, ...signer.deps });
 
     const result = await useCase.checkOwnerDecision(request);
 
@@ -263,11 +265,15 @@ describe('CheckOwnerDecisionUseCase signed re-verification (KEY0c2)', () => {
     });
   });
 
-  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+  it('refuses approved owner record when decisionTransport is absent', async () => {
     const result = await new CheckOwnerDecisionUseCase({
       requestRepo: repositoryWith(requestRecord()),
     }).checkOwnerDecision(REQUEST);
-    expect(result).toEqual({ outcome: 'approved', requestId: 'door-1', grantId: 'grant-9' });
+    expect(result).toEqual({
+      outcome: 'not-approved',
+      requestId: 'door-1',
+      reason: 'decision-signature-invalid',
+    });
   });
 
   it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {

@@ -24,9 +24,10 @@ import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.o
 export interface CheckOwnerDecisionDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   /**
-   * KEY0c2: when injected, an authorizing owner decision is re-read through
-   * the transport and bound to the signed answer before `approved` is
-   * reported. Omitted, the origin/main behaviour is kept until KEY0c3.
+   * KEY0c3: mandatory. An authorizing owner decision is re-read through the
+   * transport and bound to the signed answer before `approved` is reported;
+   * without it the check fails closed as `not-approved`
+   * (`decision-signature-invalid`).
    */
   readonly decisionTransport?: DecisionTransportPort;
 }
@@ -114,30 +115,34 @@ export class CheckOwnerDecisionUseCase implements CheckOwnerDecisionPort {
         reason: `coordination request ${requestId} carries no grant`,
       };
     }
-    // KEY0c2: when a decision transport is injected, an authorizing owner
-    // decision is re-read from the transport and bound to the signed answer.
-    // An owner-key refusal, an ambiguous or unverifiable answer, or a
-    // mismatching binding is not-approved, never approved. Without a
-    // transport the origin/main behaviour is kept.
-    if (this.deps.decisionTransport !== undefined) {
-      const answer = await this.deps.decisionTransport.readDecisionAnswer({
-        requestId: candidate.getId(),
-        projectId: recorded.projectId,
-        actionScope: candidate.getActionScope(),
-        expectedHeadSha: candidate.getExpectedHeadSha(),
-      });
-      // Fix round: a refusal is honoured in EVERY answer state — an approved
-      // answer that carries a refusalReason must still block, not authorize.
-      if (answer.refusalReason !== undefined) {
-        return { outcome: 'not-approved', requestId, reason: answer.refusalReason };
-      }
-      if (!verifySignedDecisionBinding(recorded, answer).ok) {
-        return {
-          outcome: 'not-approved',
-          requestId,
-          reason: 'decision-signature-invalid',
-        };
-      }
+    // KEY0c2: an authorizing owner decision is re-read from the transport and
+    // bound to the signed answer. An owner-key refusal, an ambiguous or
+    // unverifiable answer, or a mismatching binding is not-approved, never
+    // approved.
+    // KEY0c3: the transport is mandatory. An owner-gated record authorizes
+    // only against a verified signed answer; with no transport the check
+    // fails closed as not-approved, never approved.
+    const decisionTransport = this.deps.decisionTransport;
+    if (decisionTransport === undefined) {
+      return { outcome: 'not-approved', requestId, reason: 'decision-signature-invalid' };
+    }
+    const answer = await decisionTransport.readDecisionAnswer({
+      requestId: candidate.getId(),
+      projectId: recorded.projectId,
+      actionScope: candidate.getActionScope(),
+      expectedHeadSha: candidate.getExpectedHeadSha(),
+    });
+    // Fix round: a refusal is honoured in EVERY answer state — an approved
+    // answer that carries a refusalReason must still block, not authorize.
+    if (answer.refusalReason !== undefined) {
+      return { outcome: 'not-approved', requestId, reason: answer.refusalReason };
+    }
+    if (!verifySignedDecisionBinding(recorded, answer).ok) {
+      return {
+        outcome: 'not-approved',
+        requestId,
+        reason: 'decision-signature-invalid',
+      };
     }
     return { outcome: 'approved', requestId, grantId };
   }

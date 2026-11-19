@@ -240,9 +240,11 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     // never reads this repository directly.
     checkOwnerDecision: new CheckOwnerDecisionUseCase({
       requestRepo: coordinationRequestRepository,
+      decisionTransport,
     }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({
       requestRepo: coordinationRequestRepository,
+      decisionTransport,
       // RR1: the release grant's request id is verified against the digest of
       // its recorded coordinates at consumption, with the same digest the
       // request and resolve use cases are wired with.

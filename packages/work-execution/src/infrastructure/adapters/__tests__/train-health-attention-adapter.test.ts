@@ -997,6 +997,240 @@ describe('TrainHealthAttentionAdapter', () => {
     ).toEqual({ outcome: 'unavailable' });
     expect(requests).toEqual([]);
   });
+
+  it('reads list items by index descriptor only and refuses a sparse list before traversal', async () => {
+    const query = listQuery();
+
+    // A hostile `Symbol.iterator` (an array's own iterator) must never run:
+    // entries are read by index through own property descriptors.
+    let iteratorRuns = 0;
+    const iterableHostile: unknown[] = [projectEntry('tick-stale'), projectEntry('queue-too-large')];
+    Object.defineProperty(iterableHostile, Symbol.iterator, {
+      enumerable: false,
+      get() {
+        iteratorRuns += 1;
+        return function* hostileIterator() {
+          yield null;
+        };
+      },
+    });
+    const iterating = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: iterableHostile }),
+    });
+    expect(await iterating.listOpenTrainHealthAttention(query)).toEqual({
+      outcome: 'found',
+      items: [
+        { rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+        { rule: 'queue-too-large', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+      ],
+    });
+    expect(iteratorRuns).toBe(0);
+
+    // A hole is a malformed list: refused outright, never skipped.
+    const sparse: string[] = new Array(3);
+    sparse[0] = 'full';
+    sparse[2] = 'full';
+    expect(Object.keys(sparse).length).toBe(2);
+    const sparseAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: sparse }),
+    });
+    expect(await sparseAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+
+    // An extra own enumerable property planted beside the indices is refused too.
+    const accessorPolluted: unknown[] = ['zero', 'one'];
+    Object.defineProperty(accessorPolluted, 'hostile', {
+      value: null,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const polluted = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: accessorPolluted }),
+    });
+    expect(await polluted.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+  });
+
+  it('refuses a hole hidden by a planted extra key and an accessor-backed index even when the key count matches the length', async () => {
+    const query = listQuery();
+
+    // Deleting the sole index and adding an extra own key keeps
+    // `Object.keys(...).length === length`, so a key-count check alone would
+    // pass the malformed list through. The per-index check must refuse it.
+    const hiddenHole: string[] = ['full'];
+    delete hiddenHole[0];
+    (hiddenHole as unknown as { extra: number }).extra = 1;
+    expect(Object.keys(hiddenHole).length).toBe(1);
+    expect(hiddenHole.length).toBe(1);
+    const holedAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: hiddenHole }),
+    });
+    expect(await holedAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+
+    // An index backed by an accessor is not an own data property: refused
+    // before any element is read, never silently skipped.
+    let getterRuns = 0;
+    const accessorIndex: unknown[] = ['full'];
+    Object.defineProperty(accessorIndex, '0', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return projectEntry('tick-stale');
+      },
+    });
+    const accessorAdapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({ items: accessorIndex }),
+    });
+    expect(await accessorAdapter.listOpenTrainHealthAttention(query)).toEqual({ outcome: 'unavailable' });
+    expect(getterRuns).toBe(0);
+  });
+
+  it('refuses class-instance and custom-prototype commands, queries and delegate answers', async () => {
+    class HostileCommand {
+      projectId = PROJECT;
+      repository = { owner: OWNER, repo: REPO };
+      rule: TrainHealthAttentionCommand['rule'] = 'tick-stale';
+      pullRequest: null = null;
+      deadlineIso = DEADLINE;
+    }
+    class HostileQuery {
+      projectId = PROJECT;
+      repository = { owner: OWNER, repo: REPO };
+      deadlineIso = DEADLINE;
+    }
+    let calls = 0;
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => {
+        calls += 1;
+        return new HostileCommand();
+      },
+      clearAttentionItem: async () => {
+        calls += 1;
+        return new HostileCommand();
+      },
+      listAttentionItems: async () => new HostileQuery(),
+    });
+
+    const instance = new HostileCommand();
+    expect(await adapter.raiseTrainHealthAttention(instance as unknown as TrainHealthAttentionCommand)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.clearTrainHealthAttention(instance as unknown as TrainHealthAttentionCommand)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.listOpenTrainHealthAttention(new HostileQuery() as never)).toEqual({
+      outcome: 'unavailable',
+    });
+    expect(calls).toBe(0);
+
+    // A null-prototype object is still a plain record: it must pass.
+    const nullProto = Object.assign(Object.create(null), {
+      projectId: PROJECT,
+      repository: { owner: OWNER, repo: REPO },
+      rule: 'tick-stale',
+      pullRequest: null,
+      deadlineIso: DEADLINE,
+    }) as unknown as TrainHealthAttentionCommand;
+    const accepting = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'raised', previousRaisedAtIso: null }),
+      listAttentionItems: async () => ({ items: [] }),
+    });
+    expect(await accepting.raiseTrainHealthAttention(nullProto)).toEqual({
+      outcome: 'raised',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
+    expect(await accepting.listOpenTrainHealthAttention(listQuery())).toEqual({ outcome: 'found', items: [] });
+
+    // Delegate answers with a custom prototype are unreadable (raise/clear)
+    // and unavailable (list), even when the fields look right.
+    const customProto = Object.setPrototypeOf({ outcome: 'raised', previousRaisedAtIso: null }, class {});
+    const hostileAnswers = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => customProto,
+      clearAttentionItem: async () => customProto,
+      listAttentionItems: async () => customProto,
+    });
+    expect(await hostileAnswers.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(await hostileAnswers.clearTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(await hostileAnswers.listOpenTrainHealthAttention(listQuery())).toEqual({ outcome: 'unavailable' });
+  });
+
+  it('refuses a command, repository or query with an extra own key as invalid-request', async () => {
+    let calls = 0;
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => {
+        calls += 1;
+        return { outcome: 'raised', previousRaisedAtIso: null };
+      },
+      clearAttentionItem: async () => {
+        calls += 1;
+        return { outcome: 'cleared' };
+      },
+      listAttentionItems: async () => {
+        calls += 1;
+        return { items: [] };
+      },
+    });
+    const extra = { ...command(), actor: 'someone' };
+    expect(await adapter.raiseTrainHealthAttention(extra)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(await adapter.clearTrainHealthAttention(extra)).toEqual({
+      outcome: 'refused',
+      reasonCode: 'invalid-request',
+    });
+    expect(
+      await adapter.listOpenTrainHealthAttention({ ...listQuery(), state: 'open' } as never),
+    ).toEqual({ outcome: 'unavailable' });
+    expect(
+      await adapter.raiseTrainHealthAttention({
+        ...command(),
+        repository: { owner: OWNER, repo: REPO, host: 'example' },
+      } as unknown as TrainHealthAttentionCommand),
+    ).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('maps a concurrent-writer conflict refusal to reasonCode conflict', async () => {
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({
+        outcome: 'refused',
+        code: 'conflict',
+        reason: 'RecordAttentionItem another writer moved this item first',
+      }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'conflict',
+    });
+  });
+
+  it('skips list entries whose item is a class instance or custom-prototype object', async () => {
+    class HostileItem {
+      projectId = PROJECT;
+      kind = 'train-tick-stale';
+      subject = { kind: 'project', ref: PROJECT };
+      summary = `train-health:tick-stale repo=${OWNER}/${REPO}`;
+      lastRaisedAtIso = RAISED_AT;
+    }
+    const adapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async () => ({
+        items: [new HostileItem(), projectEntry('tick-stale'), Object.setPrototypeOf(projectEntry('tick-stale').item, class {})],
+      }),
+    });
+    expect(await adapter.listOpenTrainHealthAttention(listQuery())).toEqual({
+      outcome: 'found',
+      items: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: RAISED_AT }],
+    });
+  });
 });
 
 function projectEntry(rule: string, summaryRepo = `${OWNER}/${REPO}`, projectId = PROJECT) {

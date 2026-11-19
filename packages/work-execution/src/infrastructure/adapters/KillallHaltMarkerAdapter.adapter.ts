@@ -42,6 +42,7 @@ export interface KillallHaltMarkerAdapterOptions {
 const DEFAULT_FILE_NAME = 'killall-halt.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -83,7 +84,17 @@ function stateOfRecord(record: ConductorHaltRecord | null): KillallHaltMarkerRea
 export class KillallHaltMarkerAdapter implements KillallHaltMarkerPort {
   private inMemoryRecord: ConductorHaltRecord | null = null;
 
-  constructor(private readonly options: KillallHaltMarkerAdapterOptions = {}) {}
+  constructor(private readonly options: KillallHaltMarkerAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error('KillallHaltMarkerAdapter refuses a fileName that collides with another store');
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('KillallHaltMarkerAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async read(): Promise<KillallHaltMarkerRead> {
     const target = this.statePath;

@@ -1337,7 +1337,10 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     try {
       const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
       const events: DaemonEventRecord[] = [];
-      for (let index = 0; index < 800; index += 1) {
+      // OD7a3: a full day of one-minute ticks spanning [00:00Z, 24:00Z), so
+      // the S12 coverage guards (last tick within the grace window, gaps
+      // under the 15-minute limit) hold.
+      for (let index = 0; index < 1440; index += 1) {
         events.push(cliJobEvent(index, day));
       }
       const runtime = scheduledRuntime(stateDir, async () => ({ outcome: 'covered' }), events);

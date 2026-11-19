@@ -1663,7 +1663,10 @@ describe('ResolveActionAuthorizationUseCase', () => {
     // later read without the refusal verifies afresh.
     class QueuedDecisionTransport implements DecisionTransportPort {
       readonly reads: string[] = [];
-      constructor(private readonly queue: readonly DecisionAnswer[]) {}
+      constructor(answers: readonly DecisionAnswer[]) {
+        this.queue = [...answers];
+      }
+      private readonly queue: DecisionAnswer[];
       async readDecisionAnswer(query: DecisionAnswerQuery): Promise<DecisionAnswer> {
         this.reads.push(query.requestId);
         return this.queue.shift() ?? {

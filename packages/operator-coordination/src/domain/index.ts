@@ -8,6 +8,7 @@ export * from "./entities/index.js";
 export * from "./orchestrator-request-records.js";
 export * from "./orchestrator-session-records.js";
 export * from "./owner-item-records.js";
+export * from "./owner-key.js";
 export * from "./owner-notification.js";
 export * from "./owner-question-records.js";
 export * from "./policy-grants.js";

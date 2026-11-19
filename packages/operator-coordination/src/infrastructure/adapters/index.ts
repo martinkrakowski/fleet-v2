@@ -15,6 +15,7 @@ export * from "./OrchestratorRequestRepositoryAdapter.adapter.js";
 export * from "./OrchestratorSessionRepositoryAdapter.adapter.js";
 export * from "./owner-key.js";
 export * from "./OwnerItemRepositoryAdapter.adapter.js";
+export * from "./OwnerKeyAdapter.adapter.js";
 export * from "./OwnerQuestionRepositoryAdapter.adapter.js";
 export * from "./PermissionRequestRepositoryAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";

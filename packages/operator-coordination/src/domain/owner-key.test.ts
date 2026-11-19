@@ -20,6 +20,7 @@ const VALID_KEY = Buffer.alloc(32, 9).toString('base64');
 function safeInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     targetPath: '/keys/owner-key.pem',
+    stateDir: null,
     ancestorGitMarkers: [],
     ...overrides,
   };
@@ -214,10 +215,41 @@ describe('checkOwnerKeyPathSafety hostile input', () => {
   });
 
   it('a missing targetPath', () => {
-    expect(checkOwnerKeyPathSafety({ ancestorGitMarkers: [] })).toEqual({
+    expect(checkOwnerKeyPathSafety({ ancestorGitMarkers: [], stateDir: null })).toEqual({
       ok: false,
-      code: 'invalid-input',
+      code: 'missing-field',
     });
+  });
+
+  it('a plain object without stateDir is refused (missing-field, fail closed)', () => {
+    expect(
+      checkOwnerKeyPathSafety({ targetPath: '/keys/owner-key.pem', ancestorGitMarkers: [] }),
+    ).toEqual({ ok: false, code: 'missing-field' });
+  });
+
+  it('a Proxy whose ownKeys omits stateDir is refused (missing-field, fail closed)', () => {
+    let ownKeysCalls = 0;
+    const target = { targetPath: '/keys/owner-key.pem', ancestorGitMarkers: [] };
+    const proxy = new Proxy(target, {
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    // The hidden `stateDir` must not skip the state-dir check: the missing
+    // field is a refusal, never a silently-passed safety check.
+    expect(checkOwnerKeyPathSafety(proxy)).toEqual({ ok: false, code: 'missing-field' });
+    expect(ownKeysCalls).toBe(1);
+  });
+
+  it('an explicit stateDir: null with a safe target is accepted', () => {
+    expect(
+      checkOwnerKeyPathSafety({
+        targetPath: '/keys/owner-key.pem',
+        stateDir: null,
+        ancestorGitMarkers: [],
+      }),
+    ).toEqual({ ok: true, targetPath: '/keys/owner-key.pem' });
   });
 
   it('an unknown key on the record', () => {

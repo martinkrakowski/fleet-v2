@@ -47,6 +47,7 @@ type DeriveOwnerPublicKeyRefusal = Extract<DeriveOwnerPublicKeyResult, { ok: fal
 
 /** Every typed way one owner-key operation can fail closed. */
 export type OwnerKeyErrorCode =
+  | 'missing-field'
   | 'invalid-input'
   | 'hostile-input'
   | 'path-too-long'
@@ -153,10 +154,12 @@ async function checkOutputLocation(options: GenerateOwnerKeyFileOptions):
   // `--out` or `--state-dir`) are resolved here, against the process working
   // directory, before the pure domain check sees them.
   const absoluteOutPath = resolve(options.outPath);
-  const absoluteStateDir = options.stateDir === undefined ? undefined : resolve(options.stateDir);
+  const absoluteStateDir = options.stateDir === undefined ? null : resolve(options.stateDir);
+  // The state directory is ALWAYS passed explicitly — `null` when the CLI
+  // has none — so the domain's required-field contract cannot be skipped.
   const safety = checkOwnerKeyPathSafety({
     targetPath: absoluteOutPath,
-    ...(absoluteStateDir !== undefined ? { stateDir: absoluteStateDir } : {}),
+    stateDir: absoluteStateDir,
     ancestorGitMarkers: [],
   });
   if (!safety.ok) {

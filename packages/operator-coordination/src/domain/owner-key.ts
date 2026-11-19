@@ -28,6 +28,7 @@ export const RAW_ED25519_PUBLIC_KEY_BYTES = 32;
 
 /** Refusal codes `checkOwnerKeyPathSafety` returns. */
 export type OwnerKeyPathErrorCode =
+  | 'missing-field'
   | 'invalid-input'
   | 'hostile-input'
   | 'path-too-long'
@@ -377,7 +378,7 @@ function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPat
   if (!markersRead.ok) {
     return markersRead;
   }
-  if (values.has('stateDir')) {
+  if (values.get('stateDir') !== null) {
     const normalizedStateDir = normalizePath(values.get('stateDir') as string);
     if (!normalizedStateDir.startsWith('/')) {
       return { ok: false, code: 'path-not-absolute' };
@@ -398,9 +399,12 @@ function evaluatePathSafety(values: Map<string, unknown>): { ok: true; targetPat
 }
 
 /**
- * Validate the boundary input for one owner-key file write: an optional
- * `stateDir` exclusion and the ancestor git-marker list, against the
- * `targetPath`. Only own enumerable data properties are read (a getter
+ * Validate the boundary input for one owner-key file write: the required
+ * `stateDir` exclusion (a path string, or an explicit `null` when there is
+ * no state directory — never an absent field) and the required ancestor
+ * git-marker list, against the required `targetPath`. A missing field is
+ * refused with `missing-field`, so a Proxy whose `ownKeys` hides a field
+ * cannot make a safety check fail open. Only own enumerable data properties are read (a getter
  * never runs); a non-plain object, a symbol key, a prototype-polluting own
  * key, a Proxy whose traps throw, a sparse or over-long marker array, or an
  * over-long or NUL-carrying path is refused. Both `targetPath` and
@@ -430,17 +434,23 @@ export function checkOwnerKeyPathSafety(raw: unknown): OwnerKeyPathSafetyResult 
   if (!recordRead.ok) {
     return recordRead;
   }
-  for (const required of ['targetPath', 'ancestorGitMarkers'] as const) {
+  // Every safety-relevant field is REQUIRED as an own data property: a
+  // Proxy (or any hostile record) whose `ownKeys` hides one of them can no
+  // longer make the corresponding check silently skipped — a missing field
+  // fails closed with `missing-field`. `stateDir` is either a path string
+  // or an explicit `null` (no state directory).
+  for (const required of PATH_INPUT_KEYS) {
     if (!recordRead.values.has(required)) {
-      return { ok: false, code: 'invalid-input' };
+      return { ok: false, code: 'missing-field' };
     }
   }
   const targetCheck = checkPathString(recordRead.values.get('targetPath'));
   if (targetCheck !== null) {
     return { ok: false, code: targetCheck };
   }
-  if (recordRead.values.has('stateDir')) {
-    const stateCheck = checkPathString(recordRead.values.get('stateDir'));
+  const stateDirValue = recordRead.values.get('stateDir');
+  if (stateDirValue !== null) {
+    const stateCheck = checkPathString(stateDirValue);
     if (stateCheck !== null) {
       return { ok: false, code: stateCheck };
     }

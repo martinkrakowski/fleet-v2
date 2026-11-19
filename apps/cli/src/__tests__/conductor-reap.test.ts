@@ -1084,6 +1084,7 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
       options: {
         coordinationRequest?: unknown;
         consumeOutcome?: unknown;
+        findRequestById?: (linkedRequestId: string) => Promise<unknown>;
       } = {},
     ) {
       const calls = { sync: 0, list: 0, find: 0, resolve: 0, consume: 0 };
@@ -1114,8 +1115,11 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
           },
         },
         coordinationRequestRepository: {
-          findRequestById: async () => {
+          findRequestById: async (linkedRequestId: string) => {
             calls.find += 1;
+            if (options.findRequestById) {
+              return options.findRequestById(linkedRequestId);
+            }
             return options.coordinationRequest ?? null;
           },
         },
@@ -1305,6 +1309,68 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
         reason: 'no-scoped-owner-approval',
       });
       expect(refusedReplay.calls).toEqual({ sync: 1, list: 1, find: 1, resolve: 0, consume: 1 });
+    });
+
+    it('returns the first qualifying approval before a later question lookup rejects', async () => {
+      const actionId = unsealedWorktreeRemovalActionId(RUN_ID, VALID_REQUEST.attemptId);
+      const actionScope = unsealedWorktreeRemovalScope(
+        VALID_REQUEST.attemptId,
+        sha256HexDigest(VALID_REQUEST.worktreePath),
+      );
+      const consumption = {
+        consumptionId: 'consumption-1',
+        grantId: 'grant-9',
+        requestId: 'req-9',
+        actionId,
+        attemptId: VALID_REQUEST.attemptId,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        consumedAtIso: NOW,
+      };
+      const coordReq = {
+        id: 'req-9',
+        projectId: VALID_REQUEST.projectId,
+        actionScope,
+        expectedHeadSha: VALID_REQUEST.expectedHeadSha,
+        policyGrant: undefined,
+        grantId: 'grant-9',
+        consumptions: [consumption],
+      };
+      const listed = () => ({
+        questions: [
+          {
+            doorKind: 'one-way',
+            state: 'answered',
+            questionId: 'oq-9',
+            linkedRequestId: 'req-9',
+            answer: { shape: 'accept', answeredVia: 'signed-decision' },
+          },
+          {
+            doorKind: 'one-way',
+            state: 'answered',
+            questionId: 'oq-late',
+            linkedRequestId: 'req-late',
+            answer: { shape: 'accept', answeredVia: 'signed-decision' },
+          },
+        ],
+      });
+
+      // The first question's lookup qualifies and authorizes; the later
+      // question's lookup would reject, but the scan must already have
+      // returned on the first match, exactly as before the refactor.
+      const firstWins = authorizerWith(listed, {
+        findRequestById: async (linkedRequestId: string) => {
+          if (linkedRequestId === 'req-9') {
+            return coordReq;
+          }
+          throw new Error('later lookup exploded');
+        },
+        consumeOutcome: { outcome: 'consumed', consumption },
+      });
+      await expect(firstWins.authorize(VALID_REQUEST)).resolves.toEqual({
+        outcome: 'approved',
+        approvalReference: 'oq-9:req-9:grant-9',
+      });
+      expect(firstWins.calls.find).toBe(1);
     });
   });
 

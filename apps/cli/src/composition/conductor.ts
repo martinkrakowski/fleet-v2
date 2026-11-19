@@ -643,12 +643,11 @@ async function authorizeUnsealedRemovalWithScope(
   if (!synced.ok) {
     return { outcome: 'unknown', reason: synced.reason };
   }
-  const candidates = await selectOwnerQuestions(
-    synced.questions,
+  const result = await authorizeSelectedQuestions(
+    coordination,
     scope,
-    coordinationRequestRepository,
+    selectOwnerQuestions(synced.questions, scope, coordinationRequestRepository),
   );
-  const result = await authorizeSelectedQuestions(coordination, scope, candidates);
   if (result === null) {
     return { outcome: 'blocked', reason: 'no-scoped-owner-approval' };
   }
@@ -693,13 +692,17 @@ interface SelectedOwnerQuestion {
  * The answered one-way owner questions whose linked coordination request is
  * bound to this exact removal scope (project, action scope, head, no policy
  * grant). A sparse array's hole is skipped, never read as a question.
+ *
+ * Yields lazily, in question order: each lookup happens only when the
+ * consumer asks for the next candidate, so a rejection from a later
+ * question's `findRequestById` can never abort the scan before an earlier
+ * qualifying match is used (the pre-refactor short-circuit behaviour).
  */
-async function selectOwnerQuestions(
+async function* selectOwnerQuestions(
   questions: readonly unknown[],
   scope: UnsealedRemovalScope,
   coordinationRequestRepository: CoordinationRequestRepositoryAdapter,
-): Promise<SelectedOwnerQuestion[]> {
-  const selected: SelectedOwnerQuestion[] = [];
+): AsyncGenerator<SelectedOwnerQuestion> {
   for (let index = 0; index < questions.length; index += 1) {
     if (!Object.hasOwn(questions, index)) {
       continue;
@@ -718,23 +721,23 @@ async function selectOwnerQuestions(
     ) {
       continue;
     }
-    selected.push({ question, coordReq });
+    yield { question, coordReq };
   }
-  return selected;
 }
 
 /**
- * Authorize the selected candidates in order: a crash-recovery-shaped request
- * recovers only through the verified consume replay, everything else goes
- * through the fresh resolve-and-consume. Returns the first approved result,
- * or null when no candidate yields one.
+ * Authorize the candidate questions in order, pulling each next candidate
+ * only after the previous one failed to authorize: a crash-recovery-shaped
+ * request recovers only through the verified consume replay, everything else
+ * goes through the fresh resolve-and-consume. Returns the first approved
+ * result, or null when no candidate yields one.
  */
 async function authorizeSelectedQuestions(
   coordination: UnsealedRemovalAuthorizerDeps['coordination'],
   scope: UnsealedRemovalScope,
-  candidates: readonly SelectedOwnerQuestion[],
+  candidates: AsyncGenerator<SelectedOwnerQuestion>,
 ): Promise<AuthorizeUnsealedWorktreeRemovalResult | null> {
-  for (const candidate of candidates) {
+  for await (const candidate of candidates) {
     const authorized = isCrashRecoveryConsumption(candidate.coordReq, scope)
       ? await tryCrashRecovery(coordination, scope, candidate)
       : await freshConsume(coordination, scope, candidate);

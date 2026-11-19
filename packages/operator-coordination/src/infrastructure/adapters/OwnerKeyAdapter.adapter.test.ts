@@ -90,7 +90,26 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 import { canonicalDecisionBytes, verifyDecisionSignature } from './DecisionSignature.adapter.js';
-import { deriveOwnerPublicKeyFromFile, generateOwnerKeyFile, ownerKeyIdentitySeam } from './OwnerKeyAdapter.adapter.js';
+import {
+  deriveOwnerPublicKeyFromFile,
+  generateOwnerKeyFile,
+  type OwnerKeyFsDeps,
+} from './OwnerKeyAdapter.adapter.js';
+import type { FileHandle } from 'node:fs/promises';
+
+/**
+ * A fake identity check injected through the `deps` parameter (there is no
+ * mutable seam to poke): `behavior` decides what the fake reports.
+ */
+function fakeDeps(
+  behavior: (
+    handle: FileHandle,
+    filePath: string,
+    stateDir: string | undefined,
+  ) => Promise<{ ok: true } | { ok: false; code: 'identity-changed' | 'unsafe-path-state-dir'; message: string }>,
+): OwnerKeyFsDeps {
+  return { verifyWrittenIdentity: behavior };
+}
 
 let root: string;
 
@@ -103,7 +122,6 @@ afterEach(() => {
   failureFlags.close = false;
   failureFlags.swapPath = null;
   failureFlags.statSize = null;
-  delete ownerKeyIdentitySeam.verify;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -294,34 +312,33 @@ describe('generateOwnerKeyFile', () => {
     expect(existsSync(keyPath)).toBe(false);
   });
 
-  it('refuses with identity-changed and removes the file when a seam reports a different dev/ino after the write', async () => {
+  it('refuses with identity-changed and removes the file when the injected identity check reports a different dev/ino after the write', async () => {
     const keyPath = join(root, 'owner-key.pem');
-    // The seam stands in for the real dev/ino check: it reports the mismatch
-    // a parent swap between the location check and the write would produce.
-    ownerKeyIdentitySeam.verify = async () => ({
+    // The injected dep stands in for the real dev/ino check: it reports the
+    // mismatch a parent swap between the location check and the write would
+    // produce.
+    const result = await generateOwnerKeyFile({ outPath: keyPath }, fakeDeps(async () => ({
       ok: false as const,
       code: 'identity-changed' as const,
       message: 'owner-key: the written file changed identity after the write',
-    });
-    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    })));
     expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
     // Nothing must be left behind.
     expect(existsSync(keyPath)).toBe(false);
   });
 
-  it('removes the created file when a seam reports the realpath moved into the state dir after the write', async () => {
+  it('removes the created file when the injected identity check reports the realpath moved into the state dir after the write', async () => {
     const stateDir = join(root, 'state');
     mkdirPrivate(stateDir);
     const keyPath = join(root, 'owner-key.pem');
-    // The seam stands in for a post-write location check that now resolves
-    // the written file's realpath inside the state directory (the parent was
-    // moved there between the write and the check).
-    ownerKeyIdentitySeam.verify = async () => ({
+    // The injected dep stands in for a post-write location check that now
+    // resolves the written file's realpath inside the state directory (the
+    // parent was moved there between the write and the check).
+    const result = await generateOwnerKeyFile({ outPath: keyPath, stateDir }, fakeDeps(async () => ({
       ok: false as const,
       code: 'unsafe-path-state-dir' as const,
       message: 'owner-key: the output path is inside the state directory',
-    });
-    const result = await generateOwnerKeyFile({ outPath: keyPath, stateDir });
+    })));
     expect(result).toMatchObject({ ok: false, code: 'unsafe-path-state-dir' });
     // The refusal removed the file this run created.
     expect(existsSync(keyPath)).toBe(false);
@@ -329,9 +346,10 @@ describe('generateOwnerKeyFile', () => {
 
   it('does not delete a file some other writer swapped in when cleaning up after a refusal', async () => {
     const keyPath = join(root, 'owner-key.pem');
-    // The seam first replaces the file at the path with a DIFFERENT inode
-    // (the move a real swap would leave behind), then reports the mismatch.
-    ownerKeyIdentitySeam.verify = async () => {
+    // The injected dep first replaces the file at the path with a DIFFERENT
+    // inode (the move a real swap would leave behind), then reports the
+    // mismatch.
+    const result = await generateOwnerKeyFile({ outPath: keyPath }, fakeDeps(async () => {
       rmSync(keyPath);
       writeFileSync(keyPath, 'someone else\n', { mode: 0o600 });
       return {
@@ -339,17 +357,15 @@ describe('generateOwnerKeyFile', () => {
         code: 'identity-changed' as const,
         message: 'owner-key: the written file changed identity after the write',
       };
-    };
-    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    }));
     expect(result).toMatchObject({ ok: false, code: 'identity-changed' });
     // The dev/ino guard held: the swapped-in file is not ours to delete.
     expect(readFileSync(keyPath, 'utf8')).toBe('someone else\n');
   });
 
-  it('succeeds when the seam reports the identity as unchanged', async () => {
+  it('succeeds when the injected identity check reports the identity as unchanged', async () => {
     const keyPath = join(root, 'owner-key.pem');
-    ownerKeyIdentitySeam.verify = async () => ({ ok: true as const });
-    const result = await generateOwnerKeyFile({ outPath: keyPath });
+    const result = await generateOwnerKeyFile({ outPath: keyPath }, fakeDeps(async () => ({ ok: true as const })));
     expect(result).toMatchObject({ ok: true });
     expect(existsSync(keyPath)).toBe(true);
   });
@@ -528,5 +544,22 @@ describe('signing round trip', () => {
       expect(text).not.toContain('PRIVATE KEY');
       expect(text).not.toContain(pem.trim());
     }
+  });
+});
+
+describe('public package exports', () => {
+  it("the package's runtime exports contain no seam or deps object", async () => {
+    const exported = await import('@fleet/operator-coordination');
+    const names = Object.keys(exported);
+    for (const name of names) {
+      expect(name).not.toBe('ownerKeyIdentitySeam');
+      expect(name).not.toBe('realOwnerKeyFsDeps');
+      expect(name).not.toMatch(/Seam$/);
+      // Any exported object named after a deps shape would be a mutable
+      // seam in disguise; none may leave the module.
+      expect(name).not.toMatch(/Deps$/);
+    }
+    expect(exported).not.toHaveProperty('ownerKeyIdentitySeam');
+    expect(exported).not.toHaveProperty('realOwnerKeyFsDeps');
   });
 });

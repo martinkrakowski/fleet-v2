@@ -67,18 +67,27 @@ export type OwnerKeyErrorCode =
   | 'identity-changed';
 
 /**
- * Test seam for the post-write identity check: real parent-swap races are
- * impractical to stage, so a test can install a fake `verify` here that
- * reports the mismatch a race would produce (a different dev/ino pair after
- * the write). Production code must leave this unset; when it is unset the
- * real `verifyWrittenIdentity` runs.
+ * The read-only filesystem/identity dependency of the owner-key adapter.
+ * It is passed per call (a frozen default is used when omitted), never a
+ * mutable module-level seam: no consumer can swap out the identity checks
+ * after the fact, and tests inject fakes through the parameter.
  */
-export const ownerKeyIdentitySeam: {
-  verify?: (
+export interface OwnerKeyFsDeps {
+  readonly verifyWrittenIdentity: (
     handle: FileHandle,
     filePath: string,
+    stateDir: string | undefined,
   ) => Promise<{ ok: true } | { ok: false; code: OwnerKeyErrorCode; message: string }>;
-} = {};
+}
+
+/**
+ * The real dependencies, frozen and module-private. Production code paths
+ * always run these; the object itself is never exported.
+ */
+const realOwnerKeyFsDeps: OwnerKeyFsDeps = Object.freeze({
+  verifyWrittenIdentity: (handle: FileHandle, filePath: string, stateDir: string | undefined) =>
+    verifyWrittenIdentity(handle, filePath, stateDir),
+});
 
 /**
  * Whether `file` is `root` itself or lies inside it, decided from
@@ -371,19 +380,19 @@ async function writeAndEnforceMode(handle: FileHandle, privatePem: string): Prom
  * Close the parent-swap race: while the handle is still open, verify that the
  * file just written still has the same dev/ino at the `realpath` of
  * `writePath` and that the resolved path is still outside the state directory
- * and any git repository or worktree (see `verifyWrittenIdentity`). A fake
- * seam may stand in for the real check in tests. The seam itself can also
- * fail: the failure is a typed refusal, never a thrown error.
+ * and any git repository or worktree (see `verifyWrittenIdentity`). The
+ * identity check comes from the read-only `deps` (the frozen real one by
+ * default, a fake injected by tests). The check itself can also fail: the
+ * failure is a typed refusal, never a thrown error.
  */
 async function checkWrittenIdentity(
   handle: FileHandle,
   writePath: string,
   stateDir: string | undefined,
+  deps: OwnerKeyFsDeps,
 ): Promise<{ ok: true } | GenerateRefusal> {
   try {
-    return ownerKeyIdentitySeam.verify !== undefined
-      ? await ownerKeyIdentitySeam.verify(handle, writePath)
-      : await verifyWrittenIdentity(handle, writePath, stateDir);
+    return await deps.verifyWrittenIdentity(handle, writePath, stateDir);
   } catch {
     return {
       ok: false,
@@ -449,6 +458,7 @@ async function writePrivateKeyAtomically(
   writePath: string,
   privatePem: string,
   stateDir: string | undefined,
+  deps: OwnerKeyFsDeps,
 ): Promise<{ ok: true } | GenerateRefusal> {
   const existing = await refuseIfPathExists(writePath);
   if (existing !== null) {
@@ -461,7 +471,7 @@ async function writePrivateKeyAtomically(
   const handle = opened.handle;
   if (await writeAndEnforceMode(handle, privatePem)) {
     // Nothing this run created may be left behind on a post-write refusal.
-    const identity = await checkWrittenIdentity(handle, writePath, stateDir);
+    const identity = await checkWrittenIdentity(handle, writePath, stateDir, deps);
     if (!identity.ok) {
       return refuseWithCleanup(handle, writePath, identity);
     }
@@ -496,8 +506,15 @@ async function writePrivateKeyAtomically(
  * that realpath, so a parent swapped in between check and write cannot
  * survive. Returns the canonical base64 public key and the installation
  * edit; never the private key. Every failure is a typed refusal.
+ *
+ * The filesystem/identity operations come from the read-only `deps`
+ * parameter (the frozen, module-private `realOwnerKeyFsDeps` by default);
+ * tests inject fakes through this parameter and no mutable seam exists.
  */
-export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions): Promise<GenerateOwnerKeyFileResult> {
+export async function generateOwnerKeyFile(
+  options: GenerateOwnerKeyFileOptions,
+  deps: OwnerKeyFsDeps = realOwnerKeyFsDeps,
+): Promise<GenerateOwnerKeyFileResult> {
   const location = await checkOutputLocation(options);
   if (!location.ok) {
     return location;
@@ -510,7 +527,7 @@ export async function generateOwnerKeyFile(options: GenerateOwnerKeyFileOptions)
   // `outPath`: the resolved parent was just checked, so a symlink swapped
   // into the original parent chain cannot redirect the write.
   const writePath = join(location.parentReal, basename(options.outPath));
-  const written = await writePrivateKeyAtomically(writePath, material.privatePem, options.stateDir);
+  const written = await writePrivateKeyAtomically(writePath, material.privatePem, options.stateDir, deps);
   if (!written.ok) {
     return written;
   }

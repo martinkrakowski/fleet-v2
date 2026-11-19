@@ -262,6 +262,14 @@ describe('parseSignDecisionInput field validation', () => {
     ).toBe(false);
     expect(parseSignDecisionInput(validInput({ decisionRevision: 'r'.repeat(129) })).ok).toBe(false);
   });
+
+  it('refuses a grantId containing a C1 control character', () => {
+    expect(parseSignDecisionInput(validInput({ grantId: 'grant\u0085x' }))).toEqual({
+      ok: false,
+      code: 'invalid-sign-decision-input',
+    });
+    expect(parseSignDecisionInput(validInput({ grantId: 'grant\u009fx' })).ok).toBe(false);
+  });
 });
 
 describe('buildSignableDecisionFields', () => {

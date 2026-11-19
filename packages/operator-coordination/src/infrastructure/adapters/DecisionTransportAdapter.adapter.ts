@@ -178,8 +178,10 @@ function inspectCandidateOwnKeys(candidate: unknown): PropertyKey[] | null {
 
 /**
  * Whether one own key is safe to skip. Returns `false` when the candidate
- * must be reported as awaiting: an accessor property, or an own
- * `requestId`/`actionScope`/`projectId` string that names a different
+ * must be reported as awaiting: an accessor property, an own
+ * `requestId`/`actionScope`/`projectId` value that is present but not a
+ * non-empty string (malformed — `null` and other non-strings are refused,
+ * never silently dropped), or such a string that names a different
  * request, scope or project than the query. A non-string key is skipped.
  */
 function ownKeyIsBenign(
@@ -199,8 +201,13 @@ function ownKeyIsBenign(
   if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
     return false;
   }
-  if (typeof descriptor.value !== 'string') {
+  if (key !== 'requestId' && key !== 'actionScope' && key !== 'projectId') {
     return true;
+  }
+  // A present identity field must be a bounded non-empty string; `null` or
+  // any other non-string is refused as malformed, not treated as absent.
+  if (typeof descriptor.value !== 'string' || descriptor.value.length === 0) {
+    return false;
   }
   const expected =
     key === 'requestId'

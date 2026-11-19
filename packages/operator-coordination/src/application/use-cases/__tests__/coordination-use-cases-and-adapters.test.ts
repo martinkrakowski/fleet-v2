@@ -2691,6 +2691,37 @@ describe('DecisionTransportAdapter', () => {
     });
   });
 
+  it('refuses a validly signed answer whose own requestId is null', async () => {
+    const { publicKeyBase64, privateKey } = testKeyPair();
+    const signature = testSignature(
+      {
+        ...query,
+        decisionRevision: 'decision-3',
+        grantId: 'grant-9',
+        state: 'approved',
+      },
+      privateKey,
+    );
+    const adapter = new DecisionTransportAdapter({
+      ownerPublicKey: publicKeyBase64,
+      answers: {
+        'request-1': {
+          state: 'approved',
+          // Present but not a non-empty string: refused as malformed, never
+          // silently dropped during normalization.
+          requestId: null,
+          decisionRevision: 'decision-3',
+          grantId: 'grant-9',
+          signature,
+        },
+      },
+    } as never);
+    await expect(adapter.readDecisionAnswer(query)).resolves.toMatchObject({
+      state: 'awaiting-decision',
+      grantId: null,
+    });
+  });
+
   it('never upgrades a grantless, malformed or absent answer to approval', async () => {
     const adapter = new DecisionTransportAdapter({
       answers: {

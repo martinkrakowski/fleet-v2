@@ -144,6 +144,17 @@ describe('verifySignedDecisionBinding', () => {
     expect(verifySignedDecisionBinding(requestRecord(), answer)).toEqual({ ok: true });
   });
 
+  it('refuses a record with an empty actionScope even when the answer omits actionScope', () => {
+    const { actionScope, ...answer } = validAnswer();
+    void actionScope;
+    expect(
+      verifySignedDecisionBinding(requestRecord({ actionScope: '' }), answer),
+    ).toEqual({ ok: false, code: 'decision-binding-mismatch' });
+    expect(
+      verifySignedDecisionBinding(requestRecord({ actionScope: null as never }), answer),
+    ).toEqual({ ok: false, code: 'decision-binding-mismatch' });
+  });
+
   it('refuses a non-approved answer with decision-binding-not-approved', () => {
     expect(
       verifySignedDecisionBinding(requestRecord(), { ...validAnswer(), state: 'declined' }),

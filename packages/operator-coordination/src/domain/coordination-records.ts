@@ -1120,7 +1120,13 @@ export function verifySignedDecisionBinding(
   // The record id binds every answer; the answer's own requestId, when it
   // carries one, must name the same request. A present field whose value is
   // `null` or any other non-string is refused, never treated as absent.
-  if (!isBoundedDecisionField(record.values['id'])) {
+  // The record's own identity fields are always validated, whether or not
+  // the answer carries them: a record with an empty or non-string
+  // `actionScope` (or `id`) is refused even when the answer omits the field.
+  if (
+    !isBoundedDecisionField(record.values['id']) ||
+    !isBoundedDecisionField(record.values['actionScope'])
+  ) {
     return { ok: false, code: 'decision-binding-mismatch' };
   }
   if (snapshotHasOwnKey(answer.values, 'requestId')) {
@@ -1134,7 +1140,6 @@ export function verifySignedDecisionBinding(
   if (snapshotHasOwnKey(answer.values, 'actionScope')) {
     if (
       !isBoundedDecisionField(answer.values['actionScope']) ||
-      !isBoundedDecisionField(record.values['actionScope']) ||
       answer.values['actionScope'] !== record.values['actionScope']
     ) {
       return { ok: false, code: 'decision-binding-mismatch' };

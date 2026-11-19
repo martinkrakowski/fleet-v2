@@ -601,7 +601,11 @@ export function unsealedWorktreeRemovalAuthorizer(
           continue;
         }
         // Crash recovery: a grant already consumed by exactly this action id
-        // and attempt re-answers approved without a second owner signature.
+        // and attempt recovers only through the verified consume replay.
+        // KEY0c3: the stored `consumptions[0]` receipt alone is never
+        // authority — `recordAuthorizationConsumption` re-verifies the signed
+        // answer, so a missing or mismatching signed answer never returns
+        // `approved`.
         const consumption = coordReq.consumptions[0];
         if (
           coordReq.consumptions.length === 1 &&
@@ -610,10 +614,24 @@ export function unsealedWorktreeRemovalAuthorizer(
           consumption.attemptId === attemptId &&
           coordReq.grantId !== null
         ) {
-          return {
-            outcome: 'approved',
-            approvalReference: `${question.questionId}:${coordReq.id}:${coordReq.grantId}`,
-          };
+          const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
+            {
+              consumptionId: consumption.consumptionId,
+              grantId: coordReq.grantId,
+              actionId,
+              actionScope,
+              attemptId,
+              expectedHeadSha,
+              nowIso,
+            },
+          );
+          if (consumed.outcome === 'consumed') {
+            return {
+              outcome: 'approved',
+              approvalReference: `${question.questionId}:${coordReq.id}:${coordReq.grantId}`,
+            };
+          }
+          continue;
         }
         const resolved = await coordination.resolveActionAuthorization.resolveActionAuthorization({
           projectId,

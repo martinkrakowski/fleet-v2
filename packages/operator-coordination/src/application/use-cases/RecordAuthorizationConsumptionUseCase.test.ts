@@ -107,13 +107,18 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
 
   it('successfully consumes when actionScope and head commit match', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
-    await repo.saveRequest(makeApprovedGrantRecord({
+    const record = makeApprovedGrantRecord({
       grantId: 'grant-push',
       actionScope: 'forge:push-and-open-pr',
       expectedHeadSha: 'head-H',
-    }));
+    });
+    await repo.saveRequest(record);
 
-    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    // KEY0c3: the transport is mandatory for owner-gated scopes, so the
+    // consumption is seeded with its signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signer.deps });
 
     const result = await useCase.recordAuthorizationConsumption({
       consumptionId: 'c-1',
@@ -133,13 +138,17 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
 
   it('successfully consumes non-forge scope host:restart when supplied scope matches exactly', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
-    await repo.saveRequest(makeApprovedGrantRecord({
+    const record = makeApprovedGrantRecord({
       grantId: 'grant-restart',
       actionScope: 'host:restart',
       expectedHeadSha: 'head-H',
-    }));
+    });
+    await repo.saveRequest(record);
 
-    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    // KEY0c3: owner-gated consumption requires the signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signer.deps });
 
     const result = await useCase.recordAuthorizationConsumption({
       consumptionId: 'c-restart',
@@ -159,13 +168,17 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
 
   it('successfully consumes non-forge scope relay:fleet-master when supplied scope matches exactly', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
-    await repo.saveRequest(makeApprovedGrantRecord({
+    const record = makeApprovedGrantRecord({
       grantId: 'grant-relay',
       actionScope: 'relay:fleet-master',
       expectedHeadSha: 'head-H',
-    }));
+    });
+    await repo.saveRequest(record);
 
-    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+    // KEY0c3: owner-gated consumption requires the signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, ...signer.deps });
 
     const result = await useCase.recordAuthorizationConsumption({
       consumptionId: 'c-relay',
@@ -396,9 +409,14 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
 
   it('consumes a digest-bound release record whose root matches', async () => {
     const requestRepo = new InMemoryCoordinationRequestRepo();
-    await requestRepo.saveRequest(createReleaseRecord());
+    const record = createReleaseRecord();
+    await requestRepo.saveRequest(record);
+    // KEY0c3: release grants are owner-gated, so the consumption needs the
+    // transport and a seeded signed answer.
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
     const result = await consumeRelease(
-      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, ...signer.deps, computeDigest: digest }),
     );
     expect(result.outcome).toBe('consumed');
     const stored = await requestRepo.findRequestById(
@@ -640,11 +658,11 @@ describe('RecordAuthorizationConsumptionUseCase signed re-verification (KEY0c2)'
     expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
   });
 
-  it('keeps origin/main behaviour when decisionTransport is omitted', async () => {
+  it('refuses approved owner record when decisionTransport is absent', async () => {
     const result = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: repositoryWith(ownerRecord()),
     }).recordAuthorizationConsumption(REQUEST);
-    expect(result.outcome).toBe('consumed');
+    expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
   });
 
   it('surfaces owner-key-unpinned and owner-key-env-mismatch', async () => {
@@ -762,7 +780,7 @@ describe('RecordAuthorizationConsumptionUseCase signed re-verification (KEY0c2)'
     expect(result).toEqual({ outcome: 'refused', reason: 'decision-signature-invalid' });
   });
 
-  it('keeps policy and merge grants unchanged with decisionTransport injected', async () => {
+  it('keeps policy and merge grants unchanged with and without decisionTransport', async () => {
     const policyHead = 'a'.repeat(40);
     const policyGrant = ownerRecord({
       actionScope: 'forge:merge-pr',
@@ -780,5 +798,15 @@ describe('RecordAuthorizationConsumptionUseCase signed re-verification (KEY0c2)'
       expectedHeadSha: policyHead,
     });
     expect(result.outcome).toBe('consumed');
+    // KEY0c3: a non-signed scope keeps origin/main behaviour even when the
+    // transport is omitted entirely.
+    const withoutTransport = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repositoryWith(policyGrant),
+    }).recordAuthorizationConsumption({
+      ...REQUEST,
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: policyHead,
+    });
+    expect(withoutTransport.outcome).toBe('consumed');
   });
 });

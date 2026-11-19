@@ -6,7 +6,7 @@
 
 import { sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,7 +22,29 @@ function mkdirPrivate(path: string, options: { recursive?: boolean } = {}): void
   chmodSync(path, 0o700);
 }
 
-const failureFlags = vi.hoisted(() => ({ write: false, close: false, swapPath: null as string | null }));
+/**
+ * Whether the `mkfifo` utility is available: Node has no portable
+ * `mkfifoSync`, so FIFO fixtures are built with the external utility
+ * (the same way main's `packages/installation` load tests do) and the
+ * tests using them are skipped when it is missing.
+ */
+function mkfifoAvailable(): boolean {
+  try {
+    execFileSync('sh', ['-c', 'command -v mkfifo'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const failureFlags = vi.hoisted(() => ({
+  write: false,
+  close: false,
+  swapPath: null as string | null,
+  // When set, every handle.stat() reports this size instead of the real
+  // one: it stages a file that grows AFTER the adapter's fstat look.
+  statSize: null as number | null,
+}));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
@@ -31,7 +53,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     ...actual,
     async open(...args: Parameters<typeof actual.open>) {
       const handle = await actual.open(...args);
-      if (!failureFlags.write && !failureFlags.close) {
+      if (!failureFlags.write && !failureFlags.close && failureFlags.statSize === null) {
         return handle;
       }
       const wrapped = {
@@ -46,7 +68,14 @@ vi.mock('node:fs/promises', async (importOriginal) => {
               throw new Error('simulated write failure');
             }
           : handle.writeFile.bind(handle),
-        stat: handle.stat.bind(handle),
+        stat: async (...statArgs: Parameters<typeof handle.stat>) => {
+          const stat = await handle.stat(...statArgs);
+          if (failureFlags.statSize !== null) {
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { size: failureFlags.statSize });
+          }
+          return stat;
+        },
+        read: handle.read.bind(handle),
         readFile: handle.readFile.bind(handle),
         chmod: handle.chmod.bind(handle),
         close: failureFlags.close
@@ -73,6 +102,7 @@ afterEach(() => {
   failureFlags.write = false;
   failureFlags.close = false;
   failureFlags.swapPath = null;
+  failureFlags.statSize = null;
   delete ownerKeyIdentitySeam.verify;
   rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
@@ -342,14 +372,11 @@ describe('deriveOwnerPublicKeyFromFile', () => {
 
   it('refuses a FIFO key path promptly (O_NONBLOCK, real fifo)', async () => {
     const fifoPath = join(root, 'key-fifo');
+    if (!mkfifoAvailable()) {
+      return;
+    }
     try {
-      // `mkfifoSync` exists only on newer Node builds; fall back to the
-      // `mkfifo` utility, and skip when neither is available.
-      if (typeof mkfifoSync === 'function') {
-        mkfifoSync(fifoPath, 0o600);
-      } else {
-        execFileSync('mkfifo', [fifoPath]);
-      }
+      execFileSync('mkfifo', [fifoPath]);
     } catch (error) {
       const code = (error as { code?: unknown }).code;
       if (code === 'EPERM' || code === 'ENOSYS' || code === 'EINVAL' || code === 'ENOTSUP') {
@@ -401,6 +428,20 @@ describe('deriveOwnerPublicKeyFromFile', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe('unreadable-key');
+    }
+  });
+
+  it('refuses a file that grows past the cap after fstat (key-too-large)', async () => {
+    const { keyPath } = await makeKey('grew.pem');
+    // The file on disk holds far more than the cap, but the fstat the
+    // adapter sees reports a small size: only the bounded read from the
+    // open handle can catch what grew.
+    appendFileSync(keyPath, Buffer.from('x'.repeat(20000)));
+    failureFlags.statSize = 32;
+    const result = await deriveOwnerPublicKeyFromFile({ keyPath });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('key-too-large');
     }
   });
 

@@ -54,6 +54,7 @@ export type OwnerKeyErrorCode =
   | 'unsafe-path-git-repo'
   | 'write-failed'
   | 'unreadable-key'
+  | 'key-too-large'
   | 'invalid-key'
   | 'symlink-refused'
   | 'unsafe-key-permissions'
@@ -551,7 +552,24 @@ export async function deriveOwnerPublicKeyFromFile(options: DeriveOwnerPublicKey
     if (stat.size > MAX_KEY_FILE_BYTES) {
       return { ok: false, code: 'unreadable-key', message: 'owner-key: the key file is too large' };
     }
-    const pem = await handle.readFile('utf8');
+    // Bounded read from the open handle, not `readFile`: the file could
+    // grow between the `fstat` above and the read, so the byte cap is
+    // enforced on the bytes actually taken, at most cap + 1 of them. A
+    // handle-level read on a FIFO would block, but `fstat` above already
+    // refused every non-regular file on the same handle.
+    const capped = Buffer.alloc(MAX_KEY_FILE_BYTES + 1);
+    let taken = 0;
+    while (taken < capped.length) {
+      const { bytesRead } = await handle.read(capped, taken, capped.length - taken);
+      if (bytesRead === 0) {
+        break;
+      }
+      taken += bytesRead;
+    }
+    if (taken > MAX_KEY_FILE_BYTES) {
+      return { ok: false, code: 'key-too-large', message: 'owner-key: the key file is too large' };
+    }
+    const pem = capped.subarray(0, taken).toString('utf8');
     let privateKey: ReturnType<typeof createPrivateKey>;
     try {
       privateKey = createPrivateKey(pem);

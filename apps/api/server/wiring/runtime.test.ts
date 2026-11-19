@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi, afterAll } from 'vitest';
@@ -1029,6 +1029,86 @@ describe('KEY0b: pinned owner public key in the API composition root', () => {
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
       configureFleetApiRuntime(null);
+    }
+  });
+});
+
+describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
+  it('a forged signature byte keeps the owner grant awaiting-decision; the valid answer authorizes', async () => {
+    const HEAD = makeHeadH();
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-tamper-'));
+    try {
+      configureFleetApiRuntime({ ...pinnedRuntimeConfig(stateDir), env: {} });
+      const operator = getOperatorComposition();
+      try {
+        // Request an owner-gated forge grant through the runtime's own use case.
+        const requested = await operator.requestScopedDecision.requestScopedDecision({
+          requestId: 'req-api-tamper',
+          projectId: 'proj-api-test',
+          kind: 'action-decision',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          proposalDigest: 'prop-api-tamper',
+          policyRevision: 'pol-1',
+          attemptId: 'att-api-tamper',
+        });
+        expect(requested).toMatchObject({ outcome: 'requested' });
+        const record = await operator.coordinationRequestRepository.findRequestById('req-api-tamper');
+        if (record === null) throw new Error('expected the requested decision to be recorded');
+        expect(record).toMatchObject({ state: 'awaiting-decision', grantId: null, decisionRevision: null });
+
+        // The owner's correctly signed answer, read back through the runtime's own transport.
+        const fields = {
+          requestId: record.id,
+          projectId: record.projectId,
+          actionScope: record.actionScope,
+          expectedHeadSha: record.expectedHeadSha,
+          decisionRevision: 'dec-tamper',
+          grantId: 'grant-api-tamper',
+          state: 'approved' as const,
+        };
+        writeSignedAnswer(stateDir, fields, ownerKey);
+        await expectApprovedAnswerReadableThrough(decisionTransportOf(operator), fields);
+
+        // Corrupt exactly one byte of the signature on disk.
+        const answerPath = join(stateDir, 'decisions', `${fields.requestId}.json`);
+        const answer = JSON.parse(readFileSync(answerPath, 'utf8')) as { signature: string };
+        answer.signature = (answer.signature[0] === 'A' ? 'B' : 'A') + answer.signature.slice(1);
+        writeFileSync(answerPath, `${JSON.stringify(answer, null, 2)}\n`);
+        const tamperedRead = await decisionTransportOf(operator).readDecisionAnswer({
+          requestId: fields.requestId,
+          projectId: fields.projectId,
+          actionScope: fields.actionScope,
+          expectedHeadSha: fields.expectedHeadSha,
+        });
+        expect(tamperedRead.state).toBe('awaiting-decision');
+
+        // Resolving while the tampered answer is present: a typed block, never authorized.
+        const resolveRequest = {
+          projectId: 'proj-api-test',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          attemptId: 'att-api-tamper',
+        };
+        const tampered = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+        expect(tampered).toEqual({
+          outcome: 'blocked',
+          reason: 'recorded request req-api-tamper is awaiting-decision, which does not authorize an action',
+        });
+        expect(await operator.coordinationRequestRepository.findRequestById('req-api-tamper')).toMatchObject({
+          state: 'awaiting-decision',
+          grantId: null,
+        });
+
+        // The untouched valid answer authorizes the same grant.
+        writeSignedAnswer(stateDir, fields, ownerKey);
+        const restored = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+        expect(restored).toMatchObject({ outcome: 'authorized', grantId: fields.grantId });
+      } finally {
+        configureFleetApiRuntime(null);
+      }
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

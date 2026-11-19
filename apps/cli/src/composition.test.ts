@@ -28,6 +28,7 @@ import {
   expectApprovedAnswerReadableThrough,
   writeSignedAnswer,
 } from './__tests__/signed-decision-fixture.js';
+import { coordinationCommands } from './commands/coordination.js';
 import type {
   AttemptRecord,
   PreparePullRequestFeedbackFixRequest,
@@ -2537,5 +2538,85 @@ describe('KEY0b: pinned owner public key in the CLI composition root', () => {
       pullRequestNumber: 7,
     });
     expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+});
+
+describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
+  it('a forged signature byte keeps the owner grant awaiting-decision; the valid answer authorizes', async () => {
+    const HEAD = makeHeadH();
+    const key = ephemeralOwnerKey();
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-comp-tamper-'));
+    try {
+      const rt = createFleetCliRuntime({ stateDir, ownerPublicKey: key.ownerPublicKey, env: {} });
+
+      // Request an owner-gated forge grant through the real runtime.
+      const requested = await coordinationCommands['request-decision'](
+        {
+          requestId: 'req-tamper',
+          projectId: 'proj-cli-test',
+          kind: 'action-decision',
+          actionScope: forgeActionScope('push-and-open-pr'),
+          expectedHeadSha: HEAD,
+          proposalDigest: 'prop-tamper',
+          policyRevision: 'pol-1',
+          attemptId: 'att-tamper',
+        },
+        rt,
+      );
+      expect(requested).toMatchObject({ outcome: 'requested' });
+      const record = await rt.coordination.coordinationRequestRepository.findRequestById('req-tamper');
+      if (record === null) throw new Error('expected the requested decision to be recorded');
+      expect(record).toMatchObject({ state: 'awaiting-decision', grantId: null, decisionRevision: null });
+
+      // The owner's correctly signed answer, read back through the runtime's own transport.
+      const fields = {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-tamper',
+        grantId: 'grant-tamper',
+        state: 'approved' as const,
+      };
+      writeSignedAnswer(stateDir, fields, key);
+      await expectApprovedAnswerReadableThrough(rt.coordination.decisionTransport, fields);
+
+      // Corrupt exactly one byte of the signature on disk.
+      const answerPath = path.join(stateDir, 'decisions', `${fields.requestId}.json`);
+      const answer = JSON.parse(await fs.readFile(answerPath, 'utf8')) as { signature: string };
+      answer.signature = (answer.signature[0] === 'A' ? 'B' : 'A') + answer.signature.slice(1);
+      await fs.writeFile(answerPath, `${JSON.stringify(answer, null, 2)}\n`);
+      const tamperedRead = await rt.coordination.decisionTransport.readDecisionAnswer({
+        requestId: fields.requestId,
+        projectId: fields.projectId,
+        actionScope: fields.actionScope,
+        expectedHeadSha: fields.expectedHeadSha,
+      });
+      expect(tamperedRead.state).toBe('awaiting-decision');
+
+      // Resolving while the tampered answer is present: a typed block, never authorized.
+      const resolveRequest = {
+        projectId: 'proj-cli-test',
+        actionScope: forgeActionScope('push-and-open-pr'),
+        expectedHeadSha: HEAD,
+        attemptId: 'att-tamper',
+      };
+      const tampered = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(tampered).toEqual({
+        outcome: 'blocked',
+        reason: 'recorded request req-tamper is awaiting-decision, which does not authorize an action',
+      });
+      expect(await rt.coordination.coordinationRequestRepository.findRequestById('req-tamper')).toMatchObject({
+        state: 'awaiting-decision',
+        grantId: null,
+      });
+
+      // The untouched valid answer authorizes the same grant.
+      writeSignedAnswer(stateDir, fields, key);
+      const restored = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(restored).toMatchObject({ outcome: 'authorized', grantId: fields.grantId });
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });

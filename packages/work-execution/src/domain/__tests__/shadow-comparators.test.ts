@@ -9,7 +9,7 @@ import {
   compareShadowMergeSets,
   compareShadowPremergeStatuses,
 } from '../shadow-comparators.js';
-import type { ShadowMergeSetItem } from '../shadow-comparators.js';
+import type { ShadowMergeSetItem, ShadowPremergeStatusItem } from '../shadow-comparators.js';
 
 /** Secret-shaped fakes are assembled from inert pieces (CO4 test precedent). */
 function fakeSecretShape(): string {
@@ -343,6 +343,19 @@ describe('shadow comparators', () => {
       divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
       truncated: false,
     });
+  });
+
+  it('a numeric headOid where a string field is due reports invalid-item for that element', () => {
+    const result = compareShadowPremergeStatuses({
+      fleet: [{ headOid: 12345, state: 'success' }] as unknown as readonly ShadowPremergeStatusItem[],
+      shell: [],
+    });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+    expect(result.shellCount).toBe(0);
+    expect(result.equal).toBe(false);
   });
 
   it('a root array returns the fallback result (a list is due on the fleet and shell fields, not the root)', () => {

@@ -627,11 +627,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       actionScope: record.actionScope,
       expectedHeadSha: record.expectedHeadSha,
     });
+    // A refusalReason on the answer (regardless of its state) means the
+    // answer must not be persisted: return the refusal and keep the stored
+    // record byte-identical so a later read re-verifies afresh.
+    if (answer.refusalReason !== undefined) {
+      return { record, refusalReason: answer.refusalReason };
+    }
     if (answer.state === 'awaiting-decision') {
-      return {
-        record,
-        ...(answer.refusalReason !== undefined ? { refusalReason: answer.refusalReason } : {}),
-      };
+      return { record };
     }
     if (answer.state === 'declined') {
       return { record };

@@ -1875,12 +1875,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw') {
       return 'merge-entries-unavailable';
     }
-    // Defensive: MergeQueueRepositoryAdapter#listMergeEntries does not
-    // itself filter by the query's `repository` (infrastructure/adapters,
-    // outside this unit's scope) — it returns every stored entry regardless
-    // of the query. Filter here by `repoDigest` so a call scoped to this
-    // repository is never contaminated by another repository's live
-    // entries in S1's merge-set comparison.
+    // Defensive: MergeQueueRepositoryAdapter#listMergeEntries now filters by
+    // the query's `repository` itself, so a call scoped to this repository
+    // should already return only this repository's entries. The filter by
+    // `repoDigest` is kept anyway, so a regression or a foreign store
+    // implementation can never contaminate S1's merge-set comparison with
+    // another repository's live entries.
     const journalEntries = journal.kind === 'ok' ? journal.entries : [];
     return [
       ...read.value

@@ -140,6 +140,57 @@ function isHostileRequestShape(request: unknown): boolean {
 }
 
 /**
+ * The own `length` data value of the candidate array: a number when the
+ * descriptor is a present data property, else null. Cost: one descriptor read.
+ */
+function candidateLengthValue(candidates: unknown[]): number | null {
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(candidates, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
+    return null;
+  }
+  return lengthDescriptor.value;
+}
+
+/**
+ * Whether `key` is a canonical own key of the candidate list: `length`, or a
+ * canonical index below `length`. Any other key — including a
+ * `Symbol.iterator` override — is refused. Cost: constant per key.
+ */
+function isCanonicalCandidateKey(key: PropertyKey, length: number): boolean {
+  if (typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(String(key)))) {
+    return false;
+  }
+  return key === 'length' || Number(key) < length;
+}
+
+/**
+ * Whether the own property at `key` is a present data property: a descriptor
+ * with a value and no accessor pair. A hole (no descriptor), an accessor or a
+ * throwing descriptor read is false. Cost: one descriptor read.
+ */
+function isOwnDataCandidateDescriptor(candidates: unknown[], key: PropertyKey): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(candidates, key);
+  return descriptor !== undefined && 'value' in descriptor && !('get' in descriptor || 'set' in descriptor);
+}
+
+/**
+ * Whether every canonical index `0 .. length-1` holds an own data-property
+ * string. Cost: linear in `length`, capped by `SPD_SAY_MAX_CANDIDATES` (16).
+ */
+function candidateElementsAreStrings(candidates: unknown[], length: number): boolean {
+  for (let index = 0; index < length; index += 1) {
+    if (!isOwnDataCandidateDescriptor(candidates, index)) {
+      return false;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
+    if (descriptor === undefined || typeof descriptor.value !== 'string') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Whether the injected candidate list may be traversed: a plain (non-Proxy)
  * array within the cap whose length is read once from its own descriptor and
  * whose every entry is a string read from its own data descriptor, without a
@@ -149,46 +200,33 @@ function isHostileRequestShape(request: unknown): boolean {
  * data property would otherwise let iteration yield unvalidated paths). The
  * WHOLE list is validated before any entry is probed. `isProxy` observes no
  * trap and no getter.
+ *
+ * Cost: linear in the list length, capped by `SPD_SAY_MAX_CANDIDATES` (16);
+ * `Reflect.ownKeys` is bounded by that cap because the polluting-key and cap
+ * checks run before it.
  */
 function isTraversableCandidateList(candidates: unknown): boolean {
   if (!Array.isArray(candidates) || types.isProxy(candidates)) {
     return false;
   }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(candidates, 'length');
-  if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
-    return false;
-  }
-  const length = lengthDescriptor.value;
-  if (length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
+  const length = candidateLengthValue(candidates);
+  if (length === null || length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
     return false;
   }
   for (const key of Reflect.ownKeys(candidates)) {
     // Only the canonical indices and `length` may be own keys; any other key
     // (including a `Symbol.iterator` override) is refused.
-    if (typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key))) {
+    if (!isCanonicalCandidateKey(key, length)) {
       return false;
     }
-    if (key !== 'length' && Number(key) >= length) {
+    if (!isOwnDataCandidateDescriptor(candidates, key)) {
       return false;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(candidates, key);
-    if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
-      return false;
-    }
-    if (key !== 'length' && typeof descriptor.value !== 'string') {
+    if (key !== 'length' && typeof (Object.getOwnPropertyDescriptor(candidates, key) as PropertyDescriptor).value !== 'string') {
       return false;
     }
   }
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
-    if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
-      return false;
-    }
-    if (typeof descriptor.value !== 'string') {
-      return false;
-    }
-  }
-  return true;
+  return candidateElementsAreStrings(candidates, length);
 }
 
 /** True when the candidate may be probed: a plain string starting with `/`. */

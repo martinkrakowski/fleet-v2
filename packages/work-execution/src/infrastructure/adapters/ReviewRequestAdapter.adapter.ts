@@ -509,13 +509,61 @@ interface BriefRequestFields {
 }
 
 /**
+ * A required brief-request string field: a string, non-empty, not secret-shaped.
+ * Cost: linear in the value's length up to the caller's caps; the secret scan
+ * runs only after the value is a string.
+ */
+function isValidBriefRequestString(value: unknown): value is string {
+  return typeof value === 'string' && isNonEmptyTrimmed(value) && !containsSecretShape(value);
+}
+
+/**
+ * The validated optional brief fields of a brief-verify request: `nowIso` (a
+ * string when present), no `diffSummary` at all, `briefText` (a string within
+ * `BRIEF_TEXT_MAX_BYTES`, refused on its UTF-16 length before any byte count
+ * when over 65536 code units) and `briefManifestRaw` (a required non-empty
+ * string). Null when any check fails. Cost: linear in the brief text length,
+ * capped by `BRIEF_TEXT_MAX_BYTES` (64 KiB). Never throws.
+ */
+function readBriefOptionalTextFields(
+  optional: Record<string, unknown>,
+): { readonly nowIso?: string; readonly briefText: string; readonly briefManifestRaw: string } | null {
+  const nowIso = optional.nowIso;
+  if (nowIso !== undefined && typeof nowIso !== 'string') {
+    return null;
+  }
+  if (optional.diffSummary !== undefined) {
+    return null;
+  }
+  const briefText = optional.briefText;
+  // Not a type predicate: a non-string is refused here, and a string still
+  // refuses on `.length > 65536` inside `briefTextIsRefused` before any byte count.
+  if (typeof briefText !== 'string') {
+    return null;
+  }
+  if (briefTextIsRefused(briefText)) {
+    return null;
+  }
+  // The manifest bytes are required: the frozen-brief digest covers
+  // `prose + '\n' + manifestRaw`, so a request without them cannot be bound
+  // to the subject's digest at all. A non-string is refused here.
+  const briefManifestRaw = optional.briefManifestRaw;
+  if (typeof briefManifestRaw !== 'string' || !isNonEmptyTrimmed(briefManifestRaw)) {
+    return null;
+  }
+  return {
+    ...(typeof nowIso === 'string' ? { nowIso } : {}),
+    briefText,
+    briefManifestRaw,
+  };
+}
+
+/**
  * Own-data fields of a brief-verify request. Null when any check fails.
  * The request's own `projectId` must be present and equal `subjectProjectId`;
- * an absent id is not a match. Cost: a fixed set of keys. `briefText` whose
- * UTF-16 length is over 65536 code units is refused before trim or a byte
- * scan; only a shorter string is trimmed and then measured, capped at
- * `BRIEF_TEXT_MAX_BYTES` (over-size text is refused, never forwarded). Secret
- * scans run only after the value is a string. Never throws.
+ * an absent id is not a match. Cost: a fixed set of keys, plus a brief-text
+ * scan capped at `BRIEF_TEXT_MAX_BYTES` (see `readBriefOptionalTextFields`).
+ * Never throws.
  */
 function readBriefRequestFields(request: unknown, subjectProjectId: string): BriefRequestFields | null {
   try {
@@ -534,36 +582,17 @@ function readBriefRequestFields(request: unknown, subjectProjectId: string): Bri
     if (typeof requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(requestId) || containsSecretShape(requestId)) {
       return null;
     }
-    if (typeof policyRevision !== 'string' || !isNonEmptyTrimmed(policyRevision) || containsSecretShape(policyRevision)) {
+    if (!isValidBriefRequestString(policyRevision)) {
       return null;
     }
-    if (typeof implementerModel !== 'string' || !isNonEmptyTrimmed(implementerModel) || containsSecretShape(implementerModel)) {
+    if (!isValidBriefRequestString(implementerModel)) {
       return null;
     }
-    if (typeof reviewerModel !== 'string' || !isNonEmptyTrimmed(reviewerModel) || containsSecretShape(reviewerModel)) {
+    if (!isValidBriefRequestString(reviewerModel)) {
       return null;
     }
-    const nowIso = optional.nowIso;
-    if (nowIso !== undefined && typeof nowIso !== 'string') {
-      return null;
-    }
-    if (optional.diffSummary !== undefined) {
-      return null;
-    }
-    const briefText = optional.briefText;
-    // Not a type predicate: a non-string is refused here, and a string still
-    // refuses on `.length > 65536` inside `briefTextIsRefused` before any byte count.
-    if (typeof briefText !== 'string') {
-      return null;
-    }
-    if (briefTextIsRefused(briefText)) {
-      return null;
-    }
-    // The manifest bytes are required: the frozen-brief digest covers
-    // `prose + '\n' + manifestRaw`, so a request without them cannot be bound
-    // to the subject's digest at all. A non-string is refused here.
-    const briefManifestRaw = optional.briefManifestRaw;
-    if (typeof briefManifestRaw !== 'string' || !isNonEmptyTrimmed(briefManifestRaw)) {
+    const texts = readBriefOptionalTextFields(optional);
+    if (texts === null) {
       return null;
     }
     return {
@@ -571,9 +600,7 @@ function readBriefRequestFields(request: unknown, subjectProjectId: string): Bri
       policyRevision,
       implementerModel,
       reviewerModel,
-      briefText,
-      briefManifestRaw,
-      ...(typeof nowIso === 'string' ? { nowIso } : {}),
+      ...texts,
     };
   } catch {
     return null;
@@ -1131,6 +1158,58 @@ type AssessmentRead =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: 'not-configured' | 'unreadable' };
 
+/**
+ * The brief receipts in `list` whose own `requestId` is `requestId`, in list
+ * order. A hole, a non-object entry or an unreadable `requestId` is null (the
+ * caller reads it as `unreadable`). `length` is the number this operation
+ * already read; this loop does not read `.length`. Cost: linear in
+ * `list.length`, capped by `MAX_BRIEF_RECEIPTS_READ` (256). Never throws.
+ */
+function matchBriefReceiptsByRequestId(list: BoundedList, requestId: string): ReviewReceiptRecord[] | null {
+  const matches: ReviewReceiptRecord[] = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const receipt = ownElement(list.list, index);
+    if (typeof receipt !== 'object' || receipt === null) {
+      return null;
+    }
+    const record = receipt as ReviewReceiptRecord;
+    const idRead = ownProperty(record, 'requestId');
+    if (idRead === 'unreadable') {
+      return null;
+    }
+    if (idRead !== undefined && idRead.value === requestId) {
+      matches.push(record);
+    }
+  }
+  return matches;
+}
+
+/**
+ * The summary of the single matched brief receipt: more than one match, no
+ * match at all, or a receipt that is not this brief's receipt is
+ * `receipt-mismatch`; a failing summary read is `unreadable`. Cost: constant
+ * besides the summary read, linear in the findings array length, capped by
+ * `MAX_BRIEF_FINDINGS_READ` (1024). Never throws.
+ */
+function summarizeBriefReceiptMatch(
+  matches: readonly ReviewReceiptRecord[],
+  brief: BriefSubject,
+  requestId: string,
+): FindReviewReceiptResult {
+  const only = matches[0];
+  if (only === undefined || matches.length > 1 || !isBriefReceiptOf(only, brief)) {
+    return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+  }
+  try {
+    const summary = summaryOf(only, 'brief-verify', requestId);
+    return summary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: summary };
+  } catch {
+    return { outcome: 'unavailable', reason: 'unreadable' };
+  }
+}
+
 export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
 
@@ -1682,36 +1761,14 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (list === null) {
       return { outcome: 'unavailable', reason: 'unreadable' };
     }
-    const matches: ReviewReceiptRecord[] = [];
-    for (let index = 0; index < list.length; index += 1) {
-      const receipt = ownElement(list.list, index);
-      if (typeof receipt !== 'object' || receipt === null) {
-        return { outcome: 'unavailable', reason: 'unreadable' };
-      }
-      const record = receipt as ReviewReceiptRecord;
-      const idRead = ownProperty(record, 'requestId');
-      if (idRead === 'unreadable') {
-        return { outcome: 'unavailable', reason: 'unreadable' };
-      }
-      if (idRead !== undefined && idRead.value === requestId) {
-        matches.push(record);
-      }
+    const matches = matchBriefReceiptsByRequestId(list, requestId);
+    if (matches === null) {
+      return { outcome: 'unavailable', reason: 'unreadable' };
     }
     if (matches.length === 0) {
       return { outcome: 'not-found' };
     }
-    const only = matches[0];
-    if (only === undefined || matches.length > 1 || !isBriefReceiptOf(only, brief)) {
-      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
-    }
-    try {
-      const summary = summaryOf(only, 'brief-verify', requestId);
-      return summary === null
-        ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
-        : { outcome: 'found', receipt: summary };
-    } catch {
-      return { outcome: 'unavailable', reason: 'unreadable' };
-    }
+    return summarizeBriefReceiptMatch(matches, brief, requestId);
   }
 
   private async findLatestChainReceiptOfKind(

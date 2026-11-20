@@ -462,22 +462,14 @@ function readEvidenceDay(element: unknown, failed: Set<string>): number | null {
  * A transparent Proxy over the document answers every prototype, key and
  * descriptor read exactly as its target would, so the checks above cannot
  * tell it from data. The structured-clone serializer refuses any Proxy
- * exotic object. Position fixes which side effects the probe can cause:
- *
- * - Called after a descriptor walk has proved every own property a data
- *   property with a primitive value (the pre-existing readers below), the
- *   probe reads no getter and costs a constant walk over at most the
- *   permitted keys.
- * - Called as the FIRST touch of an unknown input (the shadow-park
- *   validators), the probe refuses every Proxy — root or nested — observing
- *   no trap of any kind, before any prototype, own-key or descriptor check
- *   can run. On plain data the serializer materializes a cloneable
- *   accessor's value into the throwaway probe clone (one accessor read per
- *   accessor), but the value it answers can never reach an accepted
- *   result: any accessor is still refused from its own descriptor
- *   afterwards, whatever the accessor answers.
- *
- * A clone failure means a stand-in, never data.
+ * exotic object observing no trap of any kind. The probe is therefore called
+ * only AFTER the caller's descriptor walk has proved the reachable graph:
+ * every own property a data property (an accessor is refused from its own
+ * descriptor, so the probe reads no getter), the shape and key counts
+ * bounded (a sparse or enormous array, an array-like and extra keys are
+ * refused before the probe, so the serializer never materializes unbounded
+ * input). On that proved-bounded data the probe costs a constant walk and
+ * refuses a root or nested Proxy as a stand-in, never data.
  */
 function isCloneableData(raw: unknown): boolean {
   try {
@@ -801,38 +793,36 @@ const NOT_SHADOW_PARK = { ok: false, reason: 'not-shadow-park' } as const;
 
 /**
  * Validate one parked merge-queue entry as a shadow park and build the
- * canonical journal payload for it. The structured-clone probe is the FIRST
- * touch of the entry: the serializer refuses any Proxy exotic object — root
- * or nested — observing no trap of any kind, so no prototype, own-key or
- * descriptor check ever exercises a supplied Proxy's traps before the Proxy
- * is refused. After a successful probe (the whole reachable graph is then
- * proved Proxy-free), the plain-object shape and `readMergeQueueEntryRecord`
- * (own data-property descriptors only, so a throwing or tracked getter is
- * never invoked by the walk) check the record shape; the serializer may have
- * materialized a cloneable accessor's value once into the throwaway probe
- * clone, but the value an accessor answers can never reach an accepted
- * result — any accessor is refused from its own descriptor afterwards.
- * Arrays (sparse or dense), array-like objects with an own numeric `length`,
- * and `__proto__`/`constructor`/`prototype` own keys are refused by the same
- * checks. Only an ordinary park qualifies: the entry must be `parked` with a
- * reason other than `veto-hold` (SH24a park semantics). Cost bound: linear
- * in a constant — the entry record is a fixed shape of 25 keys (plus
- * optional `baseBranch`), every text bounded, and the probe walks only
- * proved primitive data properties plus at most one accessor read per
- * accessor.
+ * canonical journal payload for it. The plain-record shape and the
+ * `readMergeQueueEntryRecord` descriptor walk come FIRST: arrays (sparse or
+ * dense, of any length), array-like objects with an own numeric `length`,
+ * extra keys, `__proto__`/`constructor`/`prototype` own keys, and any
+ * accessor are all refused from their own descriptors before anything
+ * traverses the entry, so a getter is never invoked (its call count stays
+ * 0) and no unbounded input is ever materialized. Only after that walk has
+ * proved the reachable graph plain and bounded does the structured-clone
+ * probe run, refusing a root or nested Proxy as a stand-in — the serializer
+ * observes no trap of any kind. Only an ordinary park qualifies: the entry
+ * must be `parked` with a reason other than `veto-hold` (SH24a park
+ * semantics). Cost bound: linear in a constant — the entry record is a
+ * fixed shape of 25 keys (plus optional `baseBranch`), every text bounded,
+ * and the probe walks only proved data properties.
  */
 export function buildShadowParkJournalPayload(entry: unknown): CutoverShadowParkPayloadRead {
   try {
-    // Probe first: a supplied Proxy is refused by the serializer observing
-    // no trap, before any prototype/own-key/descriptor check can run one.
-    if (!isCloneableData(entry)) {
-      return INVALID_PARK_ENTRY;
-    }
+    // Shape first, pre-traversal: a non-object, an array (sparse or of
+    // enormous length) and an array-like are refused without cloning.
     if (!isPlainRecordObject(entry)) {
       return INVALID_PARK_ENTRY;
     }
     const read = readMergeQueueEntryRecord(entry);
     if (!read.ok) {
+      return INVALID_PARK_ENTRY;
+    }
+    // Probe second: after the descriptor walk proved the entry plain and
+    // bounded, the serializer refuses a Proxy stand-in observing no trap,
+    // and reads no getter (accessors were refused from their descriptors).
+    if (!isCloneableData(entry)) {
       return INVALID_PARK_ENTRY;
     }
     const current = read.record;
@@ -883,37 +873,31 @@ function isShadowParkSegment(value: unknown): value is string {
 
 /**
  * The schema v3 (initial) validator for a stored or received `shadowPark`
- * record, for reuse by the journal adapter lane. The structured-clone probe
- * is the FIRST touch of `raw`: the serializer refuses any Proxy exotic
- * object — root or nested — observing no trap of any kind, before any
- * prototype, own-key or descriptor check can exercise one. After a
- * successful probe the record is read through its own data-property
- * descriptors (`readExactPlainRecord` on `['entryId', 'repository',
+ * record, for reuse by the journal adapter lane. The descriptor walk comes
+ * FIRST: `readExactPlainRecord` on `['entryId', 'repository',
  * 'pullRequest', 'headOid', 'reason', 'attempt', 'notBeforeIso']` and
- * `['owner', 'repo']`), so a throwing or tracked getter is never invoked by
- * the walk (the serializer may have materialized a cloneable accessor's
- * value once into the throwaway probe clone, but the value an accessor
- * answers can never reach an accepted result — any accessor is refused from
- * its own descriptor afterwards). An array, a sparse array, an array-like
- * object with an own numeric `length`, and any
- * `__proto__`/`constructor`/`prototype` own key are refused by the exact-key
- * shape check. `entryId` must satisfy `isMergeSafeId` (up to 256 bytes,
- * secret-free), `owner` and `repo` a bounded repository segment,
+ * `['owner', 'repo']` refuses — pre-traversal, from the object's own
+ * property descriptors — an array (sparse or of enormous length), an
+ * array-like object, extra or missing keys, any
+ * `__proto__`/`constructor`/`prototype` own key, and any accessor, so a
+ * throwing or tracked getter is never invoked (its call count stays 0) and
+ * no unbounded input is ever materialized. Only after the walk has proved
+ * the record plain and bounded does the structured-clone probe run,
+ * refusing a root or nested Proxy as a stand-in — the serializer observes
+ * no trap of any kind. `entryId` must satisfy `isMergeSafeId` (up to 256
+ * bytes, secret-free), `owner` and `repo` a bounded repository segment,
  * `pullRequest` a safe positive integer, `headOid` 40 lowercase hex chars,
- * `reason` a park reason other than `veto-hold`, `attempt` a safe integer of
- * at least 0, and `notBeforeIso` `null` or a bounded zoned ISO time. No
+ * `reason` a park reason other than `veto-hold`, `attempt` a safe integer
+ * of at least 0, and `notBeforeIso` `null` or a bounded zoned ISO time. No
  * field may be secret-shaped. Cost bound: linear in a constant — a fixed
  * shape of 7 keys, every text bounded by a named cap, and the probe over
- * proved primitive data properties plus at most one accessor read per
- * accessor.
+ * proved data properties.
  */
 export function readCutoverShadowParkRecord(raw: unknown): CutoverShadowParkRecordRead {
   try {
-    // Probe first: a supplied Proxy is refused by the serializer observing
-    // no trap, before any prototype/own-key/descriptor check can run one.
-    if (!isCloneableData(raw)) {
-      return INVALID_PARK_RECORD;
-    }
+    // Shape first, pre-traversal: the exact-key descriptor walk refuses a
+    // non-object, an array (sparse or of enormous length), an array-like,
+    // extra/missing keys and any accessor before anything is materialized.
     const snapshot = readExactPlainRecord(raw, SHADOW_PARK_KEYS);
     if (snapshot === null) {
       return INVALID_PARK_RECORD;
@@ -939,6 +923,12 @@ export function readCutoverShadowParkRecord(raw: unknown): CutoverShadowParkReco
       attempt < 0 ||
       !isNullableIso(notBeforeIso)
     ) {
+      return INVALID_PARK_RECORD;
+    }
+    // Probe last: after the descriptor walk proved the record plain and
+    // bounded, the serializer refuses a Proxy stand-in observing no trap,
+    // and reads no getter (accessors were refused from their descriptors).
+    if (!isCloneableData(raw)) {
       return INVALID_PARK_RECORD;
     }
     return {

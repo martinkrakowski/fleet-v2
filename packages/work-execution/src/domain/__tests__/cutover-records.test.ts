@@ -1155,20 +1155,18 @@ describe('buildShadowParkJournalPayload', () => {
     }
   });
 
-  it('refuses a getter on the entry as invalid-park-entry, its value never reaching the record', () => {
-    // The first-touch serializer probe materializes a cloneable accessor's
-    // value once into the throwaway probe clone (one read); the descriptor
-    // walk refuses the accessor afterwards whatever it answers, so the value
-    // it returns can never reach an accepted payload.
+  it('refuses a getter on the entry as invalid-park-entry without ever running it', () => {
+    // The descriptor walk reads the accessor's own descriptor and refuses it
+    // from there; the structured-clone probe runs only after the entry is
+    // proved plain and bounded, so the getter is never invoked at all.
     const entry = withCountingGetter(parkedEntry(), 'state');
     expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
-    expect(entry.calls()).toBe(1);
+    expect(entry.calls()).toBe(0);
   });
 
   it('refuses a non-enumerable getter on the entry without running it as invalid-park-entry', () => {
-    // The serializer's probe walks own *enumerable* properties only, so a
-    // non-enumerable accessor is never read at all; the descriptor walk
-    // refuses it from its own descriptor.
+    // A non-enumerable accessor is refused by the descriptor walk (the key
+    // must be an enumerable data property), so the getter is never run.
     const entry = withCountingGetter(parkedEntry(), 'state', { enumerable: false });
     expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
     expect(entry.calls()).toBe(0);
@@ -1180,13 +1178,13 @@ describe('buildShadowParkJournalPayload', () => {
     expect(entry.gets()).toBe(0);
   });
 
-  it('refuses a recording Proxy without running any of its traps as invalid-park-entry', () => {
-    // The structured-clone probe is the first touch of the entry and refuses
-    // any Proxy exotic object before a prototype, own-key or descriptor
-    // check can exercise a single trap — not just the `get` trap.
+  it('refuses a recording Proxy as invalid-park-entry without running its get trap', () => {
+    // The shape/descriptor validation runs first; the structured-clone probe
+    // then refuses the Proxy observing no trap of any kind — in particular
+    // the `get` trap never runs, so no value can be read through the Proxy.
     const proxy = recordingProxy(parkedEntry());
     expect(buildShadowParkJournalPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
-    expect(proxy.calls()).toEqual([]);
+    expect(proxy.calls()).not.toContain('get');
   });
 
   it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
@@ -1316,20 +1314,18 @@ describe('readCutoverShadowParkRecord', () => {
     });
   });
 
-  it('refuses a getter on the record as invalid-park-record, its value never reaching the result', () => {
-    // The first-touch serializer probe materializes a cloneable accessor's
-    // value once into the throwaway probe clone (one read); the descriptor
-    // walk refuses the accessor afterwards whatever it answers, so the value
-    // it returns can never reach an accepted record.
+  it('refuses a getter on the record as invalid-park-record without ever running it', () => {
+    // The descriptor walk reads the accessor's own descriptor and refuses it
+    // from there; the structured-clone probe runs only after the record is
+    // proved plain and bounded, so the getter is never invoked at all.
     const record = withCountingGetter(parkRecord(), 'entryId');
     expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
-    expect(record.calls()).toBe(1);
+    expect(record.calls()).toBe(0);
   });
 
   it('refuses a non-enumerable getter on the record without running it as invalid-park-record', () => {
-    // The serializer's probe walks own *enumerable* properties only, so a
-    // non-enumerable accessor is never read at all; the descriptor walk
-    // refuses it from its own descriptor.
+    // A non-enumerable accessor is refused by the descriptor walk (the key
+    // must be an enumerable data property), so the getter is never run.
     const record = withCountingGetter(parkRecord(), 'entryId', { enumerable: false });
     expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
     expect(record.calls()).toBe(0);
@@ -1341,13 +1337,13 @@ describe('readCutoverShadowParkRecord', () => {
     expect(record.gets()).toBe(0);
   });
 
-  it('refuses a recording Proxy without running any of its traps as invalid-park-record', () => {
-    // The structured-clone probe is the first touch of the record and refuses
-    // any Proxy exotic object before a prototype, own-key or descriptor
-    // check can exercise a single trap — not just the `get` trap.
+  it('refuses a recording Proxy as invalid-park-record without running its get trap', () => {
+    // The shape/descriptor validation runs first; the structured-clone probe
+    // then refuses the Proxy observing no trap of any kind — in particular
+    // the `get` trap never runs, so no value can be read through the Proxy.
     const proxy = recordingProxy(parkRecord());
     expect(readCutoverShadowParkRecord(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
-    expect(proxy.calls()).toEqual([]);
+    expect(proxy.calls()).not.toContain('get');
   });
 
   it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {

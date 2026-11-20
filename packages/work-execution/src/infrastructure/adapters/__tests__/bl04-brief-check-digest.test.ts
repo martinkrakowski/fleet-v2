@@ -498,6 +498,46 @@ describe('ReviewRequestAdapter brief-check digest binding (BL04)', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('binds the digest binding and the dispatch to one snapshotted attempt id (adversarial Proxy)', async () => {
+    // The proxy answers attempt A's id on the first `get` of `attemptId` (the
+    // digest binding's read) and attempt B's id on every later read (the
+    // dispatch's re-reads). Only the fix — snapshotting the fields once —
+    // keeps the whole call on attempt A.
+    const B_ATTEMPT_ID = 'attempt-B';
+    let attemptIdGets = 0;
+    const base = makeBoundRequest();
+    const proxy = new Proxy(base as object, {
+      get(target, key, receiver) {
+        if (key === 'attemptId') {
+          attemptIdGets += 1;
+          return attemptIdGets === 1 ? Reflect.get(target, key, receiver) : B_ATTEMPT_ID;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const findAttemptByIdCalls: string[] = [];
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: makeReceipt() });
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview,
+      findAttemptById: async (id: string) => {
+        findAttemptByIdCalls.push(id);
+        return makeAttempt() as never;
+      },
+    });
+
+    const result = await adapter.requestReview(proxy as never);
+
+    // The fixed adapter snapshots `attemptId` through property descriptors,
+    // so the hostile `get` trap is never consulted for it at all.
+    expect(attemptIdGets).toBe(0);
+    // The repository read and the reviewer request name the same attempt: the
+    // one the digest was bound to, never the proxy's later answer.
+    expect(findAttemptByIdCalls).toEqual([base.attemptId]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].attemptId).toBe(base.attemptId);
+    expect(result).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
+  });
+
   it('yields exactly the plain-data result for a Proxy over a valid request', async () => {
     const { requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: makeReceipt() });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });

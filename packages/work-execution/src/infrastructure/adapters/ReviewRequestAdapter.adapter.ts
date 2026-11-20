@@ -865,6 +865,39 @@ function requestFieldsAreValid(
   }
 }
 
+/**
+ * BL04 (fix round 3): the attempt request's required fields, snapshotted once.
+ * A hostile `Proxy` can answer attempt A's id when the digest binding reads
+ * `request.attemptId` and attempt B's id when dispatch re-reads it, so the
+ * binding, the dispatch and the receipt predicate all use this snapshot and
+ * never re-read the possibly-hostile request. Every field is read through
+ * `ownProperty` (a getter never runs); `null` when any required field is
+ * absent, an accessor or a failing descriptor read.
+ */
+const ATTEMPT_REQUEST_FIELDS = [
+  'requestId',
+  'kind',
+  'attemptId',
+  'projectId',
+  'policyRevision',
+  'implementerModel',
+  'reviewerModel',
+  'candidateHeadSha',
+] as const;
+
+function snapshotAttemptRequestFields(request: unknown): Record<string, unknown> | null {
+  const snapshot = snapshotOptionalFields(request, ATTEMPT_REQUEST_FIELDS);
+  if (snapshot === null) {
+    return null;
+  }
+  for (const key of ATTEMPT_REQUEST_FIELDS) {
+    if (snapshot[key] === undefined) {
+      return null;
+    }
+  }
+  return snapshot;
+}
+
 function isValidReviewRequest(request: ReviewRequest): boolean {
   return requestFieldsAreValid(request, [
     { key: 'requestId', kind: 'requestId' },
@@ -1388,14 +1421,16 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    * injects — must equal it, and when the attempt repository is bound, the
    * attempt's recorded `briefDigest` must equal it too. The attempt record is
    * read only through own data properties: an accessor `briefDigest` never
-   * runs its getter and is a refusal. Returns the typed `invalid-request`
+   * runs its getter and is a refusal. `attemptId` is the value snapshotted
+   * from the request before this runs (fix round 3), never a re-read of the
+   * possibly-hostile request. Returns the typed `invalid-request`
    * refusal, or null when the binding holds. Cost: linear in the capped
    * inputs (one digest over at most `BRIEF_TEXT_MAX_BYTES` of prose plus
    * `BRIEF_PACKAGE_MAX_MANIFEST_BYTES` of manifest, both caps enforced by the
    * digest formula's own refusals) plus one repository read. Never throws.
    */
   private async bindBriefCheckDigest(
-    request: ReviewRequest,
+    attemptId: string,
     briefText: string,
     optional: Record<string, unknown>,
   ): Promise<ReviewRequestResult | null> {
@@ -1429,7 +1464,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     }
     let attempt: unknown;
     try {
-      attempt = await findAttemptById(request.attemptId);
+      attempt = await findAttemptById(attemptId);
     } catch {
       return refuse();
     }
@@ -1465,17 +1500,25 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     const optional = snapshotOptionalFields(request, ['briefText', 'briefManifestRaw', 'briefPackageDigest', 'nowIso']);
     const briefText = optional?.briefText;
     const nowIso = optional?.nowIso;
+    // BL04 (fix round 3): the required request fields are snapshotted once
+    // through own data properties before anything re-reads the request; the
+    // snapshot is validated in place of the request, so a Proxy that changes
+    // its answers between the digest binding and dispatch cannot bind attempt
+    // A's digest to a reviewer request for attempt B.
+    const requestSnapshot = snapshotAttemptRequestFields(request);
     if (
       optional === null ||
-      !isValidReviewRequest(request) ||
+      requestSnapshot === null ||
+      !isValidReviewRequest(requestSnapshot as unknown as ReviewRequest) ||
       (nowIso !== undefined && typeof nowIso !== 'string') ||
       (briefText !== undefined &&
         (typeof briefText !== 'string' || briefTextByteLength(briefText) > BRIEF_TEXT_MAX_BYTES))
     ) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
-    // isValidReviewRequest accepted the kind. brief-verify was refused above, so this is an attempt kind.
-    const kind = request.kind as ReviewKind;
+    // isValidReviewRequest accepted the snapshotted kind. brief-verify was
+    // refused above, so this is an attempt kind.
+    const kind = requestSnapshot.kind as ReviewKind;
     // BL04: a brief-check that carries brief text binds it to the frozen
     // brief's package digest before any reviewer is called. The binding runs
     // before the `not-configured` check so an unbound brief is an
@@ -1483,7 +1526,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     // over at most 64 KiB of prose plus 256 KiB of manifest, plus one
     // repository read; every refusal below returns before the reviewer call.
     if (kind === 'brief-check' && briefText !== undefined) {
-      const bound = await this.bindBriefCheckDigest(request, briefText as string, optional);
+      const bound = await this.bindBriefCheckDigest(
+        requestSnapshot.attemptId as string,
+        briefText as string,
+        optional,
+      );
       if (bound !== null) {
         return bound;
       }
@@ -1491,28 +1538,31 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!this.delegates.requestIndependentReview) {
       return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
+    const attemptId = requestSnapshot.attemptId as string;
+    const projectId = requestSnapshot.projectId as string;
+    const candidateHeadSha = requestSnapshot.candidateHeadSha as string;
     return this.dispatchReview(
       {
-        assessmentId: assessmentIdForAttempt(request.attemptId),
-        projectId: request.projectId,
-        attemptId: request.attemptId,
-        candidateHeadSha: request.candidateHeadSha,
-        policyRevision: request.policyRevision,
-        implementerModel: request.implementerModel,
-        reviewerModel: request.reviewerModel,
+        assessmentId: assessmentIdForAttempt(attemptId),
+        projectId,
+        attemptId,
+        candidateHeadSha,
+        policyRevision: requestSnapshot.policyRevision as string,
+        implementerModel: requestSnapshot.implementerModel as string,
+        reviewerModel: requestSnapshot.reviewerModel as string,
         kind,
-        requestId: request.requestId,
+        requestId: requestSnapshot.requestId as string,
         // The frozen brief flows through only for a brief-check, so any other
         // kind's transport call carries exactly the fields it carried before.
         ...(kind === 'brief-check' && briefText !== undefined ? { briefText: briefText as string } : {}),
         ...(nowIso !== undefined ? { nowIso } : {}),
       },
-      { requestId: request.requestId, candidateHeadSha: request.candidateHeadSha },
+      { requestId: requestSnapshot.requestId as string, candidateHeadSha },
       (receipt) =>
-        receipt.requestId === request.requestId &&
+        receipt.requestId === requestSnapshot.requestId &&
         receipt.kind === kind &&
-        receipt.attemptId === request.attemptId &&
-        receipt.candidateHeadSha === request.candidateHeadSha &&
+        receipt.attemptId === attemptId &&
+        receipt.candidateHeadSha === candidateHeadSha &&
         // A brief-check receipt is about the brief, never the attempt
         // assessment, so it is bound to the request's project and attempt
         // directly, plus the same assessment id this attempt answers to
@@ -1521,18 +1571,18 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         // kind is bound through the full predicate.
         (kind === 'brief-check'
           ? isAttemptReceiptSubject(receipt) &&
-            receipt.projectId === request.projectId &&
-            receipt.attemptId === request.attemptId &&
-            isAttemptSubjectBoundTo(receipt, request.projectId, request.attemptId) &&
+            receipt.projectId === projectId &&
+            receipt.attemptId === attemptId &&
+            isAttemptSubjectBoundTo(receipt, projectId, attemptId) &&
             isReceiptAboutAssessment(receipt, {
-              id: assessmentIdForAttempt(request.attemptId),
-              projectId: request.projectId,
-              attemptId: request.attemptId,
+              id: assessmentIdForAttempt(attemptId),
+              projectId,
+              attemptId,
             })
           : isAttemptReceiptAbout(receipt, {
-              id: assessmentIdForAttempt(request.attemptId),
-              projectId: request.projectId,
-              attemptId: request.attemptId,
+              id: assessmentIdForAttempt(attemptId),
+              projectId,
+              attemptId,
             })),
       kind,
       false,

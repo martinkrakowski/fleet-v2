@@ -335,6 +335,28 @@ else
   bad 'static import with block comment before from flagged'; printf '%s\n' "$out"
 fi
 
+# 11f. A comment directly between the keyword and the specifier — with no
+#      whitespace at all — does not hide an extensionless relative specifier:
+#      the comment itself is the whitespace.
+R=$T/tightcomment
+mk_root "$R"
+mk_workspace "$R/packages/a"
+fixture "$R/packages/a/src/index.ts" <<'EOF'
+import/* note */'./one';
+export { value } from/* note */'../two';
+EOF
+run --root "$R"
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'packages/a/src/index.ts:1 ./one'; then
+  ok 'static import with comment tight before specifier flagged'
+else
+  bad 'static import with comment tight before specifier flagged'; printf '%s\n' "$out"
+fi
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'packages/a/src/index.ts:2 ../two'; then
+  ok 'export-from with comment tight before specifier flagged'
+else
+  bad 'export-from with comment tight before specifier flagged'; printf '%s\n' "$out"
+fi
+
 # 11d. Comment markers inside strings do not break the scan: a line of code
 #      whose string contains "//" is still scanned, and the specifier after
 #      a string containing a comment marker is still matched.

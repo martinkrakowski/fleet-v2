@@ -204,14 +204,16 @@ function handleCode(ctx) {
   if (c === "/" && d === "/") {
     ctx.state = 1;
     ctx.out += "  ";
-    ctx.i += 2;
-    return; // a comment is whitespace to the tail: pushTail untouched
+    pushTail(ctx, " "); // a comment is whitespace to the tail: the space it
+    ctx.i += 2;         // blanked keeps `import/* c */'./x'` matchable
+    return;
   }
   if (c === "/" && d === "*") {
     ctx.state = 2;
     ctx.out += "  ";
-    ctx.i += 2;
-    return; // a comment is whitespace to the tail: pushTail untouched
+    pushTail(ctx, " "); // a comment is whitespace to the tail: the space it
+    ctx.i += 2;         // blanked keeps `from/* c */'../y'` matchable
+    return;
   }
   if (c === "'") {
     ctx.state = 3;

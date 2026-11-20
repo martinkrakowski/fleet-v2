@@ -174,6 +174,25 @@ function isOwnDataCandidateDescriptor(candidates: unknown[], key: PropertyKey): 
 }
 
 /**
+ * Whether the object carries an own well-known symbol that could alter array
+ * iteration or coercion. `for...in` never yields symbols, so these are
+ * checked by named descriptor reads over a fixed list. Cost: one descriptor
+ * read per listed symbol — constant.
+ */
+function hasForbiddenOwnSymbol(source: object): boolean {
+  return FORBIDDEN_CANDIDATE_SYMBOLS.some((symbol) => Object.getOwnPropertyDescriptor(source, symbol) !== undefined);
+}
+
+/** Well-known symbols an own override of which is refused on the list. */
+const FORBIDDEN_CANDIDATE_SYMBOLS: readonly symbol[] = [
+  Symbol.iterator,
+  Symbol.asyncIterator,
+  Symbol.isConcatSpreadable,
+  Symbol.toPrimitive,
+  Symbol.toStringTag,
+];
+
+/**
  * Whether every canonical index `0 .. length-1` holds an own data-property
  * string. Cost: linear in `length`, capped by `SPD_SAY_MAX_CANDIDATES` (16).
  */
@@ -195,15 +214,23 @@ function candidateElementsAreStrings(candidates: unknown[], length: number): boo
  * array within the cap whose length is read once from its own descriptor and
  * whose every entry is a string read from its own data descriptor, without a
  * polluting own key, hole, or accessor element. The list must carry no own
- * accessor property and no own key other than the canonical indices and
- * `length` (this covers an own `Symbol.iterator` override, whose getter or
+ * accessor property and no own ENUMERABLE key other than the canonical
+ * indices and `length`; a non-enumerable extra property is never read, so it
+ * can never reach a probe or run a getter. Own well-known symbols (whose
+ * override could change iteration or coercion) are refused by name — this
+ * covers an own `Symbol.iterator` override, whose getter or
  * data property would otherwise let iteration yield unvalidated paths). The
  * WHOLE list is validated before any entry is probed. `isProxy` observes no
  * trap and no getter.
  *
- * Cost: linear in the list length, capped by `SPD_SAY_MAX_CANDIDATES` (16);
- * `Reflect.ownKeys` is bounded by that cap because the polluting-key and cap
- * checks run before it.
+ * Cost: linear in the list length, capped by `SPD_SAY_MAX_CANDIDATES` (16).
+ * The own-key check never materializes the key set: `for...in` yields keys
+ * lazily and stops at the FIRST non-canonical or inherited key, so it visits
+ * at most the capped canonical keys plus one. (A full `Reflect.ownKeys`
+ * would be unbounded on a hostile array that carries arbitrarily many extra
+ * own properties behind a capped `length`, so it is not used.) Own
+ * well-known symbols — which `for...in` never yields — are checked by named
+ * descriptor reads over a fixed list.
  */
 function isTraversableCandidateList(candidates: unknown): boolean {
   if (!Array.isArray(candidates) || types.isProxy(candidates)) {
@@ -213,18 +240,21 @@ function isTraversableCandidateList(candidates: unknown): boolean {
   if (length === null || length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
     return false;
   }
-  for (const key of Reflect.ownKeys(candidates)) {
-    // Only the canonical indices and `length` may be own keys; any other key
-    // (including a `Symbol.iterator` override) is refused.
-    if (!isCanonicalCandidateKey(key, length)) {
-      return false;
+  if (hasForbiddenOwnSymbol(candidates)) {
+    return false;
+  }
+  try {
+    for (const key in candidates) {
+      // Every enumerable key must be a canonical OWN key of the list; any
+      // other key — or an inherited key — breaks the lazy enumeration here,
+      // which keeps the traversal cost bounded (including a `Symbol.iterator`
+      // data override on a sneaky prototype).
+      if (!isCanonicalCandidateKey(key, length) || !isOwnDataCandidateDescriptor(candidates, key)) {
+        return false;
+      }
     }
-    if (!isOwnDataCandidateDescriptor(candidates, key)) {
-      return false;
-    }
-    if (key !== 'length' && typeof (Object.getOwnPropertyDescriptor(candidates, key) as PropertyDescriptor).value !== 'string') {
-      return false;
-    }
+  } catch {
+    return false;
   }
   return candidateElementsAreStrings(candidates, length);
 }

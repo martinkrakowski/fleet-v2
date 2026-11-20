@@ -7,7 +7,7 @@
 // `MAX_BRIEF_RECEIPTS_READ` (256) and the brief text by
 // `BRIEF_TEXT_MAX_BYTES` (64 KiB); every over-cap case is refused before any
 // traversal of the claimed length.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { assessmentIdForBrief, attemptIdForBrief } from '@fleet/evidence-and-acceptance';
 import type {
@@ -361,6 +361,62 @@ describe('SpdSpeak candidate list traversal (hostile input)', () => {
     );
     const adapter = speakAdapter(overCap);
     await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+  });
+
+  it('refuses a capped-length list with arbitrarily many extra own enumerable properties without materializing the key set', async () => {
+    // An array of length <= SPD_SAY_MAX_CANDIDATES can still carry an
+    // arbitrary number of extra own string properties; the traversal must be
+    // refused without ever materializing the whole key set. Prove it by
+    // breaking Reflect.ownKeys: if the traversal still called it, the result
+    // would degrade to a spawn failure instead of a typed refusal.
+    const hostile: string[] = ['/bin/sh'];
+    for (let index = 0; index < 50_000; index += 1) {
+      Object.defineProperty(hostile, `extra-${String(index)}`, {
+        value: '/evil/bin',
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    const ownKeys = vi.spyOn(Reflect, 'ownKeys').mockImplementation(() => {
+      throw new Error('unbounded key materialization');
+    });
+    try {
+      const adapter = speakAdapter(hostile);
+      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+    } finally {
+      ownKeys.mockRestore();
+    }
+  });
+
+  it('refuses an own Symbol.iterator override on a capped candidate list', async () => {
+    const hostile: string[] = ['/bin/sh'];
+    Object.defineProperty(hostile, Symbol.iterator, {
+      value: function* () {
+        yield '/evil/bin';
+      },
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+    const adapter = speakAdapter(hostile);
+    await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+  });
+
+  it('refuses an inherited enumerable key on a capped candidate list', async () => {
+    const hostile: string[] = ['/bin/sh'];
+    Object.defineProperty(Object.getPrototypeOf(hostile), 'extra', {
+      value: '/evil/bin',
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    try {
+      const adapter = speakAdapter(hostile);
+      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+    } finally {
+      delete (Object.getPrototypeOf(hostile) as Record<string, unknown>).extra;
+    }
   });
 });
 

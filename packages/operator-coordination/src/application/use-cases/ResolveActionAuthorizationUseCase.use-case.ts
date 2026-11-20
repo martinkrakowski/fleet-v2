@@ -160,8 +160,17 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       };
       return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
     }
-    const request = input as ResolveActionAuthorizationRequest;
-    if (Object.keys(request).length === 0) {
+    // Fix round 3 (BL02g): the non-shadow validation reads no field off the
+    // original request. The emptiness check and the required-field values come
+    // from the descriptor-safe snapshot taken above — a null-prototype object
+    // this code built itself, so it is known plain data — and the only reads
+    // on `input` are `Object.getOwnPropertyDescriptor` calls, which inspect a
+    // descriptor without ever running a getter or a Proxy `get` trap. An own
+    // accessor on a required field is visible through its descriptor and is
+    // refused as invalid-request; a trap throwing during that inspection is a
+    // hostile proxy, also a typed refusal. A plain-data request keeps main's
+    // exact throw on genuinely missing required fields.
+    if (snapshot === null || Object.keys(snapshot).length === 0) {
       // The HTTP boundary's empty body object: the resolve is blocked with
       // its missing coordinates named, never reported as an unimplemented
       // station.
@@ -170,10 +179,23 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       );
     }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
-      if (!isFilled(request[field])) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(input, field);
+      } catch {
+        return blocked('invalid-request');
+      }
+      if (descriptor !== undefined && descriptor.get !== undefined) {
+        return blocked('invalid-request');
+      }
+      if (!isFilled(snapshot[field])) {
         throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
       }
     }
+    // Past the validation every request field this use-case reads has been
+    // proved a filled string on the snapshot, so `request` is the ordinary
+    // main-path view of the (now effectively plain-data) input.
+    const request = input as ResolveActionAuthorizationRequest;
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {
       return blocked(

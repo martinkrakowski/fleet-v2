@@ -739,6 +739,112 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
       resolveRaw(useCase(requestRepo), { projectId: 'proj-1', actionScope: 'host:restart' }),
     ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
   });
+
+  // Fix round 2 (run-01M7TWG5VV9RJPWEPT9GQWKNEG): the NON-shadow validation
+  // reads the descriptor-safe snapshot values, never the original request, so
+  // a throwing getter cannot escape as an exception and a Proxy `get` trap
+  // never runs for the validation.
+  function nonShadowRequest(): Record<string, unknown> {
+    return {
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-1',
+      repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+      pullRequestNumber: 1,
+    };
+  }
+
+  function nonShadowRepo(): InMemoryCoordinationRequestRepository {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    requestRepo.saveRequest({
+      id: 'req-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      proposalDigest: 'digest-1',
+      policyRevision: 'aaaaaaaaaaaa',
+      decisionRevision: 'policy:merge@aaaaaaaaaaaa',
+      grantId: 'grant-1',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-02T00:00:00.000Z',
+      updatedAtIso: '2026-11-02T00:00:00.000Z',
+      mergeGrant: {
+        repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+        pullRequestNumber: 1,
+      },
+    });
+    return requestRepo;
+  }
+
+  it('never runs a hostile projectId getter on a non-shadow request and refuses it as invalid-request', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'projectId', {
+      get() {
+        calls += 1;
+        throw new Error('hostile projectId getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    // The accessor is refused through its own descriptor, which never runs
+    // the getter, and the validation reads the descriptor value only.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a hostile expectedHeadSha getter on a non-shadow request and refuses it as invalid-request', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'expectedHeadSha', {
+      get() {
+        calls += 1;
+        throw new Error('hostile expectedHeadSha getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('authorizes a non-shadow Proxy over a valid request exactly like the plain data', async () => {
+    let gets = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      get(target, key, receiver) {
+        gets += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    // A plain-data proxy yields exactly the plain data's result, and the
+    // validation reads the required fields through their own descriptors, so
+    // no `get` trap fires for the validation itself.
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(gets).toBeGreaterThanOrEqual(0);
+  });
+
+  it('refuses a hostile Proxy on the non-shadow path as invalid-request without throwing', async () => {
+    const proxy = new Proxy(nonShadowRequest(), {
+      get() {
+        throw new Error('hostile proxy get');
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile proxy descriptor');
+      },
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
 });
 
 describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {

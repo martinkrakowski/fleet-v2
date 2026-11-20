@@ -25,13 +25,16 @@ export interface PlainDataLimits {
   readonly maxStringLength: number;
 }
 
-export const DEFAULT_PLAIN_DATA_LIMITS: PlainDataLimits = {
+// Frozen so a caller cannot mutate the shared defaults at runtime (e.g.
+// `maxNodes = Infinity`) and silently bypass the resource bounds; the resolver
+// below spreads this into a fresh, private copy per call.
+export const DEFAULT_PLAIN_DATA_LIMITS: PlainDataLimits = Object.freeze({
   maxDepth: 16,
   maxKeys: 128,
   maxArrayLength: 1024,
   maxNodes: 4096,
   maxStringLength: 16_384,
-};
+});
 
 export type PlainDataRefusalReason =
   | 'proxy'
@@ -226,12 +229,11 @@ function snap(
   if (depth + 1 > limits.maxDepth) {
     return refusal('too-deep', path);
   }
-  const keys = Reflect.ownKeys(value);
   ancestors.add(value);
   try {
     return isArray
-      ? snapArray(value, keys, isProxy, limits, depth, path, ancestors, state, count)
-      : snapRecord(value, keys, isProxy, limits, depth, path, ancestors, state, count);
+      ? snapArray(value, isProxy, limits, depth, path, ancestors, state, count)
+      : snapRecord(value, isProxy, limits, depth, path, ancestors, state, count);
   } finally {
     ancestors.delete(value);
   }
@@ -239,7 +241,6 @@ function snap(
 
 function snapRecord(
   value: object,
-  keys: readonly PropertyKey[],
   isProxy: IsProxy,
   limits: PlainDataLimits,
   depth: number,
@@ -248,6 +249,7 @@ function snapRecord(
   state: SnapshotState,
   count: NodeCount,
 ): PlainDataSnapshot {
+  const keys = Reflect.ownKeys(value);
   if (keys.length > limits.maxKeys) {
     return refusal('too-many-keys', path);
   }
@@ -302,7 +304,6 @@ function snapRecord(
 
 function snapArray(
   value: object,
-  keys: readonly PropertyKey[],
   isProxy: IsProxy,
   limits: PlainDataLimits,
   depth: number,
@@ -323,9 +324,12 @@ function snapArray(
     return refusal('hostile', path);
   }
   const length = lengthDescriptor.value;
+  // The length bound is checked BEFORE the own-keys enumeration, so a very
+  // large dense array is refused without ever allocating or walking its keys.
   if (length > limits.maxArrayLength) {
     return refusal('too-many-items', path);
   }
+  const keys = Reflect.ownKeys(value);
   for (const key of keys) {
     // `Reflect.ownKeys` yields only string and symbol keys, so a non-string
     // key is a symbol key.

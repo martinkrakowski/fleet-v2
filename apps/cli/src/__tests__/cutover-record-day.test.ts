@@ -639,19 +639,25 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
     try {
       const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const result = await runtime.execution.recordShadowDay!.execute({
-        repository: { owner: 'fleet', repo: 'v2' },
-        legacyStateDir: fixtureDir,
-        day,
-      });
-      if (result.outcome !== 'recorded') {
-        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      // Through the real `runCli` boundary: the CLI returns the use case's
+      // result unchanged, so the stdout JSON must carry the non-digested
+      // `premergeCarry` diagnostics verbatim.
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as {
+        outcome: string;
+        recorded: Record<string, string>;
+        unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
+        premergeCarry?: { unresolvedCount: number; unresolvedIds: readonly string[] };
+      };
+      if (body.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${body.outcome} ${result.out}`);
       }
       // The day records S5 as a pass over an empty resolvable set, with the
       // unresolved decision printed in the `record-day` JSON output.
-      expect(result.recorded.S5).toBe('pass');
-      expect(reasonsOf(result).S5).toBeUndefined();
-      expect(result.premergeCarry).toEqual({
+      expect(body.recorded.S5).toBe('pass');
+      expect(reasonsOf(body).S5).toBeUndefined();
+      expect(body.premergeCarry).toEqual({
         unresolvedCount: 1,
         unresolvedIds: [`12@${newHead.slice(0, 12)}`],
       });

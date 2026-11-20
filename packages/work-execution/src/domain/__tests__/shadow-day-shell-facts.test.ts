@@ -612,10 +612,16 @@ describe('evaluateShadowPremergeCarry: evaluation', () => {
       ),
     ];
     const result = evaluateShadowPremergeCarry(carryInput({ decisions }));
+    // All 60 unresolved ids share the head prefix `fedcba987654`; only the PR
+    // number varies. Compute the exact expected lexicographically sorted top
+    // 50 from every unresolved decision, so a slice-before-sort bug fails.
+    const allIds = Array.from({ length: 60 }, (_, index) => `${index + 1}@${'fedcba987654'}`);
+    const expectedTop50 = [...allIds].sort().slice(0, SHADOW_CARRY_MAX_UNRESOLVED_IDS);
     expect(result.status).toBe('pass');
     expect(result.compared).toBe(1);
     expect(result.unresolvedCount).toBe(60);
     expect(result.unresolvedIds).toHaveLength(SHADOW_CARRY_MAX_UNRESOLVED_IDS);
+    expect(result.unresolvedIds).toEqual(expectedTop50);
     // Sorted, deterministic, and the same 50 ids on a second call.
     expect(result.unresolvedIds).toEqual([...result.unresolvedIds].sort());
     expect(evaluateShadowPremergeCarry(carryInput({ decisions })).unresolvedIds).toEqual(result.unresolvedIds);

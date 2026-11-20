@@ -1,10 +1,14 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_RECORD_SCHEMA_VERSION,
   CUTOVER_SHADOW_CRITERIA,
   CUTOVER_SHADOW_MIN_MERGES,
+  RETIREMENT_LEDGER_MAX_TEXT_BYTES,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
   canonicalCutoverSwitchPayload,
@@ -12,6 +16,7 @@ import {
   isWithinCutoverRollbackWindow,
   readCutoverRecord,
   readCutoverShadowEvidence,
+  readRetirementLedger,
 } from '../cutover-records.js';
 
 const DIGEST = 'a'.repeat(64);
@@ -609,5 +614,283 @@ describe('readCutoverShadowEvidence', () => {
   it('never echoes input values in its result', () => {
     const text = JSON.stringify(readCutoverShadowEvidence({ days: 'sentinel-days', merges: CUTOVER_SHADOW_MIN_MERGES }, NOW));
     expect(text).not.toContain('sentinel-days');
+  });
+});
+
+const RETIREMENT_INVALID = { ok: false, reason: 'invalid-ledger' } as const;
+
+/** A complete ledger over the pinned §1 scripts, every row verified. */
+function verifiedRows(): Array<{ script: string; verified: boolean; evidenceLink: string }> {
+  return CUTOVER_RETIREMENT_SCRIPTS.map((script, index) => ({
+    script,
+    verified: true,
+    evidenceLink: `evidence/retirement-${index}.md`,
+  }));
+}
+
+function ledger(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { schemaVersion: 1, rows: verifiedRows(), ...overrides };
+}
+
+function rowOverrides(index: number, overrides: Record<string, unknown>): unknown[] {
+  const rows = verifiedRows();
+  rows[index] = { ...rows[index], ...overrides };
+  return rows;
+}
+
+/** Replace row `index` with a getter whose value is the original field value. */
+function withRowGetter(index: number, key: string, calls: { count: number }): unknown[] {
+  const rows = verifiedRows();
+  const value = (rows[index] as Record<string, unknown>)[key];
+  const target = rows[index] as Record<string, unknown>;
+  Object.defineProperty(target, key, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      calls.count += 1;
+      return value;
+    },
+  });
+  return rows;
+}
+
+describe('CUTOVER_RETIREMENT_SCRIPTS', () => {
+  it('matches the §1 Train and Lane table Script column in the cutover plan, in exact membership and order', () => {
+    const plan = readFileSync(
+      new URL('../../../../../docs/planning/2026-11-03_cutover-plan.md', import.meta.url),
+      'utf8',
+    );
+    const inventoryStart = plan.indexOf('## 1. Inventory');
+    const inventoryEnd = plan.indexOf('## 2. Gaps', inventoryStart);
+    expect(inventoryStart).toBeGreaterThan(0);
+    expect(inventoryEnd).toBeGreaterThan(inventoryStart);
+    const tableScripts = plan
+      .slice(inventoryStart, inventoryEnd)
+      .split('\n')
+      .map((line) => /^\| `([^`]+)`/.exec(line)?.[1])
+      .filter((script): script is string => script !== undefined && /^(train|lane)\//.test(script));
+    expect(tableScripts.length).toBe(68);
+    expect([...CUTOVER_RETIREMENT_SCRIPTS]).toEqual(tableScripts);
+  });
+});
+
+describe('readRetirementLedger', () => {
+  it('reads a complete verified ledger and always builds a fresh result object', () => {
+    const raw = ledger();
+    const result = readRetirementLedger(raw);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.ledger.schemaVersion).toBe(1);
+    expect(result.ledger.rows).toEqual(verifiedRows());
+    // An identity echo of the input would fail these: the ledger is freshly built.
+    expect(result.ledger).not.toBe(raw);
+    expect(result.ledger.rows).not.toBe(raw.rows);
+    expect(result.ledger.rows[0]).not.toBe((raw.rows as unknown[])[0]);
+    (raw.rows as unknown[])[0] = { script: 'mutated', verified: true, evidenceLink: 'x' };
+    expect(JSON.stringify(result.ledger.rows[0])).not.toContain('mutated');
+    // A reader returning a constant verdict would fail these: the ok verdict is
+    // distinct from every refusal code the same input family produces.
+    expect(readRetirementLedger(ledger({ rows: [] }))).toEqual({ ok: false, reason: 'empty-ledger' });
+    expect(readRetirementLedger(ledger({ schemaVersion: 2 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: false }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+  });
+
+  it('refuses null as invalid-ledger', () => {
+    expect(readRetirementLedger(null)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses undefined as invalid-ledger', () => {
+    expect(readRetirementLedger(undefined)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a wrong primitive (a number, a string, a boolean) as invalid-ledger', () => {
+    expect(readRetirementLedger(42)).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger('str')).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(true)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a non-array object where the rows list is due as invalid-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: { length: 68, 0: verifiedRows()[0] } }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: {} }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a sparse rows array (an array hole) as invalid-ledger', () => {
+    const rows = verifiedRows();
+    delete (rows[3] as unknown as { script?: string }).script;
+    const sparse = new Array(68);
+    for (let i = 0; i < 68; i += 1) {
+      if (i !== 3) sparse[i] = rows[i];
+    }
+    expect(readRetirementLedger(ledger({ rows: sparse }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses an array-like object standing in for rows as invalid-ledger', () => {
+    const arrayLike = Object.assign(Object.create(null), { length: 68, 0: verifiedRows()[0], 1: verifiedRows()[1] });
+    expect(readRetirementLedger(ledger({ rows: arrayLike }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses an enormous rows length (2**32 - 1) before any traversal as invalid-ledger', () => {
+    const rows = [] as unknown[];
+    Object.defineProperty(rows, 'length', { value: 2 ** 32 - 1 });
+    const descriptorReads = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+    try {
+      expect(readRetirementLedger(ledger({ rows }))).toEqual(RETIREMENT_INVALID);
+      // The bound is settled before any descriptor walk over the rows.
+      expect(descriptorReads.mock.calls.length).toBeLessThan(10);
+    } finally {
+      descriptorReads.mockRestore();
+    }
+  });
+
+  it('refuses rows longer than RETIREMENT_LEDGER_MAX_ROWS as invalid-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: new Array(256 + 1) }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a getter on the root and on a row item, and never invokes either', () => {
+    const calls = { count: 0 };
+    const rootWithGetter = ledger() as Record<string, unknown>;
+    const rowsValue = rootWithGetter.rows;
+    Object.defineProperty(rootWithGetter, 'rows', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls.count += 1;
+        return rowsValue;
+      },
+    });
+    expect(readRetirementLedger(rootWithGetter)).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: withRowGetter(0, 'script', calls) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: withRowGetter(1, 'verified', calls) }))).toEqual(RETIREMENT_INVALID);
+    expect(calls.count).toBe(0);
+  });
+
+  it('refuses a transparent Proxy over a valid ledger as invalid-ledger, without firing a get trap', () => {
+    const TRAPS = [
+      'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+      'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+    ] as const;
+    const calls: string[] = [];
+    const handler: Record<string, (...args: unknown[]) => unknown> = {};
+    for (const trap of TRAPS) {
+      handler[trap] = (...args) => {
+        calls.push(trap);
+        return (Reflect as unknown as Record<string, (...args: unknown[]) => unknown>)[trap](...args);
+      };
+    }
+    const proxy = new Proxy(ledger() as object, handler as ProxyHandler<object>);
+    expect(readRetirementLedger(proxy)).toEqual(RETIREMENT_INVALID);
+    expect(calls.filter((trap) => trap === 'get')).toEqual([]);
+  });
+
+  it('refuses a Proxy standing in for the rows array itself, without firing its get trap', () => {
+    // The hostile case itself: rows is a Proxy over a valid array, and its get
+    // trap is hostile code. Every earlier check must settle without it —
+    // `length` is only ever taken from a getOwnPropertyDescriptor read.
+    const gets: Array<PropertyKey> = [];
+    const proxy = new Proxy(verifiedRows() as unknown[], {
+      get(_target, key, receiver) {
+        gets.push(key);
+        return Reflect.get(_target, key, receiver);
+      },
+    });
+    expect(readRetirementLedger(ledger({ rows: proxy }))).toEqual(RETIREMENT_INVALID);
+    expect(gets).toEqual([]);
+  });
+
+  it('refuses a prototype-polluting own key produced by JSON.parse as invalid-ledger', () => {
+    const rows = JSON.stringify(verifiedRows());
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      const parsed = JSON.parse(`{"rows":${rows},"${key}":{}}`);
+      expect(readRetirementLedger(parsed)).toEqual(RETIREMENT_INVALID);
+    }
+  });
+
+  it('refuses missing, extra and wrong-typed row keys as invalid-ledger', () => {
+    const missingKey = verifiedRows();
+    delete (missingKey[0] as { evidenceLink?: string }).evidenceLink;
+    expect(readRetirementLedger(ledger({ rows: missingKey }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: undefined }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { extra: 1 }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: 'yes' }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: 7 }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: 7 }) }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses text exceeding RETIREMENT_LEDGER_MAX_TEXT_BYTES as invalid-ledger', () => {
+    const longLink = 'e'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES + 1);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: longLink }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+    // A script is pinned, so an over-long pinned name cannot exist; an over-long
+    // non-pinned name is still refused as invalid-ledger by the byte bound.
+    const longScript = 't'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES + 1);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: longScript }) }))).toEqual(RETIREMENT_INVALID);
+    // An astral-plane string sits at the UTF-16 bound but exceeds the UTF-8 byte bound.
+    const astral = '\u{1F600}'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES / 2);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: astral }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+  });
+
+  it('refuses duplicate script as invalid-ledger', () => {
+    const rows = verifiedRows();
+    const duplicate = { ...rows[0], evidenceLink: 'other.md' };
+    rows.splice(1, 1, duplicate);
+    expect(readRetirementLedger(ledger({ rows }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses missing or extra script row as invalid-ledger', () => {
+    // Missing: a pinned script never appears.
+    const missing = verifiedRows().slice(1);
+    expect(readRetirementLedger(ledger({ rows: missing }))).toEqual(RETIREMENT_INVALID);
+    // Extra: an unknown script replaces a pinned one.
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: 'lane/not-pinned.sh' }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+  });
+
+  it('reports newer schemaVersion as unknown-version', () => {
+    expect(readRetirementLedger(ledger({ schemaVersion: 2 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    expect(readRetirementLedger(ledger({ schemaVersion: 99 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    for (const bad of [0, -1, 1.5, '1', null, true]) {
+      expect(readRetirementLedger(ledger({ schemaVersion: bad }))).toEqual(RETIREMENT_INVALID);
+    }
+  });
+
+  it('refuses empty rows array as empty-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: [] }))).toEqual({ ok: false, reason: 'empty-ledger' });
+  });
+
+  it('refuses unverified row or blank evidenceLink as row-unverified', () => {
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: false }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: '   ' }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: '' }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+  });
+
+  it('refuses secret-shaped script or evidenceLink as secret-shaped', () => {
+    // The fake token material is assembled at runtime so this source file never
+    // matches the diff-check's github-token pattern; the runtime value still
+    // exercises the secret-shaped refusal.
+    const token = `ghp_${'A'.repeat(24)}`;
+    expect(
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { script: `lane/${token}.sh` }) })),
+    ).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: `evidence/${token}` }) })),
+    ).toEqual({ ok: false, reason: 'secret-shaped' });
   });
 });

@@ -707,6 +707,38 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     });
     expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
   });
+
+  // Fix round 1 (run-01M7TWG5VV9RJPWEPT9GQWKNEG): the exported boundary never
+  // throws on a malformed non-object input — null, undefined, or a wrong
+  // primitive where a request object is due are typed `invalid-request`
+  // refusals, never exceptions.
+  it('returns a typed invalid-request refusal for a null request instead of throwing', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), null);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('returns a typed invalid-request refusal for an undefined request instead of throwing', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), undefined);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('returns a typed invalid-request refusal for a primitive where a request object is due', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), 42);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('keeps main throw on missing required fields of a well-formed object (preserved behaviour)', async () => {
+    const requestRepo = seededRepo();
+    // The fix covers only malformed non-object inputs. A well-formed object
+    // missing its required fields keeps main's exact throw (CO14b brief,
+    // preserved behaviour).
+    await expect(
+      resolveRaw(useCase(requestRepo), { projectId: 'proj-1', actionScope: 'host:restart' }),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+  });
 });
 
 describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {

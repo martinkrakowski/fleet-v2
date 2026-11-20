@@ -106,9 +106,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
     }
     // A configured runtime still refuses a missing request object instead of
-    // inventing one; the HTTP boundary always supplies an object body.
+    // inventing one: a malformed non-object input (null, undefined, or any
+    // primitive where a request object is due) is a typed refusal, never an
+    // exception. The exported boundary never throws on hostile input; only
+    // the missing required fields of a well-formed object keep main's throw.
     if (typeof input !== 'object' || input === null) {
-      throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
+      return blocked('invalid-request');
     }
     // Standing shadow import grant (owner decision 2026-11-18): the resolve
     // is head-free — the grant is bound by its digest-bound request id, its

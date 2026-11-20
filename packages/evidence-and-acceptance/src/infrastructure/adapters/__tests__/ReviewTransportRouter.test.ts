@@ -8,6 +8,7 @@ import {
   createReviewTransportRouter,
   hasReviewerSeat,
   reviewerChainSeatIds,
+  selectReviewerSeat,
   type ReviewLocation,
   type ReviewRunnerRoute,
   type ReviewTransportChains,
@@ -87,6 +88,268 @@ describe('ReviewTransportRouter', () => {
 
     it('hasReviewerSeat is true when a chain names a configured seat', () => {
       expect(hasReviewerSeat(SEATS, CHAINS)).toBe(true);
+    });
+  });
+
+  describe('hostile input (each boundary helper takes unknown and never throws)', () => {
+    // A spy get trap: a counter that must stay 0 whenever the router reads a
+    // Proxy, proving no `get` trap (and therefore no getter) ever ran.
+    let getTrapCalls: number;
+    const getTrapProxy = <T extends object>(target: T): T =>
+      new Proxy(target, {
+        get() {
+          getTrapCalls += 1;
+          return undefined;
+        },
+      });
+
+    const validChains: ReviewTransportChains = { reviewer: [{ seatId: 'reviewer' }] };
+
+    describe('reviewerChainSeatIds returns [] (never throws)', () => {
+      it('null', () => {
+        expect(reviewerChainSeatIds(null as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('a wrong primitive where a chains object is due', () => {
+        expect(reviewerChainSeatIds(7 as unknown as ReviewTransportChains)).toEqual([]);
+        expect(reviewerChainSeatIds('reviewer' as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('a non-plain object where a chains object is due', () => {
+        class Chains {}
+        expect(reviewerChainSeatIds(new Chains() as unknown as ReviewTransportChains)).toEqual([]);
+        expect(reviewerChainSeatIds(new Map() as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('a sparse chain array (a hole)', () => {
+        const sparse: unknown[] = [{ seatId: 'a' }];
+        sparse[2] = { seatId: 'c' };
+        expect(reviewerChainSeatIds({ reviewer: sparse } as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('an array-like object where a chain array is due', () => {
+        const arrayLike = { length: 1, 0: { seatId: 'a' } };
+        expect(reviewerChainSeatIds({ reviewer: arrayLike } as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('an enormous length (2**32 - 1) refused before any traversal', () => {
+        const enormous: unknown[] = [];
+        Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
+        const chains = { reviewer: enormous };
+        expect(reviewerChainSeatIds(chains as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('an enormous length over the named cap (MAX_REVIEW_CHAIN_STEPS + 1) is refused', () => {
+        const overCap: unknown[] = [];
+        Object.defineProperty(overCap, 'length', { value: 65 });
+        for (let i = 0; i < 65; i++) overCap.push({ seatId: `s${i}` });
+        expect(reviewerChainSeatIds({ reviewer: overCap } as unknown as ReviewTransportChains)).toEqual([]);
+      });
+
+      it('an accessor-backed chain entry is refused and its getter never runs', () => {
+        let getterCalls = 0;
+        const chains: Record<string, unknown> = {};
+        Object.defineProperty(chains, 'reviewer', {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            return [{ seatId: 'reviewer' }];
+          },
+        });
+        expect(reviewerChainSeatIds(chains as unknown as ReviewTransportChains)).toEqual([]);
+        expect(getterCalls).toBe(0);
+      });
+
+      it('an accessor-backed step field is refused and its getter never runs', () => {
+        let getterCalls = 0;
+        const step: Record<string, unknown> = {};
+        Object.defineProperty(step, 'seatId', {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            return 'reviewer';
+          },
+        });
+        expect(reviewerChainSeatIds({ reviewer: [step] } as unknown as ReviewTransportChains)).toEqual([]);
+        expect(getterCalls).toBe(0);
+      });
+
+      it('a Proxy over a valid chain yields exactly the plain-data result and runs no get trap', () => {
+        getTrapCalls = 0;
+        const proxied = getTrapProxy(validChains);
+        expect(reviewerChainSeatIds(proxied as unknown as ReviewTransportChains)).toEqual(['reviewer']);
+        expect(getTrapCalls).toBe(0);
+      });
+
+      it('a prototype-polluting own key from JSON.parse is ignored, and a polluting seatId is refused', () => {
+        const parsed = JSON.parse('{"__proto__":{},"reviewer":[{"seatId":"reviewer"}]}') as ReviewTransportChains;
+        expect(reviewerChainSeatIds(parsed)).toEqual(['reviewer']);
+        expect(reviewerChainSeatIds({ reviewer: [{ seatId: '__proto__' }] } as unknown as ReviewTransportChains)).toEqual([]);
+        expect(reviewerChainSeatIds({ reviewer: [{ seatId: 'constructor' }] } as unknown as ReviewTransportChains)).toEqual([]);
+      });
+    });
+
+    describe('hasReviewerSeat returns false (never throws)', () => {
+      it('null', () => {
+        expect(hasReviewerSeat(null as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+      });
+
+      it('a wrong primitive where a seat list is due', () => {
+        expect(hasReviewerSeat('seats' as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+        expect(hasReviewerSeat(3 as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+      });
+
+      it('a non-plain seat object and an array-like seat list', () => {
+        const arrayLikeSeats = { length: 1, 0: REVIEWER_SEAT };
+        expect(hasReviewerSeat(arrayLikeSeats as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+        class Seat {}
+        expect(hasReviewerSeat([new Seat()] as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+      });
+
+      it('a sparse seat list (a hole)', () => {
+        const sparse: unknown[] = [];
+        sparse[1] = REVIEWER_SEAT;
+        expect(hasReviewerSeat(sparse as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+      });
+
+      it('an enormous length (2**32 - 1) refused before any traversal', () => {
+        const enormous: unknown[] = [];
+        Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
+        expect(hasReviewerSeat(enormous as unknown as readonly ReviewTransportSeat[], validChains)).toBe(false);
+      });
+
+      it('a seat whose roles are not a dense bounded string array', () => {
+        expect(hasReviewerSeat([{ ...REVIEWER_SEAT, roles: 'reviewer' }], validChains)).toBe(false);
+        const sparseRoles: unknown[] = [];
+        sparseRoles[1] = 'reviewer';
+        expect(hasReviewerSeat([{ ...REVIEWER_SEAT, roles: sparseRoles }], validChains)).toBe(false);
+        expect(hasReviewerSeat([{ ...REVIEWER_SEAT, roles: new Array(33).fill('reviewer') }], validChains)).toBe(false);
+      });
+
+      it('a Proxy over valid seats yields exactly the plain-data verdict and runs no get trap', () => {
+        getTrapCalls = 0;
+        expect(hasReviewerSeat(getTrapProxy(SEATS), validChains)).toBe(true);
+        expect(getTrapCalls).toBe(0);
+      });
+    });
+
+    describe('selectReviewerSeat refuses with a typed code (never throws)', () => {
+      const MODEL = REVIEWER_SEAT.model;
+
+      it('null seats', () => {
+        expect(selectReviewerSeat(null, validChains, MODEL)).toEqual({
+          ok: false,
+          reason: expect.any(String),
+          code: 'seat-none',
+        });
+      });
+
+      it('a wrong primitive where a seat list is due', () => {
+        expect(selectReviewerSeat('seats', validChains, MODEL)).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a wrong primitive where a model string is due', () => {
+        expect(selectReviewerSeat(SEATS, validChains, 42)).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a whitespace-only model', () => {
+        expect(selectReviewerSeat(SEATS, validChains, '   ')).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a model over MAX_REVIEWER_MODEL_BYTES', () => {
+        expect(selectReviewerSeat(SEATS, validChains, 'x'.repeat(257))).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a non-array and an array-like seat list', () => {
+        expect(selectReviewerSeat({}, validChains, MODEL)).toMatchObject({ ok: false, code: 'seat-none' });
+        const arrayLike = { length: 1, 0: REVIEWER_SEAT };
+        expect(selectReviewerSeat(arrayLike, validChains, MODEL)).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a sparse seat list and an over-cap seat list', () => {
+        const sparse: unknown[] = [];
+        sparse[1] = REVIEWER_SEAT;
+        expect(selectReviewerSeat(sparse, validChains, MODEL)).toMatchObject({ ok: false, code: 'seat-none' });
+        const overCap = Array.from({ length: 257 }, () => REVIEWER_SEAT);
+        expect(selectReviewerSeat(overCap, validChains, MODEL)).toMatchObject({ ok: false, code: 'seat-none' });
+      });
+
+      it('a seat whose roles are a sparse array is refused', () => {
+        const sparseRoles: unknown[] = [];
+        sparseRoles[1] = 'reviewer';
+        expect(selectReviewerSeat([{ ...REVIEWER_SEAT, roles: sparseRoles }], validChains, MODEL)).toMatchObject({
+          ok: false,
+          code: 'seat-none',
+        });
+      });
+
+      it('a getter on a seat field never runs and the seat is refused', () => {
+        let getterCalls = 0;
+        const seat: Record<string, unknown> = { ...REVIEWER_SEAT };
+        Object.defineProperty(seat, 'model', {
+          enumerable: true,
+          get() {
+            getterCalls += 1;
+            return MODEL;
+          },
+        });
+        const result = selectReviewerSeat([seat], validChains, MODEL);
+        expect(result).toMatchObject({ ok: false, code: 'seat-none' });
+        expect(getterCalls).toBe(0);
+      });
+
+      it('a Proxy over valid input yields exactly the plain-data verdict and runs no get trap', () => {
+        getTrapCalls = 0;
+        const result = selectReviewerSeat(getTrapProxy(SEATS), getTrapProxy(validChains), MODEL);
+        expect(result).toMatchObject({ ok: true, seat: { id: 'reviewer', model: MODEL } });
+        expect(getTrapCalls).toBe(0);
+      });
+
+      it('a prototype-polluting seat id is refused', () => {
+        expect(selectReviewerSeat([{ ...REVIEWER_SEAT, id: '__proto__' }], validChains, MODEL)).toMatchObject({
+          ok: false,
+          code: 'seat-none',
+        });
+      });
+
+      it('still distinguishes the implementer and ambiguous refusals for well-formed input', () => {
+        expect(selectReviewerSeat(SEATS, { reviewer: [{ seatId: 'implementer' }] }, IMPLEMENTER_SEAT.model)).toMatchObject({
+          ok: false,
+          code: 'seat-implementer',
+        });
+        const ambiguous: ReviewTransportSeat[] = [
+          { ...REVIEWER_SEAT },
+          { ...REVIEWER_SEAT, id: 'reviewer-2' },
+        ];
+        const ambiguousChains = { reviewer: [{ seatId: 'reviewer' }, { seatId: 'reviewer-2' }] };
+        expect(selectReviewerSeat(ambiguous, ambiguousChains, MODEL)).toMatchObject({ ok: false, code: 'seat-ambiguous' });
+      });
+    });
+
+    it('the verdicts are not constant: the same helpers distinguish accepting and refusing inputs', () => {
+      // A function returning a constant [] / false / seat-none would fail these.
+      expect(reviewerChainSeatIds(validChains)).toEqual(['reviewer']);
+      expect(reviewerChainSeatIds({})).toEqual([]);
+      expect(hasReviewerSeat(SEATS, validChains)).toBe(true);
+      expect(hasReviewerSeat(SEATS)).toBe(false);
+      expect(selectReviewerSeat(SEATS, validChains, REVIEWER_SEAT.model)).toMatchObject({ ok: true, seat: { id: 'reviewer' } });
+      expect(selectReviewerSeat(SEATS, validChains, 'no-such-model')).toMatchObject({ ok: false, code: 'seat-none' });
+    });
+
+    it('the answers are not identity echoes of the input', () => {
+      const source = { ...REVIEWER_SEAT };
+      const seats = [source];
+      const result = selectReviewerSeat(seats, validChains, REVIEWER_SEAT.model);
+      if (!result.ok) {
+        throw new Error('expected a selected seat');
+      }
+      // A normalized copy, not the input object and not the input roles array.
+      expect(result.seat).not.toBe(source);
+      expect(result.seat.roles).toEqual(source.roles);
+      expect(result.seat.roles).not.toBe(source.roles);
+      const ids = reviewerChainSeatIds({ reviewer: [{ seatId: 'reviewer' }] } as unknown as ReviewTransportChains);
+      expect(ids).toEqual(['reviewer']);
+      expect(ids).not.toBe([{ seatId: 'reviewer' }]);
     });
   });
 

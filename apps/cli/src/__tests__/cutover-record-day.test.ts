@@ -14,11 +14,13 @@ import { runCli, type CliIo } from '../index.js';
 import type { FleetInstallation } from '@fleet/installation';
 import {
   AttemptRepositoryAdapter,
+  buildMergeKey,
   ChainRepositoryAdapter,
   ForgeReadAdapter,
   ImportTrainStateUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  type LaneRunJournalEntryRecord,
   MergeQueueRepositoryAdapter,
   ReadOnlyStateStoreError,
   ReleaseStoreAdapter,
@@ -637,19 +639,25 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
     try {
       const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const result = await runtime.execution.recordShadowDay!.execute({
-        repository: { owner: 'fleet', repo: 'v2' },
-        legacyStateDir: fixtureDir,
-        day,
-      });
-      if (result.outcome !== 'recorded') {
-        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      // Through the real `runCli` boundary: the CLI returns the use case's
+      // result unchanged, so the stdout JSON must carry the non-digested
+      // `premergeCarry` diagnostics verbatim.
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as {
+        outcome: string;
+        recorded: Record<string, string>;
+        unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
+        premergeCarry?: { unresolvedCount: number; unresolvedIds: readonly string[] };
+      };
+      if (body.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${body.outcome} ${result.out}`);
       }
       // The day records S5 as a pass over an empty resolvable set, with the
       // unresolved decision printed in the `record-day` JSON output.
-      expect(result.recorded.S5).toBe('pass');
-      expect(reasonsOf(result).S5).toBeUndefined();
-      expect(result.premergeCarry).toEqual({
+      expect(body.recorded.S5).toBe('pass');
+      expect(reasonsOf(body).S5).toBeUndefined();
+      expect(body.premergeCarry).toEqual({
         unresolvedCount: 1,
         unresolvedIds: [`12@${newHead.slice(0, 12)}`],
       });
@@ -1362,5 +1370,116 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     const result = await cli(runtime, recordDayArgs(fixtureDir, ['--scheduled=maybe']));
     expect(result.code).toBe(2);
     expect(result.err).toContain('--scheduled accepts only true');
+  });
+
+  // BL01 (item #1): `record-day`'s S1 filter and the merge queue's own
+  // entries must share ONE repoDigest formula. A live entry is enqueued
+  // through the real `MergeQueueRepositoryAdapter`, and the journaled
+  // `merge-pr` dry-run result is keyed from the INDEPENDENTLY hard-coded
+  // digest `7c155c1db6b3` (never derived through
+  // `mergeQueueRepositoryDigest`). If the two formulas ever diverged, S1's
+  // `merge/<digest>/` journal prefix would drop the live entry and S1 would
+  // report `fleet-head-unresolved` instead of comparing the merge.
+  it('compares the live merge-queue entry in S1: the adapter digest and the hard-coded 7c155c1db6b3 key agree', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const headOid = '0123456789abcdef0123456789abcdef01234567';
+    const day = '2026-06-14';
+    // Built from the independently hard-coded digest, never via
+    // `mergeQueueRepositoryDigest`.
+    const builtKey = buildMergeKey({
+      repoDigest: '7c155c1db6b3',
+      pullRequest: 7,
+      head12: headOid.slice(0, 12),
+      action: 'merge-pr',
+      attemptOrdinal: null,
+      retry: null,
+      retryProof: null,
+    });
+    if (!builtKey.ok) {
+      throw new Error(`fixture merge key refused: ${builtKey.error}`);
+    }
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const runtime = wiredRuntime(stateDir);
+      // The live merge-queue entry, through the REAL adapter.
+      const enqueued = await runtime.execution.mergeQueueRepository.enqueueMergeEntry({
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 7,
+        headOid,
+        tier: 2,
+        enqueuedBy: 'cli',
+        runId: null,
+        entryId: runtime.conductor.newUlid(),
+        successorEntryId: runtime.conductor.newUlid(),
+        enqueuedAtIso: `${day}T09:00:00.000Z`,
+        deadlineIso: '2026-06-15T12:05:00.000Z',
+      });
+      expect(enqueued.outcome).toBe('created');
+      // The matching journaled would-merge (intent + dry-run result) under
+      // the hard-coded digest's key. A merge key carries no run, so `runId`
+      // is null (cast through the step-entry helpers' run-id parameter).
+      const journal = runtime.conductor.laneRunJournal;
+      const intent: LaneRunJournalEntryRecord = {
+        version: 1,
+        entryId: runtime.conductor.newUlid(),
+        kind: 'intent',
+        key: builtKey.key,
+        runId: null,
+        recordedAtIso: `${day}T09:59:00Z`,
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: null,
+        reasonCode: null,
+        detail: null,
+        grantId: null,
+        state: null,
+      };
+      const mergeResult: LaneRunJournalEntryRecord = {
+        version: 1,
+        entryId: runtime.conductor.newUlid(),
+        kind: 'result',
+        key: builtKey.key,
+        runId: null,
+        recordedAtIso: `${day}T10:00:30Z`,
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: 'dry-run',
+        reasonCode: 'would-merge',
+        detail: null,
+        grantId: null,
+        state: null,
+      };
+      expect(await journal.append(intent)).toMatchObject({ outcome: 'appended' });
+      expect(await journal.append(mergeResult)).toMatchObject({ outcome: 'appended' });
+      // The matching shell `result/merged` event on the day.
+      await fs.writeFile(
+        path.join(fixtureDir, 'events.jsonl'),
+        `${JSON.stringify({ at: `${day}T10:00:00Z`, kind: 'result', outcome: 'merged', pr: 7, headOid, detail: '' })}\n`,
+      );
+
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as { outcome: string; recorded: Record<string, string> };
+      expect(body.outcome).toBe('recorded');
+      // The live entry was compared, not dropped: S1 passes.
+      expect(body.recorded.S1).toBe('pass');
+      const ledger = JSON.parse(await fs.readFile(path.join(stateDir, 'cutover-shadow.json'), 'utf8')) as {
+        days?: ReadonlyArray<{ day: string; mergesCompared: number | null; verdicts: Record<string, { verdict: string }> }>;
+        ledger?: { days?: ReadonlyArray<{ day: string; mergesCompared: number | null; verdicts: Record<string, { verdict: string }> }> };
+      };
+      const days = ledger.days ?? ledger.ledger?.days ?? [];
+      const dayRecord = days.find((entry) => entry.day === day);
+      if (dayRecord === undefined) {
+        throw new Error('expected the recorded day in the ledger');
+      }
+      expect(dayRecord.mergesCompared).toBe(1);
+      expect(dayRecord.verdicts.S1?.verdict).toBe('pass');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

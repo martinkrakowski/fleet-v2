@@ -5701,6 +5701,7 @@ describe('RecordShadowDayUseCase hostile input, CAS retries and empty-day asymme
       repository: new Proxy({ owner: OWNER, repo: REPO }, {}) as unknown as { owner: string; repo: string },
     });
     const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
     expect(result).toEqual(plain);
   });
 

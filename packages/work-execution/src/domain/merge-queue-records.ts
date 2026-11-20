@@ -144,6 +144,12 @@ export function isMergeSafeId(value: unknown): value is string {
   if (typeof value !== 'string') {
     return false;
   }
+  // UTF-16 length is a lower bound on the UTF-8 byte count, so a string with
+  // more code units than the byte cap cannot fit: refuse it before ANY
+  // encoding (and before `trim`, which also copies the whole string).
+  if (value.length > ID_MAX_BYTES) {
+    return false;
+  }
   if (value.trim().length === 0) {
     return false;
   }

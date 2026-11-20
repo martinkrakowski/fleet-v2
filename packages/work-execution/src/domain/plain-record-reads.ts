@@ -16,6 +16,10 @@ export function readExactPlainRecord(value: unknown, keys: readonly string[]): R
   if (!isPlainRecordObject(value)) {
     return null;
   }
+  // Reflect.ownKeys is the one unavoidable enumeration (no API counts keys
+  // without listing them): it runs exactly once per object and the count is
+  // checked immediately, before any descriptor or value read — that immediate
+  // count refusal is the accepted bound on hostile objects with many keys.
   const ownKeys = Reflect.ownKeys(value);
   if (ownKeys.length !== keys.length) {
     return null;

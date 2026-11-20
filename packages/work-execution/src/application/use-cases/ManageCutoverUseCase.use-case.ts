@@ -23,6 +23,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_SHADOW_CRITERIA,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
@@ -939,12 +940,25 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (read.value.status === 'unreadable') return unknown('retirement-ledger-unreadable');
     if (read.value.status === 'unknown-version') return unknown('retirement-ledger-unknown-version');
     const verdict = readRetirementLedger(read.value.ledger);
-    if (verdict.ok) return null;
-    if (verdict.reason === 'empty-ledger' || verdict.reason === 'row-unverified') {
+    if (!verdict.ok) {
+      // Fail closed: every parser reason is a refusal or an unknown, never a
+      // pass, and never a write.
+      if (verdict.reason === 'unknown-version') return unknown('retirement-ledger-unknown-version');
+      if (verdict.reason === 'empty-ledger' || verdict.reason === 'row-unverified') {
+        return refuse('retirement-ledger-failed');
+      }
+      return unknown('retirement-ledger-unreadable');
+    }
+    // Retire proceeds only when the ledger read is ok AND every pinned §1
+    // script carries a row with verified true. The parser already requires the
+    // exact row set; this re-check fails closed if it ever did not.
+    const verifiedScripts = new Set(
+      verdict.ledger.rows.filter((row) => row.verified === true).map((row) => row.script),
+    );
+    if (CUTOVER_RETIREMENT_SCRIPTS.some((script) => !verifiedScripts.has(script))) {
       return refuse('retirement-ledger-failed');
     }
-    if (verdict.reason === 'unknown-version') return unknown('retirement-ledger-unknown-version');
-    return unknown('retirement-ledger-unreadable');
+    return null;
   }
 
   /** Unknown lane coverage is never a pass: only an exact zero of unrecorded lanes proceeds. */

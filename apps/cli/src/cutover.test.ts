@@ -81,7 +81,7 @@ async function seedSwitched(runtime: FleetCliRuntime, trainPauseSetByCutover: bo
 interface LedgerRow {
   readonly script: string;
   readonly verified: boolean;
-  readonly evidence: string;
+  readonly evidenceLink: string;
 }
 
 /** One verified row with an evidence link for every §1 cutover-plan script. */
@@ -91,7 +91,7 @@ function validRetirementLedger(
   const rows: LedgerRow[] = CUTOVER_RETIREMENT_SCRIPTS.map((script) => ({
     script,
     verified: true,
-    evidence: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
+    evidenceLink: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
   }));
   for (const [index, override] of Object.entries(rowOverrides)) {
     rows[Number(index)] = { ...rows[Number(index)], ...override };
@@ -435,7 +435,7 @@ describe('fleet-v2 cutover status and rollback', () => {
     writeRetirementLedger(
       JSON.stringify({
         schemaVersion: 1,
-        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidence: 'e' }],
+        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidenceLink: 'e' }],
       }),
     );
     await expectRetireRefusal(extra, { outcome: 'unknown', reason: 'retirement-ledger-unreadable' });

@@ -335,7 +335,7 @@ type RetirementLedgerReader = NonNullable<ManageCutoverDependencies['readRetirem
 interface LedgerRow {
   readonly script: string;
   readonly verified: boolean;
-  readonly evidence: string;
+  readonly evidenceLink: string;
 }
 
 /** One verified row with an evidence link for every §1 cutover-plan script. */
@@ -345,7 +345,7 @@ function validRetirementLedger(
   const rows: LedgerRow[] = CUTOVER_RETIREMENT_SCRIPTS.map((script) => ({
     script,
     verified: true,
-    evidence: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
+    evidenceLink: `docs/planning/2026-11-03_cutover-plan.md §1 ${script} adopted attempt`,
   }));
   for (const [index, override] of Object.entries(rowOverrides)) {
     rows[Number(index)] = { ...rows[Number(index)], ...override };
@@ -1328,7 +1328,7 @@ describe('ManageCutoverUseCase retire', () => {
     for (const ledger of [
       { schemaVersion: 1, rows: [] },
       validRetirementLedger({ 0: { verified: false } }),
-      validRetirementLedger({ 0: { evidence: '' } }),
+      validRetirementLedger({ 0: { evidenceLink: '' } }),
     ]) {
       const h = await harness();
       const useCase = useCaseWithReaders(h, { readRetirementLedger: async () => ({ status: 'ok', ledger }) });
@@ -1349,7 +1349,7 @@ describe('ManageCutoverUseCase retire', () => {
       // An extra script row that is not part of the inventory.
       {
         schemaVersion: 1,
-        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidence: 'e' }],
+        rows: [...validRetirementLedger().rows, { script: 'train/extra.sh', verified: true, evidenceLink: 'e' }],
       },
       // A duplicated row.
       {
@@ -1357,9 +1357,9 @@ describe('ManageCutoverUseCase retire', () => {
         rows: [...validRetirementLedger().rows.slice(0, -1), validRetirementLedger().rows[0]],
       },
       // Over-long text.
-      validRetirementLedger({ 0: { evidence: 'e'.repeat(257) } }),
+      validRetirementLedger({ 0: { evidenceLink: 'e'.repeat(257) } }),
       // Secret-shaped text.
-      validRetirementLedger({ 0: { evidence: LANE_ONLY_SECRET } }),
+      validRetirementLedger({ 0: { evidenceLink: LANE_ONLY_SECRET } }),
     ]) {
       const h = await harness();
       const useCase = useCaseWithReaders(h, { readRetirementLedger: async () => ({ status: 'ok', ledger }) });
@@ -1459,7 +1459,7 @@ describe('ManageCutoverUseCase retire', () => {
 
   it('readRetirementLedger refuses every malformed ledger shape', () => {
     const valid = validRetirementLedger();
-    expect(readRetirementLedger(valid)).toEqual({ ok: true });
+    expect(readRetirementLedger(valid)).toEqual({ ok: true, ledger: valid });
     expect(readRetirementLedger({ schemaVersion: 1, rows: [] })).toEqual({ ok: false, reason: 'empty-ledger' });
     expect(readRetirementLedger({ schemaVersion: 1, rows: valid.rows.slice(1) })).toEqual({ ok: false, reason: 'invalid-ledger' });
     expect(readRetirementLedger({ schemaVersion: 2, rows: [] })).toEqual({ ok: false, reason: 'unknown-version' });
@@ -1469,7 +1469,7 @@ describe('ManageCutoverUseCase retire', () => {
       ok: false,
       reason: 'row-unverified',
     });
-    expect(readRetirementLedger({ schemaVersion: 1, rows: [{ ...valid.rows[0], evidence: LANE_ONLY_SECRET }] })).toEqual({
+    expect(readRetirementLedger({ schemaVersion: 1, rows: valid.rows.map((row, i) => i === 0 ? { ...row, evidenceLink: LANE_ONLY_SECRET } : row) })).toEqual({
       ok: false,
       reason: 'secret-shaped',
     });

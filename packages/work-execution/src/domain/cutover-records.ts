@@ -4,6 +4,13 @@
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
+import {
+  MERGE_PARK_REASONS,
+  isMergeHex40,
+  isMergeSafeId,
+  readMergeQueueEntryRecord,
+} from './merge-queue-records.js';
+import type { MergeParkReason, MergeQueueRepositoryRef } from './merge-queue-records.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
@@ -455,10 +462,15 @@ function readEvidenceDay(element: unknown, failed: Set<string>): number | null {
  * A transparent Proxy over the document answers every prototype, key and
  * descriptor read exactly as its target would, so the checks above cannot
  * tell it from data. The structured-clone serializer refuses any Proxy
- * exotic object, and at this point every own property on the document is a
- * validated data property with a primitive value, so the probe reads no
- * getter and costs a constant walk over at most the permitted keys. A
- * clone failure here means a stand-in, never data.
+ * exotic object — the clone probe rejects the Proxy itself (full trap-free
+ * refusal arrives with the shared snapshotPlainData (PX1) adoption). The probe is therefore called
+ * only AFTER the caller's descriptor walk has proved the reachable graph:
+ * every own property a data property (an accessor is refused from its own
+ * descriptor, so the probe reads no getter), the shape and key counts
+ * bounded (a sparse or enormous array, an array-like and extra keys are
+ * refused before the probe, so the serializer never materializes unbounded
+ * input). On that proved-bounded data the probe costs a constant walk and
+ * refuses a root or nested Proxy as a stand-in, never data.
  */
 function isCloneableData(raw: unknown): boolean {
   try {
@@ -716,4 +728,412 @@ export function readRetirementLedger(raw: unknown): RetirementLedgerRead {
   } catch {
     return INVALID_LEDGER;
   }
+}
+
+// SW2a1: the bounded shadow-park record the cutover switch releases (plan §3.2,
+// SH24a). During shadow, an ordinary park persists silently without notifying
+// (`veto-hold` never persists under shadow); at `cutover switch` each ordinary
+// parked entry is recorded in the cutover journal and released back to
+// `queued`. Domain only: the port and adapter wiring is a sibling lane.
+
+/** The hard entry cap of the cutover journal. */
+export const MAX_CUTOVER_JOURNAL_ENTRIES = 10_000;
+/**
+ * Journal room every switch reserves on top of the parks it records: the
+ * `switched` result plus a later `rollback` intent and its result.
+ */
+export const CUTOVER_SWITCH_JOURNAL_RESERVE = 4;
+/** The most shadow parks one switch may record and release. */
+export const MAX_SHADOW_PARKS_PER_SWITCH = 500;
+
+/** One ordinary shadow park, frozen at its parked revision. */
+export interface CutoverShadowParkRecord {
+  readonly entryId: string;
+  readonly repository: MergeQueueRepositoryRef;
+  readonly pullRequest: number;
+  readonly headOid: string;
+  readonly reason: Exclude<MergeParkReason, 'veto-hold'>;
+  readonly attempt: number;
+  readonly notBeforeIso: string | null;
+}
+
+export type CutoverShadowParkKeyRead =
+  | { readonly ok: true; readonly key: string }
+  | { readonly ok: false; readonly reason: 'invalid-park-key' };
+
+const PARK_DIGEST_PATTERN = /^[0-9a-f]{32}$/;
+const INVALID_PARK_KEY = { ok: false, reason: 'invalid-park-key' } as const;
+
+/**
+ * The digest-keyed journal key of one shadow park:
+ * `cutover/shadow-park-<32 hex>@<revision>` — 44 characters, so it fits
+ * `CUTOVER_KEY`'s 64-char segment even when the `entryId` behind the digest is
+ * up to 256 bytes per `isMergeSafeId`. The digest is 32 lowercase hex chars
+ * (an `entryId` digest, not the id itself, so the id length never reaches the
+ * key) and the revision a safe integer in `[1, MAX_REVISION]`. Inputs are read
+ * with `typeof` checks only, so no getter and no Proxy trap ever runs.
+ * Cost bound: constant — two bounded pattern/integer checks and one
+ * fixed-length string build.
+ */
+export function cutoverShadowParkKey(entryIdDigest: unknown, revision: unknown): CutoverShadowParkKeyRead {
+  if (typeof entryIdDigest !== 'string' || !PARK_DIGEST_PATTERN.test(entryIdDigest)) {
+    return INVALID_PARK_KEY;
+  }
+  if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1 || revision > MAX_REVISION) {
+    return INVALID_PARK_KEY;
+  }
+  return { ok: true, key: `cutover/shadow-park-${entryIdDigest}@${revision}` };
+}
+
+export type CutoverShadowParkPayloadRead =
+  | { readonly ok: true; readonly record: CutoverShadowParkRecord; readonly canonicalPayload: string }
+  | { readonly ok: false; readonly reason: 'invalid-park-entry' | 'not-shadow-park' };
+
+const INVALID_PARK_ENTRY = { ok: false, reason: 'invalid-park-entry' } as const;
+const NOT_SHADOW_PARK = { ok: false, reason: 'not-shadow-park' } as const;
+
+/**
+ * Validate one parked merge-queue entry as a shadow park and build the
+ * canonical journal payload for it. The plain-record shape and the
+ * `readMergeQueueEntryRecord` descriptor walk come FIRST: arrays (sparse or
+ * dense, of any length), array-like objects with an own numeric `length`,
+ * extra keys, `__proto__`/`constructor`/`prototype` own keys, and any
+ * accessor are all refused from their own descriptors before anything
+ * traverses the entry, so a getter is never invoked (its call count stays
+ * 0) and no unbounded input is ever materialized. Only after that walk has
+ * proved the reachable graph plain and bounded does the structured-clone
+ * probe run, refusing a root or nested Proxy as a stand-in — the clone probe
+ * refuses the Proxy (full trap-free refusal arrives with the shared
+ * snapshotPlainData (PX1) adoption). Only an ordinary park qualifies: the entry
+ * must be `parked` with a reason other than `veto-hold` (SH24a park
+ * semantics). Cost bound: linear in a constant — the entry record is a
+ * fixed shape of 25 keys (plus optional `baseBranch`), every text bounded,
+ * and the probe walks only proved data properties.
+ */
+export function buildShadowParkJournalPayload(entry: unknown): CutoverShadowParkPayloadRead {
+  try {
+    // Shape first, pre-traversal: a non-object, an array (sparse or of
+    // enormous length) and an array-like are refused without cloning.
+    if (!isPlainRecordObject(entry)) {
+      return INVALID_PARK_ENTRY;
+    }
+    const read = readMergeQueueEntryRecord(entry);
+    if (!read.ok) {
+      return INVALID_PARK_ENTRY;
+    }
+    // Probe second: after the descriptor walk proved the entry plain and
+    // bounded, the structured-clone probe refuses a Proxy stand-in (its
+    // serializer rejects the Proxy before reading through it), and reads no
+    // getter (accessors were refused from their descriptors). Full trap-free
+    // refusal arrives with the shared snapshotPlainData (PX1) adoption.
+    if (!isCloneableData(entry)) {
+      return INVALID_PARK_ENTRY;
+    }
+    const current = read.record;
+    if (current.state !== 'parked' || !isShadowParkReason(current.reason)) {
+      // Not parked at all, parked with no reason, or a `veto-hold` (which never
+      // persists under shadow, SH24a) — none of it is a shadow park.
+      return NOT_SHADOW_PARK;
+    }
+    const reason: Exclude<MergeParkReason, 'veto-hold'> = current.reason;
+    const record: CutoverShadowParkRecord = {
+      entryId: current.entryId,
+      repository: { owner: current.repository.owner, repo: current.repository.repo },
+      pullRequest: current.pullRequest,
+      headOid: current.headOid,
+      reason,
+      attempt: current.attempt,
+      notBeforeIso: current.notBeforeIso,
+    };
+    return {
+      ok: true,
+      record,
+      canonicalPayload: JSON.stringify({ ...record, revision: current.revision }),
+    };
+  } catch {
+    return INVALID_PARK_ENTRY;
+  }
+}
+
+export type CutoverShadowParkRecordRead =
+  | { readonly ok: true; readonly record: CutoverShadowParkRecord }
+  | { readonly ok: false; readonly reason: 'invalid-park-record' };
+
+const SHADOW_PARK_KEYS = ['entryId', 'repository', 'pullRequest', 'headOid', 'reason', 'attempt', 'notBeforeIso'];
+const SHADOW_PARK_REPOSITORY_KEYS = ['owner', 'repo'];
+const SHADOW_PARK_SEGMENT_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
+const INVALID_PARK_RECORD = { ok: false, reason: 'invalid-park-record' } as const;
+
+/** An owner/repo segment: bounded, no `.` or `..`, never secret-shaped. */
+function isShadowParkSegment(value: unknown): value is string {
+  if (typeof value !== 'string' || !SHADOW_PARK_SEGMENT_PATTERN.test(value)) {
+    return false;
+  }
+  if (value === '.' || value === '..') {
+    return false;
+  }
+  return !isSecretShapedText(value);
+}
+
+/**
+ * The schema v3 (initial) validator for a stored or received `shadowPark`
+ * record, for reuse by the journal adapter lane. The descriptor walk comes
+ * FIRST: `readExactPlainRecord` on `['entryId', 'repository',
+ * 'pullRequest', 'headOid', 'reason', 'attempt', 'notBeforeIso']` and
+ * `['owner', 'repo']` refuses — pre-traversal, from the object's own
+ * property descriptors — an array (sparse or of enormous length), an
+ * array-like object, extra or missing keys, any
+ * `__proto__`/`constructor`/`prototype` own key, and any accessor, so a
+ * throwing or tracked getter is never invoked (its call count stays 0) and
+ * no unbounded input is ever materialized. Only after the walk has proved
+ * the record plain and bounded does the structured-clone probe run,
+ * refusing a root or nested Proxy as a stand-in — the clone probe refuses
+ * the Proxy (full trap-free refusal arrives with the shared snapshotPlainData
+ * (PX1) adoption). `entryId` must satisfy `isMergeSafeId` (up to 256
+ * bytes, secret-free), `owner` and `repo` a bounded repository segment,
+ * `pullRequest` a safe positive integer, `headOid` 40 lowercase hex chars,
+ * `reason` a park reason other than `veto-hold`, `attempt` a safe integer
+ * of at least 0, and `notBeforeIso` `null` or a bounded zoned ISO time. No
+ * field may be secret-shaped. Cost bound: linear in a constant — a fixed
+ * shape of 7 keys, every text bounded by a named cap, and the probe over
+ * proved data properties.
+ */
+export function readCutoverShadowParkRecord(raw: unknown): CutoverShadowParkRecordRead {
+  try {
+    // Shape first, pre-traversal: the exact-key descriptor walk refuses a
+    // non-object, an array (sparse or of enormous length), an array-like,
+    // extra/missing keys and any accessor before anything is materialized.
+    const snapshot = readExactPlainRecord(raw, SHADOW_PARK_KEYS);
+    if (snapshot === null) {
+      return INVALID_PARK_RECORD;
+    }
+    return readValidatedShadowPark(raw, snapshot);
+  } catch {
+    return INVALID_PARK_RECORD;
+  }
+}
+
+export type CutoverShadowParkPayloadRecordRead =
+  | { readonly ok: true; readonly record: CutoverShadowParkRecord; readonly revision: number }
+  | { readonly ok: false; readonly reason: 'invalid-park-record' };
+
+/** The 7 park keys plus the `revision` a stored canonical payload carries. */
+const SHADOW_PARK_PAYLOAD_KEYS = [...SHADOW_PARK_KEYS, 'revision'];
+
+/**
+ * The reader for one STORED shadow-park journal payload: exactly the payload
+ * `buildShadowParkJournalPayload` writes — the 7 park keys plus `revision`,
+ * a non-negative safe integer — so a payload that was accepted at park time
+ * reads back as the same park instead of being refused and lost. The
+ * descriptor walk comes FIRST (`readExactPlainRecord` on the 8 keys, the
+ * same exact-record reader the 7-key record reader uses): arrays, sparse
+ * arrays, array-like objects, extra or missing keys,
+ * `__proto__`/`constructor`/`prototype` own keys and any accessor are all
+ * refused from their own descriptors before anything traverses the payload,
+ * so a getter is never invoked and no unbounded input is ever materialized.
+ * Only after the walk has proved the payload plain and bounded does the
+ * structured-clone probe run, refusing a root or nested Proxy as a stand-in.
+ * Every field check is the 7-key record reader's own; only `revision` is
+ * read here (non-negative safe integer, `typeof` only). Cost bound: linear
+ * in a constant — a fixed shape of 8 keys, every text bounded by a named
+ * cap, and the probe over proved data properties.
+ */
+export function readCutoverShadowParkPayload(raw: unknown): CutoverShadowParkPayloadRecordRead {
+  try {
+    // Shape first, pre-traversal: the exact-key descriptor walk refuses a
+    // non-object, an array (sparse or of enormous length), an array-like,
+    // extra/missing keys and any accessor before anything is materialized.
+    const snapshot = readExactPlainRecord(raw, SHADOW_PARK_PAYLOAD_KEYS);
+    if (snapshot === null) {
+      return INVALID_PARK_RECORD;
+    }
+    const { revision } = snapshot;
+    if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+      return INVALID_PARK_RECORD;
+    }
+    const read = readValidatedShadowPark(raw, snapshot);
+    return read.ok ? { ok: true, record: read.record, revision } : read;
+  } catch {
+    return INVALID_PARK_RECORD;
+  }
+}
+
+/** The field checks shared by the 7-key record reader and the 8-key payload reader. */
+function readValidatedShadowPark(raw: unknown, snapshot: Record<string, unknown>): CutoverShadowParkRecordRead {
+  const repository = readExactPlainRecord(snapshot.repository, SHADOW_PARK_REPOSITORY_KEYS);
+  if (repository === null) {
+    return INVALID_PARK_RECORD;
+  }
+  const { entryId, pullRequest, headOid, reason, attempt, notBeforeIso } = snapshot;
+  const owner = repository.owner;
+  const repo = repository.repo;
+  if (
+    !isMergeSafeId(entryId) ||
+    !isShadowParkSegment(owner) ||
+    !isShadowParkSegment(repo) ||
+    typeof pullRequest !== 'number' ||
+    !Number.isSafeInteger(pullRequest) ||
+    pullRequest < 1 ||
+    !isMergeHex40(headOid) ||
+    !isShadowParkReason(reason) ||
+    typeof attempt !== 'number' ||
+    !Number.isSafeInteger(attempt) ||
+    attempt < 0 ||
+    !isNullableIso(notBeforeIso)
+  ) {
+    return INVALID_PARK_RECORD;
+  }
+  // Probe last: after the descriptor walk proved the record plain and
+  // bounded, the clone probe refuses a root or nested Proxy stand-in. It is
+  // not yet a full trap-free refusal — that arrives with the shared
+  // `snapshotPlainData` (PX1) adoption — but no value is read through a
+  // Proxy here: accessors were refused from their descriptors above.
+  if (!isCloneableData(raw)) {
+    return INVALID_PARK_RECORD;
+  }
+  return {
+    ok: true,
+    record: {
+      entryId,
+      repository: { owner, repo },
+      pullRequest,
+      headOid,
+      reason,
+      attempt,
+      notBeforeIso,
+    },
+  };
+}
+
+const SHADOW_PARK_REASONS = MERGE_PARK_REASONS.filter((candidate) => candidate !== 'veto-hold');
+
+/** An ordinary park reason: any park reason but `veto-hold` (SH24a). */
+function isShadowParkReason(value: unknown): value is Exclude<MergeParkReason, 'veto-hold'> {
+  return typeof value === 'string' && (SHADOW_PARK_REASONS as readonly string[]).includes(value);
+}
+
+export type CutoverJournalCapacityRead =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason: 'invalid-capacity-input' | 'too-many-shadow-parks' | 'journal-capacity-exceeded';
+    };
+
+const INVALID_CAPACITY_INPUT = { ok: false, reason: 'invalid-capacity-input' } as const;
+
+/** A non-negative safe integer; `typeof` reads no property, so no trap runs. */
+function isCapacityCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Whether one `cutover switch` may record `parkCount` shadow parks into a
+ * journal that already holds `existingCount` entries. Both inputs must be
+ * non-negative safe integers (`NaN`/`Infinity`, floats, non-numbers, objects
+ * and Proxies are refused); the parks are capped at
+ * `MAX_SHADOW_PARKS_PER_SWITCH`, and the total after the switch — existing
+ * entries plus the new parks plus `CUTOVER_SWITCH_JOURNAL_RESERVE` — must stay
+ * within `MAX_CUTOVER_JOURNAL_ENTRIES`. Cost bound: constant — three named
+ * constant comparisons and two `typeof` checks.
+ */
+export function checkCutoverJournalCapacity(existingCount: unknown, parkCount: unknown): CutoverJournalCapacityRead {
+  if (!isCapacityCount(existingCount) || !isCapacityCount(parkCount)) {
+    return INVALID_CAPACITY_INPUT;
+  }
+  if (parkCount > MAX_SHADOW_PARKS_PER_SWITCH) {
+    return { ok: false, reason: 'too-many-shadow-parks' };
+  }
+  if (existingCount + parkCount + CUTOVER_SWITCH_JOURNAL_RESERVE > MAX_CUTOVER_JOURNAL_ENTRIES) {
+    return { ok: false, reason: 'journal-capacity-exceeded' };
+  }
+  return { ok: true };
+}
+
+export type CutoverJournalReplayCapacityRead =
+  | { readonly ok: true; readonly parkCount: number }
+  | { readonly ok: false; readonly reason: 'invalid-capacity-input' | 'too-many-shadow-parks' | 'journal-capacity-exceeded' };
+
+/**
+ * The replay-safe capacity pre-check of one `cutover switch` that journals
+ * shadow parks: `parkKeys` are the journal keys the switch would append and
+ * `journaledKeys` the park keys the journal already holds, so a replay that
+ * re-presents parks its earlier pass already journaled does not double-count
+ * them — only parks NOT already present in the journal (by journal key)
+ * count against the capacity, and the same pass re-run answers the same
+ * verdict without ever exceeding it. Both inputs must be plain arrays of
+ * well-formed shadow-park journal keys (the exact strings
+ * `cutoverShadowParkKey` builds); every element is read from its own
+ * descriptor and checked with a bounded pattern before any key is compared,
+ * and any other shape — a non-array, a Proxy array stand-in, a non-string or
+ * malformed key, or a duplicate pending key — is refused as
+ * `invalid-capacity-input`. The resulting un-journaled park count goes
+ * through the very checks of `checkCutoverJournalCapacity` (per-switch
+ * park cap, journal cap with the switch reserve). Cost bound: linear in the
+ * bounded input lengths (each capped at `MAX_CUTOVER_JOURNAL_ENTRIES`) with
+ * a constant per key.
+ */
+export function checkCutoverJournalReplayCapacity(
+  existingCount: unknown,
+  parkKeys: unknown,
+  journaledKeys: unknown,
+): CutoverJournalReplayCapacityRead {
+  const pending = snapshotJournalKeys(parkKeys);
+  const journaled = snapshotJournalKeys(journaledKeys);
+  if (pending === null || journaled === null) {
+    return { ok: false, reason: 'invalid-capacity-input' };
+  }
+  // A duplicate pending key is not a park list: one switch parks distinct
+  // entries, so the same key twice is a malformed request, not a replay.
+  if (new Set(pending).size !== pending.length) {
+    return { ok: false, reason: 'invalid-capacity-input' };
+  }
+  const journaledSet = new Set(journaled);
+  const unjournaled = pending.filter((key) => !journaledSet.has(key));
+  const capacity = checkCutoverJournalCapacity(existingCount, unjournaled.length);
+  return capacity.ok ? { ok: true, parkCount: unjournaled.length } : capacity;
+}
+
+/** The journal keys of a plain string array, read from descriptors; null for any other shape. */
+function snapshotJournalKeys(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  // An array stand-in is refused before any element is read: the length is
+  // read from its own descriptor (no `get`), a Proxy array fails the clone
+  // probe below, and the count is bounded so no unbounded input is walked.
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value > MAX_CUTOVER_JOURNAL_ENTRIES
+  ) {
+    return null;
+  }
+  const out: string[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (descriptor === undefined || typeof descriptor.value !== 'string' || !isShadowParkJournalKey(descriptor.value)) {
+      return null;
+    }
+    out.push(descriptor.value);
+  }
+  // The serializer probe refuses a root or nested Proxy array stand-in; it
+  // is not yet a full trap-free refusal — that arrives with the shared
+  // `snapshotPlainData` (PX1) adoption — but no value was read through a
+  // Proxy here: elements were read from their own descriptors above.
+  if (!isCloneableData(value)) {
+    return null;
+  }
+  return out;
+}
+
+/** The exact shape `cutoverShadowParkKey` builds: `cutover/shadow-park-<32 hex>@<revision>`. */
+function isShadowParkJournalKey(value: string): boolean {
+  const match = /^cutover\/shadow-park-([0-9a-f]{32})@([0-9]+)$/.exec(value);
+  if (match === null) {
+    return false;
+  }
+  const revision = Number(match[2]);
+  return Number.isSafeInteger(revision) && revision >= 1 && revision <= MAX_REVISION;
 }

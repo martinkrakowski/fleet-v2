@@ -484,6 +484,10 @@ export const SHADOW_ONE_TIME_REQUIREMENTS: Readonly<Record<ShadowOneTimeCriterio
 /** Release-tree reports above this count are refused before any element is read. */
 export const SHADOW_ONE_TIME_MAX_TESTS = 16;
 
+/** A release-test path longer than this many characters is refused from the
+ * string's own `length` before its shape is judged. */
+export const SHADOW_ONE_TIME_MAX_PATH_LENGTH = 256;
+
 export interface ShadowReleaseTestFact {
   readonly path: string;
   readonly present: boolean;
@@ -564,8 +568,10 @@ type FieldRead<T> = { readonly ok: true; readonly value: T } | { readonly ok: fa
  * means the release tree could not be read. A fail beats any unknown.
  * Cost: linear in the capped input. The caps are the named constants
  * `SHADOW_ONE_TIME_MAX_TESTS` (refused from the array's own `length` before
- * any element is traversed) and `SHADOW_ATTESTATION_FACTS.length` (inside
- * `readShadowAttestations`). Own data properties only, so no getter ever
+ * any element is traversed), `SHADOW_ONE_TIME_MAX_PATH_LENGTH` (refused from
+ * a path string's own `length` before its shape is judged) and
+ * `SHADOW_ATTESTATION_FACTS.length` (inside `readShadowAttestations`). Own
+ * data properties only, so no getter ever
  * runs. A Proxy stand-in is refused by the shape checks or yields exactly
  * the plain data, because every read goes through
  * `Object.getOwnPropertyDescriptor` and `Reflect.ownKeys`, never a `get`
@@ -693,9 +699,14 @@ function isQuarantineFlag(value: unknown): value is boolean | null {
   return value === null || typeof value === 'boolean';
 }
 
-/** A non-empty path that carries no secret shape, or null. Cost: linear in the path string. */
+/** A non-empty path within `SHADOW_ONE_TIME_MAX_PATH_LENGTH` that carries no
+ * secret shape, or null. Cost: linear in the path string, and an over-cap
+ * path is refused from its own `length` before `isSecretShaped` runs. */
 function readTestPath(value: unknown): string | null {
-  if (typeof value !== 'string' || value.length === 0 || isSecretShaped(value)) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > SHADOW_ONE_TIME_MAX_PATH_LENGTH) {
+    return null;
+  }
+  if (isSecretShaped(value)) {
     return null;
   }
   return value;

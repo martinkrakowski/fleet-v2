@@ -5415,3 +5415,478 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     expect((result as { recorded: Record<string, string> }).recorded.S12).toBe('pass');
   });
 });
+
+/**
+ * BL01: hostile-input hardening of `RecordShadowDayUseCase.execute` (the
+ * request snapshot and its repository), the CAS retry paths, the CAS
+ * refusal/throw mappings, and the empty-day / drift asymmetry.
+ */
+describe('RecordShadowDayUseCase hostile input, CAS retries and empty-day asymmetry (BL01)', () => {
+  /** The deps are readonly in the contract; tests swap fakes through this mutable view. */
+  type MutableDeps = {
+    -readonly [K in keyof RecordShadowDayDependencies]: RecordShadowDayDependencies[K];
+  };
+  /** The common hostile assertions: refused invalid-request, nothing written, no CAS. */
+  function expectRefused(
+    harness: Harness,
+    result: RecordShadowDayResult,
+  ): void {
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  }
+
+  it('refuses a null request as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(null as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses an undefined request as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(undefined as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a wrong primitive (a number where a record is due) as invalid-request, never echoing it', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(7 as unknown as RecordShadowDayRequest);
+    // The result is the exact typed refusal — an identity echo of the input
+    // (or any shape carrying the raw value) would fail this toEqual.
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.evidence.calls.cas).toBe(0);
+  });
+
+  it('refuses an array request as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute([makeRequest()] as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a non-plain object (a Date) as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(new Date() as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a prototype-polluting own __proto__ key produced by JSON.parse as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = JSON.parse('{"repository":{"owner":"octo","repo":"train"},"legacyStateDir":"/state/legacy","day":"2026-11-16","__proto__":{"admin":true}}');
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile as RecordShadowDayRequest));
+  });
+
+  it('refuses a prototype-polluting own constructor key produced by JSON.parse as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = JSON.parse('{"repository":{"owner":"octo","repo":"train"},"legacyStateDir":"/state/legacy","day":"2026-11-16","constructor":{"prototype":{}}}');
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile as RecordShadowDayRequest));
+  });
+
+  it('refuses a prototype-polluting own prototype key produced by JSON.parse as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = JSON.parse('{"repository":{"owner":"octo","repo":"train"},"legacyStateDir":"/state/legacy","day":"2026-11-16","prototype":{}}');
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile as RecordShadowDayRequest));
+  });
+
+  it('refuses a symbol own key as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = { ...makeRequest(), [Symbol('hostile')]: 1 } as unknown as RecordShadowDayRequest;
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a request with more than MAX_REQUEST_OWN_KEYS own keys as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = { ...makeRequest(), extra1: 1, extra2: 2, extra3: 3, extra4: 4, extra5: 5 } as unknown as RecordShadowDayRequest;
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('ignores unknown extra own data keys within the cap and records a result deep-equal to the plain-data result', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    // A constant-refusal implementation would fail here: the request carries
+    // an unknown extra key and is still recorded.
+    const request = { ...makeRequest(), junk: 'ignored' } as unknown as RecordShadowDayRequest;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
+    // The ignored extra key must not change the outcome: the recorded result
+    // is deep-equal to the result of the same request without the extra key.
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    expect(result).toEqual(plain);
+  });
+
+  it('refuses a repository with more than MAX_REPOSITORY_OWN_KEYS own keys as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({ repository: { owner: OWNER, repo: REPO, a: 1, b: 2, c: 3 } as unknown as { owner: string; repo: string } });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('ignores unknown extra repository own data keys within the cap and records a result deep-equal to the plain-data result', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const request = makeRequest({ repository: { owner: OWNER, repo: REPO, extra: 'ignored' } as unknown as { owner: string; repo: string } });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
+    // The ignored extra repository key must not change the outcome: the
+    // recorded result is deep-equal to the result of the same request with a
+    // plain { owner, repo } repository.
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    expect(result).toEqual(plain);
+  });
+
+  it('refuses a repository field that is a getter flipping between two valid refs, running the getter zero times', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let repositoryReads = 0;
+    const request = {
+      get repository(): { owner: string; repo: string } {
+        repositoryReads += 1;
+        return repositoryReads === 1 ? { owner: OWNER, repo: REPO } : { owner: 'other', repo: 'repo' };
+      },
+      legacyStateDir: LEGACY_STATE_DIR,
+      day: DAY,
+    } as unknown as RecordShadowDayRequest;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    // The getter must never run: own data-property descriptors only.
+    expect(repositoryReads).toBe(0);
+    expect(harness.evidence.calls.cas).toBe(0);
+  });
+
+  it('refuses a nested repository.owner getter, running the getter zero times', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let ownerReads = 0;
+    const request = makeRequest({
+      repository: {
+        get owner(): string {
+          ownerReads += 1;
+          return OWNER;
+        },
+        repo: REPO,
+      } as unknown as { owner: string; repo: string },
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(ownerReads).toBe(0);
+    expect(harness.evidence.calls.cas).toBe(0);
+  });
+
+  it('refuses an empty legacyStateDir as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ legacyStateDir: '' })));
+  });
+
+  it('refuses a non-string legacyStateDir as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ legacyStateDir: 42 as unknown as string })));
+  });
+
+  it('yields the plain-data result with zero get traps for a transparent Proxy over a valid request, deep-equal to the plain-data result', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let getTraps = 0;
+    const proxied = new Proxy(makeRequest(), {
+      get(target, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(proxied);
+    expectRecorded(result);
+    expect(getTraps).toBe(0);
+    // The proxied request must behave exactly like the same plain-data
+    // request: its result is deep-equal to the result of a fresh plain run.
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    expect(result).toEqual(plain);
+  });
+
+  it('refuses a Proxy whose getPrototypeOf trap throws as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const proxied = new Proxy(makeRequest(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(proxied as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a Proxy whose ownKeys trap throws as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const proxied = new Proxy(makeRequest(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys');
+      },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(proxied as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a Proxy whose getOwnPropertyDescriptor trap throws as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const proxied = new Proxy(makeRequest(), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile getOwnPropertyDescriptor');
+      },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(proxied as unknown as RecordShadowDayRequest));
+  });
+
+  it('refuses a repository that is a non-plain object (a class instance with the valid fields as own properties) as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    class HostileRepository {
+      owner: string;
+      repo: string;
+      constructor() {
+        this.owner = OWNER;
+        this.repo = REPO;
+      }
+    }
+    const hostile = makeRequest({ repository: new HostileRepository() as unknown as { owner: string; repo: string } });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository carrying a symbol own key alongside the valid fields as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: { owner: OWNER, repo: REPO, [Symbol('hostile')]: 1 } as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository carrying a JSON.parse-produced own __proto__ key alongside the valid fields as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: JSON.parse('{"owner":"octo","repo":"train","__proto__":{"admin":true}}') as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository carrying a JSON.parse-produced own constructor key alongside the valid fields as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: JSON.parse('{"owner":"octo","repo":"train","constructor":{"prototype":{}}}') as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository carrying a JSON.parse-produced own prototype key alongside the valid fields as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: JSON.parse('{"owner":"octo","repo":"train","prototype":{}}') as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository that is a Proxy whose ownKeys trap throws as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: new Proxy({ owner: OWNER, repo: REPO }, {
+        ownKeys() {
+          throw new Error('hostile repository ownKeys');
+        },
+      }) as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('refuses a repository that is a Proxy whose getPrototypeOf trap throws as invalid-request', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const hostile = makeRequest({
+      repository: new Proxy({ owner: OWNER, repo: REPO }, {
+        getPrototypeOf() {
+          throw new Error('hostile repository getPrototypeOf');
+        },
+      }) as unknown as { owner: string; repo: string },
+    });
+    expectRefused(harness, await new RecordShadowDayUseCase(harness.deps).execute(hostile));
+  });
+
+  it('yields a result deep-equal to the plain-data result for a transparent Proxy over a valid repository', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    const request = makeRequest({
+      repository: new Proxy({ owner: OWNER, repo: REPO }, {}) as unknown as { owner: string; repo: string },
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
+    expect(result).toEqual(plain);
+  });
+
+  it('records a request with exactly MAX_REQUEST_OWN_KEYS own keys, deep-equal to the plain-data result', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    const request = { ...makeRequest(), extra1: 1, extra2: 2, extra3: 3, extra4: 4 } as unknown as RecordShadowDayRequest;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
+    expect(result).toEqual(plain);
+  });
+
+  it('records a repository with exactly MAX_REPOSITORY_OWN_KEYS own keys, deep-equal to the plain-data result', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const plainHarness = makeHarness(cleanFixture(DAY), NOW);
+    const plain = await new RecordShadowDayUseCase(plainHarness.deps).execute(makeRequest());
+    const request = makeRequest({
+      repository: { owner: OWNER, repo: REPO, extra1: 'ignored', extra2: 'ignored' } as unknown as { owner: string; repo: string },
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectRecorded(result);
+    expect(result).toEqual(plain);
+  });
+
+  it('conflict-then-saved: a first compareAndSet conflict is retried once and records', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    // Days append in order: the earlier day is recorded first, so the
+    // conflict-retried write appends the later day onto a revision-1 ledger.
+    const first = await useCase.execute(makeRequest({ day: '2026-11-15' }));
+    expectRecorded(first);
+    const deps = harness.deps as MutableDeps;
+    const realCas = deps.evidence.compareAndSet;
+    let casCalls = 0;
+    deps.evidence.compareAndSet = async (request) => {
+      casCalls += 1;
+      if (casCalls === 1) {
+        return { outcome: 'conflict', currentRevision: 1 } as const;
+      }
+      return realCas(request);
+    };
+    // Reset the fake clock: the first run's S8 sample gap consumed part of
+    // the request deadline.
+    harness.setNow(NOW);
+    const readsBefore = harness.evidence.calls.read;
+    const second = await useCase.execute(makeRequest());
+    expect(second).toMatchObject({ outcome: 'recorded', day: DAY });
+    // One initial read, one re-read after the conflict; two compareAndSet calls.
+    expect(harness.evidence.calls.read - readsBefore).toBe(2);
+    expect(casCalls).toBe(2);
+  });
+
+  it('conflict-then-unchanged: a conflict whose re-read already holds the day answers unchanged without a second compareAndSet', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const deps = harness.deps as MutableDeps;
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    // Run 1 records the day EMPTY (every criterion unevaluated), so run 2's
+    // first write attempt still changes something and reaches compareAndSet.
+    const legacyEvents = deps.legacy.readLegacyTrainEvents;
+    const daemonRead = deps.daemonEvents.readAfterCursor;
+    const checkState = deps.checkState;
+    deps.legacy.readLegacyTrainEvents = undefined;
+    deps.daemonEvents.readAfterCursor = async () => ({ ok: false, reason: 'invalid-cursor' } as const);
+    deps.checkState = async () => null;
+    harness.setImportDryRun(refusedImport());
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded).toEqual({});
+    // Restore the readers: run 2 evaluates the criteria and proposes the
+    // full verdict set.
+    deps.legacy.readLegacyTrainEvents = legacyEvents;
+    deps.daemonEvents.readAfterCursor = daemonRead;
+    deps.checkState = checkState;
+    harness.setImportDryRun(dryRunImport(cleanImportKeys()));
+    const realCas = deps.evidence.compareAndSet;
+    let casCalls = 0;
+    deps.evidence.compareAndSet = async (request) => {
+      casCalls += 1;
+      if (casCalls === 1) {
+        // A concurrent writer lands the IDENTICAL verdict set at revision 2
+        // before this run's write lands; the run's own write then reports
+        // conflict against revision 2.
+        await realCas(request);
+        return { outcome: 'conflict', currentRevision: 2 } as const;
+      }
+      return realCas(request);
+    };
+    // Reset the fake clock: the first run's S8 sample gap consumed part of
+    // the request deadline.
+    harness.setNow(NOW);
+    const readsBefore = harness.evidence.calls.read;
+    const second = await useCase.execute(makeRequest());
+    expect(second).toMatchObject({ outcome: 'unchanged', revision: 2 });
+    expect(harness.evidence.calls.read - readsBefore).toBe(2);
+    // The re-read already held the matching day record: no second CAS.
+    expect(casCalls).toBe(1);
+  });
+
+  it('maps a compareAndSet refused read-only to unknown ledger-busy and writes nothing', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const deps = harness.deps as MutableDeps;
+    let casCalls = 0;
+    deps.evidence.compareAndSet = async () => {
+      casCalls += 1;
+      return { outcome: 'refused', reason: 'read-only' };
+    };
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'ledger-busy' });
+    expect(casCalls).toBe(1);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('maps a thrown compareAndSet to unknown ledger-unreadable and writes nothing', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const deps = harness.deps as MutableDeps;
+    let casCalls = 0;
+    deps.evidence.compareAndSet = async () => {
+      casCalls += 1;
+      throw new Error('compareAndSet failed');
+    };
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'ledger-unreadable' });
+    expect(casCalls).toBe(1);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('records an empty day (verdicts {}) when every criterion is unevaluated', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const deps = harness.deps as MutableDeps;
+    const legacyEvents = deps.legacy.readLegacyTrainEvents;
+    const daemonRead = deps.daemonEvents.readAfterCursor;
+    const checkState = deps.checkState;
+    // Every criterion unevaluated: no shell events, no daemon events, no
+    // state check, a refused import dry-run, and no conducted/chains/
+    // premergeCarry/oneTime wiring (the harness never wires those).
+    deps.legacy.readLegacyTrainEvents = undefined;
+    deps.daemonEvents.readAfterCursor = async () => ({ ok: false, reason: 'invalid-cursor' } as const);
+    deps.checkState = async () => null;
+    harness.setImportDryRun(refusedImport());
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({});
+    const stored = harness.evidence.stored;
+    if (stored === null) {
+      throw new Error('expected a stored ledger');
+    }
+    const dayRecord = stored.days.find((entry) => entry.day === DAY);
+    if (dayRecord === undefined) {
+      throw new Error('expected the day to be appended');
+    }
+    expect(dayRecord.verdicts).toEqual({});
+    expect(dayRecord.mergesCompared).toBeNull();
+    // Restore the readers for the drift run below.
+    deps.legacy.readLegacyTrainEvents = legacyEvents;
+    deps.daemonEvents.readAfterCursor = daemonRead;
+    deps.checkState = checkState;
+    harness.setImportDryRun(dryRunImport(cleanImportKeys()));
+    // Reset the fake clock: the first run's S8 sample gap consumed part of
+    // the request deadline.
+    harness.setNow(NOW);
+    // A later run on the same day whose criteria now evaluate has nothing
+    // recorded to conflict with: the new verdicts merge into the empty day
+    // (the asymmetry's other arm — only a CHANGED recorded digest conflicts,
+    // as the next test pins).
+    const second = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(second);
+    expect(second.recorded.S1).toBe('pass');
+    expect(harness.evidence.stored?.revision).toBe(2);
+  });
+
+  it('refuses a re-run whose live state drifted a recorded verdict with verdict-conflict, not unchanged', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const deps = harness.deps as MutableDeps;
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S9).toBe('pass');
+    // Drift: the live state check now reports a bad sample, so S9's verdict
+    // and digest change between runs. Reset the fake clock first: the first
+    // run's S8 sample gap consumed part of the request deadline.
+    harness.setNow(NOW);
+    deps.checkState = async () => ({ checked: 5, bad: 1 });
+    const second = await useCase.execute(makeRequest());
+    expect(second).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored?.revision).toBe(1);
+  });
+});

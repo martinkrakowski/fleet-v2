@@ -292,4 +292,292 @@ describe('shadow comparators', () => {
       delete (Object.prototype as Record<string, unknown>).headOid;
     }
   });
+
+  it('a null root input returns the fallback result and never throws', () => {
+    const result = compareShadowMergeSets(null as unknown as { fleet: readonly ShadowMergeSetItem[]; shell: [] });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('an undefined root input returns the fallback result and never throws', () => {
+    const result = compareShadowBriefVerdicts(undefined as unknown as { fleet: never[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'brief-verdict',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('a wrong primitive at the root (a string where a record is due) returns the fallback result', () => {
+    const result = compareShadowGateVerdicts('not-a-record' as unknown as { fleet: never[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'gate-verdict',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('a number at the root returns the fallback result', () => {
+    const result = compareShadowEnqueueSets(7 as unknown as { fleet: never[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'enqueue-set',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('a root array returns the fallback result (a list is due on the fleet and shell fields, not the root)', () => {
+    const result = compareShadowPremergeStatuses([1, 2, 3] as unknown as { fleet: never[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'premerge-status',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('a root with a getter returns the fallback result and the getter never runs', () => {
+    let calls = 0;
+    const root = {};
+    Object.defineProperty(root, 'fleet', { enumerable: true, get: () => { calls += 1; return [{ pullRequest: 1, headOid: FIRST_HEAD }]; } });
+    Object.defineProperty(root, 'shell', { enumerable: true, value: [] });
+    const result = compareShadowMergeSets(root as unknown as { fleet: readonly ShadowMergeSetItem[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+    expect(calls).toBe(0);
+  });
+
+  it('a non-iterable object where a list is due reports invalid-fleet-list', () => {
+    const result = compareShadowMergeSets({
+      fleet: { a: 1 } as unknown as readonly ShadowMergeSetItem[],
+      shell: [],
+    });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+  });
+
+  it('an array-like object where a list is due reports invalid-fleet-list', () => {
+    const result = compareShadowMergeSets({
+      fleet: { length: 1, 0: { pullRequest: 1, headOid: FIRST_HEAD } } as unknown as readonly ShadowMergeSetItem[],
+      shell: [],
+    });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+  });
+
+  it('an array hole (a sparse array) is invalid-item and never traversed as an element', () => {
+    const sparse = new Array<ShadowMergeSetItem>(2);
+    sparse[1] = { pullRequest: 1, headOid: FIRST_HEAD };
+    const result = compareShadowMergeSets({ fleet: sparse, shell: [] });
+    expect(result.divergences).toEqual([
+      { key: `1@${FIRST_HEAD}`, code: 'missing-in-shell', fleet: 'would-merge', shell: null },
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(1);
+  });
+
+  it('a leading array hole ([, item]) is invalid-item at index 0', () => {
+    const item: ShadowMergeSetItem = { pullRequest: 1, headOid: FIRST_HEAD };
+    const sparse = new Array<ShadowMergeSetItem | undefined>(2);
+    sparse[0] = undefined;
+    sparse[1] = item;
+    delete sparse[0];
+    const result = compareShadowMergeSets({ fleet: sparse as unknown as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: `1@${FIRST_HEAD}`, code: 'missing-in-shell', fleet: 'would-merge', shell: null },
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+  });
+
+  it('an item index getter never runs: the element is invalid-item with no getter call', () => {
+    let calls = 0;
+    const fleet: ShadowMergeSetItem[] = [];
+    Object.defineProperty(fleet, 0, {
+      enumerable: true,
+      get: () => { calls += 1; return { pullRequest: 1, headOid: FIRST_HEAD }; },
+    });
+    const result = compareShadowMergeSets({ fleet, shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+    expect(calls).toBe(0);
+  });
+
+  it('an enormous-length sparse array (2**32 - 1) is refused before any traversal', () => {
+    const sparse: unknown[] = [];
+    Object.defineProperty(sparse, 'length', { value: 2 ** 32 - 1 });
+    const result = compareShadowMergeSets({ fleet: sparse as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+    expect(result.shellCount).toBe(0);
+  });
+
+  it('a Proxy over a valid input yields exactly the plain-data result and runs no get trap', () => {
+    const valid = {
+      fleet: [{ pullRequest: 42, headOid: FIRST_HEAD }],
+      shell: [{ pullRequest: 42, headOid: FIRST_HEAD }],
+    };
+    const traps: string[] = [];
+    const proxy = new Proxy(valid, {
+      get(target, key, receiver) {
+        traps.push(`get:${String(key)}`);
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const expected = compareShadowMergeSets(valid);
+    const result = compareShadowMergeSets(proxy as unknown as typeof valid);
+    expect(result).toEqual(expected);
+    expect(result.equal).toBe(true);
+    expect(traps).toEqual([]);
+  });
+
+  it('a Proxy over an array side cannot bypass the item cap with a lying length get trap', () => {
+    // The get trap reports length 0 during the cap check, then the real
+    // 2**32 - 1 length in the loop condition: without the fix collectSide
+    // walks the whole range accumulating divergences without bound.
+    const huge: unknown[] = [];
+    Object.defineProperty(huge, 'length', { value: 2 ** 32 - 1 });
+    huge[0] = { pullRequest: 1, headOid: FIRST_HEAD };
+    let lengthReads = 0;
+    const proxy = new Proxy(huge, {
+      get(target, key) {
+        if (key === 'length') {
+          lengthReads += 1;
+          return lengthReads === 1 ? 0 : Reflect.get(target, key);
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(result.fleetCount).toBe(0);
+    expect(result.shellCount).toBe(0);
+    expect(lengthReads).toBe(0);
+  });
+
+  it('a Proxy over an array side with a lying length trap yields exactly the plain-data result', () => {
+    const items = [
+      { pullRequest: 1, headOid: FIRST_HEAD },
+      { pullRequest: 2, headOid: SECOND_HEAD },
+    ];
+    const proxy = new Proxy(items, {
+      get(target, key) {
+        if (key === 'length') return 0;
+        return Reflect.get(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: items });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: true,
+      compared: 2,
+      fleetCount: 2,
+      shellCount: 2,
+      divergences: [],
+      truncated: false,
+    });
+  });
+
+  it('a Proxy whose get trap would return a fake fleet list never runs the trap', () => {
+    let calls = 0;
+    const root = {};
+    Object.defineProperty(root, 'fleet', { enumerable: true, get: () => { calls += 1; return [{ pullRequest: 1, headOid: FIRST_HEAD }]; } });
+    Object.defineProperty(root, 'shell', { enumerable: true, value: [] });
+    const proxy = new Proxy(root, {});
+    const result = compareShadowMergeSets(proxy as unknown as { fleet: readonly ShadowMergeSetItem[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+    expect(calls).toBe(0);
+  });
+
+  it('a JSON-parsed root with a __proto__ own key is refused, not treated as a record', () => {
+    const parsed: Record<string, unknown> = JSON.parse('{"__proto__": {"polluted": true}, "fleet": [], "shell": []}');
+    const result = compareShadowMergeSets(parsed as unknown as { fleet: never[]; shell: never[] });
+    expect(result.equal).toBe(false);
+    expect(result.divergences).toEqual([
+      { key: 'comparison', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('a JSON-parsed root with a constructor own key is refused, not treated as a record', () => {
+    const parsed: Record<string, unknown> = JSON.parse('{"constructor": {"prototype": {}}, "fleet": [], "shell": []}');
+    const result = compareShadowMergeSets(parsed as unknown as { fleet: never[]; shell: never[] });
+    expect(result).toEqual({
+      kind: 'merge-set',
+      equal: false,
+      compared: 0,
+      fleetCount: 0,
+      shellCount: 0,
+      divergences: [{ key: 'comparison', code: 'invalid-item', fleet: null, shell: null }],
+      truncated: false,
+    });
+  });
+
+  it('a constant verdict function would fail: two genuinely different verdict sets are not reported equal', () => {
+    const result = compareShadowGateVerdicts({
+      fleet: [{ headOid: FIRST_HEAD, predicate: 'checks', verdict: 'pass' }],
+      shell: [{ headOid: FIRST_HEAD, predicate: 'checks', verdict: 'fail' }],
+    });
+    expect(result.equal).toBe(false);
+    expect(result.divergences).toEqual([
+      { key: `${FIRST_HEAD}#checks`, code: 'false-pass', fleet: 'pass', shell: 'fail' },
+    ]);
+  });
+
+  it('an identity echo of the input would fail: the result carries only ids and codes, never the echoed item', () => {
+    const item = { briefId: 'BL11', verdict: 'rejected' };
+    const result = compareShadowBriefVerdicts({ fleet: [item], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'BL11', code: 'missing-in-shell', fleet: 'rejected', shell: null },
+    ]);
+    const echoed = JSON.stringify(result);
+    expect(echoed).not.toContain('"briefId"');
+    expect(echoed).not.toContain('"verdict"');
+  });
 });

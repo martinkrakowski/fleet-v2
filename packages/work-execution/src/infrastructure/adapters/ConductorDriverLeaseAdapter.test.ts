@@ -173,15 +173,18 @@ describe('ConductorDriverLeaseAdapter file shape, read-back and quarantine', () 
     }
   });
 
-  it('refuses file names that collide with another store or are unsafe', async () => {
-    const colliding = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: 'lane-runs.json' });
-    await expect(colliding.read()).rejects.toThrow(/collides with another store/);
+  it('refuses file names that collide with another store or are unsafe at construction', () => {
+    expect(() => new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: 'lane-runs.json' })).toThrow(
+      /collides with another store/,
+    );
 
-    const escaping = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: '../x.json' });
-    await expect(escaping.read()).rejects.toThrow(/unsafe state file name/);
+    expect(() => new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: '../x.json' })).toThrow(
+      /unsafe state file name/,
+    );
     for (const dotName of ['.', '..']) {
-      const dot = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: dotName });
-      await expect(dot.read()).rejects.toThrow(/unsafe state file name/);
+      expect(() => new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: dotName })).toThrow(
+        /unsafe state file name/,
+      );
     }
   });
 });

@@ -38,6 +38,8 @@ import type {
 } from '../../application/ports/out/TrainHealthAttentionPort.out-port.js';
 import { TRAIN_HEALTH_ATTENTION_RULES } from '../../application/ports/out/TrainHealthAttentionPort.out-port.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 
 /** The actor train-health items are raised and resolved as. */
 export const TRAIN_HEALTH_ATTENTION_ACTOR = 'train-watchdog';
@@ -101,10 +103,6 @@ type MappedAnswer<T extends string> =
 
 type Unreadable = { readonly outcome: 'refused'; readonly reasonCode: 'unreadable' };
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 /** An own data property only: an accessor reads as undefined and never runs. */
 function ownValue(source: unknown, key: string): unknown {
   if (typeof source !== 'object' || source === null) {
@@ -127,8 +125,14 @@ function isSegment(value: unknown): value is string {
 }
 
 function snapshotRepository(raw: unknown): Repository | null {
-  const owner = ownValue(raw, 'owner');
-  const repo = ownValue(raw, 'repo');
+  // Exact-key read: class instances and custom-prototype objects are refused,
+  // and no extra own key is tolerated on a repository.
+  const exact = readExactPlainRecord(raw, ['owner', 'repo']);
+  if (exact === null) {
+    return null;
+  }
+  const owner = exact.owner;
+  const repo = exact.repo;
   if (isSegment(owner) && isSegment(repo)) {
     return { owner, repo };
   }
@@ -246,14 +250,18 @@ function readCommandFields(raw: Record<string, unknown>): CommandFields | null {
  */
 function snapshotCommand(raw: unknown): Snapshot | null {
   try {
-    if (!isPlainObject(raw)) {
+    // Exact-key read: the command carries exactly these five own keys (a
+    // project-scoped rule carries `pullRequest: null`), so a class instance, a
+    // custom-prototype object or any extra key is refused.
+    const exact = readExactPlainRecord(raw, ['projectId', 'repository', 'deadlineIso', 'rule', 'pullRequest']);
+    if (exact === null) {
       return null;
     }
-    const fields = readCommandFields(raw);
+    const fields = readCommandFields(exact);
     if (fields === null) {
       return null;
     }
-    const identity = identityOf(fields.rule, fields.projectId, fields.repository, ownValue(raw, 'pullRequest'));
+    const identity = identityOf(fields.rule, fields.projectId, fields.repository, exact.pullRequest);
     if (identity === null) {
       return null;
     }
@@ -265,14 +273,16 @@ function snapshotCommand(raw: unknown): Snapshot | null {
 
 function snapshotListQuery(raw: unknown): ListQuery | null {
   try {
-    if (!isPlainObject(raw)) {
+    // Exact-key read: the query carries exactly these three own keys.
+    const exact = readExactPlainRecord(raw, ['projectId', 'repository', 'deadlineIso']);
+    if (exact === null) {
       return null;
     }
-    const projectId = ownValue(raw, 'projectId');
+    const projectId = exact.projectId;
     if (!validProjectId(projectId)) {
       return null;
     }
-    const repository = snapshotRepository(ownValue(raw, 'repository'));
+    const repository = snapshotRepository(exact.repository);
     if (repository === null) {
       return null;
     }
@@ -300,7 +310,10 @@ function refusedWithCode(code: unknown): { readonly outcome: 'refused'; readonly
 /** Map one raise or clear answer. `accepted` is the success outcomes for that call. */
 function mapAttentionAnswer<T extends string>(answer: unknown, accepted: readonly T[]): MappedAnswer<T> {
   try {
-    if (!isPlainObject(answer)) {
+    // A plain record object, but not exact-key: a delegate answer may carry
+    // additional own fields (e.g. a refusal `reason`). A class instance or a
+    // custom-prototype object is refused as unreadable.
+    if (!isPlainRecordObject(answer)) {
       return refusedUnreadable();
     }
     const outcome = ownValue(answer, 'outcome');
@@ -476,7 +489,15 @@ function screenedRule(item: unknown, projectId: string): TrainHealthAttentionRul
 /** One open item for this repository, or null when the entry is foreign or malformed. */
 function openItemOf(entry: unknown, projectId: string, repository: Repository): OpenTrainHealthAttentionItem | null {
   try {
+    // Plain record object, not exact-key: a list entry may carry additional
+    // own fields; a class instance or custom prototype is malformed.
+    if (!isPlainRecordObject(entry)) {
+      return null;
+    }
     const item = ownValue(entry, 'item');
+    if (!isPlainRecordObject(item)) {
+      return null;
+    }
     const rule = screenedRule(item, projectId);
     if (rule === null) {
       return null;
@@ -495,17 +516,80 @@ function openItemOf(entry: unknown, projectId: string, repository: Repository): 
   }
 }
 
+/**
+ * The capped element list of a real, dense array, or null for any stand-in:
+ * a non-array, a subclassed or custom-prototype array, an array with an
+ * accessor `length`, an oversized array, a sparse array (a hole) or an array
+ * carrying an extra own enumerable property such as a getter planted beside
+ * the indices, an accessor-backed index or a missing index whose slot is
+ * replaced by an extra key. `Object.keys` lists own enumerable string keys
+ * without reading any value, so comparing its count to the descriptor
+ * `length` refuses an extra key before a single element is read; each index
+ * `0..length-1` is then required to be its own enumerable data property, so a
+ * hole is refused even when a planted extra key keeps the counts equal.
+ * The length and every index are read from own descriptors, so no iterator,
+ * getter, `length` property read or accessor ever runs. The cost is linear
+ * in the capped input (`LIST_ITEM_CAP`).
+ */
+function boundedEntryList(value: unknown): readonly unknown[] | null {
+  // `Array.isArray` follows a Proxy without running a trap.
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    lengthDescriptor.value > LIST_ITEM_CAP
+  ) {
+    return null;
+  }
+  const entryCount = lengthDescriptor.value;
+  if (Object.keys(value).length !== entryCount) {
+    return null;
+  }
+  // Every index must be present as an own enumerable data property: a hole
+  // is a malformed list, not something to skip, even when a planted extra
+  // key keeps the key count equal to `length`.
+  for (let index = 0; index < entryCount; index += 1) {
+    const indexDescriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      indexDescriptor === undefined ||
+      !indexDescriptor.enumerable ||
+      indexDescriptor.get !== undefined ||
+      indexDescriptor.set !== undefined ||
+      !('value' in indexDescriptor)
+    ) {
+      return null;
+    }
+  }
+  return value as readonly unknown[];
+}
+
+/** The own enumerable data-property element at `index`; undefined for a hole or an accessor. */
+function ownEntryElement(array: readonly unknown[], index: number): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+  return descriptor !== undefined && descriptor.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+}
+
 function itemsFromAnswer(answer: unknown, projectId: string, repository: Repository): ListOpenTrainHealthAttentionResult {
-  const entries = ownValue(answer, 'items');
-  if (!Array.isArray(entries)) {
+  // Plain record object, not exact-key: the answer may carry additional own
+  // fields; a class instance or custom prototype is unavailable.
+  if (!isPlainRecordObject(answer)) {
     return { outcome: 'unavailable' };
   }
-  if (entries.length > LIST_ITEM_CAP) {
+  const entries = boundedEntryList(ownValue(answer, 'items'));
+  if (entries === null) {
     return { outcome: 'unavailable' };
   }
   const items: OpenTrainHealthAttentionItem[] = [];
-  for (const entry of entries) {
-    const parsed = openItemOf(entry, projectId, repository);
+  // Indexed descriptor reads, never `for...of`: no iterator is ever fetched,
+  // and the dense-array check above refuses holes instead of skipping them.
+  const entryCount = entries.length;
+  for (let index = 0; index < entryCount; index += 1) {
+    const parsed = openItemOf(ownEntryElement(entries, index), projectId, repository);
     if (parsed !== null) {
       items.push(parsed);
     }

@@ -124,10 +124,13 @@ export function parseHostAudibleAlertRequest(request: unknown): SpdSayRequestPar
  * a prototype-polluting own key. `isProxy` observes no trap and no getter.
  */
 function isHostileRequestShape(request: unknown): boolean {
-  if (!isPlainRecordObject(request)) {
+  // `isProxy` first: it observes no trap, while `isPlainRecordObject` reads the
+  // prototype and would trigger a Proxy `getPrototypeOf` trap before the Proxy
+  // is refused.
+  if (types.isProxy(request)) {
     return true;
   }
-  if (types.isProxy(request)) {
+  if (!isPlainRecordObject(request)) {
     return true;
   }
   if (hasPollutingKey(request)) {

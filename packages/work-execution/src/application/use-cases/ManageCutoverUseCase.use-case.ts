@@ -930,6 +930,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     }
     const read = await this.guarded(deadlineIso, reader);
     if (read.kind === 'deadline') return unknown('deadline-exceeded');
+    // A read that starts before the deadline but completes after it must not
+    // pass the gate: the deadline is rechecked against the clock once the
+    // reader has returned, failing closed.
+    if (this.deadlineReached(deadlineIso)) return unknown('deadline-exceeded');
     if (read.kind === 'threw') return unknown('retirement-ledger-unreadable');
     if (read.value.status === 'absent') return refuse('retirement-ledger-absent');
     if (read.value.status === 'unreadable') return unknown('retirement-ledger-unreadable');

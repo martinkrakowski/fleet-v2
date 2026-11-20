@@ -1428,6 +1428,35 @@ describe('ManageCutoverUseCase retire', () => {
     expect(totalWriteCalls(h)).toBe(0);
   });
 
+  it('retire returns unknown deadline-exceeded when the deadline is reached during the ledger read', async () => {
+    const h = await harness();
+    h.clock.now = SWITCHED_AT;
+    let read = 0;
+    const useCase = useCaseWithReaders(h, {
+      readRetirementLedger: async () => {
+        read += 1;
+        h.clock.now = EARLIER_DEADLINE;
+        return { status: 'ok', ledger: validRetirementLedger() };
+      },
+    });
+    // The gate itself must fail the pass: the ledger read may not hand a
+    // deadline reached during reading to the steps after it.
+    const intentSpy = vi.spyOn(
+      useCase as unknown as {
+        appendIntentUnlessRecorded: (...args: unknown[]) => Promise<unknown>,
+      },
+      'appendIntentUnlessRecorded',
+    );
+    expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW, deadlineIso: EARLIER_DEADLINE }))).toEqual({
+      outcome: 'unknown',
+      reason: 'deadline-exceeded',
+    });
+    expect(read).toBe(1);
+    expect(intentSpy).not.toHaveBeenCalled();
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(await journalEntries(h, 'cutover/retire@1')).toHaveLength(0);
+  });
+
   it('readRetirementLedger refuses every malformed ledger shape', () => {
     const valid = validRetirementLedger();
     expect(readRetirementLedger(valid)).toEqual({ ok: true });

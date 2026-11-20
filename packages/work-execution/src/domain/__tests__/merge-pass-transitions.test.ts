@@ -288,12 +288,34 @@ describe('buildReleasedParkEntry', () => {
     }
   });
 
-  it('refuses a getter on the entry without running it as invalid-entry', () => {
+  it('refuses a getter on the entry as invalid-entry, its value never reaching the record', () => {
+    // The first-touch serializer probe materializes a cloneable accessor's
+    // value once into the throwaway probe clone (one read); the descriptor
+    // walk refuses the accessor afterwards whatever it answers, so the value
+    // it returns can never reach an accepted entry.
     let count = 0;
     const target = parked();
     const copy = { ...target };
     Object.defineProperty(copy, 'state', {
       enumerable: true,
+      get() {
+        count += 1;
+        return target.state;
+      },
+    });
+    expect(buildReleasedParkEntry(copy)).toEqual({ ok: false, reason: 'invalid-entry' });
+    expect(count).toBe(1);
+  });
+
+  it('refuses a non-enumerable getter on the entry without running it as invalid-entry', () => {
+    // The serializer's probe walks own *enumerable* properties only, so a
+    // non-enumerable accessor is never read at all; the descriptor walk
+    // refuses it from its own descriptor.
+    let count = 0;
+    const target = parked();
+    const copy = { ...target };
+    Object.defineProperty(copy, 'state', {
+      enumerable: false,
       get() {
         count += 1;
         return target.state;
@@ -307,6 +329,49 @@ describe('buildReleasedParkEntry', () => {
     const proxied = getCounterProxy(parked());
     expect(buildReleasedParkEntry(proxied.value)).toEqual({ ok: false, reason: 'invalid-entry' });
     expect(proxied.gets()).toBe(0);
+  });
+
+  it('refuses a recording Proxy without running any of its traps as invalid-entry', () => {
+    // The structured-clone probe is the first touch of the entry and refuses
+    // any Proxy exotic object before a prototype, own-key or descriptor
+    // check can exercise a single trap — not just the `get` trap.
+    const calls: string[] = [];
+    const traps = [
+      'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+      'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+    ];
+    const handler: Record<string, (...args: unknown[]) => unknown> = {};
+    for (const trap of traps) {
+      handler[trap] = (...args: unknown[]) => {
+        calls.push(trap);
+        return (Reflect as unknown as Record<string, (...args: unknown[]) => unknown>)[trap](...args);
+      };
+    }
+    const proxied = new Proxy(parked() as unknown as object, handler as ProxyHandler<object>);
+    expect(buildReleasedParkEntry(proxied)).toEqual({ ok: false, reason: 'invalid-entry' });
+    expect(calls).toEqual([]);
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
+    const throwingHandler: Record<string, () => never> = {};
+    for (const trap of [
+      'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+      'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+    ]) {
+      throwingHandler[trap] = () => {
+        throw new Error('trap');
+      };
+    }
+    for (const hostile of [
+      new Proxy(parked() as unknown as object, throwingHandler as ProxyHandler<object>),
+      (() => {
+        const { proxy, revoke } = Proxy.revocable(parked() as unknown as object, {});
+        revoke();
+        return proxy;
+      })(),
+    ]) {
+      expect(buildReleasedParkEntry(hostile)).toEqual({ ok: false, reason: 'invalid-entry' });
+    }
   });
 
   it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {

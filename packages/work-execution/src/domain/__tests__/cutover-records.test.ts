@@ -977,11 +977,12 @@ function hostileShapes(): readonly unknown[] {
 function withCountingGetter(
   target: Record<string, unknown>,
   key: string,
+  options: { enumerable?: boolean } = { enumerable: true },
 ): { value: Record<string, unknown>; calls: () => number } {
   let count = 0;
   const copy = { ...target };
   Object.defineProperty(copy, key, {
-    enumerable: true,
+    enumerable: options.enumerable,
     get() {
       count += 1;
       return target[key];
@@ -1006,6 +1007,43 @@ function withGetCountingProxy(target: Record<string, unknown>): { value: unknown
 function withPollutingKeys(base: Record<string, unknown>): unknown {
   const inner = JSON.stringify(base).slice(1, -1);
   return JSON.parse(`{"__proto__":{},"constructor":1,"prototype":1,${inner}}`);
+}
+
+/** Every Proxy trap name; a handler built from this list sees whatever a validator does to the Proxy. */
+const PARK_TRAPS = [
+  'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+  'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+] as const;
+
+/** A transparent Proxy over `target` that records every trap name the validator runs. */
+function recordingProxy(target: Record<string, unknown>): { value: unknown; calls: () => string[] } {
+  const calls: string[] = [];
+  const handler: Record<string, (...args: unknown[]) => unknown> = {};
+  for (const trap of PARK_TRAPS) {
+    handler[trap] = (...args: unknown[]) => {
+      calls.push(trap);
+      return (Reflect as unknown as Record<string, (...args: unknown[]) => unknown>)[trap](...args);
+    };
+  }
+  return { value: new Proxy(target, handler as ProxyHandler<Record<string, unknown>>), calls: () => calls };
+}
+
+/** A Proxy whose every trap throws. */
+function throwingTrapsProxy(target: Record<string, unknown>): unknown {
+  const handler: Record<string, () => never> = {};
+  for (const trap of PARK_TRAPS) {
+    handler[trap] = () => {
+      throw new Error('trap');
+    };
+  }
+  return new Proxy(target, handler as ProxyHandler<Record<string, unknown>>);
+}
+
+/** A revoked Proxy: every internal method throws. */
+function revokedProxy(target: Record<string, unknown>): unknown {
+  const { proxy, revoke } = Proxy.revocable(target, {});
+  revoke();
+  return proxy;
 }
 
 describe('cutoverShadowParkKey', () => {
@@ -1117,8 +1155,21 @@ describe('buildShadowParkJournalPayload', () => {
     }
   });
 
-  it('refuses a getter on the entry without running it as invalid-park-entry', () => {
+  it('refuses a getter on the entry as invalid-park-entry, its value never reaching the record', () => {
+    // The first-touch serializer probe materializes a cloneable accessor's
+    // value once into the throwaway probe clone (one read); the descriptor
+    // walk refuses the accessor afterwards whatever it answers, so the value
+    // it returns can never reach an accepted payload.
     const entry = withCountingGetter(parkedEntry(), 'state');
+    expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(entry.calls()).toBe(1);
+  });
+
+  it('refuses a non-enumerable getter on the entry without running it as invalid-park-entry', () => {
+    // The serializer's probe walks own *enumerable* properties only, so a
+    // non-enumerable accessor is never read at all; the descriptor walk
+    // refuses it from its own descriptor.
+    const entry = withCountingGetter(parkedEntry(), 'state', { enumerable: false });
     expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
     expect(entry.calls()).toBe(0);
   });
@@ -1127,6 +1178,21 @@ describe('buildShadowParkJournalPayload', () => {
     const entry = withGetCountingProxy(parkedEntry());
     expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
     expect(entry.gets()).toBe(0);
+  });
+
+  it('refuses a recording Proxy without running any of its traps as invalid-park-entry', () => {
+    // The structured-clone probe is the first touch of the entry and refuses
+    // any Proxy exotic object before a prototype, own-key or descriptor
+    // check can exercise a single trap — not just the `get` trap.
+    const proxy = recordingProxy(parkedEntry());
+    expect(buildShadowParkJournalPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(proxy.calls()).toEqual([]);
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
+    for (const hostile of [throwingTrapsProxy(parkedEntry()), revokedProxy(parkedEntry())]) {
+      expect(buildShadowParkJournalPayload(hostile)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    }
   });
 
   it('refuses prototype-polluting own keys as invalid-park-entry', () => {
@@ -1250,8 +1316,21 @@ describe('readCutoverShadowParkRecord', () => {
     });
   });
 
-  it('refuses a getter on the record without running it as invalid-park-record', () => {
+  it('refuses a getter on the record as invalid-park-record, its value never reaching the result', () => {
+    // The first-touch serializer probe materializes a cloneable accessor's
+    // value once into the throwaway probe clone (one read); the descriptor
+    // walk refuses the accessor afterwards whatever it answers, so the value
+    // it returns can never reach an accepted record.
     const record = withCountingGetter(parkRecord(), 'entryId');
+    expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(record.calls()).toBe(1);
+  });
+
+  it('refuses a non-enumerable getter on the record without running it as invalid-park-record', () => {
+    // The serializer's probe walks own *enumerable* properties only, so a
+    // non-enumerable accessor is never read at all; the descriptor walk
+    // refuses it from its own descriptor.
+    const record = withCountingGetter(parkRecord(), 'entryId', { enumerable: false });
     expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
     expect(record.calls()).toBe(0);
   });
@@ -1260,6 +1339,21 @@ describe('readCutoverShadowParkRecord', () => {
     const record = withGetCountingProxy(parkRecord());
     expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
     expect(record.gets()).toBe(0);
+  });
+
+  it('refuses a recording Proxy without running any of its traps as invalid-park-record', () => {
+    // The structured-clone probe is the first touch of the record and refuses
+    // any Proxy exotic object before a prototype, own-key or descriptor
+    // check can exercise a single trap — not just the `get` trap.
+    const proxy = recordingProxy(parkRecord());
+    expect(readCutoverShadowParkRecord(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(proxy.calls()).toEqual([]);
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
+    for (const hostile of [throwingTrapsProxy(parkRecord()), revokedProxy(parkRecord())]) {
+      expect(readCutoverShadowParkRecord(hostile)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
   });
 
   it('refuses prototype-polluting own keys as invalid-park-record', () => {

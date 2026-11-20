@@ -79,11 +79,14 @@ function validated(entry: unknown): MergeQueueEntryRecord | null {
 
 /**
  * Refuse a Proxy stand-in: the structured-clone serializer refuses any Proxy
- * exotic object, while a transparent Proxy answers every descriptor read in
- * the record reader exactly as its target would. A transparent cloneable-data
- * entry is a fixed-shape record of primitive fields, so the probe reads no
- * getter and costs a constant walk. Only called after `validated` accepted
- * the entry, so no getter is ever reached by the probe.
+ * exotic object — root or nested — observing no trap of any kind. Called as
+ * the FIRST touch of the raw entry, before any prototype, own-key or
+ * descriptor check, so no supplied Proxy's prototype/own-key/descriptor
+ * traps can ever run. On plain data the serializer materializes a cloneable
+ * accessor's value once into the throwaway probe clone, but the value an
+ * accessor answers can never reach an accepted result: the record reader
+ * refuses any accessor from its own descriptor afterwards. A fixed-shape
+ * record of primitive fields costs a constant probe walk.
  */
 function isCloneableEntry(raw: unknown): boolean {
   try {
@@ -185,19 +188,27 @@ export function buildParkedEntry(entry: unknown, input: ParkInput): MergeEntryBu
  * (SH24a): the attempt history is preserved, the park reason and
  * `notBeforeIso` are cleared, and the revision moves exactly one. An ordinary
  * park only — a `veto-hold` never persists under shadow, so it is never
- * released here. The entry is read through own data-property descriptors only
- * (`readMergeQueueEntryRecord`), so a getter is never run, a Proxy stand-in
- * fails the record shape, and sparse arrays, array-like objects and
- * prototype-polluting keys are refused. Cost bound: linear in a constant —
- * one validated read of the fixed-shape entry record and one rebuilt record.
+ * released here. The structured-clone probe is the FIRST touch of the entry
+ * (`isCloneableEntry`), refusing any supplied Proxy before the record reader
+ * can exercise its prototype, own-key or descriptor traps; the entry is then
+ * read through own data-property descriptors only
+ * (`readMergeQueueEntryRecord`), so a throwing or tracked getter is never
+ * invoked by the walk (the probe may have materialized a cloneable
+ * accessor's value once into the throwaway probe clone, but the value an
+ * accessor answers can never reach an accepted result), and sparse arrays,
+ * array-like objects and prototype-polluting keys are refused. Cost bound:
+ * linear in a constant — one validated read of the fixed-shape entry record
+ * and one rebuilt record.
  */
 export function buildReleasedParkEntry(entry: unknown): MergeEntryBuild {
   try {
-    const current = validated(entry);
-    if (current === null) {
+    // Probe first: a supplied Proxy is refused by the serializer observing
+    // no trap, before any prototype/own-key/descriptor check can run one.
+    if (!isCloneableEntry(entry)) {
       return { ok: false, reason: 'invalid-entry' };
     }
-    if (!isCloneableEntry(entry)) {
+    const current = validated(entry);
+    if (current === null) {
       return { ok: false, reason: 'invalid-entry' };
     }
     if (terminal(current)) {

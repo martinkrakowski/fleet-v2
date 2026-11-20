@@ -73,6 +73,7 @@ export interface ConductorDriverLeaseAdapterOptions {
 const DEFAULT_FILE_NAME = 'conductor-driver-lease.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -130,7 +131,19 @@ function currentLeaseOf(records: readonly ConductorDriverLeaseRecord[]): Conduct
 export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
   private inMemoryLease: ConductorDriverLeaseRecord | null = null;
 
-  constructor(private readonly options: ConductorDriverLeaseAdapterOptions = {}) {}
+  constructor(private readonly options: ConductorDriverLeaseAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error(
+          'ConductorDriverLeaseAdapter refuses a fileName that collides with another store',
+        );
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('ConductorDriverLeaseAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async read(): Promise<ConductorDriverLeaseRecord | null> {
     const target = this.statePath;

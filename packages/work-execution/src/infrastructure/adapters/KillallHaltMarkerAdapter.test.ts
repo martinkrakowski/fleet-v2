@@ -155,14 +155,11 @@ describe('KillallHaltMarkerAdapter file shape, unreadable marker and file names'
     expect(await adapter.read()).toEqual({ state: 'halted' });
   });
 
-  it('refuses file names that collide with another store or are unsafe', async () => {
-    const colliding = makeFileAdapter(tempDir, 'conductor-halt.json');
-    await expect(colliding.read()).rejects.toThrow(/collides with another store/);
+  it('refuses file names that collide with another store or are unsafe at construction', () => {
+    expect(() => makeFileAdapter(tempDir, 'conductor-halt.json')).toThrow(/collides with another store/);
 
-    const pauseColliding = makeFileAdapter(tempDir, 'killall-train-pause.json');
-    await expect(pauseColliding.read()).rejects.toThrow(/collides with another store/);
+    expect(() => makeFileAdapter(tempDir, 'killall-train-pause.json')).toThrow(/collides with another store/);
 
-    const escaping = makeFileAdapter(tempDir, '../x');
-    await expect(escaping.read()).rejects.toThrow(/unsafe state file name/);
+    expect(() => makeFileAdapter(tempDir, '../x')).toThrow(/unsafe state file name/);
   });
 });

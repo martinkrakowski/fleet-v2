@@ -32,6 +32,8 @@ import type {
 } from '../../../application/ports/out/ReviewRequestPort.out-port.js';
 import { CiStateAdapter } from '../CiStateAdapter.adapter.js';
 import { ReviewRequestAdapter } from '../ReviewRequestAdapter.adapter.js';
+import { sha256HexDigest } from '../AttemptArtifactAdapter.adapter.js';
+import { computeBriefPackageDigest } from '../../../domain/value-objects/BriefPackage.vo.js';
 
 const ASSESSMENT_ID = 'assessment-attempt-example-1';
 const HEAD = '0000000000000000000000000000000000000000';
@@ -473,9 +475,15 @@ describe('ReviewRequestAdapter.requestReview', () => {
       receipt: makeReceipt({ kind: 'brief-check' }),
     });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const briefText = '1. Add the review seat.\n2. Wire the checklist.';
+    const manifestRaw = '# manifest\n';
+    const computed = computeBriefPackageDigest({ prose: briefText, manifestRaw }, sha256HexDigest);
+    if (!computed.ok) {
+      throw new Error('fixture digest must compute');
+    }
 
     const result = await adapter.requestReview(
-      makeReviewRequest({ kind: 'brief-check', briefText: '1. Add the review seat.\n2. Wire the checklist.' }),
+      makeReviewRequest({ kind: 'brief-check', briefText, briefManifestRaw: manifestRaw, briefPackageDigest: computed.briefDigest }),
     );
 
     expect(result).toEqual({
@@ -521,9 +529,15 @@ describe('ReviewRequestAdapter.requestReview', () => {
       receipt: makeReceipt({ kind: 'brief-check' }),
     });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const briefText = 'a'.repeat(64 * 1024);
+    const manifestRaw = '# manifest\n';
+    const computed = computeBriefPackageDigest({ prose: briefText, manifestRaw }, sha256HexDigest);
+    if (!computed.ok) {
+      throw new Error('fixture digest must compute');
+    }
 
     const result = await adapter.requestReview(
-      makeReviewRequest({ kind: 'brief-check', briefText: 'a'.repeat(64 * 1024) }),
+      makeReviewRequest({ kind: 'brief-check', briefText, briefManifestRaw: manifestRaw, briefPackageDigest: computed.briefDigest }),
     );
 
     expect(result).toEqual({

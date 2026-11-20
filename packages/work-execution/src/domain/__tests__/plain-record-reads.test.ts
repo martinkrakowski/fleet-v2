@@ -1,13 +1,12 @@
 /**
- * BL06a hostile-input tests for `readBoundedDenseArray` and
- * `readOwnDataElement`: every export takes `unknown` at its boundary and
- * never throws — each refusal is the typed `null` result, and no getter or
- * Proxy `get` trap ever runs.
+ * BL06a hostile-input tests for `readBoundedDenseArray`: it takes `unknown`
+ * at its boundary and never throws — each refusal is the typed `null`
+ * result, and no getter or Proxy `get` trap ever runs.
  */
 
 import { describe, expect, it } from 'vitest';
 
-import { readBoundedDenseArray, readOwnDataElement } from '../plain-record-reads.js';
+import { readBoundedDenseArray } from '../plain-record-reads.js';
 
 /** A revoked Proxy throws on every trap, including [[GetPrototypeOf]]. */
 function revokedProxy(): unknown {
@@ -66,6 +65,7 @@ describe('readBoundedDenseArray', () => {
 
   it('refuses an accessor length in O(1) before any key enumeration', () => {
     let getterCalls = 0;
+    let ownKeysCalls = 0;
     const target: unknown[] = [];
     const proxied = new Proxy(target, {
       getOwnPropertyDescriptor(t, prop) {
@@ -81,9 +81,14 @@ describe('readBoundedDenseArray', () => {
         }
         return Reflect.getOwnPropertyDescriptor(t, prop);
       },
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
     });
     expect(readBoundedDenseArray(proxied, 8)).toBeNull();
     expect(getterCalls).toBe(0);
+    expect(ownKeysCalls).toBe(0);
   });
 
   it('refuses a non-safe-integer length reported by an own length descriptor', () => {
@@ -94,8 +99,23 @@ describe('readBoundedDenseArray', () => {
     expect(readBoundedDenseArray(proxyWithLength(['a'], -1), 8)).toBeNull();
   });
 
-  it('refuses an enormous sparse length (2**32 - 1) before any traversal', () => {
-    expect(readBoundedDenseArray(proxyWithLength([], 2 ** 32 - 1), 8)).toBeNull();
+  it('refuses an enormous sparse length (2**32 - 1) before any traversal or key enumeration', () => {
+    let ownKeysCalls = 0;
+    const proxied = new Proxy([], {
+      getOwnPropertyDescriptor(t, prop) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(t, prop);
+        if (prop === 'length' && descriptor !== undefined) {
+          return { ...descriptor, value: 2 ** 32 - 1 };
+        }
+        return descriptor;
+      },
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+    expect(ownKeysCalls).toBe(0);
   });
 
   it('refuses a length above the cap', () => {
@@ -142,12 +162,54 @@ describe('readBoundedDenseArray', () => {
   });
 
   it.each(['__proto__', 'constructor', 'prototype', '01'])(
-    'refuses the extra own key %s produced by JSON.parse without running any trap',
+    'refuses the extra own key %s on a real array so the canonical-key loop must run',
     (key) => {
-      const json = JSON.parse(`{"0":"a","length":1,"${key}":"x"}`) as unknown;
-      expect(readBoundedDenseArray(json, 8)).toBeNull();
+      const value: unknown[] = ['x'];
+      Object.defineProperty(value, key, { value: 1, enumerable: true, configurable: true, writable: true });
+      expect(readBoundedDenseArray(value, 8)).toBeNull();
     },
   );
+
+  it('rejects a consistent-liar Proxy outright: it reports an empty array while proxy[0] is still x', () => {
+    // The traps satisfy every Proxy invariant (length is reported as a
+    // non-configurable, non-enumerable data property like the real target's
+    // own length), so reflection alone cannot detect the lie.
+    const proxied = new Proxy(['x'], {
+      getOwnPropertyDescriptor(t, prop) {
+        if (prop === 'length') {
+          return { value: 0, writable: true, enumerable: false, configurable: false };
+        }
+        return undefined;
+      },
+      ownKeys: () => ['length'],
+    });
+    expect(proxied[0]).toBe('x');
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+  });
+
+  it('rejects every Proxy outright: traps count calls and prove no get trap ever ran', () => {
+    let getTraps = 0;
+    const proxied = new Proxy(['x'], {
+      get(target, prop, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, prop, receiver);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      ownKeys(target) {
+        return Reflect.ownKeys(target);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+    expect(getTraps).toBe(0);
+  });
+
+  it('refuses an index descriptor without a value ({ get: undefined, set: undefined })', () => {
+    const value: unknown[] = ['a'];
+    Object.defineProperty(value, 0, { get: undefined, set: undefined, enumerable: true, configurable: true });
+    expect(readBoundedDenseArray(value, 8)).toBeNull();
+  });
 
   it('refuses a length key that is an accessor (on the root, counter stays 0)', () => {
     let getterCalls = 0;
@@ -164,7 +226,7 @@ describe('readBoundedDenseArray', () => {
     expect(getterCalls).toBe(0);
   });
 
-  it('accepts a Proxy over a valid array, reading descriptors only (no get trap runs)', () => {
+  it('rejects a transparent Proxy over a valid array outright (no get trap runs)', () => {
     let getTraps = 0;
     const valid = ['a', 'b'];
     const proxied = new Proxy(valid, {
@@ -173,7 +235,7 @@ describe('readBoundedDenseArray', () => {
         return Reflect.get(target, prop, receiver);
       },
     });
-    expect(readBoundedDenseArray(proxied, 8)).toEqual({ array: ['a', 'b'], length: 2 });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
     expect(getTraps).toBe(0);
   });
 
@@ -203,15 +265,20 @@ describe('readBoundedDenseArray', () => {
     expect(readBoundedDenseArray(proxied, 8)).toBeNull();
   });
 
-  it('uses the validated descriptor value: a Proxy changing its descriptor between reads cannot spoof the copy', () => {
-    let indexReads = 0;
+  it('rejects a Proxy that spoofs a descriptor between reads outright: no get trap runs', () => {
+    let spoofAttempts = 0;
+    let getTraps = 0;
     const valid = ['a', 'b'];
     const proxied = new Proxy(valid, {
+      get(target, prop, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, prop, receiver);
+      },
       getOwnPropertyDescriptor(target, prop) {
         const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
         if (prop === '1' && descriptor !== undefined) {
-          indexReads += 1;
-          if (indexReads > 1) {
+          spoofAttempts += 1;
+          if (spoofAttempts > 1) {
             // Second request for the same index: change the answer.
             return { get() { return 'spoofed'; }, enumerable: true, configurable: true };
           }
@@ -219,8 +286,8 @@ describe('readBoundedDenseArray', () => {
         return descriptor;
       },
     });
-    const read = readBoundedDenseArray(proxied, 8);
-    expect(read).toEqual({ array: ['a', 'b'], length: 2 });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+    expect(getTraps).toBe(0);
   });
 
   it('is not a constant verdict: different inputs give different results', () => {
@@ -238,40 +305,5 @@ describe('readBoundedDenseArray', () => {
     expect(read?.array).not.toBe(input);
     input.push('c');
     expect(read?.array).toEqual(['a', 'b']);
-  });
-});
-
-describe('readOwnDataElement', () => {
-  it('reads an own enumerable data element through its descriptor', () => {
-    expect(readOwnDataElement(['a', 'b'], 1)).toBe('b');
-  });
-
-  it('returns undefined for a hole or a non-enumerable index without throwing', () => {
-    const sparse: unknown[] = [];
-    sparse[1] = 'b';
-    expect(readOwnDataElement(sparse, 0)).toBeUndefined();
-
-    const hidden: unknown[] = ['a', 'b'];
-    Object.defineProperty(hidden, 1, { value: 'b', enumerable: false, configurable: true, writable: true });
-    expect(readOwnDataElement(hidden, 1)).toBeUndefined();
-  });
-
-  it('never runs an accessor (the call counter stays 0)', () => {
-    let getterCalls = 0;
-    const value: unknown[] = ['a'];
-    Object.defineProperty(value, 0, {
-      get() {
-        getterCalls += 1;
-        return 'x';
-      },
-      enumerable: true,
-      configurable: true,
-    });
-    expect(readOwnDataElement(value, 0)).toBeUndefined();
-    expect(getterCalls).toBe(0);
-  });
-
-  it('never throws on a revoked Proxy', () => {
-    expect(readOwnDataElement(revokedProxy() as readonly unknown[], 0)).toBeUndefined();
   });
 });

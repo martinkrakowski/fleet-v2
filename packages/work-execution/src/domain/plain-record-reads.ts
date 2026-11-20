@@ -126,7 +126,13 @@ export interface BoundedDenseArray {
  * symbol and non-enumerable keys, followed by an `O(cap)` bound for the
  * per-index descriptor checks. There is no "linear in the capped input"
  * claim: the `O(K)` engine bound is the accepted cost of owning-keys
- * validation on every JavaScript engine.
+ * validation on every JavaScript engine. Every Proxy exotic object is
+ * rejected outright by a final `structuredClone` probe (exactly as
+ * `cutover-records.ts` probes its evidence document): a Proxy can answer
+ * every descriptor and key check consistently while lying, so the probe
+ * runs only after the walk has proved every own property a plain data
+ * value — it reads no getter — and a clone failure means a stand-in, never
+ * data. Uncloneable data values (functions, cycles) are refused as well.
  *
  * Returns the array's elements as a fresh dense copy when `value` is a
  * genuine `Array` (prototype exactly `Array.prototype`) whose own keys are
@@ -210,7 +216,7 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     } catch {
       return null;
     }
-    if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined) {
+    if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
       return null;
     }
     // Use the descriptor already validated above: a Proxy could answer a
@@ -219,28 +225,18 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     // enumerable data property.
     out.push(descriptor.value);
   }
-  return { array: out, length };
-}
-
-/**
- * Read `array[index]` through its own property descriptor only (no getter
- * ever runs), returning the element value; null-contract note: the caller
- * validates the descriptor, so this returns the descriptor's value when the
- * index is an enumerable own data property and `undefined` otherwise (the
- * hole/accessor/non-enumerable rejection happens in the caller's descriptor
- * check). O(1) per call; never throws.
- */
-export function readOwnDataElement(array: readonly unknown[], index: number): unknown {
-  let descriptor: PropertyDescriptor | undefined;
+  // Final gate, exactly as `cutover-records.ts` probes its evidence document:
+  // the walk above has proved every own property a plain enumerable data
+  // value, so the serializer probe reads no getter. A Proxy exotic object is
+  // refused by the serializer without running its `get` trap, so a consistent
+  // liar that answered every descriptor and key check as data is still
+  // rejected here; a clone failure means a stand-in, never data.
   try {
-    descriptor = Object.getOwnPropertyDescriptor(array, index);
+    structuredClone(value);
   } catch {
-    return undefined;
+    return null;
   }
-  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || descriptor.enumerable !== true) {
-    return undefined;
-  }
-  return descriptor.value;
+  return { array: out, length };
 }
 
 /**

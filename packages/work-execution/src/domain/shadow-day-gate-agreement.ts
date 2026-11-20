@@ -48,6 +48,8 @@ export type ShadowGateAgreementEvaluation = ShadowCriterionEvaluation & {
   readonly falsePasses: number;
   readonly stricterFails: number;
   readonly unsettled: number;
+  /** True only when the comparator's divergence list was truncated. */
+  readonly truncated: boolean;
 };
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -62,6 +64,7 @@ interface GateCounts {
   readonly falsePasses: number;
   readonly stricterFails: number;
   readonly unsettled: number;
+  readonly truncated: boolean;
 }
 
 interface CalendarDay {
@@ -101,9 +104,10 @@ const ZERO_COUNTS: GateCounts = Object.freeze({
   falsePasses: 0,
   stricterFails: 0,
   unsettled: 0,
+  truncated: false,
 });
 
-/** Cost: O(1). Copies the five counts onto a frozen result and returns it. */
+/** Cost: O(1). Copies the counts onto a frozen result and returns it. */
 function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateCounts): ShadowGateAgreementEvaluation {
   return Object.freeze({
     status,
@@ -113,6 +117,7 @@ function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateC
     falsePasses: counts.falsePasses,
     stricterFails: counts.stricterFails,
     unsettled: counts.unsettled,
+    truncated: counts.truncated,
   });
 }
 
@@ -404,20 +409,25 @@ function hasIncompleteDivergence(divergences: readonly ShadowDivergence[]): bool
   return false;
 }
 
-/** Cost: O(1). Agreeing is `compared` minus the tallied divergence kinds. */
-function countsFrom(compared: number, tallies: DivergenceTally, unsettled: number): GateCounts {
+/**
+ * Cost: O(1). When the comparison was truncated, `agreeing` is `0` — a
+ * truncated head is never counted as agreeing. Otherwise `agreeing` is
+ * `compared` minus the tallied divergence kinds.
+ */
+function countsFrom(compared: number, tallies: DivergenceTally, unsettled: number, truncated: boolean): GateCounts {
   return {
     compared,
-    agreeing: compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers,
+    agreeing: truncated ? 0 : compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers,
     falsePasses: tallies.falsePasses,
     stricterFails: tallies.stricterFails,
     unsettled,
+    truncated,
   };
 }
 
 /** Cost: O(1) once the tallies exist. False pass on D outranks the agreeing-head floor. */
 function decide(compared: number, tallies: DivergenceTally, unsettled: number): ShadowGateAgreementEvaluation {
-  const counts = countsFrom(compared, tallies, unsettled);
+  const counts = countsFrom(compared, tallies, unsettled, false);
   if (tallies.falsePassOnDay) {
     return evaluation('fail', 'gate-false-pass', counts);
   }
@@ -430,9 +440,11 @@ function decide(compared: number, tallies: DivergenceTally, unsettled: number): 
 /**
  * Cost: linear in the comparator's listed divergences. Truncation stays
  * fail-closed (`unknown/gate-comparison-incomplete`) and carries a fresh
- * result whose counts are what the comparator computed: `compared`, the
- * divergence tallies up to the cap, and the unsettled count. A listed code
- * that means the two sides were not the heads just built contributes no counts.
+ * result with `truncated: true`, `agreeing: 0` — a truncated head is never
+ * counted as agreeing — and counts that are what the comparator computed:
+ * `compared`, the lower-bound divergence tallies up to `SHADOW_DIVERGENCE_MAX`,
+ * and the unsettled count. A listed code that means the two sides were not
+ * the heads just built contributes no counts.
  */
 function verdictFromComparison(
   comparison: ShadowComparisonResult,
@@ -451,7 +463,7 @@ function verdictFromComparison(
     return evaluation(
       'unknown',
       'gate-comparison-incomplete',
-      countsFrom(comparison.compared, tallies, unsettled),
+      countsFrom(comparison.compared, tallies, unsettled, true),
     );
   }
   return decide(comparison.compared, tallies, unsettled);
@@ -517,7 +529,11 @@ function judgeShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation
  * Every value is taken from its own property descriptor, so no getter ever
  * runs and a Proxy stand-in either is refused or yields exactly the plain
  * data's verdict. Never throws. The result carries a status, a reason code
- * and counts only — never a head oid or any other input value.
+ * and counts only — never a head oid or any other input value. A result
+ * whose comparison was truncated carries `truncated: true` and `agreeing: 0`
+ * (truncated heads are never counted as agreeing) with lower-bound divergence
+ * counts up to `SHADOW_DIVERGENCE_MAX`; every non-truncated result and every
+ * refusal carries `truncated: false`.
  */
 export function evaluateShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation {
   try {

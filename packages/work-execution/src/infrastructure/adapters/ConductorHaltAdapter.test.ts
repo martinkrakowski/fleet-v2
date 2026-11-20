@@ -186,12 +186,14 @@ describe('ConductorHaltAdapter file shape, unreadable marker and file names', ()
     expect(await adapter.read()).toEqual({ state: 'halted', record: HALTED_RECORD });
   });
 
-  it('refuses file names that collide with another store or are unsafe', async () => {
-    const colliding = new ConductorHaltAdapter({ stateDir: tempDir, fileName: 'lane-runs.json' });
-    await expect(colliding.read()).rejects.toThrow(/collides with another store/);
+  it('refuses file names that collide with another store or are unsafe at construction', () => {
+    expect(() => new ConductorHaltAdapter({ stateDir: tempDir, fileName: 'lane-runs.json' })).toThrow(
+      /collides with another store/,
+    );
 
-    const escaping = new ConductorHaltAdapter({ stateDir: tempDir, fileName: '../x' });
-    await expect(escaping.read()).rejects.toThrow(/unsafe state file name/);
+    expect(() => new ConductorHaltAdapter({ stateDir: tempDir, fileName: '../x' })).toThrow(
+      /unsafe state file name/,
+    );
   });
 });
 

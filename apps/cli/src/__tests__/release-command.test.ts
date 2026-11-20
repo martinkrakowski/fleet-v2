@@ -630,6 +630,97 @@ describe('release command', () => {
     },
   );
 
+  it(
+    "CO14c-1 fix round 3: an absent daemon.cliPath with a checkable --root " +
+      "is the release-root-state-dir-unknown refusal, not a usage error",
+    async () => {
+      // The root exists on disk, so the root pre-check runs; but the
+      // installation records no `daemon.cliPath` at all, so no configured
+      // root can be resolved and the checkable root is refused with the
+      // unknown-state-dir reason before any usage decision.
+      const root = await mkdtemp(join(tmpdir(), 'co14c-noclipath-root-'));
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-noclipath-state-'));
+      const rt = createFleetCliRuntime({
+        stateDir,
+        installation: {
+          schemaVersion: 2,
+          forge: { mode: 'none' },
+          hosts: {},
+          daemon: {
+            nodePath: '/usr/bin/node',
+            stateDir,
+            unitDir: join(stateDir, 'units'),
+            installationFile: join(stateDir, 'fleet.json'),
+          },
+        } as never,
+      });
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    },
+  );
+
+  it(
+    "CO14c-1 fix round 3: a getter on daemon.cliPath with a checkable --root " +
+      "is refused without ever invoking the getter",
+    async () => {
+      // A `daemon.cliPath` defined as an own accessor is hostile input: the
+      // root pre-check must inspect own property descriptors only, see the
+      // getter, refuse, and never run the getter — a getter could observe or
+      // even change state. The counter proves it never ran.
+      const root = await mkdtemp(join(tmpdir(), 'co14c-getter-root-'));
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-getter-state-'));
+      const daemon: Record<string, unknown> = {
+        nodePath: '/usr/bin/node',
+        stateDir,
+        unitDir: join(stateDir, 'units'),
+        installationFile: join(stateDir, 'fleet.json'),
+      };
+      let getterCalls = 0;
+      Object.defineProperty(daemon, 'cliPath', {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return `${root}/current/apps/cli/dist/bin.js`;
+        },
+      });
+      const rt = createFleetCliRuntime({
+        stateDir,
+        installation: {
+          schemaVersion: 2,
+          forge: { mode: 'none' },
+          hosts: {},
+          daemon,
+        } as never,
+      });
+      // Runtime composition (SH19c) reads `daemon.cliPath` once by design to
+      // derive the record-day release root; that read is not the CO14c-1
+      // boundary. The guarantee under test is the release handler's root
+      // pre-check: `configuredReleaseRoot` inspects own property descriptors
+      // only and never runs the getter. The counter is reset after
+      // composition so the assertion below covers exactly the handler path.
+      getterCalls = 0;
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(getterCalls).toBe(0);
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    },
+  );
+
   it('install with a live driver lease is refused', async () => {
     const d = deps(LIVE_LEASE);
     expect(await manageReleaseFromPayload({ ...installPayload, apply: true, project: PROJECT }, d)).toEqual({

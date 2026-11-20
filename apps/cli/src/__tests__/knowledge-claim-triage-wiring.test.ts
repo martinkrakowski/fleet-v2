@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type {
   DecisionsSectionV2,
@@ -179,9 +179,12 @@ describe("CLI knowledge composition claim triage wiring", () => {
       },
     });
     expect((await capture(runtime)).outcome).toBe("captured");
-    await settle();
-    // One candidate, one batch, one reservation: exactly one request.
-    expect(fetch.calls).toHaveLength(1);
+    // The post-capture triage hook is started, not awaited: wait for the
+    // request deterministically instead of sleeping a fixed beat.
+    await vi.waitFor(() => {
+      // One candidate, one batch, one reservation: exactly one request.
+      expect(fetch.calls).toHaveLength(1);
+    });
     // The stub key reader saw exactly the configured keyFile path.
     expect(readKeys).toEqual([JEV_BASE.keyFile]);
     // The request was receipted in the same journal the ranking advice uses.

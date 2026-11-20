@@ -193,6 +193,22 @@ function collectSide(side: 'fleet' | 'shell', input: unknown, validate: ItemVali
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }
+  // The length itself was read through `getOwnPropertyDescriptor`, which on a
+  // Proxy is the hostile `getOwnPropertyDescriptor` trap (a plain array's
+  // `length` is non-configurable but writable, so the trap may report any
+  // value without breaking the engine's invariants). A reported length is
+  // therefore accepted only when the index descriptors the object itself
+  // exposes agree with it: a plain array owns exactly the indices below its
+  // length (holes included), so index `length - 1` must exist and index
+  // `length` must not. A proxy that reports length 0 over a one-item array
+  // still exposes index 0 here, and the list is refused instead of silently
+  // compared as empty.
+  const beyondEnd = Object.getOwnPropertyDescriptor(input, length);
+  const last = length > 0 ? Object.getOwnPropertyDescriptor(input, length - 1) : undefined;
+  if (beyondEnd !== undefined || (length > 0 && last === undefined)) {
+    divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
+    return [];
+  }
   const entries: ValidatedEntry[] = [];
   for (let index = 0; index < length; index += 1) {
     // Read through the own data descriptor only: an array hole, a prototype

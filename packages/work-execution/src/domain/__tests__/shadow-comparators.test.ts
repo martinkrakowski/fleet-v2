@@ -529,6 +529,42 @@ describe('shadow comparators', () => {
     });
   });
 
+  it('a Proxy whose getOwnPropertyDescriptor trap lies about length cannot hide its item from an empty shell list', () => {
+    // The descriptor trap reports a `length: 0` data descriptor while still
+    // exposing the real index descriptors: a length read through the hostile
+    // object's own descriptor is still a lie, so the reported length must be
+    // cross-checked against the index descriptors the object itself exposes.
+    const items = [{ pullRequest: 1, headOid: FIRST_HEAD }];
+    const proxy = new Proxy(items, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') return { value: 0, writable: true, enumerable: false, configurable: false }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.equal).toBe(false);
+    expect(result.fleetCount).toBe(0);
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+  });
+
+  it('a Proxy whose getOwnPropertyDescriptor trap inflates length is refused before traversal', () => {
+    const items = [{ pullRequest: 1, headOid: FIRST_HEAD }];
+    const proxy = new Proxy(items, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') return { value: 5, writable: true, enumerable: false, configurable: false }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: items });
+    expect(result.equal).toBe(false);
+    expect(result.fleetCount).toBe(0);
+    expect(result.divergences).toContainEqual({
+      key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null,
+    });
+  });
+
   it('a Proxy whose get trap would return a fake fleet list never runs the trap', () => {
     let calls = 0;
     const root = {};

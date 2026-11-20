@@ -77,6 +77,23 @@ function validated(entry: unknown): MergeQueueEntryRecord | null {
   return read.ok ? read.record : null;
 }
 
+/**
+ * Refuse a Proxy stand-in: the structured-clone serializer refuses any Proxy
+ * exotic object, while a transparent Proxy answers every descriptor read in
+ * the record reader exactly as its target would. A transparent cloneable-data
+ * entry is a fixed-shape record of primitive fields, so the probe reads no
+ * getter and costs a constant walk. Only called after `validated` accepted
+ * the entry, so no getter is ever reached by the probe.
+ */
+function isCloneableEntry(raw: unknown): boolean {
+  try {
+    structuredClone(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function next(entry: MergeQueueEntryRecord, changes: Partial<MergeQueueEntryRecord>): MergeEntryBuild {
   const read = readMergeQueueEntryRecord({ ...entry, ...changes, revision: entry.revision + 1 });
   return read.ok ? { ok: true, record: read.record } : { ok: false, reason: 'invalid-entry' };
@@ -158,6 +175,38 @@ export function buildParkedEntry(entry: unknown, input: ParkInput): MergeEntryBu
       attempt: input.nextAttempt,
       notBeforeIso: input.notBeforeIso,
     });
+  } catch {
+    return { ok: false, reason: 'invalid-entry' };
+  }
+}
+
+/**
+ * Release one shadow-parked entry back to `queued` at `cutover switch`
+ * (SH24a): the attempt history is preserved, the park reason and
+ * `notBeforeIso` are cleared, and the revision moves exactly one. An ordinary
+ * park only — a `veto-hold` never persists under shadow, so it is never
+ * released here. The entry is read through own data-property descriptors only
+ * (`readMergeQueueEntryRecord`), so a getter is never run, a Proxy stand-in
+ * fails the record shape, and sparse arrays, array-like objects and
+ * prototype-polluting keys are refused. Cost bound: linear in a constant —
+ * one validated read of the fixed-shape entry record and one rebuilt record.
+ */
+export function buildReleasedParkEntry(entry: unknown): MergeEntryBuild {
+  try {
+    const current = validated(entry);
+    if (current === null) {
+      return { ok: false, reason: 'invalid-entry' };
+    }
+    if (!isCloneableEntry(entry)) {
+      return { ok: false, reason: 'invalid-entry' };
+    }
+    if (terminal(current)) {
+      return { ok: false, reason: 'terminal-entry' };
+    }
+    if (current.state !== 'parked' || current.reason === null || current.reason === 'veto-hold') {
+      return { ok: false, reason: 'invalid-input' };
+    }
+    return next(current, { state: 'queued', reason: null, notBeforeIso: null });
   } catch {
     return { ok: false, reason: 'invalid-entry' };
   }

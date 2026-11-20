@@ -7,6 +7,7 @@ import {
   buildMergedEntry,
   buildParkedEntry,
   buildReadyEntry,
+  buildReleasedParkEntry,
   buildSupersession,
   buildVetoEntry,
   decideMergeTransition,
@@ -201,5 +202,119 @@ describe('decideMergeTransition', () => {
       expect(bad).toEqual({ outcome: 'refused', reason: 'invalid-successor' });
     }
     expect(decideMergeTransition([stored, entry({ entryId: id(2), pullRequest: 4, headOid: HEAD_2 })], command).outcome).toBe('refused'); // id collision
+  });
+});
+
+// SW2a1: the shadow-park release transition (SH24a). At `cutover switch` an
+// ordinary parked entry goes back to `queued`; a `veto-hold` never persists
+// under shadow and is never released.
+
+function parked(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEntryRecord {
+  return entry({ state: 'parked', reason: 'checks', attempt: 2, notBeforeIso: '2026-11-05T12:00:00.000Z', ...overrides });
+}
+
+/** A transparent proxy whose `get` trap is counted and never expected to run. */
+function getCounterProxy(target: MergeQueueEntryRecord): { value: unknown; gets: () => number } {
+  let count = 0;
+  const proxied = new Proxy(target, {
+    get(t, key, recv) {
+      count += 1;
+      return Reflect.get(t, key, recv);
+    },
+  });
+  return { value: proxied, gets: () => count };
+}
+
+/** `base` plus the polluting own keys `__proto__`, `constructor` and `prototype` (via JSON.parse). */
+function withPollutingKeys(base: MergeQueueEntryRecord): unknown {
+  const inner = JSON.stringify(base).slice(1, -1);
+  return JSON.parse(`{"__proto__":{},"constructor":1,"prototype":1,${inner}}`);
+}
+
+describe('buildReleasedParkEntry', () => {
+  it('releases a parked entry to queued, keeping attempt and clearing reason and notBefore', () => {
+    const built = buildReleasedParkEntry(parked());
+    expect(built).toMatchObject({
+      ok: true,
+      record: {
+        state: 'queued',
+        reason: null,
+        notBeforeIso: null,
+        attempt: 2,
+        entryId: parked().entryId,
+        headOid: HEAD,
+        revision: 2,
+      },
+    });
+  });
+
+  it('refuses a terminal entry as terminal-entry', () => {
+    expect(
+      buildReleasedParkEntry(parked({ state: 'merged', mergeCommitOid: MERGE_OID, mergedAtIso: '2026-11-01T10:00:00.000Z' })),
+    ).toEqual({ ok: false, reason: 'terminal-entry' });
+    expect(buildReleasedParkEntry(parked({ state: 'dropped', reason: 'closed' }))).toEqual({
+      ok: false,
+      reason: 'terminal-entry',
+    });
+    expect(buildReleasedParkEntry(parked({ state: 'superseded', reason: null, notBeforeIso: null }))).toEqual({
+      ok: false,
+      reason: 'terminal-entry',
+    });
+  });
+
+  it('refuses a non-parked entry or a veto-hold park as invalid-input', () => {
+    expect(buildReleasedParkEntry(entry())).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(buildReleasedParkEntry(entry({ state: 'ready' }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(buildReleasedParkEntry(parked({ reason: 'veto-hold' }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses malformed records as invalid-entry without throwing', () => {
+    const sparse: unknown[] = [];
+    sparse[3] = 'x';
+    for (const bad of [
+      null,
+      undefined,
+      7,
+      'x',
+      true,
+      { not: 'an entry' },
+      sparse,
+      { length: 1, 0: 'x' },
+      { length: 2 ** 32 - 1, 0: 'x' },
+      new Array(2 ** 32 - 1),
+      withPollutingKeys(parked()),
+    ]) {
+      expect(buildReleasedParkEntry(bad)).toEqual({ ok: false, reason: 'invalid-entry' });
+    }
+  });
+
+  it('refuses a getter on the entry without running it as invalid-entry', () => {
+    let count = 0;
+    const target = parked();
+    const copy = { ...target };
+    Object.defineProperty(copy, 'state', {
+      enumerable: true,
+      get() {
+        count += 1;
+        return target.state;
+      },
+    });
+    expect(buildReleasedParkEntry(copy)).toEqual({ ok: false, reason: 'invalid-entry' });
+    expect(count).toBe(0);
+  });
+
+  it('refuses a proxy entry with no get trap run as invalid-entry', () => {
+    const proxied = getCounterProxy(parked());
+    expect(buildReleasedParkEntry(proxied.value)).toEqual({ ok: false, reason: 'invalid-entry' });
+    expect(proxied.gets()).toBe(0);
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(buildReleasedParkEntry(parked({ reason: 'veto-hold' })).ok).toBe(false);
+    expect(buildReleasedParkEntry(null).ok).toBe(false);
+    // An identity echo (returning the entry) fails the shaped-success assertions.
+    expect(buildReleasedParkEntry(parked())).not.toEqual(parked());
+    expect(buildReleasedParkEntry(parked()).ok).toBe(true);
   });
 });

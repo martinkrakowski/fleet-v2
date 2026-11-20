@@ -78,7 +78,16 @@ const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'con
  * A class instance, a Map, or anything exotic is refused rather than probed.
  */
 function isPlainObject(value: unknown): value is Record<string, string> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  // A revoked Proxy throws on the internal [[IsArray]] probe, so the check
+  // sits inside try/catch like every other probe on untrusted input.
+  try {
+    if (Array.isArray(value)) {
+      return false;
+    }
+  } catch {
     return false;
   }
   try {
@@ -334,6 +343,12 @@ export function selectReviewerSeat(
 ): { ok: true; seat: ReviewTransportSeat } | { ok: false; reason: string; code: ReviewUnavailableCode } {
   if (typeof reviewerModel !== 'string') {
     return { ok: false, reason: 'Reviewer model must be a string', code: 'seat-none' };
+  }
+  // Every code unit costs at least one UTF-8 byte, so a string longer than the
+  // cap cannot fit under it: refuse before `trim` or any encoding scan touches
+  // an arbitrarily large string (bounded-input cost requirement).
+  if (reviewerModel.length > MAX_REVIEWER_MODEL_BYTES) {
+    return { ok: false, reason: 'Reviewer model must be a non-empty string within the length cap', code: 'seat-none' };
   }
   const model = reviewerModel.trim();
   if (model.length === 0 || new TextEncoder().encode(model).length > MAX_REVIEWER_MODEL_BYTES) {

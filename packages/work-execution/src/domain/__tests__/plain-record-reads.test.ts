@@ -177,6 +177,52 @@ describe('readBoundedDenseArray', () => {
     expect(getTraps).toBe(0);
   });
 
+  it('returns null when a Proxy descriptor trap throws for an index (never propagates)', () => {
+    const valid = ['a', 'b'];
+    const proxied = new Proxy(valid, {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === '0') {
+          throw new Error('hostile descriptor trap');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+  });
+
+  it('returns null when a Proxy descriptor trap throws during the per-index read', () => {
+    const valid = ['a', 'b'];
+    const proxied = new Proxy(valid, {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === '1') {
+          throw new Error('hostile descriptor trap');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+  });
+
+  it('uses the validated descriptor value: a Proxy changing its descriptor between reads cannot spoof the copy', () => {
+    let indexReads = 0;
+    const valid = ['a', 'b'];
+    const proxied = new Proxy(valid, {
+      getOwnPropertyDescriptor(target, prop) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+        if (prop === '1' && descriptor !== undefined) {
+          indexReads += 1;
+          if (indexReads > 1) {
+            // Second request for the same index: change the answer.
+            return { get() { return 'spoofed'; }, enumerable: true, configurable: true };
+          }
+        }
+        return descriptor;
+      },
+    });
+    const read = readBoundedDenseArray(proxied, 8);
+    expect(read).toEqual({ array: ['a', 'b'], length: 2 });
+  });
+
   it('is not a constant verdict: different inputs give different results', () => {
     const one = readBoundedDenseArray(['a'], 8);
     const two = readBoundedDenseArray(['a', 'b'], 8);

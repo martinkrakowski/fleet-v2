@@ -201,12 +201,23 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
   }
   const out: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
-    // O(cap) traversal bound: one descriptor check per canonical index.
-    const descriptor = Object.getOwnPropertyDescriptor(value as object, index);
+    // O(cap) traversal bound: one descriptor check per canonical index. The
+    // descriptor call is wrapped because a hostile Proxy trap may throw; the
+    // helper's contract is null rather than a propagated error.
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value as object, index);
+    } catch {
+      return null;
+    }
     if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined) {
       return null;
     }
-    out.push(readOwnDataElement(value as readonly unknown[], index));
+    // Use the descriptor already validated above: a Proxy could answer a
+    // second descriptor request with an accessor or an altered value, so the
+    // copy must come from the one this loop just proved to be a plain,
+    // enumerable data property.
+    out.push(descriptor.value);
   }
   return { array: out, length };
 }

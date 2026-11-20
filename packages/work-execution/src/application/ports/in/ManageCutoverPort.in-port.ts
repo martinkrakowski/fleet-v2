@@ -104,7 +104,9 @@ export type ManageCutoverRefusalReason =
   | 'shadow-criteria-failed'
   | 'unrecorded-lanes'
   | 'conductor-driver-live'
-  | 'inside-rollback-window';
+  | 'inside-rollback-window'
+  | 'retirement-ledger-absent'
+  | 'retirement-ledger-failed';
 
 export type ManageCutoverUnknownReason =
   | 'deadline-exceeded'
@@ -120,7 +122,9 @@ export type ManageCutoverUnknownReason =
   | 'cutover-record-write-failed'
   | 'shadow-evidence-unreadable'
   | 'shadow-evidence-unknown-version'
-  | 'unrecorded-lanes-unknown';
+  | 'unrecorded-lanes-unknown'
+  | 'retirement-ledger-unreadable'
+  | 'retirement-ledger-unknown-version';
 
 export type ManageCutoverResult =
   | ManageCutoverStatusResult

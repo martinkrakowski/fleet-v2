@@ -17,11 +17,13 @@ import {
   canonicalCutoverRollbackPayload,
   canonicalCutoverSwitchPayload,
   checkCutoverJournalCapacity,
+  checkCutoverJournalReplayCapacity,
   cutoverJournalKey,
   cutoverShadowParkKey,
   isWithinCutoverRollbackWindow,
   readCutoverRecord,
   readCutoverShadowEvidence,
+  readCutoverShadowParkPayload,
   readCutoverShadowParkRecord,
   readRetirementLedger,
 } from '../cutover-records.js';
@@ -1178,10 +1180,11 @@ describe('buildShadowParkJournalPayload', () => {
     expect(entry.gets()).toBe(0);
   });
 
-  it('refuses a recording Proxy as invalid-park-entry without running its get trap', () => {
+  it('refuses a recording Proxy as invalid-park-entry, asserting only that its get trap never ran', () => {
     // The shape/descriptor validation runs first; the structured-clone probe
-    // then refuses the Proxy observing no trap of any kind — in particular
-    // the `get` trap never runs, so no value can be read through the Proxy.
+    // then refuses the Proxy (full trap-free refusal arrives with the shared
+    // snapshotPlainData (PX1) adoption) — the assertions below check exactly
+    // that no `get` trap ran, so no value can be read through the Proxy.
     const proxy = recordingProxy(parkedEntry());
     expect(buildShadowParkJournalPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
     expect(proxy.calls()).not.toContain('get');
@@ -1337,10 +1340,11 @@ describe('readCutoverShadowParkRecord', () => {
     expect(record.gets()).toBe(0);
   });
 
-  it('refuses a recording Proxy as invalid-park-record without running its get trap', () => {
+  it('refuses a recording Proxy as invalid-park-record, asserting only that its get trap never ran', () => {
     // The shape/descriptor validation runs first; the structured-clone probe
-    // then refuses the Proxy observing no trap of any kind — in particular
-    // the `get` trap never runs, so no value can be read through the Proxy.
+    // then refuses the Proxy (full trap-free refusal arrives with the shared
+    // snapshotPlainData (PX1) adoption) — the assertions below check exactly
+    // that no `get` trap ran, so no value can be read through the Proxy.
     const proxy = recordingProxy(parkRecord());
     expect(readCutoverShadowParkRecord(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
     expect(proxy.calls()).not.toContain('get');
@@ -1410,5 +1414,138 @@ describe('checkCutoverJournalCapacity', () => {
     // An identity echo (returning the inputs) fails the shaped-success assertions.
     expect(checkCutoverJournalCapacity(0, 0)).not.toEqual(0);
     expect(checkCutoverJournalCapacity(0, 0)).toEqual({ ok: true });
+  });
+});
+
+describe('readCutoverShadowParkPayload (stored-payload round trip)', () => {
+  it('reads back the canonical payload a park wrote, record and revision intact', () => {
+    // The hostile case itself: the exact bytes the journal would store.
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    const stored = JSON.parse(built.canonicalPayload) as unknown;
+    const read = readCutoverShadowParkPayload(stored);
+    expect(read).toEqual({
+      ok: true,
+      record: built.record,
+      revision: 3,
+    });
+  });
+
+  it('refuses the 8-key payload with the 7-key record reader (documented)', () => {
+    // The finding this reader fixes: the stored payload carries `revision`,
+    // so the 7-key record reader must keep refusing it.
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    expect(readCutoverShadowParkRecord(JSON.parse(built.canonicalPayload) as unknown)).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses a malformed revision or a missing key as invalid-park-record without throwing', () => {
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    for (const bad of [
+      { ...built.record, revision: -1 },
+      { ...built.record, revision: 1.5 },
+      { ...built.record, revision: '3' },
+      built.record,
+    ]) {
+      expect(readCutoverShadowParkPayload(bad)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+  });
+
+  it('refuses hostile shapes as invalid-park-record without throwing', () => {
+    for (const bad of hostileShapes()) {
+      expect(readCutoverShadowParkPayload(bad)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+  });
+
+  it('refuses a recording Proxy as invalid-park-record, asserting only that its get trap never ran', () => {
+    const proxy = recordingProxy({ ...parkRecord(), revision: 3 });
+    expect(readCutoverShadowParkPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(proxy.calls()).not.toContain('get');
+  });
+});
+
+describe('checkCutoverJournalReplayCapacity', () => {
+  const keys = (digests: readonly string[], revision: number): string[] =>
+    digests.map((digest) => (cutoverShadowParkKey(digest, revision) as { key: string }).key);
+
+  it('counts only parks not already present in the journal, by journal key', () => {
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)], 1);
+    const journaled = keys(['a'.repeat(32)], 1);
+    expect(checkCutoverJournalReplayCapacity(9990, pending, journaled)).toEqual({
+      ok: true,
+      parkCount: 2,
+    });
+  });
+
+  it('a replay of the same pass does not exceed capacity: every park already journaled answers ok at a full journal', () => {
+    // The journal is already at its cap: a fresh park of ANY of these would
+    // exceed it, but the replay re-presents parks its earlier pass already
+    // journaled, so none counts and the verdict stays `ok` — the same pass
+    // re-run never exceeds capacity.
+    const full = MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE;
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32)], 7);
+    expect(checkCutoverJournalCapacity(full, 1)).toEqual({ ok: false, reason: 'journal-capacity-exceeded' });
+    expect(checkCutoverJournalReplayCapacity(full, pending, pending)).toEqual({ ok: true, parkCount: 0 });
+  });
+
+  it('still refuses capacity when an un-journaled park would exceed the journal', () => {
+    const full = MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE;
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32)], 7);
+    const journaled = keys(['a'.repeat(32)], 7);
+    expect(checkCutoverJournalReplayCapacity(full, pending, journaled)).toEqual({
+      ok: false,
+      reason: 'journal-capacity-exceeded',
+    });
+  });
+
+  it('refuses hostile inputs as invalid-capacity-input without throwing', () => {
+    const good = keys(['a'.repeat(32)], 1);
+    for (const bad of [
+      null,
+      undefined,
+      'cutover/shadow-park-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1',
+      { length: 1, 0: good[0] },
+      new Proxy([good[0]], {}),
+      [good[0], good[0]],
+      ['not-a-key'],
+      [`cutover/shadow-park-${'a'.repeat(32)}@0`],
+      [`cutover/shadow-park-${'a'.repeat(32)}@${1_000_000_001}`],
+      [7],
+    ]) {
+      expect(checkCutoverJournalReplayCapacity(0, bad, [])).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+      // A duplicate journaled key is harmless (the journal holds a key once,
+      // so the Set dedupes it): only the pending list must be duplicate-free.
+      const duplicated = Array.isArray(bad) && bad.length === 2 && bad[0] === bad[1];
+      if (!duplicated) {
+        expect(checkCutoverJournalReplayCapacity(0, [], bad)).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+      }
+    }
+  });
+
+  it('refuses a pending list longer than the journal as invalid-capacity-input', () => {
+    const digest = 'a'.repeat(32);
+    const tooMany = Array.from({ length: MAX_CUTOVER_JOURNAL_ENTRIES + 1 }, (_, i) =>
+      (cutoverShadowParkKey(digest, i + 1) as { key: string }).key);
+    expect(checkCutoverJournalReplayCapacity(0, tooMany, [])).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    const pending = keys(['a'.repeat(32)], 1);
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(checkCutoverJournalReplayCapacity(NaN, pending, []).ok).toBe(false);
+    expect(checkCutoverJournalReplayCapacity(0, ['junk'], []).ok).toBe(false);
+    // An identity echo (returning the inputs) fails the shaped-success assertions.
+    expect(checkCutoverJournalReplayCapacity(0, pending, [])).toEqual({ ok: true, parkCount: 1 });
+    expect(checkCutoverJournalReplayCapacity(0, pending, pending)).toEqual({ ok: true, parkCount: 0 });
   });
 });

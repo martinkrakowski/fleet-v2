@@ -218,7 +218,7 @@ describe('round-trip', () => {
     expect(result).toEqual({
       ok: false,
       reason: 'malformed',
-      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+      error: 'MergeQueueEntry exceeds its schema key count',
     });
   });
 });
@@ -328,7 +328,7 @@ describe('malformed refusals', () => {
   });
 
   it('refuses an extra key and a missing key', () => {
-    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry must have exactly the v1 entry keys');
+    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry exceeds its schema key count');
     const missingState = rawEntry();
     delete missingState.state;
     expectMalformed(missingState, 'MergeQueueEntry must have exactly the v1 entry keys');
@@ -390,10 +390,12 @@ describe('hostile inputs', () => {
     const input = makeEntry();
     Object.defineProperty(input, '__proto__', { value: 'polluted', enumerable: true, configurable: true });
     const result = readMergeQueueEntryRecord(input);
+    // The own `__proto__` key is an extra own key, so the bounded key-count
+    // refusal answers it with its own distinct message.
     expect(result).toEqual({
       ok: false,
       reason: 'malformed',
-      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+      error: 'MergeQueueEntry exceeds its schema key count',
     });
   });
 
@@ -760,7 +762,9 @@ describe('hostile-input bounds', () => {
     }
     // Every expected key is present and valid, so the only possible refusal
     // cause is the own-key count — checked before any descriptor or value read.
-    expectMalformed(hostile, 'MergeQueueEntry must have exactly the v1 entry keys');
+    // The key-count refusal has its own distinct message; asserting it (and
+    // not a shared message) proves this bound check fired.
+    expectMalformed(hostile, 'MergeQueueEntry exceeds its schema key count');
   });
 
   it('refuses a nested repository record with 10,000 extra keys at the key-count check', () => {
@@ -768,7 +772,8 @@ describe('hostile-input bounds', () => {
     for (let i = 0; i < 10_000; i += 1) {
       repository[`extra-${i}`] = i;
     }
-    // owner and repo are valid segments, so this refusal is the key count.
-    expectMalformed(rawEntry({ repository }), 'MergeQueueEntry repository must have valid owner and repo');
+    // owner and repo are valid segments, so this refusal is the key count —
+    // its own distinct message, not the shared owner/repo refusal.
+    expectMalformed(rawEntry({ repository }), 'MergeQueueEntry repository exceeds its schema key count');
   });
 });

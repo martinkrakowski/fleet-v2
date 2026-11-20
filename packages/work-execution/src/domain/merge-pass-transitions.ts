@@ -79,7 +79,9 @@ function validated(entry: unknown): MergeQueueEntryRecord | null {
 
 /**
  * Refuse a Proxy stand-in: the structured-clone serializer refuses any Proxy
- * exotic object — root or nested — observing no trap of any kind. Called
+ * exotic object — root or nested — the clone probe rejects the Proxy itself
+ * (full trap-free refusal arrives with the shared snapshotPlainData (PX1)
+ * adoption). Called
  * only AFTER `readMergeQueueEntryRecord`'s descriptor walk has proved the
  * raw entry plain and bounded: every accessor is refused from its own
  * descriptor (so the probe reads no getter), and arrays, sparse arrays,
@@ -194,8 +196,9 @@ export function buildParkedEntry(entry: unknown, input: ParkInput): MergeEntryBu
  * never invoked (its call count stays 0) and no unbounded input is ever
  * materialized. Only after that walk has proved the entry plain and bounded
  * does the structured-clone probe run (`isCloneableEntry`), refusing a
- * supplied root or nested Proxy as a stand-in while the serializer observes
- * no trap of any kind. Cost bound: linear in a constant — one validated read
+ * supplied root or nested Proxy as a stand-in while the clone probe rejects
+ * the Proxy itself (full trap-free refusal arrives with the shared
+ * snapshotPlainData (PX1) adoption). Cost bound: linear in a constant — one validated read
  * of the fixed-shape entry record and one rebuilt record.
  */
 export function buildReleasedParkEntry(entry: unknown): MergeEntryBuild {
@@ -205,8 +208,10 @@ export function buildReleasedParkEntry(entry: unknown): MergeEntryBuild {
       return { ok: false, reason: 'invalid-entry' };
     }
     // Probe second: after the descriptor walk proved the entry plain and
-    // bounded, the serializer refuses a Proxy stand-in observing no trap,
-    // and reads no getter (accessors were refused from their descriptors).
+    // bounded, the structured-clone probe refuses a Proxy stand-in (its
+    // serializer rejects the Proxy before reading through it), and reads no
+    // getter (accessors were refused from their descriptors). Full trap-free
+    // refusal arrives with the shared snapshotPlainData (PX1) adoption.
     if (!isCloneableEntry(entry)) {
       return { ok: false, reason: 'invalid-entry' };
     }

@@ -329,10 +329,11 @@ describe('buildReleasedParkEntry', () => {
     expect(proxied.gets()).toBe(0);
   });
 
-  it('refuses a recording Proxy as invalid-entry without running its get trap', () => {
+  it('refuses a recording Proxy as invalid-entry, asserting only that its get trap never ran', () => {
     // The shape/descriptor validation runs first; the structured-clone probe
-    // then refuses the Proxy observing no trap of any kind — in particular
-    // the `get` trap never runs, so no value can be read through the Proxy.
+    // then refuses the Proxy (full trap-free refusal arrives with the shared
+    // snapshotPlainData (PX1) adoption) — the assertions below check exactly
+    // that no `get` trap ran, so no value can be read through the Proxy.
     const calls: string[] = [];
     const traps = [
       'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',

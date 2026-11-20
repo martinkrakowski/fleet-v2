@@ -124,6 +124,22 @@ function normalizeLimits(
   if (!notProxy) {
     return { ok: false };
   }
+  // Every reflection operation below (`Array.isArray`, the prototype read,
+  // `Reflect.ownKeys`, the descriptor reads) can itself throw on a hostile
+  // value — a revoked Proxy, for instance, may return `false` from the
+  // detector yet throw on any other operation. Such a failure is malformed
+  // input, so it must surface as `invalid-limits`, never escape to the outer
+  // catch and become `hostile`.
+  try {
+    return normalizeTrustedLimits(limits);
+  } catch {
+    return { ok: false };
+  }
+}
+
+function normalizeTrustedLimits(
+  limits: unknown,
+): { ok: true; limits: PlainDataLimits } | { ok: false } {
   if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) {
     return { ok: false };
   }

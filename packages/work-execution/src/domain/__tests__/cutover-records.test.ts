@@ -785,6 +785,21 @@ describe('readRetirementLedger', () => {
     expect(calls.filter((trap) => trap === 'get')).toEqual([]);
   });
 
+  it('refuses a Proxy standing in for the rows array itself, without firing its get trap', () => {
+    // The hostile case itself: rows is a Proxy over a valid array, and its get
+    // trap is hostile code. Every earlier check must settle without it —
+    // `length` is only ever taken from a getOwnPropertyDescriptor read.
+    const gets: Array<PropertyKey> = [];
+    const proxy = new Proxy(verifiedRows() as unknown[], {
+      get(_target, key, receiver) {
+        gets.push(key);
+        return Reflect.get(_target, key, receiver);
+      },
+    });
+    expect(readRetirementLedger(ledger({ rows: proxy }))).toEqual(RETIREMENT_INVALID);
+    expect(gets).toEqual([]);
+  });
+
   it('refuses a prototype-polluting own key produced by JSON.parse as invalid-ledger', () => {
     const rows = JSON.stringify(verifiedRows());
     for (const key of ['__proto__', 'constructor', 'prototype']) {

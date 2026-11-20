@@ -588,30 +588,46 @@ function isBoundedLedgerText(value: unknown): value is string {
 }
 
 /**
- * A real, dense, bounded array whose own keys are exactly its indices and
- * `length`: a hole, an extra property, a symbol key or an enormous `length`
- * is refused without any traversal of the elements.
+ * The length of a real, dense, bounded array whose own keys are exactly its
+ * indices and `length`, else null: a hole, an extra property, a symbol key or
+ * an enormous `length` is refused without any traversal of the elements.
+ *
+ * The length is taken from the own `length` data descriptor, never read
+ * through the array itself: a Proxy standing in for the array answers a
+ * `length` read through its `get` trap — hostile code — while a
+ * descriptor read fires no `get`. The returned length is proved, so the
+ * caller never indexes the array (`[i]` is a `get`) either; elements are
+ * taken from their own descriptors.
  */
-function isBoundedRowArray(rows: unknown): rows is readonly unknown[] {
+function boundedRowArrayLength(rows: unknown): number | null {
   if (!Array.isArray(rows) || Object.getPrototypeOf(rows) !== Array.prototype) {
-    return false;
+    return null;
   }
-  if (rows.length > RETIREMENT_LEDGER_MAX_ROWS) {
-    return false;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(rows, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    'get' in lengthDescriptor ||
+    'set' in lengthDescriptor
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length > RETIREMENT_LEDGER_MAX_ROWS) {
+    return null;
   }
   const ownKeys = Reflect.ownKeys(rows);
-  if (ownKeys.length !== rows.length + 1) {
-    return false;
+  if (ownKeys.length !== length + 1) {
+    return null;
   }
   for (const key of ownKeys) {
     if (key === 'length') {
       continue;
     }
-    if (typeof key !== 'string' || !/^\d+$/.test(key) || Number(key) >= rows.length) {
-      return false;
+    if (typeof key !== 'string' || !/^\d+$/.test(key) || Number(key) >= length) {
+      return null;
     }
   }
-  return true;
+  return length;
 }
 
 /**
@@ -643,19 +659,23 @@ export function readRetirementLedger(raw: unknown): RetirementLedgerRead {
     if (snapshot === null) {
       return INVALID_LEDGER;
     }
-    if (!isBoundedRowArray(snapshot.rows)) {
+    // The row count is proved by `boundedRowArrayLength`; the array itself is
+    // never indexed or probed for `length` again, so a Proxy stand-in that
+    // reaches here still fires no `get` before the final cloneability refusal.
+    const rowCount = boundedRowArrayLength(snapshot.rows);
+    if (rowCount === null) {
       return INVALID_LEDGER;
     }
-    if (snapshot.rows.length === 0) {
+    if (rowCount === 0) {
       return { ok: false, reason: 'empty-ledger' };
     }
-    if (snapshot.rows.length !== CUTOVER_RETIREMENT_SCRIPTS.length) {
+    if (rowCount !== CUTOVER_RETIREMENT_SCRIPTS.length) {
       return INVALID_LEDGER;
     }
     const pinned: ReadonlySet<string> = new Set<string>(CUTOVER_RETIREMENT_SCRIPTS);
     const seen = new Set<string>();
     const rows: RetirementLedgerRow[] = [];
-    for (let index = 0; index < snapshot.rows.length; index += 1) {
+    for (let index = 0; index < rowCount; index += 1) {
       // Own data-property descriptors only: a getter at any index is never read,
       // so it can never run, and the element is taken from the descriptor value.
       const descriptor = Object.getOwnPropertyDescriptor(snapshot.rows, index);

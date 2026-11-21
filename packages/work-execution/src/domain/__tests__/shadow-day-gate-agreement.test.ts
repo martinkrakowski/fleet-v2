@@ -393,6 +393,33 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     expect(evaluateShadowGateAgreement(gateInput(enormous))).toEqual(INVALID);
   });
 
+  it('a symbol own key on the heads list is unknown/invalid-input', () => {
+    const heads: unknown[] = agreeing(1);
+    Object.defineProperty(heads, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+  });
+
+  it('a non-enumerable extra own key on the heads list is unknown/invalid-input', () => {
+    const heads: unknown[] = agreeing(1);
+    Object.defineProperty(heads, 'extra', { value: 1, enumerable: false, configurable: true, writable: true });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+  });
+
+  it('a list-level accessor element refuses the heads list (unknown/invalid-input)', () => {
+    const heads: unknown[] = agreeing(1);
+    let accessorCalls = 0;
+    Object.defineProperty(heads, 0, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return head(1);
+      },
+    });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+    expect(accessorCalls).toBe(0);
+  });
+
   it('a getter on the root never runs', () => {
     let calls = 0;
     const root: Record<string, unknown> = {};

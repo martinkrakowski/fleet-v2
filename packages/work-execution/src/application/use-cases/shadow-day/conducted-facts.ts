@@ -37,6 +37,7 @@ import {
 } from '../../../domain/shadow-day-conformance.js';
 import { isZonedIsoDateTime } from '../../../domain/conductor-halt.js';
 import { readExactPlainRecord } from '../../../domain/plain-record-reads.js';
+import { readBoundedDenseArray } from '../../../domain/shadow-evidence-ledger.js';
 
 /**
  * Cap on the request's merged pull-request list. An over-cap list is refused
@@ -120,8 +121,6 @@ const REQUEST_KEYS: readonly string[] = ['mergedPullRequests', 'deadlineIso'];
 /** A 40-hex commit id; anything else never resolves a run's head. */
 const HEAD_HEX_40_PATTERN = /^[0-9a-f]{40}$/;
 
-const MAX_ARRAY_LENGTH = 2 ** 32 - 1;
-
 const refused = (reason: ShadowConformanceRunsUnknown): ShadowConformanceRunsRead => ({
   status: 'unknown',
   reason,
@@ -183,16 +182,13 @@ export function isPastDeadline(nowIso: () => string, deadlineIso: string): boole
 }
 
 /**
- * One merged pull-request id read through its own data-property descriptor.
- * Cost: O(1). A missing slot, an accessor, or anything that is not a safe
- * integer of at least 1 is refused.
+ * One merged pull-request id read from the validated dense copy
+ * (`readBoundedDenseArray` returned a fresh array whose elements were read
+ * through their own data-property descriptors, so no getter ever ran). Cost:
+ * `O(1)`. Anything that is not a safe integer of at least 1 is refused.
  */
 function readPullRequestId(items: readonly unknown[], index: number): number | null {
-  const descriptor = Object.getOwnPropertyDescriptor(items, index);
-  if (descriptor === undefined || descriptor.get !== undefined) {
-    return null;
-  }
-  const value = descriptor.value;
+  const value = items[index];
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
     return null;
   }
@@ -200,35 +196,15 @@ function readPullRequestId(items: readonly unknown[], index: number): number | n
 }
 
 /**
- * Every own key is `length` or a canonical array index inside `length`: the
- * key's `String(Number(k))` form, a safe integer, below `length`. Anything
- * else — a symbol, a named key, a non-canonical digit string such as `"01"`,
- * an index beyond `length` — is refused.
- * Cost: linear in the array's own-key count (capped by the caller).
- */
-function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key === 'symbol') {
-      return false;
-    }
-    if (key === 'length') {
-      continue;
-    }
-    const asNumber = Number(key);
-    if (!Number.isSafeInteger(asNumber) || String(asNumber) !== key || asNumber < 0 || asNumber >= length) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
- * The merged pull-request id set. Cost: linear in the capped list; the caps
- * (`SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS`, `MAX_ARRAY_LENGTH`) are named
- * constants. A real, dense array is required: a wrong primitive, a
- * non-iterable object, an array-like, a hole, an accessor, an over-cap
- * length or a foreign own key is refused before any traversal. `null` reads
- * as "not a merged pull-request list" — the caller refuses the request.
+ * The merged pull-request id set. Cost: an `O(1)` length/prototype pre-gate,
+ * then the accepted `O(K)` engine bound of `Reflect.ownKeys` (where `K` is
+ * the target's own-property count), then `O(cap)` element traversal with cap
+ * `SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS` — a named constant. A real, dense
+ * array of `Array.prototype` is required: a wrong primitive, a non-iterable
+ * object, an array-like, a subclassed array, a hole, an accessor, a
+ * non-enumerable index, an over-cap length, a symbol or foreign own key is
+ * refused before any traversal. `null` reads as "not a merged
+ * pull-request list" — the caller refuses the request.
  */
 export function readMergedPullRequestIds(value: unknown): ReadonlySet<number> | null {
   // A hostile container (e.g. a Proxy whose `ownKeys` or `getOwnPropertyDescriptor`
@@ -243,27 +219,13 @@ export function readMergedPullRequestIds(value: unknown): ReadonlySet<number> | 
 }
 
 function readMergedPullRequestIdsOrThrow(value: unknown): ReadonlySet<number> | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number'
-  ) {
-    return null;
-  }
-  const length = lengthDescriptor.value;
-  if (length >= MAX_ARRAY_LENGTH || length > SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS) {
-    return null;
-  }
-  if (!ownKeysAreIndices(value, length)) {
+  const read = readBoundedDenseArray(value, SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS);
+  if (read === null) {
     return null;
   }
   const ids = new Set<number>();
-  for (let index = 0; index < length; index += 1) {
-    const id = readPullRequestId(value, index);
+  for (let index = 0; index < read.length; index += 1) {
+    const id = readPullRequestId(read.array, index);
     if (id === null) {
       return null;
     }
@@ -279,17 +241,20 @@ export type LaneRunWarnCountRead =
 
 /**
  * RC1: the pure early-warning count read behind `cutover shadow record-day`.
- * It validates the raw lane-run array as a real, dense data array — a wrong
- * primitive, a non-iterable object, an array-like, a hole, an accessor, a
- * foreign own key (including prototype-polluting names), an over-cap length
- * or a hostile container is refused — and reports the store's run count with
- * the early-warning verdict.
+ * It validates the raw lane-run array as a real, dense data array of
+ * `Array.prototype` — a wrong primitive, a non-iterable object, an
+ * array-like, a subclassed array, a hole, an accessor, a non-enumerable
+ * index, a foreign own key (including prototype-polluting names and symbol
+ * keys), an over-cap length or a hostile container is refused — and reports
+ * the store's run count with the early-warning verdict.
  *
- * Cost: linear in the capped input; the caps (`SHADOW_FACTS_WARN_MAX_SCAN`,
- * `MAX_ARRAY_LENGTH`) are named constants. Every failure path is fail-closed:
- * the typed `{ status: 'unknown', reason: 'runs-unreadable' }` refusal, never
- * a throw — a throwing `Proxy` trap reads as an unreadable source. Getters
- * are never invoked: descriptors are inspected, not evaluated.
+ * Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)` engine
+ * bound of `Reflect.ownKeys` (where `K` is the target's own-property count),
+ * then `O(cap)` element traversal with cap `SHADOW_FACTS_WARN_MAX_SCAN` — a
+ * named constant. Every failure path is fail-closed: the typed
+ * `{ status: 'unknown', reason: 'runs-unreadable' }` refusal, never a throw
+ * — a throwing `Proxy` trap reads as an unreadable source. Getters are never
+ * invoked: descriptors are inspected, not evaluated.
  */
 export function checkLaneRunWarnCount(value: unknown): LaneRunWarnCountRead {
   try {
@@ -300,45 +265,11 @@ export function checkLaneRunWarnCount(value: unknown): LaneRunWarnCountRead {
 }
 
 function checkLaneRunWarnCountOrThrow(value: unknown): LaneRunWarnCountRead {
-  if (!Array.isArray(value)) {
+  const read = readBoundedDenseArray(value, SHADOW_FACTS_WARN_MAX_SCAN);
+  if (read === null) {
     return { status: 'unknown', reason: 'runs-unreadable' };
   }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number'
-  ) {
-    return { status: 'unknown', reason: 'runs-unreadable' };
-  }
-  const length = lengthDescriptor.value;
-  if (
-    !Number.isSafeInteger(length) ||
-    length < 0 ||
-    length >= MAX_ARRAY_LENGTH ||
-    length > SHADOW_FACTS_WARN_MAX_SCAN
-  ) {
-    return { status: 'unknown', reason: 'runs-unreadable' };
-  }
-  if (!ownKeysAreIndices(value, length)) {
-    return { status: 'unknown', reason: 'runs-unreadable' };
-  }
-  // Descriptors are read, never invoked: a hole (no descriptor) or an
-  // accessor — a getter or a setter-only slot, which has no `get` — is
-  // refused without evaluating any element. A data descriptor (`value`, no
-  // accessor pair) is required.
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (
-      descriptor === undefined ||
-      !('value' in descriptor) ||
-      descriptor.get !== undefined ||
-      descriptor.set !== undefined
-    ) {
-      return { status: 'unknown', reason: 'runs-unreadable' };
-    }
-  }
-  return { status: 'ok', count: length, warn: length > SHADOW_FACTS_WARN_RUNS };
+  return { status: 'ok', count: read.length, warn: read.length > SHADOW_FACTS_WARN_RUNS };
 }
 
 /** The candidate runs: every run whose `prNumber` is in the merged set. Cost: O(runs). */

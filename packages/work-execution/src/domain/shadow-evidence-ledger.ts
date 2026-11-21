@@ -18,6 +18,131 @@ import {
 } from './record-schema-version.js';
 
 export const SHADOW_LEDGER_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+
+/** A dense array of own enumerable data elements, with its true length. */
+export interface BoundedDenseArray {
+  readonly array: readonly unknown[];
+  readonly length: number;
+}
+
+/**
+ * The shared bounded dense-array reader, hosted in this lane-owned file: the
+ * canonical home for it is `plain-record-reads.ts` (supplied by BL06a), which
+ * is outside this brief's OWNED file list, so this lane may not carry the
+ * addition there. The body is the agreed descriptor-copy form without a
+ * serializer probe: `structuredClone` reads the getters of nested objects, so
+ * a probe would break the "a getter on an item never runs" contract every
+ * consumer below owns.
+ *
+ * Cost policy (decided, BL06a): ECMAScript `[[OwnPropertyKeys]]` has no
+ * count-only primitive, so this helper applies an `O(1)` pre-gate on length
+ * and prototype (invalid `cap`, non-array, wrong prototype, and every
+ * forbidden `length` are refused before any key enumeration), then pays an
+ * accepted engine-level `O(K)` bound in the target's own-property count `K`
+ * for the single `Reflect.ownKeys` call needed to reject foreign named,
+ * symbol and non-enumerable keys, followed by an `O(cap)` bound for the
+ * per-index descriptor checks. There is no "linear in the capped input"
+ * claim: the `O(K)` engine bound is the accepted cost of owning-keys
+ * validation on every JavaScript engine.
+ *
+ * Returns the array's elements as a fresh dense copy when `value` is a
+ * genuine `Array` (prototype exactly `Array.prototype`) whose own keys are
+ * exactly the canonical dense indices `0..length-1` plus a plain data
+ * `length`, with `length` a non-negative safe integer `<= cap`; null
+ * otherwise. A missing, accessor, non-number, non-safe-integer, negative,
+ * `>= 2**32 - 1`, or `> cap` length is refused in `O(1)` before any key
+ * enumeration, so a revoked Proxy that throws there never reaches
+ * `Reflect.ownKeys`. Holes, accessors, non-enumerable indices, symbol keys,
+ * and extra named or non-canonical own keys (including `__proto__`,
+ * `constructor`, `prototype`, `"01"`) return null without ever invoking a
+ * getter or a Proxy `get` trap. Every failure, including a revoked Proxy
+ * throwing anywhere along the path, returns null and never throws. Because
+ * the copy is built only from the descriptor answers the target's own
+ * reflection gives, a Proxy stand-in is either refused or yields exactly
+ * the result the plain data its reflection reports would give: no `get`
+ * trap is ever consulted, so a lying `get` trap cannot shorten the walk.
+ */
+export function readBoundedDenseArray(value: unknown, cap: number): BoundedDenseArray | null {
+  if (!Number.isSafeInteger(cap) || cap < 0) {
+    return null;
+  }
+  let isArray: boolean;
+  let prototype: unknown;
+  let lengthDescriptor: PropertyDescriptor | undefined;
+  try {
+    isArray = Array.isArray(value);
+    prototype = isArray ? Object.getPrototypeOf(value) : undefined;
+    lengthDescriptor = isArray ? Object.getOwnPropertyDescriptor(value, 'length') : undefined;
+  } catch {
+    return null;
+  }
+  // O(1) gate: refuse everything a property descriptor can decide before any
+  // key enumeration runs.
+  if (
+    !isArray ||
+    prototype !== Array.prototype ||
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number'
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length >= 2 ** 32 - 1 || length > cap) {
+    return null;
+  }
+  let ownKeys: PropertyKey[];
+  try {
+    // Accepted O(K) engine bound: `[[OwnPropertyKeys]]` materializes all K
+    // own keys; no count-only primitive exists on any engine.
+    ownKeys = Reflect.ownKeys(value as object);
+  } catch {
+    return null;
+  }
+  if (ownKeys.length !== length + 1) {
+    return null;
+  }
+  for (const key of ownKeys) {
+    if (typeof key === 'symbol') {
+      return null;
+    }
+    if (key === 'length') {
+      continue;
+    }
+    const index = Number(key);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== key) {
+      return null;
+    }
+  }
+  const out: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    // O(cap) traversal bound: one descriptor check per canonical index. The
+    // descriptor call is wrapped because a hostile Proxy trap may throw; the
+    // helper's contract is null rather than a propagated error.
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value as object, index);
+    } catch {
+      return null;
+    }
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      !('value' in descriptor)
+    ) {
+      return null;
+    }
+    // Use the descriptor already validated above: a Proxy could answer a
+    // second descriptor request with an accessor or an altered value, so the
+    // copy must come from the one this loop just proved to be a plain,
+    // enumerable data property.
+    out.push(descriptor.value);
+  }
+  return { array: out, length };
+}
 export const SHADOW_LEDGER_MAX_DAYS = 31;
 export const SHADOW_REASON_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const SHADOW_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
@@ -90,11 +215,14 @@ export type ShadowLedgerRead =
  * name). A Proxy stand-in either is refused by the shape checks below or
  * yields exactly the result the plain data would, since every read here goes
  * through `Object.getOwnPropertyDescriptor`/`Reflect.ownKeys`, never a `get`
- * trap. Cost: linear in the capped input — at most `SHADOW_LEDGER_MAX_DAYS`
+ * trap. Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)`
+ * engine bound of `Reflect.ownKeys` (where `K` is the target's own-property
+ * count), then `O(cap)` element traversal — at most `SHADOW_LEDGER_MAX_DAYS`
  * days times `CUTOVER_SHADOW_CRITERIA.length` verdicts, each with a constant
- * number of descriptor reads; an oversized or non-dense `days` array is
- * refused from its own keys before any element is traversed. Never throws,
- * never echoes the input.
+ * number of descriptor reads; an oversized, sparse, accessor-carrying,
+ * non-enumerable-index, symbol-keyed, foreign-keyed or subclassed `days`
+ * array is refused from its own keys and prototype before any element is
+ * traversed. Never throws, never echoes the input.
  */
 export function readShadowLedger(raw: unknown): ShadowLedgerRead {
   try {
@@ -117,15 +245,14 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
     ) {
       return INVALID_LEDGER;
     }
-    const dayArray = Array.isArray(days) ? (days as readonly unknown[]) : null;
-    const dayCount = dayArray === null ? null : boundedArrayLength(dayArray);
-    if (dayCount === null || dayArray === null) {
+    const dayList = days === null ? null : boundedArrayLength(days);
+    if (dayList === null) {
       return INVALID_LEDGER;
     }
     const readDays: ShadowDayRecord[] = [];
     let previousSerial: number | null = null;
-    for (let index = 0; index < dayCount; index += 1) {
-      const day = readDayRecord(ownElement(dayArray, index));
+    for (let index = 0; index < dayList.length; index += 1) {
+      const day = readDayRecord(dayList[index]);
       if (day === null) {
         return INVALID_LEDGER;
       }
@@ -165,40 +292,20 @@ export function isVersionAboveCurrent(raw: unknown): boolean {
 }
 
 /**
- * The capped element count of a real, dense array, or null for any stand-in,
- * oversized, sparse, or extra-keyed array. `Object.keys` lists own enumerable
- * string keys without reading any value, so it runs no getter; comparing its
- * count to `length` catches both a hole (fewer keys than `length`) and an
- * extra own enumerable property such as a getter planted beside the indices
- * (more keys than `length`) — either way, the array is refused before a
- * single element or any extra property is read, so a getter hiding on it
- * never runs, here or when the ledger is rebuilt afterward.
+ * The capped element list of a real, dense array of `Array.prototype`, or
+ * null for any stand-in. Cost: an `O(1)` length/prototype pre-gate, then the
+ * accepted `O(K)` engine bound of `Reflect.ownKeys` (where `K` is the
+ * target's own-property count), then `O(cap)` element traversal with cap
+ * `SHADOW_LEDGER_MAX_DAYS`. `Reflect.ownKeys` lists own keys — string,
+ * symbol, enumerable or not — without reading any value, so it runs no
+ * getter; a hole, a non-enumerable index, a symbol key, an extra own
+ * property (such as a getter planted beside the indices), a subclassed
+ * array or an over-cap length is refused before a single element is read,
+ * so a getter hiding on it never runs, here or when the ledger is rebuilt
+ * afterward. No getter and no Proxy `get` trap ever runs.
  */
-function boundedArrayLength(value: unknown): number | null {
-  // `Array.isArray` follows a Proxy without running a trap; the length is
-  // read from its own descriptor, so no `get` trap ever runs.
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    lengthDescriptor.value > SHADOW_LEDGER_MAX_DAYS
-  ) {
-    return null;
-  }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
-    return null;
-  }
-  return lengthDescriptor.value;
-}
-
-/** The own data-property element at `index`, or undefined for a hole or an accessor. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+function boundedArrayLength(value: unknown): readonly unknown[] | null {
+  return readBoundedDenseArray(value, SHADOW_LEDGER_MAX_DAYS)?.array ?? null;
 }
 
 /** One day record, or null when any field is out of shape. */

@@ -8,7 +8,8 @@
 import { parseBaseBranch, type BaseBranchValue } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
-import { readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
+import type { BoundedDenseArray } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import {
   compareShadowEnqueueSets,
@@ -142,56 +143,20 @@ interface ValidatedSample {
 }
 
 /**
- * One array validated by `boundedList`: the array itself, plus the length
- * already read from its own property descriptor. Every caller uses THIS
- * length for its iteration bound and never reads `.length` on `list` again:
- * a plain `.length` property read on a Proxy-wrapped array invokes its `get`
- * trap, which can lie (report a shorter length than the real one, or zero),
- * letting a caller silently skip elements it should have compared. Returning
- * the array alone and leaving callers to read its `.length` was exactly that
- * mistake — fixed here so it cannot recur at a new call site.
+ * The capped element list of a real, dense array, or null for any stand-in.
+ * Delegates to the shared `readBoundedDenseArray`: an `O(1)`
+ * length/prototype pre-gate, the accepted `O(K)` engine bound of the single
+ * `Reflect.ownKeys` call (K = the target's own-property count) that rejects
+ * foreign named, symbol and non-enumerable keys, then an `O(cap)`
+ * per-index descriptor traversal over `SHADOW_INTAKE_MAX_KEYS`. Symbol keys
+ * and non-enumerable extra keys — which the previous `Object.keys` count
+ * ignored — are now refused, and an accessor element refuses the whole list
+ * before any item reader runs. The returned `array` is a fresh dense copy
+ * this module created, so plain indexed reads on it can never run a getter
+ * or a Proxy `get` trap.
  */
-interface BoundedList {
-  readonly list: readonly unknown[];
-  readonly length: number;
-}
-
-/**
- * The capped element list of a real, dense array, or null for any stand-in,
- * sparse, oversized, accessor-polluted or extra-keyed array. `Object.keys`
- * lists own enumerable string keys without reading any value, so it runs no
- * getter; comparing its count to `length` catches both a hole (fewer keys
- * than `length`) and an extra own enumerable property such as a getter
- * planted beside the indices — either way the array is refused from its
- * `length`/keys before a single element is read. Returns the length read
- * from the descriptor alongside the array (see `BoundedList`): no caller may
- * read `.length` on the returned array as a plain property access again.
- */
-function boundedList(value: unknown, cap: number): BoundedList | null {
-  // `Array.isArray` follows a Proxy without running a trap; the length is
-  // read from its own descriptor, so no `get` trap ever runs.
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    lengthDescriptor.value > cap
-  ) {
-    return null;
-  }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
-    return null;
-  }
-  return { list: value as readonly unknown[], length: lengthDescriptor.value };
-}
-
-/** The own enumerable data-property element at `index`, or undefined for a hole or an accessor. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && descriptor.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+function boundedList(value: unknown, cap: number): BoundedDenseArray | null {
+  return readBoundedDenseArray(value, cap);
 }
 
 /**
@@ -224,8 +189,8 @@ function validateKey(raw: unknown): ValidatedKey | null {
 /**
  * Every element of a bounded list as a key, or null when any is out of
  * shape. Iterates on the length `boundedList` already read from the
- * descriptor, never `list.length` as a plain property access: `list` may be
- * a Proxy, and a plain `.length` read on it would invoke its `get` trap.
+ * descriptor, over the fresh dense copy the helper returned — a plain
+ * indexed read there can never run a getter or a Proxy `get` trap.
  */
 function validateKeys(raw: unknown, arrayCap: number): readonly ValidatedKey[] | null {
   const bounded = boundedList(raw, arrayCap);
@@ -234,7 +199,7 @@ function validateKeys(raw: unknown, arrayCap: number): readonly ValidatedKey[] |
   }
   const keys: ValidatedKey[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const key = validateKey(ownElement(bounded.list, index));
+    const key = validateKey(bounded.array[index]);
     if (key === null) {
       return null;
     }
@@ -501,8 +466,12 @@ function persistentChainBase(first: readonly ValidatedKey[], second: readonly Va
  * Cost: linear in the capped input — at most two samples, each with four
  * lists capped at `SHADOW_INTAKE_MAX_KEYS` keys, each key and field read once
  * through its own descriptor; the comparisons are linear in the same bounds.
- * Never throws, never echoes an input value, never runs a getter or reaches a
- * `get` trap.
+ * Each list read pays the accepted engine bound of `readBoundedDenseArray`:
+ * an `O(1)` length/prototype pre-gate, `O(K)` in the target's own-property
+ * count K for the single `Reflect.ownKeys` call, then `O(cap)` element
+ * traversal — so an oversized, sparse, extra-keyed or accessor-backed list
+ * is refused before any key is validated. Never throws, never echoes an
+ * input value, never runs a getter or reaches a `get` trap.
  */
 export function evaluateShadowIntake(input: unknown): ShadowIntakeEvaluation {
   try {
@@ -510,15 +479,15 @@ export function evaluateShadowIntake(input: unknown): ShadowIntakeEvaluation {
     if (samplesRaw === null) {
       return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
-    // `pair.length` below is the length `boundedList` already read from the
-    // descriptor, never a plain `.length` read on `pair.list` (which may be
-    // a Proxy whose `get` trap can lie about it); see `validateKeys` above.
+    // `pair.array` is the fresh dense copy `boundedList` returned, so plain
+    // indexed reads here can never run a getter or a Proxy `get` trap; see
+    // `validateKeys` above.
     const pair = boundedList(samplesRaw.samples, 2);
     if (pair === null || pair.length !== 2) {
       return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
-    const first = validateSample(ownElement(pair.list, 0));
-    const second = validateSample(ownElement(pair.list, 1));
+    const first = validateSample(pair.array[0]);
+    const second = validateSample(pair.array[1]);
     if (first === null || second === null) {
       return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }

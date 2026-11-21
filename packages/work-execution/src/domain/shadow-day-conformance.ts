@@ -9,7 +9,8 @@
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { head12Of, parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_ONE_WAY_STEPS } from './lane-run-records.js';
-import { readExactPlainRecord, readBoundedDenseArray } from './plain-record-reads.js';
+import { readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray } from './shadow-evidence-ledger.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';

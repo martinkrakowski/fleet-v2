@@ -7,13 +7,10 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
-import {
-  isCalendarDateTime,
-  readExactPlainRecord,
-  readBoundedDenseArray,
-} from './plain-record-reads.js';
+import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
 import { compareShadowGateVerdicts } from './shadow-comparators.js';
 import type { ShadowComparisonResult, ShadowDivergence } from './shadow-comparators.js';
+import { readBoundedDenseArray } from './shadow-evidence-ledger.js';
 import type { ShadowCriterionEvaluation, ShadowCriterionStatus } from './shadow-evidence-ledger.js';
 
 /** Heads that must agree across the trailing window before a day can pass. */

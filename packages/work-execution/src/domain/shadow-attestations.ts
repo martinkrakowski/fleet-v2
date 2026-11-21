@@ -12,8 +12,8 @@ import {
   readExactPlainRecord,
   readPlainRecordWithOptionalKeys,
   snapshotPlainDataRecord,
-  readBoundedDenseArray,
 } from './plain-record-reads.js';
+import { readBoundedDenseArray } from './shadow-evidence-ledger.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,

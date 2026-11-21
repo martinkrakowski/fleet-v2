@@ -39,7 +39,6 @@ import { isZonedIsoDateTime } from '../../../domain/conductor-halt.js';
 import {
   readExactPlainRecord,
   readBoundedDenseArray,
-  readOwnDataElement,
 } from '../../../domain/plain-record-reads.js';
 
 /**
@@ -185,13 +184,13 @@ export function isPastDeadline(nowIso: () => string, deadlineIso: string): boole
 }
 
 /**
- * One merged pull-request id read through its own data-property descriptor
- * (via `readOwnDataElement`, so no getter ever runs). Cost: `O(1)`. A
- * missing slot, an accessor, or anything that is not a safe integer of at
- * least 1 is refused.
+ * One merged pull-request id read from the validated dense copy
+ * (`readBoundedDenseArray` returned a fresh array whose elements were read
+ * through their own data-property descriptors, so no getter ever ran). Cost:
+ * `O(1)`. Anything that is not a safe integer of at least 1 is refused.
  */
 function readPullRequestId(items: readonly unknown[], index: number): number | null {
-  const value = readOwnDataElement(items, index);
+  const value = items[index];
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
     return null;
   }

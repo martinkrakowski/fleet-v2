@@ -9,7 +9,7 @@
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { head12Of, parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_ONE_WAY_STEPS } from './lane-run-records.js';
-import { readExactPlainRecord, readBoundedDenseArray, readOwnDataElement } from './plain-record-reads.js';
+import { readExactPlainRecord, readBoundedDenseArray } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
@@ -897,7 +897,7 @@ function readCapped<T>(value: unknown, cap: number, readOne: (raw: unknown) => T
   if (bounded === null) return null;
   const items: T[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const item = readOne(readOwnDataElement(bounded.array, index));
+    const item = readOne(bounded.array[index]);
     if (item === null) return null;
     items.push(item);
   }

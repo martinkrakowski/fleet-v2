@@ -10,7 +10,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { CUTOVER_SHADOW_CONSECUTIVE_DAYS, CUTOVER_SHADOW_CRITERIA, LEGACY_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys, readBoundedDenseArray, readOwnDataElement } from './plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys, readBoundedDenseArray } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,
@@ -127,7 +127,7 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
     const readDays: ShadowDayRecord[] = [];
     let previousSerial: number | null = null;
     for (let index = 0; index < dayList.length; index += 1) {
-      const day = readDayRecord(readOwnDataElement(dayList, index));
+      const day = readDayRecord(dayList[index]);
       if (day === null) {
         return INVALID_LEDGER;
       }

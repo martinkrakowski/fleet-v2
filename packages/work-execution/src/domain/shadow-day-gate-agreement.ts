@@ -11,7 +11,6 @@ import {
   isCalendarDateTime,
   readExactPlainRecord,
   readBoundedDenseArray,
-  readOwnDataElement,
 } from './plain-record-reads.js';
 import { compareShadowGateVerdicts } from './shadow-comparators.js';
 import type { ShadowComparisonResult, ShadowDivergence } from './shadow-comparators.js';
@@ -212,7 +211,7 @@ function readHeads(value: unknown): readonly ValidHead[] | null {
   }
   const heads: ValidHead[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const head = readHead(readOwnDataElement(bounded.array, index));
+    const head = readHead(bounded.array[index]);
     if (head === null) {
       return null;
     }

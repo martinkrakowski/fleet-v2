@@ -13,7 +13,6 @@ import {
   readPlainRecordWithOptionalKeys,
   snapshotPlainDataRecord,
   readBoundedDenseArray,
-  readOwnDataElement,
 } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
@@ -273,7 +272,7 @@ function collectAttestations(bounded: BoundedAttestations): readonly ShadowAttes
   const attestations: ShadowAttestation[] = [];
   let previousIndex = -1;
   for (let index = 0; index < bounded.length; index += 1) {
-    const next = readNextAttestation(readOwnDataElement(bounded.array, index), previousIndex);
+    const next = readNextAttestation(bounded.array[index], previousIndex);
     if (next === null) {
       return null;
     }
@@ -637,7 +636,7 @@ function readReleaseTestField(value: unknown): FieldRead<ReadonlyMap<string, Sha
 function collectReleaseTests(bounded: BoundedAttestations): FieldRead<ReadonlyMap<string, ShadowReleaseTestFact>> {
   const tests = new Map<string, ShadowReleaseTestFact>();
   for (let index = 0; index < bounded.length; index += 1) {
-    const fact = readReleaseTest(readOwnDataElement(bounded.array, index));
+    const fact = readReleaseTest(bounded.array[index]);
     if (fact === null || tests.has(fact.path)) {
       return { ok: false };
     }

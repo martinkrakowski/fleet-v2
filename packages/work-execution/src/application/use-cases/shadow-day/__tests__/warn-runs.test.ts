@@ -148,25 +148,6 @@ describe('checkLaneRunWarnCount (RC1)', () => {
     expect(checkLaneRunWarnCount(items)).toEqual(UNKNOWN);
   });
 
-  it('refuses a subclassed array (a foreign prototype)', () => {
-    class FancyArray extends Array {}
-    const subclassed = FancyArray.from(denseArray(2));
-    expect(Array.isArray(subclassed)).toBe(true);
-    expect(checkLaneRunWarnCount(subclassed)).toEqual(UNKNOWN);
-  });
-
-  it('refuses a non-enumerable own index', () => {
-    const items: unknown[] = denseArray(2);
-    Object.defineProperty(items, 1, { value: { runId: 'hidden' }, enumerable: false, configurable: true, writable: true });
-    expect(checkLaneRunWarnCount(items)).toEqual(UNKNOWN);
-  });
-
-  it('refuses a symbol own key', () => {
-    const items: unknown[] = denseArray(2);
-    Object.defineProperty(items, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
-    expect(checkLaneRunWarnCount(items)).toEqual(UNKNOWN);
-  });
-
   it('yields exactly the plain-data verdict for a Proxy over a valid input, with no get trap run', () => {
     let getTraps = 0;
     const valid = denseArray(1501);

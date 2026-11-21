@@ -143,7 +143,11 @@ export interface BoundedDenseArray {
  * and extra named or non-canonical own keys (including `__proto__`,
  * `constructor`, `prototype`, `"01"`) return null without ever invoking a
  * getter or a Proxy `get` trap. Every failure, including a revoked Proxy
- * throwing anywhere along the path, returns null and never throws.
+ * throwing anywhere along the path, returns null and never throws. Because
+ * the copy is built only from the descriptor answers the target's own
+ * reflection gives, a Proxy stand-in is either refused or yields exactly
+ * the result the plain data its reflection reports would give: no `get`
+ * trap is ever consulted, so a lying `get` trap cannot shorten the walk.
  */
 export function readBoundedDenseArray(value: unknown, cap: number): BoundedDenseArray | null {
   if (!Number.isSafeInteger(cap) || cap < 0) {
@@ -172,12 +176,7 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     return null;
   }
   const length = lengthDescriptor.value;
-  if (
-    !Number.isSafeInteger(length) ||
-    length < 0 ||
-    length >= 2 ** 32 - 1 ||
-    length > cap
-  ) {
+  if (!Number.isSafeInteger(length) || length < 0 || length >= 2 ** 32 - 1 || length > cap) {
     return null;
   }
   let ownKeys: PropertyKey[];
@@ -214,7 +213,13 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     } catch {
       return null;
     }
-    if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined) {
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      !('value' in descriptor)
+    ) {
       return null;
     }
     // Use the descriptor already validated above: a Proxy could answer a
@@ -224,27 +229,6 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     out.push(descriptor.value);
   }
   return { array: out, length };
-}
-
-/**
- * Read `array[index]` through its own property descriptor only (no getter
- * ever runs), returning the element value; null-contract note: the caller
- * validates the descriptor, so this returns the descriptor's value when the
- * index is an enumerable own data property and `undefined` otherwise (the
- * hole/accessor/non-enumerable rejection happens in the caller's descriptor
- * check). O(1) per call; never throws.
- */
-export function readOwnDataElement(array: readonly unknown[], index: number): unknown {
-  let descriptor: PropertyDescriptor | undefined;
-  try {
-    descriptor = Object.getOwnPropertyDescriptor(array, index);
-  } catch {
-    return undefined;
-  }
-  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || descriptor.enumerable !== true) {
-    return undefined;
-  }
-  return descriptor.value;
 }
 
 /**

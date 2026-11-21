@@ -193,13 +193,22 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (existing !== null && !existing.isSymbolicLink()) {
         return { outcome: 'unreadable' };
       }
-      // CO14b #4c: the store-level marker is written AHEAD of the fence and
-      // the rename, so a repoint that landed always has its operation
-      // recorded and a crash can never leave `current` moved with the marker
-      // still unreadable. A marker write that fails refuses the whole repoint
-      // WITHOUT renaming: writing after the rename would leave a crash gap
-      // where `readLastCurrentOp` answers `unreadable` for a repoint that
-      // already landed.
+      // CO14b #4c: the store-level marker is written AFTER the fence and
+      // BEFORE the rename, so a refused or throwing fence can never leave the
+      // marker claiming a repoint that did not land (fail-closed: a failed
+      // repoint must not appear to be the operation that last wrote
+      // `current`). A marker write that fails refuses the whole repoint
+      // WITHOUT renaming, so a repoint that landed always has its marker:
+      // writing after the rename would leave a crash gap where
+      // `readLastCurrentOp` answers `unreadable` for a repoint that already
+      // landed.
+      await fs.symlink(input.sha, temp);
+      if (input.fence !== undefined && !(await passesFence(input.fence))) {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        return { outcome: 'fenced' };
+      }
+      // Nothing is awaited between the fence and the marker write plus this
+      // one atomic rename.
       const opsDir = path.join(input.root, OPS_DIR);
       await fs.mkdir(opsDir, { recursive: true });
       await writeAtomically(
@@ -207,12 +216,6 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
         CURRENT_OP_NAME,
         JSON.stringify({ version: 1, sha: input.sha, opId: input.opId ?? null }),
       );
-      await fs.symlink(input.sha, temp);
-      if (input.fence !== undefined && !(await passesFence(input.fence))) {
-        await fs.rm(temp, { force: true }).catch(() => undefined);
-        return { outcome: 'fenced' };
-      }
-      // Nothing is awaited between the fence and this one atomic rename.
       await fs.rename(temp, path.join(input.root, CURRENT_NAME));
       return { outcome: 'ok' };
     } catch {

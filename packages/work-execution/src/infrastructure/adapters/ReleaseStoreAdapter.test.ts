@@ -88,8 +88,25 @@ describe('ReleaseStoreAdapter', () => {
     expect(calls).toBe(1);
     expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
     expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', A, B, 'current']);
+    // Fix round 1: a refused or throwing fence must not leave the marker
+    // claiming the failed repoint; the marker still names the operation that
+    // last actually wrote `current` (the repoint to A above).
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: null });
+    await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) });
+    expect(
+      await adapter.repoint({
+        root,
+        sha: B,
+        fence: async () => {
+          throw new Error('lease unreadable');
+        },
+      }),
+    ).toEqual({ outcome: 'fenced' });
+    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: 'a'.repeat(32) });
     expect(await adapter.repoint({ root, sha: B, fence: async () => true })).toEqual({ outcome: 'ok' });
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: B, opId: null });
   });
 
   it('refuses to repoint to a sha that is not a kept build', async () => {

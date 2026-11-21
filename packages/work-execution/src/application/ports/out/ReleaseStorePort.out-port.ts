@@ -97,8 +97,26 @@ export interface ReleaseStorePort {
   repoint(input: {
     readonly root: string;
     readonly sha: string;
+    /**
+     * CO14b #4c: the id of the operation whose repoint this is. When given,
+     * the store records it in its store-level `current` operation marker
+     * (`.release-ops/current-op.json`) BEFORE the fence and the rename, so a
+     * later rollback can tell "the operation that last wrote `current`" from
+     * a stale intent that merely aims at the same sha. Omitted calls keep
+     * the old behaviour and overwrite the marker's opId with null.
+     */
+    readonly opId?: string;
     readonly fence?: () => Promise<boolean>;
   }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }>;
+  /**
+   * CO14b #4c: read the store-level marker of which operation last wrote
+   * `current` on a repoint. Read-only: never mutates state, never throws.
+   * `none` when no marker exists (no repoint with an operation id has run
+   * under this root yet); `unreadable` when the marker exists but cannot be
+   * read, is malformed, carries an unknown version, or names an invalid sha
+   * or opId -- never a guess. Cost is constant (one small capped file read).
+   */
+  readLastCurrentOp?(input: { readonly root: string }): Promise<ReleaseLastCurrentOpResult>;
   /** Keep the newest `keep` verified builds; never remove current or previous. */
   prune(input: {
     readonly root: string;
@@ -252,6 +270,15 @@ export type ReleaseOpenOperationPeek =
        */
       readonly repointed: boolean;
     }
+  | { readonly outcome: 'none' }
+  | { readonly outcome: 'unreadable' };
+
+/**
+ * CO14b #4c: the store-level marker of which operation last wrote `current`.
+ * `opId` is null when the last repoint carried no operation id.
+ */
+export type ReleaseLastCurrentOpResult =
+  | { readonly outcome: 'read'; readonly opId: string | null; readonly sha: string }
   | { readonly outcome: 'none' }
   | { readonly outcome: 'unreadable' };
 

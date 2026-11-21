@@ -26,6 +26,7 @@ import { randomBytes } from 'node:crypto';
 import type {
   ReleaseBuildRecord,
   ReleaseDriverBinding,
+  ReleaseLastCurrentOpResult,
   ReleaseFileFact,
   ReleaseFilesInspection,
   ReleaseOpenOperationPeek,
@@ -74,6 +75,13 @@ const CURRENT_TEMP_PATTERN = /^\.current\..+\.tmp$/;
 
 const OPS_DIR = '.release-ops';
 const DRIVER_BINDING_NAME = '.release-driver';
+/**
+ * CO14b #4c: the store-level marker of which operation last wrote `current`
+ * on a repoint, written ahead of the fence and the rename so a crash can
+ * never leave a repoint that landed without its operation recorded.
+ */
+const CURRENT_OP_NAME = 'current-op.json';
+const CURRENT_OP_KEYS = ['version', 'sha', 'opId'] as const;
 const OP_ID_PATTERN = /^[0-9a-f]{32}$/;
 /** A claim older than this is a crashed run's; the longest build budget is well inside it. */
 const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
@@ -161,10 +169,16 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
   async repoint(input: {
     readonly root: string;
     readonly sha: string;
+    readonly opId?: string;
     readonly fence?: () => Promise<boolean>;
   }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }> {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'not-found' };
+    }
+    // CO14b #4c: a malformed operation id is refused before any write, so a
+    // hostile id can never reach the marker or `current`.
+    if (input.opId !== undefined && (typeof input.opId !== 'string' || !OP_ID_PATTERN.test(input.opId))) {
+      return { outcome: 'unreadable' };
     }
     const listing = await this.list({ root: input.root });
     if (listing.outcome !== 'read') {
@@ -179,6 +193,20 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (existing !== null && !existing.isSymbolicLink()) {
         return { outcome: 'unreadable' };
       }
+      // CO14b #4c: the store-level marker is written AHEAD of the fence and
+      // the rename, so a repoint that landed always has its operation
+      // recorded and a crash can never leave `current` moved with the marker
+      // still unreadable. A marker write that fails refuses the whole repoint
+      // WITHOUT renaming: writing after the rename would leave a crash gap
+      // where `readLastCurrentOp` answers `unreadable` for a repoint that
+      // already landed.
+      const opsDir = path.join(input.root, OPS_DIR);
+      await fs.mkdir(opsDir, { recursive: true });
+      await writeAtomically(
+        opsDir,
+        CURRENT_OP_NAME,
+        JSON.stringify({ version: 1, sha: input.sha, opId: input.opId ?? null }),
+      );
       await fs.symlink(input.sha, temp);
       if (input.fence !== undefined && !(await passesFence(input.fence))) {
         await fs.rm(temp, { force: true }).catch(() => undefined);
@@ -189,6 +217,42 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       return { outcome: 'ok' };
     } catch {
       await fs.rm(temp, { force: true }).catch(() => undefined);
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  /**
+   * CO14b #4c: the marker of which operation last wrote `current`, read
+   * through the file's own data only. Never mutates state, never throws.
+   * Cost is constant: one capped small-file read (`MARKER_MAX_BYTES`) and a
+   * fixed three-key record check.
+   */
+  async readLastCurrentOp(input: unknown): Promise<ReleaseLastCurrentOpResult> {
+    try {
+      const record = readExactPlainRecord(input, ['root']);
+      const root = record === null ? undefined : record['root'];
+      if (typeof root !== 'string' || !path.isAbsolute(root)) {
+        return { outcome: 'unreadable' };
+      }
+      const text = await readSmall(path.join(root, OPS_DIR, CURRENT_OP_NAME));
+      if (text === null) {
+        return { outcome: 'none' };
+      }
+      const parsed: unknown = JSON.parse(text);
+      const marker = readExactPlainRecord(parsed, CURRENT_OP_KEYS);
+      if (marker === null || marker['version'] !== 1) {
+        return { outcome: 'unreadable' };
+      }
+      const sha = marker['sha'];
+      const opId = marker['opId'];
+      if (typeof sha !== 'string' || !SHA_PATTERN.test(sha)) {
+        return { outcome: 'unreadable' };
+      }
+      if (opId !== null && (typeof opId !== 'string' || !OP_ID_PATTERN.test(opId))) {
+        return { outcome: 'unreadable' };
+      }
+      return { outcome: 'read', sha, opId: typeof opId === 'string' ? opId : null };
+    } catch {
       return { outcome: 'unreadable' };
     }
   }

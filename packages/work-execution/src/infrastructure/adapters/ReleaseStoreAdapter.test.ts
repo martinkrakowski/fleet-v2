@@ -57,7 +57,7 @@ describe('ReleaseStoreAdapter', () => {
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
     expect(await adapter.repoint({ root, sha: B })).toEqual({ outcome: 'ok' });
     expect(await adapter.list({ root })).toMatchObject({ outcome: 'read', current: B });
-    expect((await fs.readdir(root)).sort()).toEqual([A, B, 'current']);
+    expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', A, B, 'current']);
     expect(await fs.readFile(path.join(root, 'current', 'apps', 'cli', 'dist', 'bin.js'), 'utf8')).toBe('// cli\n');
   });
 
@@ -87,7 +87,7 @@ describe('ReleaseStoreAdapter', () => {
     ).toEqual({ outcome: 'fenced' });
     expect(calls).toBe(1);
     expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
-    expect((await fs.readdir(root)).sort()).toEqual([A, B, 'current']);
+    expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', A, B, 'current']);
     expect(await adapter.repoint({ root, sha: B, fence: async () => true })).toEqual({ outcome: 'ok' });
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
   });
@@ -157,7 +157,7 @@ describe('ReleaseStoreAdapter', () => {
     await adapter.repoint({ root, sha: B });
     await fs.mkdir(path.join(root, sha('f')));
     expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'pruned', removed: [C] });
-    expect((await fs.readdir(root)).sort()).toEqual([A, B, 'current', D, E, sha('f')]);
+    expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', A, B, 'current', D, E, sha('f')]);
     expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'pruned', removed: [] });
     expect(await adapter.prune({ root, keep: 1 })).toEqual({ outcome: 'unreadable' });
   });
@@ -192,9 +192,9 @@ describe('ReleaseStoreAdapter', () => {
     };
     expect(await adapter.prune({ root, keep: 2, fence })).toEqual({ outcome: 'unreadable', removed: [A] });
     expect(calls).toBe(2);
-    expect((await fs.readdir(root)).sort()).toEqual([B, C, D, E, 'current'].sort());
+    expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', B, C, D, E, 'current'].sort());
     expect(await adapter.prune({ root, keep: 2, fence: async () => true })).toEqual({ outcome: 'pruned', removed: [B, C] });
-    expect((await fs.readdir(root)).sort()).toEqual([D, E, 'current'].sort());
+    expect((await fs.readdir(root)).sort()).toEqual(['.release-ops', D, E, 'current'].sort());
   });
 
   it('awaits the prune fence after the current re-read, as the last step before each rename', async () => {
@@ -346,5 +346,120 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.discard({ root, buildId })).toEqual({ outcome: 'ok' });
     expect(await adapter.discard({ root, buildId: 'nothex' })).toEqual({ outcome: 'unreadable' });
     expect(await adapter.discard({ root, buildId: `${A}/../../x` })).toEqual({ outcome: 'unreadable' });
+  });
+
+  it('repoint records the operation that last wrote current and readLastCurrentOp reads it back (CO14b #4c)', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    const opId = '1'.repeat(32);
+    expect(await adapter.repoint({ root, sha: A, opId })).toEqual({ outcome: 'ok' });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId });
+    expect(await adapter.repoint({ root, sha: B })).toEqual({ outcome: 'ok' });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: B, opId: null });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: B, opId: null });
+  });
+
+  it('repoint refuses an invalid opId without moving current', async () => {
+    await verified('a', 1);
+    for (const badOpId of ['not-hex', 'a'.repeat(31), 'a'.repeat(33), 42, null, { opId: 'a'.repeat(32) }]) {
+      expect(await adapter.repoint({ root, sha: A, opId: badOpId as unknown as string })).toEqual({
+        outcome: 'unreadable',
+      });
+    }
+    await expect(fs.lstat(path.join(root, 'current'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });
+    expect(await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) })).toEqual({ outcome: 'ok' });
+  });
+
+  it('repoint refuses without renaming when writing current-op.json fails', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    expect(await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) })).toEqual({ outcome: 'ok' });
+    // A file where the marker's directory must be blocks both the mkdir and
+    // the marker write: the repoint is refused and `current` stays at A.
+    await fs.rm(path.join(root, '.release-ops'), { recursive: true });
+    await fs.writeFile(path.join(root, '.release-ops'), 'not a directory');
+    expect(await adapter.repoint({ root, sha: B, opId: 'b'.repeat(32) })).toEqual({ outcome: 'unreadable' });
+    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
+    expect((await fs.readdir(root)).filter((name) => name.startsWith('.current.'))).toEqual([]);
+    expect((await fs.readdir(path.join(root, B))).includes('.fleet-release-verified')).toBe(true);
+    expect((await fs.readdir(path.join(root, A))).includes('.fleet-release-verified')).toBe(true);
+  });
+
+  it('readLastCurrentOp returns none when no marker exists', async () => {
+    await verified('a', 1);
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });
+    expect(await adapter.readLastCurrentOp({ root: path.join(tempDir, 'absent') })).toEqual({ outcome: 'none' });
+  });
+
+  it('readLastCurrentOp returns unreadable for a malformed or unknown-version marker', async () => {
+    await verified('a', 1);
+    const marker = path.join(root, '.release-ops', 'current-op.json');
+    await fs.mkdir(path.dirname(marker), { recursive: true });
+    for (const content of [
+      '{not json',
+      'null',
+      '"text"',
+      '[1,2]',
+      JSON.stringify({ version: 2, sha: A, opId: null }),
+      JSON.stringify({ version: 1, sha: 'nothex', opId: null }),
+      JSON.stringify({ version: 1, sha: A, opId: 'nothex' }),
+      JSON.stringify({ version: 1, sha: A, opId: 'a'.repeat(31) }),
+      JSON.stringify({ version: 1, sha: A, opId: null, extra: true }),
+      JSON.stringify({ version: 1, sha: A }),
+      JSON.stringify({ version: 1, sha: A, opId: null, get extra() { return 1; } }),
+    ]) {
+      await fs.writeFile(marker, content);
+      expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'unreadable' });
+    }
+    await fs.writeFile(marker, JSON.stringify({ version: 1, sha: A, opId: 'a'.repeat(32) }));
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: 'a'.repeat(32) });
+    await fs.rm(path.dirname(marker), { recursive: true });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });
+  });
+
+  it('readLastCurrentOp never throws on hostile input, and no getter ever runs', async () => {
+    expect(await adapter.readLastCurrentOp(null)).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp(undefined)).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp(42)).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp('root')).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp(['x'])).toEqual({ outcome: 'unreadable' });
+    let getterRuns = 0;
+    const hostile = {
+      get root(): string {
+        getterRuns += 1;
+        return '/srv/whatever';
+      },
+    };
+    expect(await adapter.readLastCurrentOp(hostile)).toEqual({ outcome: 'unreadable' });
+    expect(getterRuns).toBe(0);
+    const valid = { root };
+    let getTraps = 0;
+    const proxied = new Proxy(valid, {
+      get(target, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    await verified('a', 1);
+    expect(await adapter.readLastCurrentOp(proxied)).toEqual({ outcome: 'none' });
+    expect(getTraps).toBe(0);
+    // An unreadable root (a file where the directory must be) is unreadable, never none.
+    await fs.writeFile(path.join(root, '.release-ops'), 'not a directory');
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'unreadable' });
+  });
+
+  it('a constant verdict or an identity echo would fail these readLastCurrentOp tests', async () => {
+    await verified('a', 1);
+    // A constant `none` would miss the real marker; a constant `read` would
+    // miss the absent one; an echo of the input could never produce these.
+    await fs.mkdir(path.join(root, '.release-ops'), { recursive: true });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });
+    await fs.writeFile(
+      path.join(root, '.release-ops', 'current-op.json'),
+      JSON.stringify({ version: 1, sha: A, opId: 'a'.repeat(32) }),
+    );
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: 'a'.repeat(32) });
+    expect(await adapter.readLastCurrentOp({ root })).not.toEqual({ outcome: 'read', sha: A, opId: 'a'.repeat(31) });
   });
 });

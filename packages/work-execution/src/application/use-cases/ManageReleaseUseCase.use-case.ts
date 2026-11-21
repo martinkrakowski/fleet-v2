@@ -180,6 +180,22 @@
  * ever matters for `install`, whose target is always the request's own named
  * sha -- a case `resolveTarget` never re-reads for, so the outer and the
  * resolved listing are always identical there.
+ *
+ * CO14b fix round 16 (#4b-1 and #4c): two store-consistency guarantees.
+ * First (#4b-1), `resolveTarget` is now strictly read-only: it never calls
+ * `cancelOperation`, not even for an apply. A rollback intent it proves
+ * stale is REPORTED (`staleOpen`) and retired by `apply()` only after
+ * `resolveGrant` and `bindRootIfUnbound` have both succeeded -- so a
+ * concurrent apply behind a live driver lease, or an unauthorized one, can
+ * never cancel a live marked intent and its claim before the lease check
+ * or the authorization. Second (#4c), a marked (`repointed: true`) intent
+ * is adopted only when the store's own marker of which operation last
+ * wrote `current` (`readLastCurrentOp`, written by `store.repoint` ahead
+ * of the fence and the rename) still names exactly that operation and
+ * sha: an unrelated swap landing later on the same sha can no longer make
+ * a crashed rollback's spent intent look live, and a no-op `applied`
+ * replaying its spent grant is impossible. A missing or unreadable marker
+ * is fail-closed: unreadable, then refused `store-unreadable`.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -202,6 +218,7 @@ import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLease
 import type {
   ReleaseBuildRecord,
   ReleaseDriverBinding,
+  ReleaseLastCurrentOpResult,
   ReleaseOpenOperationPeek,
   ReleaseOperationBegin,
   ReleaseStorePort,
@@ -337,7 +354,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     // here, `alreadyBuilt`, only matters for `install`, whose target
     // (the request's own named sha) `resolveTarget` never re-reads for, so
     // `listing.current` is passed exactly as before.
-    return this.apply(request, target, listing.current, alreadyBuilt);
+    return this.apply(request, target, listing.current, alreadyBuilt, resolved.staleOpen);
   }
 
   /**
@@ -352,18 +369,30 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     target: string,
     plannedCurrent: string | null,
     alreadyBuilt: boolean,
+    staleOpen?: { readonly opId: string; readonly sha: string },
   ): Promise<ManageReleaseResult> {
     // One operation per apply: a durable intent with a unique id is recorded
     // before the grant is touched, and its result after the irreversible step.
     // The grant authorizes exactly this operation id; only an intent that has
     // no recorded result may be resumed, and only under its own id.
+    //
+    // CO14b #4b-1: a stale intent `resolveTarget` declined to adopt is NOT
+    // resumed even when `peekOperation` finds it by this call's own target:
+    // its opId would otherwise replay the spent grant of the crashed attempt.
+    // This call generates a fresh operation id instead, and the stale intent
+    // is retired below -- only after authorization and the root bind have
+    // both succeeded, so an unauthorized or refused request can never cancel
+    // an intent (CO14b #4b-1: no pre-auth `cancelOperation`).
     let opId: string;
     try {
       const open = await this.deps.store.peekOperation({ root: request.root, action: request.action, sha: target });
       if (open.outcome === 'unreadable') {
         return refuse('store-unreadable');
       }
-      opId = open.outcome === 'open' ? open.opId : this.deps.store.newOperationId();
+      opId =
+        open.outcome === 'open' && !(staleOpen !== undefined && open.opId === staleOpen.opId)
+          ? open.opId
+          : this.deps.store.newOperationId();
     } catch {
       return refuse('store-unreadable');
     }
@@ -387,6 +416,16 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     const bindRefusal = await this.bindRootIfUnbound(request.root);
     if (bindRefusal !== null) {
       return refuse(bindRefusal);
+    }
+    // CO14b #4b-1: the deferred retirement of a stale rollback intent runs
+    // only here -- after `resolveGrant` and `bindRootIfUnbound` have both
+    // succeeded, so an unauthorized request never cancels anyone's intent,
+    // and after the live-lease refusal in `run()` (which precedes `apply`),
+    // so a concurrent apply can no longer cancel a live marked intent and
+    // its claim before the lease check. A retire that fails refuses before
+    // `beginOperation`: no second intent is ever opened.
+    if (staleOpen !== undefined && !(await this.retireRollbackIntent(request.root, staleOpen.opId, staleOpen.sha))) {
+      return refuse('store-unreadable');
     }
     let begun: ReleaseOperationBegin;
     try {
@@ -605,6 +644,15 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         readonly previous: string | null;
         readonly builds: readonly ReleaseBuildRecord[];
         readonly current: string | null;
+        /**
+         * CO14b #4b-1: a rollback intent this call proved NOT adoptable. It
+         * is only REPORTED here -- this function is read-only and performs
+         * no store write of any kind, even for an apply -- and `apply()`
+         * retires it after `resolveGrant` and `bindRootIfUnbound` have both
+         * succeeded, so an unauthorized or lease-refused request can never
+         * cancel an intent.
+         */
+        readonly staleOpen?: { readonly opId: string; readonly sha: string };
       }
     | { readonly outcome: 'unreadable' }
   > {
@@ -641,37 +689,63 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       // authorized swap that moved `current` on since the intent began makes
       // it stale for good (an unmarked intent is skipped by the swap's own
       // cleanup), so it is retired below and the target recomputed.
-      const adoptable = open.repointed
-        ? fresh.current === open.sha
-        : fresh.current === open.sha || previousBuild(fresh.builds, fresh.current) === open.sha;
+      //
+      // CO14b #4c: a marked (`repointed: true`) intent is adopted only when
+      // the store-level `current` operation marker names exactly this
+      // operation -- `readLastCurrentOp` answers read with `opId ===
+      // open.opId && sha === open.sha` -- AND the fresh `current` still
+      // equals its sha. `current === open.sha` alone is not enough: a
+      // crashed rollback's marker-less intent could be adopted after an
+      // unrelated, separately authorized swap later lands on the same sha,
+      // reporting a no-op `applied` that replays the spent grant. A missing
+      // optional `readLastCurrentOp` port method is fail-closed: unreadable.
+      let adoptable: boolean;
+      if (open.repointed) {
+        if (this.deps.store.readLastCurrentOp === undefined) {
+          return { outcome: 'unreadable' };
+        }
+        let lastOp: ReleaseLastCurrentOpResult;
+        try {
+          lastOp = await this.deps.store.readLastCurrentOp({ root: request.root });
+        } catch {
+          return { outcome: 'unreadable' };
+        }
+        if (lastOp.outcome === 'unreadable') {
+          return { outcome: 'unreadable' };
+        }
+        adoptable =
+          fresh.current === open.sha &&
+          lastOp.outcome === 'read' &&
+          lastOp.opId === open.opId &&
+          lastOp.sha === open.sha;
+      } else {
+        adoptable = fresh.current === open.sha || previousBuild(fresh.builds, fresh.current) === open.sha;
+      }
       if (adoptable) {
         // CO14b fix round 12: this was decided against `fresh`, not the
         // caller's own listing, so `fresh` is the listing returned too.
         return { outcome: 'resolved', target: open.sha, previous: open.sha, builds: fresh.builds, current: fresh.current };
       }
-      // Proven stale under the fresh read: retire it now, not merely skip
-      // it, so it can never poison a later rollback too: a later call's own
-      // `peekAnyOpenOperation` must never find it again.
-      //
-      // CO14b fix round 11 (finding 3): retiring is a STORE WRITE
-      // (`cancelOperation`), and this function runs for a plan-only request
-      // too. A plan prints and writes nothing (this file's own documented
-      // contract, the round-4 lesson) -- the write happens only on a
-      // genuine apply; a plan-only call still falls through to report the
-      // correct, fresh target below, it simply never performs the write.
-      //
-      // CO14b fix round 14 (finding 3): a failed retire refuses the request.
-      // Proceeding would open a second rollback intent, and
-      // `peekAnyOpenOperation` reports two open intents as unreadable for
-      // every later rollback.
-      if (request.apply && !(await this.retireRollbackIntent(request.root, open.opId, open.sha))) {
-        return { outcome: 'unreadable' };
-      }
+      // Proven stale under the fresh read: do NOT adopt it. The retirement
+      // itself is deferred to `apply()` (see `staleOpen` above and the
+      // retire call there), so this function stays read-only -- a plan-only
+      // request writes nothing (the round-4 and round-11 finding-3
+      // lessons) and an apply retires only after authorization and the
+      // root bind have succeeded (#4b-1). A failed retire refuses there,
+      // before `beginOperation`, so no second intent is ever opened
+      // (the round-14 finding-3 lesson).
       const previous = previousBuild(fresh.builds, fresh.current);
       // CO14b fix round 12: `target` is resolved against `fresh`, so the
       // listing returned is `fresh` too -- never the caller's older
       // `builds`/`current`, which this branch has just proven stale.
-      return { outcome: 'resolved', target: previous, previous, builds: fresh.builds, current: fresh.current };
+      return {
+        outcome: 'resolved',
+        target: previous,
+        previous,
+        builds: fresh.builds,
+        current: fresh.current,
+        staleOpen: { opId: open.opId, sha: open.sha },
+      };
     }
     const previous = previousBuild(builds, current);
     return { outcome: 'resolved', target: previous, previous, builds, current };
@@ -770,6 +844,10 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         const repointed = await this.deps.store.repoint({
           root: request.root,
           sha: target,
+          // CO14b #4c: record this operation as the one that last wrote
+          // `current`, so a later rollback adopts a marked intent only when
+          // the marker still names exactly this operation.
+          opId: operation.opId,
           fence: () => this.stillHolds(held),
         });
         if (repointed.outcome !== 'ok') {

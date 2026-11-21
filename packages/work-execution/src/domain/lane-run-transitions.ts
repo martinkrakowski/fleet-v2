@@ -22,6 +22,10 @@ import { RUN_STOP_REFUSAL_KINDS } from './lane-run-records.js';
 import { LANE_RUN_STATES, LANE_RUN_TERMINAL_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { ImplementerSeatRole } from './value-objects/SeatPlan.vo.js';
+import type { ParkEscalationMode, ParkEscalationStayReason } from './park-escalation.js';
+import { decideParkEscalation } from './park-escalation.js';
+import { readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import { isPlainRecordObject } from './record-schema-version.js';
 import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';
 
 /** Exits of each state besides the universal `parked` and `stopped` (plan §3.2 "Exits"). */
@@ -107,7 +111,8 @@ export const LANE_RUN_REVIEWS_IN_FLIGHT = {
  * (CT-2a), or when `to` is `watching-ci` and `settledOpenPrPark` is true (R4a / G3b0: an `ambiguous`
  * `open-pr` park whose spent key the resume adopted leaves by itself; the `opening-pr` parkedFrom exit
  * would decide `open-pr` again on its spent key). Otherwise the table, except that `ready → collecting`
- * needs `provenance === 'adopted'` (CO28; `resolveLaneRunProvenance(record)`). Unknown strings → false.
+ * needs `provenance === 'adopted'` (CO28; `resolveLaneRunProvenance(record)`), and that a
+ * `parked → fixing` entry allowed by `checkParkEscalation` is `escalatedPark` (CE1). Unknown strings → false.
  */
 export function canEnterLaneRunState(
   from: string,
@@ -115,6 +120,7 @@ export function canEnterLaneRunState(
   parkedFrom?: string | null,
   settledOpenPrPark?: boolean,
   provenance?: unknown,
+  escalatedPark?: boolean,
 ): boolean {
   if (!(LANE_RUN_STATES as readonly string[]).includes(from)) {
     return false;
@@ -147,6 +153,11 @@ export function canEnterLaneRunState(
     // already open, so the `opening-pr` parkedFrom exit would decide
     // `open-pr` again on its spent key.
     if (to === 'watching-ci' && settledOpenPrPark === true) {
+      return true;
+    }
+    // CE1: an escalated `fix-no-progress` park re-enters `fixing` (the fix
+    // round of the `commit-pending` escalation) without its parkedFrom.
+    if (to === 'fixing' && escalatedPark === true) {
       return true;
     }
     return parkedFrom !== null && parkedFrom !== undefined && to === parkedFrom;
@@ -526,6 +537,101 @@ export function checkLaneRunResume(input: {
     return { ok: false, reason: 'fix-no-progress' };
   }
   return { ok: true, to: record.parked.parkedFrom };
+}
+
+/** Every reason a park escalation may be refused, including any `decideParkEscalation` stay reason. */
+export type ParkEscalationTransitionRefusal =
+  | 'malformed-input'
+  | 'run-stopped'
+  | 'stale-revision'
+  | 'not-parked'
+  | 'stop-pending'
+  | 'one-way-door'
+  | ParkEscalationStayReason;
+
+export type ParkEscalationTransitionCheck =
+  | {
+      readonly ok: true;
+      readonly to: 'fixing';
+      readonly mode: ParkEscalationMode;
+      readonly journalReasonCode: 'park-escalated';
+      readonly journalDetail: ParkEscalationMode;
+    }
+  | { readonly ok: false; readonly reason: ParkEscalationTransitionRefusal };
+
+/**
+ * The rule the conductor applies before it journals a `park-escalated` result
+ * and enters `fixing` (CE1). It follows `checkLaneRunResume`'s exact check
+ * order — state `stopped` → run-stopped; expectedRevision !== record.revision
+ * → stale-revision; stopMode not null → stop-pending; state !== 'parked' or
+ * record.parked === null → not-parked; parked.reason `stop-unconfirmed` or
+ * `stop-refused` → stop-pending; `one-way-door` → one-way-door — and then
+ * defers to `decideParkEscalation` for the park shape, the once-per-run
+ * history rule and the dirty-worktree fact. Total: any throw reads as
+ * `malformed-input`; every refusal is a typed value, nothing throws.
+ */
+export function checkParkEscalation(input: {
+  readonly record: LaneRunRecord;
+  readonly state: LaneRunStateValue;
+  readonly stopMode: RunStopMode | null;
+  readonly expectedRevision: number;
+  readonly history: readonly unknown[];
+  readonly dirtyWorktree?: unknown;
+}): ParkEscalationTransitionCheck {
+  try {
+    const snapshot = readPlainRecordWithOptionalKeys(
+      input,
+      ['record', 'state', 'stopMode', 'expectedRevision', 'history'],
+      ['dirtyWorktree'],
+    );
+    if (snapshot === null) {
+      return { ok: false, reason: 'malformed-input' };
+    }
+    const { record, state, stopMode, expectedRevision, history, dirtyWorktree } = snapshot as {
+      record: unknown;
+      state: unknown;
+      stopMode: unknown;
+      expectedRevision: unknown;
+      history: unknown;
+      dirtyWorktree?: unknown;
+    };
+    if (!isPlainRecordObject(record)) {
+      return { ok: false, reason: 'malformed-input' };
+    }
+    const revision = Object.getOwnPropertyDescriptor(record, 'revision')?.value;
+    if (typeof revision !== 'number' || !Number.isSafeInteger(revision)) {
+      return { ok: false, reason: 'malformed-input' };
+    }
+    if (typeof state !== 'string' || !(LANE_RUN_STATES as readonly string[]).includes(state)) {
+      return { ok: false, reason: 'malformed-input' };
+    }
+    if (state === 'stopped') {
+      return { ok: false, reason: 'run-stopped' };
+    }
+    if (expectedRevision !== revision) {
+      return { ok: false, reason: 'stale-revision' };
+    }
+    if (stopMode !== null) {
+      return { ok: false, reason: 'stop-pending' };
+    }
+    if (state !== 'parked' || record.parked === null) {
+      return { ok: false, reason: 'not-parked' };
+    }
+    const parkedReason = Object.getOwnPropertyDescriptor(record.parked, 'reason')?.value;
+    if (parkedReason === 'stop-unconfirmed' || parkedReason === 'stop-refused') {
+      return { ok: false, reason: 'stop-pending' };
+    }
+    if (parkedReason === 'one-way-door') {
+      return { ok: false, reason: 'one-way-door' };
+    }
+    const decision = decideParkEscalation(record.parked, history, dirtyWorktree);
+    if (decision.kind === 'stay-parked') {
+      return { ok: false, reason: decision.reason };
+    }
+    return { ok: true, to: 'fixing', mode: decision.mode, journalReasonCode: 'park-escalated', journalDetail: decision.mode };
+  } catch {
+    return { ok: false, reason: 'malformed-input' };
+  }
 }
 
 /**

@@ -44,6 +44,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'merge-dropped', 'merge-held', 'merge-enqueue-refused', 'merge-overtaken',
   'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
   'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
+  'park-escalated', // CE1: the result recording a park escalation (its detail names the mode, e.g. `commit-pending`)
   LANE_RUN_INTENT_ABANDONED_REASON_CODE, // F171: an operator stop or resume closed an ambiguous pending intent
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];

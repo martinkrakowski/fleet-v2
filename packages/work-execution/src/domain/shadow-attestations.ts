@@ -8,7 +8,13 @@
 // returns a typed refusal.
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from './plain-record-reads.js';
+import {
+  readExactPlainRecord,
+  readPlainRecordWithOptionalKeys,
+  snapshotPlainDataRecord,
+  readBoundedDenseArray,
+  readOwnDataElement,
+} from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,
@@ -258,54 +264,16 @@ function readAttestationList(value: unknown): readonly ShadowAttestation[] | nul
   return collectAttestations(bounded);
 }
 
-/** The attestation list, capped at `SHADOW_ATTESTATION_FACTS.length`. Cost: linear in that cap. */
+/** The attestation list, capped at `SHADOW_ATTESTATION_FACTS.length`; the accepted `O(K)` engine bound of `Reflect.ownKeys` is paid inside `readBoundedDenseArray` after its `O(1)` pre-gate. */
 function readBoundedAttestations(value: unknown): BoundedAttestations | null {
-  return readBoundedArray(value, SHADOW_ATTESTATION_FACTS.length);
-}
-
-/**
- * A real, dense array of at most `cap` elements, or null. The length comes
- * from its own descriptor and is refused before `Object.keys` when it is
- * over the cap, so an enormous sparse length is never traversed. Cost:
- * linear in the number of own keys, which `cap` bounds.
- */
-function readBoundedArray(value: unknown, cap: number): BoundedAttestations | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const length = ownArrayLength(value, cap);
-  if (length === null || Object.keys(value).length !== length) {
-    return null;
-  }
-  return { array: value, length };
-}
-
-/** The own data-property `length` when it is a safe integer in `[0, cap]`. Cost: O(1). */
-function ownArrayLength(value: readonly unknown[], cap: number): number | null {
-  const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (descriptor === undefined || descriptor.get !== undefined) {
-    return null;
-  }
-  const length: unknown = descriptor.value;
-  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > cap) {
-    return null;
-  }
-  return length;
-}
-
-function ownArrayElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  if (descriptor === undefined || descriptor.get !== undefined || !('value' in descriptor)) {
-    return undefined;
-  }
-  return descriptor.value;
+  return readBoundedDenseArray(value, SHADOW_ATTESTATION_FACTS.length);
 }
 
 function collectAttestations(bounded: BoundedAttestations): readonly ShadowAttestation[] | null {
   const attestations: ShadowAttestation[] = [];
   let previousIndex = -1;
   for (let index = 0; index < bounded.length; index += 1) {
-    const next = readNextAttestation(ownArrayElement(bounded.array, index), previousIndex);
+    const next = readNextAttestation(readOwnDataElement(bounded.array, index), previousIndex);
     if (next === null) {
       return null;
     }
@@ -566,7 +534,9 @@ type FieldRead<T> = { readonly ok: true; readonly value: T } | { readonly ok: fa
  * the release it was observed under (`observedDay` compared with `dayNumber`).
  * `attestations === null` means the store is absent. `releaseTests === null`
  * means the release tree could not be read. A fail beats any unknown.
- * Cost: linear in the capped input. The caps are the named constants
+ * Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)` engine
+ * bound of `Reflect.ownKeys` (where `K` is the target's own-property count),
+ * then `O(cap)` element traversal. The caps are the named constants
  * `SHADOW_ONE_TIME_MAX_TESTS` (refused from the array's own `length` before
  * any element is traversed), `SHADOW_ONE_TIME_MAX_PATH_LENGTH` (refused from
  * a path string's own `length` before its shape is judged) and
@@ -646,15 +616,17 @@ function readAttestationField(value: unknown): FieldRead<readonly ShadowAttestat
 
 /**
  * `null` means the release tree could not be read. An over-cap, sparse,
- * non-array or ill-shaped list is refused. Cost: linear in
- * `SHADOW_ONE_TIME_MAX_TESTS`, and an over-cap length is refused before any
- * element is read.
+ * non-array or ill-shaped list is refused. Cost: an `O(1)` length/prototype
+ * pre-gate, then the accepted `O(K)` engine bound of `Reflect.ownKeys`
+ * (where `K` is the target's own-property count), then `O(cap)` element
+ * traversal with cap `SHADOW_ONE_TIME_MAX_TESTS`; an over-cap length is
+ * refused before any element is read.
  */
 function readReleaseTestField(value: unknown): FieldRead<ReadonlyMap<string, ShadowReleaseTestFact> | null> {
   if (value === null) {
     return { ok: true, value: null };
   }
-  const bounded = readBoundedArray(value, SHADOW_ONE_TIME_MAX_TESTS);
+  const bounded = readBoundedDenseArray(value, SHADOW_ONE_TIME_MAX_TESTS);
   if (bounded === null) {
     return { ok: false };
   }
@@ -665,7 +637,7 @@ function readReleaseTestField(value: unknown): FieldRead<ReadonlyMap<string, Sha
 function collectReleaseTests(bounded: BoundedAttestations): FieldRead<ReadonlyMap<string, ShadowReleaseTestFact>> {
   const tests = new Map<string, ShadowReleaseTestFact>();
   for (let index = 0; index < bounded.length; index += 1) {
-    const fact = readReleaseTest(ownArrayElement(bounded.array, index));
+    const fact = readReleaseTest(readOwnDataElement(bounded.array, index));
     if (fact === null || tests.has(fact.path)) {
       return { ok: false };
     }
@@ -893,10 +865,12 @@ const COMMAND_INVALID: ShadowAttestationCommandInputParse = { ok: false, reason:
  * are outside `COMMAND_KEYS` and refused. A non-plain object (including an
  * array, a class instance or a Proxy whose prototype is not
  * `Object.prototype`) and every over-cap string are refused before any field
- * is traversed. Cost: linear in the capped input; the caps are the named
+ * is traversed. Cost: an `O(1)` length/prototype pre-gate, then the
+ * accepted `O(K)` engine bound of `Object.keys`/`Reflect.ownKeys` (where `K`
+ * is the target's own-property count), then a walk capped by the named
  * constants `MAX_ATTESTATION_NOTE_LENGTH`, `MAX_ATTESTATION_EVIDENCE_LENGTH`,
  * `MAX_ATTESTATION_AUTHORITY_LENGTH`, `MAX_ATTESTATION_OPERATION_ID_LENGTH`,
- * `MAX_ATTESTATION_DEADLINE_LENGTH` and `MAX_REVISION`, and the key set is
+ * `MAX_ATTESTATION_DEADLINE_LENGTH` and `MAX_REVISION`, with the key set
  * capped at `COMMAND_KEYS.length` — the key count is read before any field is
  * traversed, so an oversized object is refused without snapshotting a single
  * field. Never throws, never echoes an input value.
@@ -912,7 +886,11 @@ export function parseShadowAttestationCommandInput(raw: unknown): ShadowAttestat
 function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
   // The key count is read before any traversal: once the cheap plain-record
   // shape check passes, an object carrying more own enumerable keys than the
-  // capped key set is refused without snapshotting a single field.
+  // capped key set is refused without snapshotting a single field. The
+  // accepted `O(K)` engine bound of `Object.keys`/`Reflect.ownKeys` (where
+  // `K` is the target's own-property count) is paid on this single
+  // enumeration, capped at `COMMAND_KEYS.length` + the symbol/extra-key
+  // refusal inside `snapshotPlainDataRecord`.
   if (!isPlainRecordObject(raw) || Object.keys(raw).length > COMMAND_KEYS.length) {
     return COMMAND_INVALID;
   }

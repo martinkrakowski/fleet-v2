@@ -614,17 +614,18 @@ export function checkParkEscalation(input: {
     if (stopMode !== null) {
       return { ok: false, reason: 'stop-pending' };
     }
-    if (state !== 'parked' || record.parked === null) {
+    const parked = Object.getOwnPropertyDescriptor(record, 'parked')?.value;
+    if (state !== 'parked' || parked === null) {
       return { ok: false, reason: 'not-parked' };
     }
-    const parkedReason = Object.getOwnPropertyDescriptor(record.parked, 'reason')?.value;
+    const parkedReason = Object.getOwnPropertyDescriptor(parked, 'reason')?.value;
     if (parkedReason === 'stop-unconfirmed' || parkedReason === 'stop-refused') {
       return { ok: false, reason: 'stop-pending' };
     }
     if (parkedReason === 'one-way-door') {
       return { ok: false, reason: 'one-way-door' };
     }
-    const decision = decideParkEscalation(record.parked, history, dirtyWorktree);
+    const decision = decideParkEscalation(parked, history, dirtyWorktree);
     if (decision.kind === 'stay-parked') {
       return { ok: false, reason: decision.reason };
     }

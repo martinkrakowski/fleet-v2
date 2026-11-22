@@ -68,3 +68,11 @@ export type {
   PlainRecordRead,
 } from './plain-record.js';
 export { MAX_SCHEMA_FIELDS, MAX_DEPTH } from './plain-record.js';
+
+export { snapshotPlainData, DEFAULT_PLAIN_DATA_LIMITS } from './plain-data-snapshot.js';
+export type {
+  IsProxy,
+  PlainDataLimits,
+  PlainDataRefusalReason,
+  PlainDataSnapshot,
+} from './plain-data-snapshot.js';

@@ -91,6 +91,40 @@ function snapshotRepository(value: unknown): unknown {
   }
 }
 
+/**
+ * BL02g fix round: the ONE shared descriptor helper every snapshotted field
+ * goes through. An own accessor (a getter OR a setter) on ANY field the
+ * snapshot copied — required or optional (`resumeActionId`, `releaseRoot`,
+ * `repository`, `pullRequestNumber`, `attemptId`, every field) — is refused,
+ * because a set-only accessor snapshots to `undefined` exactly like an
+ * omitted field and would otherwise silently read as absent (a release retry
+ * could skip its resumable grant and fall through to an unrelated approved
+ * grant). Absence (no own property at all) stays absent and still resolves as
+ * before. Inspecting a descriptor never runs a getter, a setter or a `get`
+ * trap. Every descriptor inspection on the original input is wrapped: a
+ * hostile Proxy's `getOwnPropertyDescriptor` trap throwing is the same typed
+ * refusal, signalled by returning the offending key. Returns the first
+ * accessor-carrying field name, or null when every snapshotted field is plain
+ * data.
+ */
+function findOwnAccessorField(
+  snapshot: Record<string, unknown>,
+  input: object,
+): string | null {
+  for (const key of Object.keys(snapshot)) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(input, key);
+    } catch {
+      return key;
+    }
+    if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+      return key;
+    }
+  }
+  return null;
+}
+
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
   constructor(private readonly deps?: ResolveActionAuthorizationDependencies) {}
 
@@ -132,31 +166,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     } catch {
       return blocked('invalid-request');
     }
-    // An accessor field snapshots to `undefined` (its value is never read), but
-    // its presence is still visible through its own property descriptor, and
-    // inspecting a descriptor never runs a getter. An accessor-carrying
-    // `actionScope` (a getter or a setter) therefore cannot be resolved
-    // head-free at all: it is a typed refusal with a getter-call count of 0.
     // BL02g fix round: a set-only accessor is an accessor too — its snapshot
     // value is `undefined` exactly like an omitted field, so it must be
-    // refused the same way. A plain-data `actionScope`
+    // refused the same way. Every snapshotted field — required or optional —
+    // now goes through the one shared `findOwnAccessorField` helper, so no
+    // field can be missed: ANY own accessor on ANY field the snapshot copied
+    // is a typed `invalid-request` refusal, checked before any field —
+    // including the routing `actionScope` — is read. A plain-data request
     // — every ordinary request — reads exactly as before from the snapshot.
-    // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
-    // throw for a single key while the snapshot above succeeded (the trap
-    // threw only after the snapshot's own descriptor calls). Every descriptor
-    // inspection on the original input is therefore wrapped: a throw is the
-    // same typed `invalid-request` refusal the malformed-input path uses,
-    // never an exception escaping the resolve.
-    let actionScopeDescriptor: PropertyDescriptor | undefined;
-    try {
-      actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
-    } catch {
-      return blocked('invalid-request');
-    }
-    if (
-      actionScopeDescriptor !== undefined &&
-      (actionScopeDescriptor.get !== undefined || actionScopeDescriptor.set !== undefined)
-    ) {
+    if (snapshot !== null && findOwnAccessorField(snapshot, input) !== null) {
       return blocked('invalid-request');
     }
     const scope =
@@ -198,15 +216,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       );
     }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
-      let descriptor: PropertyDescriptor | undefined;
-      try {
-        descriptor = Object.getOwnPropertyDescriptor(input, field);
-      } catch {
-        return blocked('invalid-request');
-      }
-      if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
-        return blocked('invalid-request');
-      }
+      // BL02g fix round: the accessor check for this field already ran through
+      // the one shared `findOwnAccessorField` helper above, alongside every
+      // other snapshotted field. Only the required-field presence check stays.
       if (!isFilled(snapshot[field])) {
         throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
       }
@@ -220,29 +232,11 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       ...snapshot,
       repository: snapshotRepository(snapshot['repository']),
     } as unknown as ResolveActionAuthorizationRequest;
-    // `releaseRoot` is not a required field, so an own accessor on it
-    // survives the validation above. BL02g fix round: ANY own accessor on
-    // `releaseRoot` — a getter or a setter — is refused as
-    // `invalid-request` before the recorded request is even located. A
-    // set-only accessor snapshots to `undefined` exactly like an omitted
-    // field, so it would otherwise silently agree with an absent recorded
-    // root; refusing any accessor keeps every accessor-carrying
-    // `releaseRoot` failing closed through its own descriptor, which never
-    // invokes the getter, the setter or a `get` trap.
-    // BL02g fix round: this inspection is wrapped like every other descriptor
-    // read on `input`; a throwing trap is a typed refusal, not an exception.
-    let releaseRootDescriptor: PropertyDescriptor | undefined;
-    try {
-      releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
-    } catch {
-      return blocked('invalid-request');
-    }
-    if (
-      releaseRootDescriptor !== undefined &&
-      (releaseRootDescriptor.get !== undefined || releaseRootDescriptor.set !== undefined)
-    ) {
-      return blocked('invalid-request');
-    }
+    // BL02g fix round: an own accessor on the optional `releaseRoot` (and on
+    // every other optional snapshotted field — `resumeActionId` included) is
+    // already refused by the one shared `findOwnAccessorField` helper above,
+    // so the separate releaseRoot-only inspection is gone. No accessor can
+    // survive to the recorded-request lookup.
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {
       return blocked(

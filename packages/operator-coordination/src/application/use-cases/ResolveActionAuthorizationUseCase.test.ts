@@ -612,7 +612,7 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     });
   });
 
-  it('never runs a hostile getter on the request and refuses it as invalid-request', async () => {
+  it('refuses an accessor on projectId as invalid-request before any field is read', async () => {
     const requestRepo = seededRepo();
     let calls = 0;
     const hostile = { ...validRequest() };
@@ -624,9 +624,10 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
       enumerable: true,
     });
     const result = await resolveRaw(useCase(requestRepo), hostile);
-    // The accessor's value reads as undefined through its own descriptor, so
-    // the projectId is missing: a typed refusal, and the getter never ran.
-    expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+    // BL02g fix round: the accessor is refused through its own descriptor via
+    // the one shared helper before ANY field — projectId included — is read,
+    // so the shadow path is never reached and the getter never ran.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(calls).toBe(0);
   });
 
@@ -849,6 +850,106 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(calls).toBe(0);
   });
 
+  // BL02g fix round: EVERY snapshotted field — required or optional — goes
+  // through the one shared descriptor helper, so ANY own accessor (a getter
+  // OR a setter) on ANY field the snapshot copies is refused as
+  // invalid-request before any grant lookup runs. A set-only accessor
+  // snapshots to `undefined` exactly like an omitted field, so without the
+  // shared refusal a release retry carrying a setter-only `resumeActionId`
+  // could skip its resumable grant and fall through to an unrelated approved
+  // grant.
+  const SNAPSHOTTED_FIELDS = [
+    'projectId',
+    'actionScope',
+    'expectedHeadSha',
+    'authorizationGrantId',
+    'attemptId',
+    'releaseRoot',
+    'resumeActionId',
+    'repository',
+    'pullRequestNumber',
+  ] as const;
+
+  const ACCESSOR_KINDS = ['getter-only', 'setter-only', 'getter+setter'] as const;
+
+  function requestWithAccessor(
+    field: (typeof SNAPSHOTTED_FIELDS)[number],
+    kind: (typeof ACCESSOR_KINDS)[number],
+  ): Record<string, unknown> {
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, field, {
+      ...(kind !== 'setter-only'
+        ? {
+            get() {
+              throw new Error(`hostile ${field} getter ran`);
+            },
+          }
+        : {}),
+      ...(kind !== 'getter-only'
+        ? {
+            set() {
+              throw new Error(`hostile ${field} setter ran`);
+            },
+          }
+        : {}),
+      enumerable: true,
+    });
+    return hostile;
+  }
+
+  function countingRepo(): { repo: CoordinationRequestRepositoryPort; grantLookups: () => number } {
+    const base = nonShadowRepo();
+    let grantLookups = 0;
+    const repo: CoordinationRequestRepositoryPort = {
+      saveRequest: (record) => base.saveRequest(record),
+      findRequestById: (id) => base.findRequestById(id),
+      findRequestByGrantId: (grantId) => {
+        grantLookups += 1;
+        return base.findRequestByGrantId(grantId);
+      },
+      listRequests: (projectId) => {
+        grantLookups += 1;
+        return base.listRequests(projectId);
+      },
+    };
+    return { repo, grantLookups: () => grantLookups };
+  }
+
+  it.each(SNAPSHOTTED_FIELDS.flatMap((field) => ACCESSOR_KINDS.map((kind) => ({ field, kind }))))(
+    'refuses an own $kind accessor on snapshotted $field as invalid-request without resolving any grant',
+    async ({ field, kind }) => {
+      const { repo, grantLookups } = countingRepo();
+      const result = await resolveRaw(
+        new ResolveActionAuthorizationUseCase({ requestRepo: repo }),
+        requestWithAccessor(field, kind),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+      expect(grantLookups()).toBe(0);
+    },
+  );
+
+  // BL02g fix round: absence stays absence. A request whose optional fields
+  // are simply not present (no own property at all) carries no accessor and
+  // still resolves exactly as before.
+  it('resolves a request whose optional fields are absent as own properties exactly as before', async () => {
+    const request = {
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-1',
+      repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+      pullRequestNumber: 1,
+    };
+    const result = await resolveRaw(useCase(nonShadowRepo()), request);
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: 'grant-1',
+      requestId: 'req-1',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      policyRevision: 'aaaaaaaaaaaa',
+    });
+  });
+
   it('refuses a setter-only expectedHeadSha accessor as invalid-request without running the setter', async () => {
     let calls = 0;
     const hostile = { ...nonShadowRequest() };
@@ -895,12 +996,13 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
 
-  // BL02g fix round: a Proxy whose `getOwnPropertyDescriptor` trap throws only
-  // for `releaseRoot` (a non-required field with no own property) passes the
-  // snapshot and the required-field checks, so the late `releaseRoot`
-  // descriptor inspection must not let the trap's throw escape as an
-  // exception: it is a typed invalid-request refusal.
-  it('refuses a non-shadow Proxy whose descriptor trap throws only for releaseRoot as invalid-request without throwing', async () => {
+  // BL02g fix round: a descriptor trap that throws only for `releaseRoot` —
+  // an OPTIONAL field with no own property on the request — is never
+  // consulted: the shared helper inspects only the keys the snapshot copied,
+  // so absence (no own property at all) stays absent and the request resolves
+  // exactly like the plain data. A throwing trap for a key the snapshot
+  // copied is still the typed invalid-request refusal.
+  it('resolves a Proxy whose descriptor trap throws only for the absent optional releaseRoot exactly like the plain data', async () => {
     const proxy = new Proxy(nonShadowRequest(), {
       getOwnPropertyDescriptor(target, prop) {
         if (prop === 'releaseRoot') {
@@ -909,8 +1011,10 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
         return Reflect.getOwnPropertyDescriptor(target, prop);
       },
     });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
     const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
-    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
   });
 
   // BL02g fix round: a Proxy whose trap throws for `actionScope` only on a

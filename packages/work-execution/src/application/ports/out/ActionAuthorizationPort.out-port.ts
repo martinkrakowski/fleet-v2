@@ -97,6 +97,13 @@ export interface ActionAuthorizationPort {
   authorizeShadowImport?(
     request: AuthorizeShadowImportRequest,
   ): Promise<AuthorizeShadowImportResult>;
+
+  /**
+   * The relaunch-apply grant's head-free resolve. The grant is bound to the
+   * plan digest it names and its capped expiry; the caller supplies its own
+   * clock reading (`nowIso`). Pending and unknown results block the apply.
+   */
+  authorizeRelaunchApply?(request: AuthorizeRelaunchApplyRequest): Promise<AuthorizeRelaunchApplyResult>;
 }
 
 export interface AuthorizeShadowImportRequest {
@@ -122,5 +129,17 @@ export interface AuthorizeUnsealedWorktreeRemovalRequest {
 
 export type AuthorizeUnsealedWorktreeRemovalResult =
   | { readonly outcome: 'approved'; readonly approvalReference: string }
+  | { readonly outcome: 'blocked'; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
+export interface AuthorizeRelaunchApplyRequest {
+  /** 64 lowercase hex: the plan digest the grant must name. */
+  readonly planDigest: string;
+  readonly grantId: string;
+  readonly nowIso: string;
+}
+
+export type AuthorizeRelaunchApplyResult =
+  | { readonly outcome: 'authorized'; readonly grantId: string }
   | { readonly outcome: 'blocked'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };

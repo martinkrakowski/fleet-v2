@@ -286,6 +286,25 @@ describe('shadow attestation ledger (SH15a)', () => {
       expect(calls()).toBe(0);
     });
 
+    it('refuses a symbol own key on the attestations array with invalid-ledger', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      Object.defineProperty(attestations, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('refuses a non-enumerable extra own key on the attestations array with invalid-ledger', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      Object.defineProperty(attestations, 'hidden', { value: 1, enumerable: false, configurable: true, writable: true });
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('refuses the whole attestations list when an accessor element is present (invalid-ledger)', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      const calls = plantGetter(attestations, '0', rawAttestation());
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+      expect(calls()).toBe(0);
+    });
+
     it('a Proxy over a valid ledger yields exactly the plain data and runs no get trap', () => {
       const recorded = requireLedger(recordShadowAttestation(null, rawAttestation()));
       const plain = readShadowAttestations(recorded);

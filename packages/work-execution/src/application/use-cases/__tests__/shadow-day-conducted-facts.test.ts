@@ -920,6 +920,52 @@ describe('readShadowConformanceRuns hostile input', () => {
     expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
   });
 
+  it('refuses a subclassed array (a foreign prototype) as the merged list with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    class FancyArray extends Array {}
+    const subclassed = FancyArray.from([PR]);
+    expect(Array.isArray(subclassed)).toBe(true);
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: subclassed }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a non-enumerable own index on the merged list with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR, PR + 1];
+    Object.defineProperty(items, 1, { value: PR + 1, enumerable: false, configurable: true, writable: true });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a symbol own key on the merged list with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR];
+    Object.defineProperty(items, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses the whole list when an accessor element is present, before any item reader runs (unknown/invalid-request)', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR, PR + 1];
+    let accessorCalls = 0;
+    Object.defineProperty(items, 1, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return PR + 1;
+      },
+    });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+    expect(accessorCalls).toBe(0);
+  });
+
   it('refuses an enormous length before any traversal with unknown/invalid-request', async () => {
     const deps = makeDeps({});
     const sparse: number[] = [];

@@ -36,8 +36,7 @@ import {
   SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
 } from '../../../domain/shadow-day-conformance.js';
 import { isZonedIsoDateTime } from '../../../domain/conductor-halt.js';
-import { readExactPlainRecord } from '../../../domain/plain-record-reads.js';
-import { readBoundedDenseArray } from '../../../domain/shadow-evidence-ledger.js';
+import { readBoundedDenseArray, readExactPlainRecord } from '../../../domain/plain-record-reads.js';
 
 /**
  * Cap on the request's merged pull-request list. An over-cap list is refused

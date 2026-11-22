@@ -9,11 +9,11 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import {
+  readBoundedDenseArray,
   readExactPlainRecord,
   readPlainRecordWithOptionalKeys,
   snapshotPlainDataRecord,
 } from './plain-record-reads.js';
-import { readBoundedDenseArray } from './shadow-evidence-ledger.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,

@@ -624,11 +624,16 @@ type ShadowImportSnapshot =
 
 /**
  * Snapshot a plain object's own enumerable data properties through their
- * descriptors only. Cost is linear in `MAX_SHADOW_IMPORT_KEYS` plus the
- * bounded values copied; accessors are never invoked, symbol keys and
- * non-enumerable data keys are refused, and a prototype-polluting key
- * (`__proto__`, `constructor`, `prototype`) is refused before any key-set
- * comparison so a polluting key can never masquerade as a field.
+ * descriptors only. Cost policy (decided, BL06a): enumerating
+ * `Reflect.ownKeys(raw)` carries an accepted engine-level `O(K)` bound in
+ * the target's own-property count `K` (ECMAScript `[[OwnPropertyKeys]]` has
+ * no count-only primitive), and the loop itself is bounded by the
+ * `MAX_SHADOW_IMPORT_KEYS` prefix cap, so the traversal is
+ * `O(MAX_SHADOW_IMPORT_KEYS)` after the enumeration. Accessors are never
+ * invoked, symbol keys and non-enumerable data keys are refused, and a
+ * prototype-polluting key (`__proto__`, `constructor`, `prototype`) is
+ * refused before any key-set comparison so a polluting key can never
+ * masquerade as a field.
  */
 function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
   let ownKeys: PropertyKey[];
@@ -642,10 +647,10 @@ function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
   let forbiddenCode: ShadowImportGrantErrorCode | undefined;
   // A bounded prefix of `MAX_SHADOW_IMPORT_KEYS + 1` keys is inspected, so the
   // cost never grows past the cap; a prototype-polluting key seen inside that
-  // prefix is reported before any key-set comparison can mask it.
-  // No capped own-keys helper exists in the repo (follow-up #4v); this loop
-  // enumerates all own keys before the cap.
-  // key enumeration precedes the cap: tracked as follow-up #4v
+  // prefix is reported before any key-set comparison can mask it. The
+  // `Reflect.ownKeys` enumeration above carries an accepted engine-level
+  // `O(K)` bound in the target's own-property count `K` (no count-only
+  // primitive exists in ECMAScript).
   for (let index = 0; index < ownKeys.length; index += 1) {
     if (index > MAX_SHADOW_IMPORT_KEYS) {
       return { ok: false, code: forbiddenCode ?? 'shadow-import-grant-unexpected-key' };

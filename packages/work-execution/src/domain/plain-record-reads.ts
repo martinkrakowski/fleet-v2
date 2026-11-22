@@ -126,14 +126,26 @@ export interface BoundedDenseArray {
  * symbol and non-enumerable keys, followed by an `O(cap)` bound for the
  * per-index descriptor checks. There is no "linear in the capped input"
  * claim: the `O(K)` engine bound is the accepted cost of owning-keys
- * validation on every JavaScript engine. Every Proxy exotic object is
- * rejected outright by a final `structuredClone` probe (exactly as
- * `cutover-records.ts` probes its evidence document): a Proxy can answer
- * every descriptor and key check consistently while lying, so the probe
- * runs only after the walk has proved every own property a plain data
- * value — it reads no getter — and a clone failure means a stand-in, never
- * data. Uncloneable data values (functions, cycles) are refused as well.
+ * validation on every JavaScript engine.
  *
+ * Proxy policy (BL06a fallback bound): every Proxy exotic object —
+ * transparent, revoked, consistent-liar, descriptor-spoofing, or throwing —
+ * is refused outright, before any reflection runs, by a `structuredClone`
+ * probe on every array-shaped input, so no Proxy trap (`get`,
+ * `getOwnPropertyDescriptor`, `ownKeys`, `getPrototypeOf`) ever fires and no
+ * getter is read on the refusal path: the serializer refuses a Proxy at its
+ * root, before it walks anything. `types.isProxy` from `node:util` would do
+ * this in `O(1)`, but lint:arch refuses node builtins in the domain layer
+ * and no pure-language test for a Proxy exists (the same bound
+ * `BriefPackage.vo.ts` documents), so the probe is the simplest rule that
+ * still refuses every stand-in. Its two accepted bounds are documented here
+ * and asserted in the tests: the probe is `O(size)` on array-shaped input
+ * rather than `O(1)`, and on input that is not a Proxy it walks cloneable
+ * data, so a getter or accessor on the value or on an object stored in a
+ * valid slot may be read once during the probe. Every refusal decision and
+ * every returned element still comes solely from property descriptors — a
+ * probe read never enters the copy — and uncloneable data values (functions,
+ * cycles) are refused by the same probe.
  * Returns the array's elements as a fresh dense copy when `value` is a
  * genuine `Array` (prototype exactly `Array.prototype`) whose own keys are
  * exactly the canonical dense indices `0..length-1` plus a plain data
@@ -143,28 +155,49 @@ export interface BoundedDenseArray {
  * enumeration, so a revoked Proxy that throws there never reaches
  * `Reflect.ownKeys`. Holes, accessors, non-enumerable indices, symbol keys,
  * and extra named or non-canonical own keys (including `__proto__`,
- * `constructor`, `prototype`, `"01"`) return null without ever invoking a
- * getter or a Proxy `get` trap. Every failure, including a revoked Proxy
- * throwing anywhere along the path, returns null and never throws.
+ * `constructor`, `prototype`, `"01"`) return null; the walk itself never
+ * invokes a getter — the pre-probe's single read of cloneable data is the
+ * only path that may touch one (the documented bound above). Every failure,
+ * including a revoked Proxy throwing anywhere along the path, returns null
+ * and never throws.
  */
 export function readBoundedDenseArray(value: unknown, cap: number): BoundedDenseArray | null {
   if (!Number.isSafeInteger(cap) || cap < 0) {
     return null;
   }
   let isArray: boolean;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return null;
+  }
+  if (!isArray) {
+    return null;
+  }
+  // Proxy pre-check (BL06a fallback bound, documented in the JSDoc above):
+  // the probe refuses every Proxy exotic object before any reflection runs,
+  // firing no trap and reading no getter on the refusal path. It is the
+  // simplest rule available — lint:arch refuses the `node:util` builtin in
+  // the domain layer (`types.isProxy`) and no pure-language test for a
+  // Proxy exists — so, unlike `types.isProxy`, it walks cloneable data on
+  // the accept path; its reads never enter the copy, which comes solely
+  // from the descriptor walk below.
+  try {
+    structuredClone(value);
+  } catch {
+    return null;
+  }
   let prototype: unknown;
   let lengthDescriptor: PropertyDescriptor | undefined;
   try {
-    isArray = Array.isArray(value);
-    prototype = isArray ? Object.getPrototypeOf(value) : undefined;
-    lengthDescriptor = isArray ? Object.getOwnPropertyDescriptor(value, 'length') : undefined;
+    prototype = Object.getPrototypeOf(value);
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   } catch {
     return null;
   }
   // O(1) gate: refuse everything a property descriptor can decide before any
   // key enumeration runs.
   if (
-    !isArray ||
     prototype !== Array.prototype ||
     lengthDescriptor === undefined ||
     lengthDescriptor.get !== undefined ||
@@ -224,17 +257,6 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     // copy must come from the one this loop just proved to be a plain,
     // enumerable data property.
     out.push(descriptor.value);
-  }
-  // Final gate, exactly as `cutover-records.ts` probes its evidence document:
-  // the walk above has proved every own property a plain enumerable data
-  // value, so the serializer probe reads no getter. A Proxy exotic object is
-  // refused by the serializer without running its `get` trap, so a consistent
-  // liar that answered every descriptor and key check as data is still
-  // rejected here; a clone failure means a stand-in, never data.
-  try {
-    structuredClone(value);
-  } catch {
-    return null;
   }
   return { array: out, length };
 }

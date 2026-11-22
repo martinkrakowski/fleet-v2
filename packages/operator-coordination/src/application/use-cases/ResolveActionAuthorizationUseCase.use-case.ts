@@ -141,9 +141,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     // An accessor field snapshots to `undefined` (its value is never read), but
     // its presence is still visible through its own property descriptor, and
-    // inspecting a descriptor never runs a getter. A getter-carrying
-    // `actionScope` therefore cannot be resolved head-free at all: it is a
-    // typed refusal with a getter-call count of 0. A plain-data `actionScope`
+    // inspecting a descriptor never runs a getter. An accessor-carrying
+    // `actionScope` (a getter or a setter) therefore cannot be resolved
+    // head-free at all: it is a typed refusal with a getter-call count of 0.
+    // BL02g fix round: a set-only accessor is an accessor too — its snapshot
+    // value is `undefined` exactly like an omitted field, so it must be
+    // refused the same way. A plain-data `actionScope`
     // — every ordinary request — reads exactly as before from the snapshot.
     // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
     // throw for a single key while the snapshot above succeeded (the trap
@@ -163,7 +166,10 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     } catch {
       return blocked('invalid-request');
     }
-    if (actionScopeDescriptor !== undefined && actionScopeDescriptor.get !== undefined) {
+    if (
+      actionScopeDescriptor !== undefined &&
+      (actionScopeDescriptor.get !== undefined || actionScopeDescriptor.set !== undefined)
+    ) {
       return blocked('invalid-request');
     }
     const scope =
@@ -190,7 +196,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // this code built itself, so it is known plain data — and the only reads
     // on `input` are `Object.getOwnPropertyDescriptor` calls, which inspect a
     // descriptor without ever running a getter or a Proxy `get` trap. An own
-    // accessor on a required field is visible through its descriptor and is
+    // accessor on a required field (a getter or a setter — a set-only accessor
+    // snapshots to `undefined` exactly like an omitted field, so it is refused
+    // for the same reason) is visible through its descriptor and is
     // refused as invalid-request; a trap throwing during that inspection is a
     // hostile proxy, also a typed refusal. A plain-data request keeps main's
     // exact throw on genuinely missing required fields.
@@ -209,7 +217,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       } catch {
         return blocked('invalid-request');
       }
-      if (descriptor !== undefined && descriptor.get !== undefined) {
+      if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
         return blocked('invalid-request');
       }
       if (!isFilled(snapshot[field])) {

@@ -815,6 +815,55 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(calls).toBe(0);
   });
 
+  // BL02g fix round: a setter-only own accessor on a snapshotted field
+  // snapshots to `undefined` exactly like an omitted field, so it must be
+  // refused as invalid-request through its own descriptor (which never runs
+  // the setter) instead of surviving to the missing-required-field throw.
+  it('refuses a setter-only projectId accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'projectId', {
+      set() {
+        calls += 1;
+        throw new Error('hostile projectId setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a setter-only actionScope accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'actionScope', {
+      set() {
+        calls += 1;
+        throw new Error('hostile actionScope setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a setter-only expectedHeadSha accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'expectedHeadSha', {
+      set() {
+        calls += 1;
+        throw new Error('hostile expectedHeadSha setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
   it('authorizes a non-shadow Proxy over a valid request exactly like the plain data', async () => {
     let gets = 0;
     const proxy = new Proxy(nonShadowRequest(), {

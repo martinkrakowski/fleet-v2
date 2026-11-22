@@ -225,6 +225,36 @@ describe('shadow day intake (S8)', () => {
     expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
+  it('an own symbol key on a key list is samples-invalid (Object.keys used to ignore it)', () => {
+    const withSymbol: unknown[] = [key(1)];
+    Object.defineProperty(withSymbol, Symbol('extra'), { value: 1, enumerable: true });
+    const input = twoSamples({ shellLive: withSymbol });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
+  });
+
+  it('a non-enumerable extra own key on a key list is samples-invalid (Object.keys used to ignore it)', () => {
+    const hidden: unknown[] = [key(1)];
+    Object.defineProperty(hidden, 'extra', { value: 1, enumerable: false });
+    const input = twoSamples({ shellLive: hidden });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
+  });
+
+  it('an accessor element refuses the whole key list before any item reader runs (samples-invalid)', () => {
+    let calls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, 0, {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return key(1);
+      },
+    });
+    accessorList.length = 1;
+    const input = twoSamples({ shellLive: accessorList as unknown as Record<string, unknown> });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
+    expect(calls).toBe(0);
+  });
+
   it('a getter nested inside the samples-list stand-in never runs', () => {
     const counter = { calls: 0 };
     const withGetter = withCountingGetter({ length: 2, 0: sample(), 1: sample() }, 'samples', counter);

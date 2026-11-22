@@ -52,7 +52,9 @@ export type PlainDataRefusalReason =
   | 'unsupported-type'
   | 'detector-threw'
   | 'hostile'
-  | 'invalid-limits';
+  | 'invalid-limits'
+  | 'non-finite-number'
+  | 'negative-zero';
 
 export type PlainDataSnapshot =
   | { readonly ok: true; readonly value: unknown }
@@ -68,7 +70,11 @@ const LIMIT_KEYS: readonly string[] = [
 
 const CANONICAL_INDEX = /^(0|[1-9][0-9]*)$/;
 
-const INVALID_LIMITS: PlainDataSnapshot = { ok: false, reason: 'invalid-limits', path: null };
+const INVALID_LIMITS: PlainDataSnapshot = Object.freeze({
+  ok: false,
+  reason: 'invalid-limits',
+  path: null,
+});
 
 interface SnapshotState {
   /** The path whose traversal was in flight, `null` before any object read. */
@@ -193,6 +199,12 @@ function snap(
     return { ok: true, value };
   }
   if (typeof value === 'boolean' || typeof value === 'number') {
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      return refusal('non-finite-number', path);
+    }
+    if (typeof value === 'number' && Object.is(value, -0)) {
+      return refusal('negative-zero', path);
+    }
     return { ok: true, value };
   }
   if (typeof value === 'string') {

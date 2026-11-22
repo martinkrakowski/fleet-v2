@@ -304,11 +304,13 @@ describe('snapshotPlainData', () => {
         { [Symbol('s')]: 1 },
       ];
       for (const limits of cases) {
-        expect(snapshotPlainData({ a: 1 }, types.isProxy, limits as never)).toEqual({
+        const result = snapshotPlainData({ a: 1 }, types.isProxy, limits as never);
+        expect(result).toEqual({
           ok: false,
           reason: 'invalid-limits',
           path: null,
         });
+        expect(Object.isFrozen(result)).toBe(true);
       }
     });
 
@@ -451,7 +453,7 @@ describe('snapshotPlainData', () => {
 
     it('refuses functions, bigints, symbols, and undefined as unsupported-type', () => {
       const symbolValue = Symbol('v');
-      for (const input of [(() => {})(), 1n, symbolValue, undefined]) {
+      for (const input of [() => {}, 1n, symbolValue, undefined]) {
         expect(snapshotPlainData(input, types.isProxy)).toEqual({
           ok: false,
           reason: 'unsupported-type',
@@ -463,6 +465,76 @@ describe('snapshotPlainData', () => {
         reason: 'unsupported-type',
         path: 'a',
       });
+      expect(snapshotPlainData({ fn: () => {} }, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'unsupported-type',
+        path: 'fn',
+      });
+    });
+
+    it('refuses non-finite numbers as non-finite-number, top-level and nested', () => {
+      for (const input of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+        expect(snapshotPlainData(input, types.isProxy)).toEqual({
+          ok: false,
+          reason: 'non-finite-number',
+          path: null,
+        });
+      }
+      expect(snapshotPlainData({ a: Number.NaN }, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'non-finite-number',
+        path: 'a',
+      });
+      expect(snapshotPlainData({ list: [1, Number.POSITIVE_INFINITY] }, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'non-finite-number',
+        path: 'list[1]',
+      });
+    });
+
+    it('refuses negative zero as negative-zero, top-level and nested', () => {
+      expect(snapshotPlainData(-0, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'negative-zero',
+        path: null,
+      });
+      expect(snapshotPlainData({ a: -0 }, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'negative-zero',
+        path: 'a',
+      });
+      expect(snapshotPlainData({ list: [1, -0] }, types.isProxy)).toEqual({
+        ok: false,
+        reason: 'negative-zero',
+        path: 'list[1]',
+      });
+    });
+
+    it('refuses own __proto__ and constructor properties without pollution or prototype change', () => {
+      const input: Record<string, unknown> = {
+        constructor: { own: true },
+        normal: 1,
+      };
+      Object.defineProperty(input, '__proto__', {
+        value: { polluted: true },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      const snap = snapshotPlainData(input, types.isProxy);
+      expect(snap.ok).toBe(true);
+      if (!snap.ok) {
+        return;
+      }
+      const value = snap.value as Record<string, unknown>;
+      const protoDescriptor = Object.getOwnPropertyDescriptor(value, '__proto__');
+      expect(protoDescriptor).toBeDefined();
+      expect(protoDescriptor?.value).toEqual({ polluted: true });
+      const ctorDescriptor = Object.getOwnPropertyDescriptor(value, 'constructor');
+      expect(ctorDescriptor).toBeDefined();
+      expect(ctorDescriptor?.value).toEqual({ own: true });
+      expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     });
 
     it('refuses a throwing reflection trap as hostile with the in-flight path', () => {
@@ -520,16 +592,39 @@ describe('snapshotPlainData', () => {
   describe('no-runtime-specifier guard', () => {
     // Every form a runtime specifier can take: a static `import ... from`,
     // a side-effect `import` with single or double quotes, a dynamic
-    // `import()`, a `require()`, and a re-`export ... from`.
-    const NODE_SPECIFIER_PATTERN = new RegExp([
-      "import\\s+['\"]node:",
-      "import\\s+[^'\"]*\\s+from\\s+['\"]node:",
-      "import\\(\\s*['\"]node:",
-      "require\\(\\s*['\"]node:",
-      "export\\s+[^'\"]*\\s+from\\s+['\"]node:",
-    ].join('|'), 'g');
+    // `import()`, a `require()`, and a re-`export ... from` — for both
+    // `node:`-prefixed specifiers and bare Node builtin specifiers
+    // (including subpath imports such as `fs/promises`).
+    const BUILTINS = [
+      'node:',
+      'fs',
+      'path',
+      'os',
+      'child_process',
+      'net',
+      'http',
+      'https',
+      'crypto',
+      'stream',
+      'util',
+      'events',
+      'url',
+      'buffer',
+      'process',
+      'vm',
+      'worker_threads',
+    ];
+    const NODE_SPECIFIER_PATTERN = new RegExp(
+      BUILTINS.flatMap((builtin) => [
+        `import\\s*[(\\s'"]*['"]${builtin}[^'"]*['"]`,
+        `import\\s+[^'"]*\\s+from\\s*['"]${builtin}[^'"]*['"]`,
+        `require\\s*\\(\\s*['"]${builtin}[^'"]*['"]`,
+        `export\\s+[^'"]*\\s+from\\s*['"]${builtin}[^'"]*['"]`,
+      ]).join('|'),
+      'g',
+    );
 
-    it('the pattern itself matches all five specifier forms', () => {
+    it('the pattern matches node: and bare builtin specifier forms', () => {
       const forms = [
         "import 'node:process';",
         'import "node:os";',
@@ -537,9 +632,27 @@ describe('snapshotPlainData', () => {
         "await import('node:fs');",
         "require('node:fs');",
         "export * from 'node:fs';",
+        "import fs from 'fs';",
+        "import { join } from 'path';",
+        "import 'fs/promises';",
+        "require('child_process');",
+        "export * from 'crypto';",
       ];
       for (const form of forms) {
         expect(NODE_SPECIFIER_PATTERN.test(form)).toBe(true);
+        NODE_SPECIFIER_PATTERN.lastIndex = 0;
+      }
+    });
+
+    it('the pattern does not false-positive on relative or non-builtin strings', () => {
+      const safe = [
+        "import { snapshotPlainData } from '../plain-data-snapshot.js';",
+        "import './helper';",
+        "const note = 'the path module is not imported here';",
+        "export * from './index.js';",
+      ];
+      for (const form of safe) {
+        expect(NODE_SPECIFIER_PATTERN.test(form)).toBe(false);
         NODE_SPECIFIER_PATTERN.lastIndex = 0;
       }
     });

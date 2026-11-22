@@ -78,6 +78,27 @@ const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
 
 const FORGE_SCOPE_PREFIX = 'forge:';
 
+/**
+ * One step of the `execute` pipeline: either the typed result to return now
+ * or the value the next step consumes.
+ */
+type DecisionStep<T> =
+  | { readonly result: RequestScopedDecisionResult }
+  | { readonly value: T };
+
+/** The release-root read the domain helper returns. */
+type ReleaseRootRead = ReturnType<typeof readReleaseRoot>;
+
+/** A request that passed every validation decided before the clock or the grant bindings. */
+interface ValidatedDecisionRequest {
+  readonly request: RequestScopedDecisionRequest;
+  readonly kind: CoordinationKind;
+  readonly releaseRoot: ReleaseRootRead;
+  readonly releaseRootValue: string | undefined;
+  readonly isReleaseScope: boolean;
+  readonly isShadowScope: boolean;
+}
+
 type ShadowImportGrantEvaluation =
   | { readonly ok: true; readonly grant: ShadowImportGrantRecord }
   | { readonly ok: false; readonly reason: string };
@@ -143,25 +164,52 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: RequestScopedDecisionUseCase');
     }
-    // The request is snapshotted once by the domain's shared own-data-descriptor
-    // reader before any field is read, so a throwing getter (an accessor whose
-    // value collapses to `undefined`) or a Proxy trap can only produce a typed
-    // refusal — and no field is ever read off the original afterwards. The
-    // loose reader ignores unknown keys: an ordinary decision carrying an
-    // unknown body key behaves exactly as on main, where it was never a
-    // rejection and never produced a misleading field message.
-    // A Proxy's `getPrototypeOf`, `ownKeys` and `getOwnPropertyDescriptor`
-    // traps can throw while the snapshot is taken. Any such throw is a hostile
-    // body, mapped to the typed `invalid-request` refusal — never an exception
-    // out of `execute`. Ordinary inputs snapshot exactly as before.
+    const validated = this.snapshotAndValidateRequest(input);
+    if ('result' in validated) {
+      return validated.result;
+    }
+    const scope = validated.value;
+    const now = this.resolveNowIsoForScope(this.deps, scope);
+    if ('result' in now) {
+      return now.result;
+    }
+    const grants = this.evaluateGrantBindings(this.deps, scope, now.value);
+    if ('result' in grants) {
+      return grants.result;
+    }
+    const recorded = await this.recordProposal(this.deps, scope, now.value, grants.value);
+    if ('result' in recorded) {
+      return recorded.result;
+    }
+    return this.applyVerifiedDecision(this.deps, scope, now.value, recorded.value);
+  }
+
+  /**
+   * Snapshot the request once and validate every field and scope rule that is
+   * decided before the trusted clock or the grant bindings are consulted.
+   * The request is snapshotted once by the domain's shared own-data-descriptor
+   * reader before any field is read, so a throwing getter (an accessor whose
+   * value collapses to `undefined`) or a Proxy trap can only produce a typed
+   * refusal — and no field is ever read off the original afterwards. The
+   * loose reader ignores unknown keys: an ordinary decision carrying an
+   * unknown body key behaves exactly as on main, where it was never a
+   * rejection and never produced a misleading field message.
+   * A Proxy's `getPrototypeOf`, `ownKeys` and `getOwnPropertyDescriptor`
+   * traps can throw while the snapshot is taken. Any such throw is a hostile
+   * body, mapped to the typed `invalid-request` refusal — never an exception
+   * out of `execute`. Ordinary inputs snapshot exactly as before.
+   */
+  private snapshotAndValidateRequest(
+    input: object,
+  ): DecisionStep<ValidatedDecisionRequest> {
     let snapshot: Record<string, unknown> | null;
     try {
       snapshot = readPlainObjectLoose(input);
     } catch {
-      return { outcome: 'rejected', reason: 'invalid-request' };
+      return { result: { outcome: 'rejected', reason: 'invalid-request' } };
     }
     if (snapshot === null) {
-      return { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' };
+      return { result: { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' } };
     }
     // The reader copies `descriptor.value`, which is `undefined` for an
     // accessor — the same value an explicitly-omitted optional field carries
@@ -175,22 +223,26 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     const request = snapshot as unknown as RequestScopedDecisionRequest;
     for (const field of ['requestId', 'projectId', 'actionScope', 'proposalDigest', 'policyRevision'] as const) {
       if (!isFilled(request[field])) {
-        return { outcome: 'rejected', reason: `a decision request requires a non-empty ${field}` };
+        return { result: { outcome: 'rejected', reason: `a decision request requires a non-empty ${field}` } };
       }
     }
     if (request.expectedHeadSha !== null && !isFilled(request.expectedHeadSha)) {
       return {
-        outcome: 'rejected',
-        reason: 'a decision request requires an expectedHeadSha string or null',
+        result: {
+          outcome: 'rejected',
+          reason: 'a decision request requires an expectedHeadSha string or null',
+        },
       };
     }
     if (request.attemptId !== undefined && !isFilled(request.attemptId)) {
-      return { outcome: 'rejected', reason: 'a decision request attemptId must be a non-empty string when given' };
+      return { result: { outcome: 'rejected', reason: 'a decision request attemptId must be a non-empty string when given' } };
     }
     if (request.attemptId !== undefined && ATTEMPT_CONTROL_CHARACTER.test(request.attemptId)) {
       return {
-        outcome: 'rejected',
-        reason: 'a decision request attemptId must not contain control or bidi characters',
+        result: {
+          outcome: 'rejected',
+          reason: 'a decision request attemptId must not contain control or bidi characters',
+        },
       };
     }
     if (
@@ -198,8 +250,10 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       request.attemptId.trim().length > MAX_GRANT_ATTEMPT_ID_LENGTH
     ) {
       return {
-        outcome: 'rejected',
-        reason: 'a decision request attemptId must be at most 256 characters',
+        result: {
+          outcome: 'rejected',
+          reason: 'a decision request attemptId must be at most 256 characters',
+        },
       };
     }
     // CO14 follow-up: a release decision may bind its grant to the release
@@ -219,15 +273,17 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (isReleaseScope) {
       if (releaseRoot.state !== 'valid') {
         return {
-          outcome: 'rejected',
-          reason:
-            releaseRoot.state === 'invalid'
-              ? 'a decision request releaseRoot must be a bounded absolute path without ".." when given'
-              : 'release-root-required',
+          result: {
+            outcome: 'rejected',
+            reason:
+              releaseRoot.state === 'invalid'
+                ? 'a decision request releaseRoot must be a bounded absolute path without ".." when given'
+                : 'release-root-required',
+          },
         };
       }
     } else if (releaseRootIsAccessor || releaseRoot.state !== 'absent') {
-      return { outcome: 'rejected', reason: 'release-root-forbidden-for-scope' };
+      return { result: { outcome: 'rejected', reason: 'release-root-forbidden-for-scope' } };
     }
     // The plain root value when one is present (only a release scope reaches
     // the digest below with one): TypeScript cannot carry the scope-correlated
@@ -236,8 +292,10 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     const kind = CoordinationKind.create(request.kind);
     if (!kind.success || kind.value === undefined) {
       return {
-        outcome: 'rejected',
-        reason: `a decision request requires a recorded kind: ${String(request.kind)}`,
+        result: {
+          outcome: 'rejected',
+          reason: `a decision request requires a recorded kind: ${String(request.kind)}`,
+        },
       };
     }
     // CO24f: a forge action decision must name the attempt it authorizes; the
@@ -250,74 +308,120 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       request.attemptId === undefined
     ) {
       return {
-        outcome: 'rejected',
-        reason: 'a forge action decision requires an attemptId',
+        result: {
+          outcome: 'rejected',
+          reason: 'a forge action decision requires an attemptId',
+        },
       };
     }
-    // Standing shadow import grant (owner decision 2026-11-18): the unattended
-    // timer's grant is head-free, bounded by a future expiry within the TTL
-    // cap, and bound to its request id by a digest of its exact coordinates
-    // ({ scope, owner, repo, expiresAtIso }). Every failure here is a typed
-    // rejection before anything is recorded.
-    // The grant's moment is the composition root's trusted clock alone: for
-    // this scope the request-supplied `nowIso` is ignored, and `createdAtIso`
-    // is recorded from the same clock. The composition root supplies the
-    // clock — the authority that caps the grant's lifetime depends on it
-    // here — so a shadow request without the injected clock is a typed
-    // rejection, never a grant measured against the requester's own clock.
-    // GR1a2: the digest and expiry are re-checked on resolve against the real
-    // clock; recording-time checks alone do not establish the guarantee.
-    const isShadowScope = isShadowImportActionScope(request.actionScope.trim());
-    let nowIso: string;
-    if (isShadowScope) {
-      if (this.deps.shadowImportClock === undefined) {
-        return { outcome: 'rejected', reason: 'shadow-import-clock-unavailable' };
-      }
-      nowIso = this.deps.shadowImportClock.nowIso();
-    } else {
-      nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
+    return {
+      value: {
+        request,
+        kind: kind.value,
+        releaseRoot,
+        releaseRootValue,
+        isReleaseScope,
+        isShadowScope: isShadowImportActionScope(request.actionScope.trim()),
+      },
+    };
+  }
+
+  /**
+   * The grant's moment is the composition root's trusted clock alone: for a
+   * shadow scope the request-supplied `nowIso` is ignored, and `createdAtIso`
+   * is recorded from the same clock. The composition root supplies the
+   * clock — the authority that caps the grant's lifetime depends on it
+   * here — so a shadow request without the injected clock is a typed
+   * rejection, never a grant measured against the requester's own clock.
+   * Ordinary (non-shadow) decisions keep exactly their main behaviour and
+   * never consult this clock: `nowIso` falls back to
+   * `new Date().toISOString()` when it is `null`, empty or not a string.
+   */
+  private resolveNowIsoForScope(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+  ): DecisionStep<string> {
+    if (!scope.isShadowScope) {
+      return { value: isFilled(scope.request.nowIso) ? scope.request.nowIso : new Date().toISOString() };
     }
+    if (deps.shadowImportClock === undefined) {
+      return { result: { outcome: 'rejected', reason: 'shadow-import-clock-unavailable' } };
+    }
+    return { value: deps.shadowImportClock.nowIso() };
+  }
+
+  /**
+   * Every grant binding decided before anything is recorded. The standing
+   * shadow import grant (owner decision 2026-11-18): the unattended timer's
+   * grant is head-free, bounded by a future expiry within the TTL cap, and
+   * bound to its request id by a digest of its exact coordinates
+   * ({ scope, owner, repo, expiresAtIso }). GR1a2: the digest and expiry are
+   * re-checked on resolve against the real clock; recording-time checks alone
+   * do not establish the guarantee.
+   * RR1: a release grant is bound to its root by the request id itself. The
+   * owner's Ed25519 decision signature covers `{ requestId, ... }` but not
+   * `releaseRoot`, so the root is covered only when the request id carries
+   * the digest of the exact coordinates it names. Every failure here is a
+   * typed rejection before anything is recorded, mirroring the shadow
+   * import grant's binding (GR1a1).
+   */
+  private evaluateGrantBindings(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+    nowIso: string,
+  ): DecisionStep<ShadowImportGrantRecord | undefined> {
     let shadowImportGrant: ShadowImportGrantRecord | undefined;
-    if (isShadowScope) {
-      const grantEvaluation = evaluateShadowImportGrant(request, nowIso, this.deps.computeDigest);
+    if (scope.isShadowScope) {
+      const grantEvaluation = evaluateShadowImportGrant(scope.request, nowIso, deps.computeDigest);
       if (!grantEvaluation.ok) {
-        return { outcome: 'rejected', reason: grantEvaluation.reason };
+        return { result: { outcome: 'rejected', reason: grantEvaluation.reason } };
       }
       shadowImportGrant = grantEvaluation.grant;
     }
-    // RR1: a release grant is bound to its root by the request id itself. The
-    // owner's Ed25519 decision signature covers `{ requestId, ... }` but not
-    // `releaseRoot`, so the root is covered only when the request id carries
-    // the digest of the exact coordinates it names. Every failure here is a
-    // typed rejection before anything is recorded, mirroring the shadow
-    // import grant's binding (GR1a1).
-    if (isReleaseScope) {
-      if (request.expectedHeadSha === null || !isFilled(request.expectedHeadSha)) {
-        return { outcome: 'rejected', reason: 'release-expected-head-required' };
+    if (scope.isReleaseScope) {
+      if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
+        return { result: { outcome: 'rejected', reason: 'release-expected-head-required' } };
       }
-      if (this.deps.computeDigest === undefined) {
-        return { outcome: 'rejected', reason: 'release-grant-digest-unavailable' };
+      if (deps.computeDigest === undefined) {
+        return { result: { outcome: 'rejected', reason: 'release-grant-digest-unavailable' } };
       }
       const payloadResult = releaseGrantDigestPayload({
-        actionScope: request.actionScope.trim(),
-        projectId: request.projectId.trim(),
-        expectedHeadSha: request.expectedHeadSha.trim(),
-        releaseRoot: releaseRootValue,
-        nonce: readReleaseNonce(request),
+        actionScope: scope.request.actionScope.trim(),
+        projectId: scope.request.projectId.trim(),
+        expectedHeadSha: scope.request.expectedHeadSha.trim(),
+        releaseRoot: scope.releaseRootValue,
+        nonce: readReleaseNonce(scope.request),
       });
       if (!payloadResult.ok) {
-        return { outcome: 'rejected', reason: payloadResult.code };
+        return { result: { outcome: 'rejected', reason: payloadResult.code } };
       }
-      const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`;
-      if (request.requestId.trim() !== expectedRequestId) {
-        return { outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' };
+      const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${deps.computeDigest(payloadResult.value)}`;
+      if (scope.request.requestId.trim() !== expectedRequestId) {
+        return { result: { outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' } };
       }
     }
-    const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());
+    return { value: shadowImportGrant };
+  }
+
+  /**
+   * The proposal is durable before any decider is asked. A duplicate that
+   * raced past the lookup above is refused by the store's revision check and
+   * surfaces as a typed rejection, not as an adapter error.
+   */
+  private async recordProposal(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+    nowIso: string,
+    shadowImportGrant: ShadowImportGrantRecord | undefined,
+  ): Promise<DecisionStep<CoordinationRequestRecord>> {
+    const { request } = scope;
+    const existing = await deps.requestRepo.findRequestById(request.requestId.trim());
     if (existing !== null) {
       return {
-        outcome: 'rejected',
-        reason: `a coordination request with id ${request.requestId.trim()} is already recorded`,
+        result: {
+          outcome: 'rejected',
+          reason: `a coordination request with id ${request.requestId.trim()} is already recorded`,
+        },
       };
     }
     // The proposal is durable before any decider is asked. A duplicate that
@@ -326,7 +430,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     const proposal: CoordinationRequestRecord = CoordinationRequest.fromRecord({
       id: request.requestId.trim(),
       projectId: request.projectId.trim(),
-      kind: kind.value.getValue(),
+      kind: scope.kind.getValue(),
       state: 'awaiting-decision',
       actionScope: request.actionScope.trim(),
       expectedHeadSha: request.expectedHeadSha === null ? null : request.expectedHeadSha.trim(),
@@ -344,8 +448,8 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       ...(request.attemptId !== undefined
         ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
         : {}),
-      ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
-      ...(isReleaseScope && readReleaseNonce(request) !== undefined
+      ...(scope.releaseRoot.state === 'valid' ? { releaseRoot: scope.releaseRoot.value } : {}),
+      ...(scope.isReleaseScope && readReleaseNonce(request) !== undefined
         ? { releaseNonce: readReleaseNonce(request) }
         : {}),
       ...(shadowImportGrant !== undefined ? { shadowImportGrant } : {}),
@@ -353,13 +457,29 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // The proposal is durable before any decider is asked. A duplicate that
     // raced past the lookup above is refused by the store's revision check and
     // surfaces as a typed rejection, not as an adapter error.
-    const recorded = await this.recordOrReject(this.deps.requestRepo, proposal);
+    const recorded = await this.recordOrReject(deps.requestRepo, proposal);
     if (recorded === undefined) {
       return {
-        outcome: 'rejected',
-        reason: `a coordination request with id ${request.requestId.trim()} lost a revision race; another writer recorded it first`,
+        result: {
+          outcome: 'rejected',
+          reason: `a coordination request with id ${request.requestId.trim()} lost a revision race; another writer recorded it first`,
+        },
       };
     }
+    return { value: recorded };
+  }
+
+  /**
+   * The recorded proposal is refreshed from a verified answer (when a
+   * transport is wired) and, when decided, persisted at the next revision.
+   * Absence and ambiguity stay awaiting; nothing is invented here.
+   */
+  private async applyVerifiedDecision(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+    nowIso: string,
+    recorded: CoordinationRequestRecord,
+  ): Promise<RequestScopedDecisionResult> {
     const answer = await this.readVerifiedAnswer(recorded);
     if (answer === undefined || answer.state === 'awaiting-decision') {
       return { outcome: 'requested', request: recorded };
@@ -376,13 +496,13 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       revision: recorded.revision + 1,
       // A shadow request's moment is the trusted clock's, never the
       // request-supplied one; ordinary decisions keep main's behaviour.
-      updatedAtIso: isShadowScope
+      updatedAtIso: scope.isShadowScope
         ? nowIso
-        : isFilled(request.nowIso)
-          ? request.nowIso
+        : isFilled(scope.request.nowIso)
+          ? scope.request.nowIso
           : new Date().toISOString(),
     };
-    const persisted = await this.recordOrReject(this.deps.requestRepo, decided);
+    const persisted = await this.recordOrReject(deps.requestRepo, decided);
     if (persisted === undefined) {
       return {
         outcome: 'rejected',

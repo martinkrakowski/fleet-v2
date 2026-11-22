@@ -104,10 +104,17 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
           ...(releaseRoot !== undefined ? { releaseRoot } : {}),
         });
       }
+      // M5: the head is a required flag on every non-shadow scope, so a
+      // missing or blank one is a usage error at this boundary (exit 2),
+      // never the use case's not-implemented throw.
+      const expectedHeadSha = str(p, 'expectedHeadSha');
+      if (expectedHeadSha.trim() === '') {
+        throw new CliUsageError('resolve-auth: --expected-head-sha is required for scopes other than merge:import-shadow');
+      }
       return rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
         projectId: str(p, 'projectId'),
         actionScope,
-        expectedHeadSha: str(p, 'expectedHeadSha'),
+        expectedHeadSha,
         authorizationGrantId: optStr(p, 'authorizationGrantId'),
         ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
         ...(releaseRoot !== undefined ? { releaseRoot } : {}),

@@ -883,33 +883,9 @@ export function parseShadowAttestationCommandInput(raw: unknown): ShadowAttestat
 }
 
 function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
-  // The key count is read before any traversal: once the cheap plain-record
-  // shape check passes, an object carrying more own enumerable keys than the
-  // capped key set is refused without snapshotting a single field. The
-  // accepted `O(K)` engine bound of `Object.keys`/`Reflect.ownKeys` (where
-  // `K` is the target's own-property count) is paid on this single
-  // enumeration, capped at `COMMAND_KEYS.length` + the symbol/extra-key
-  // refusal inside `snapshotPlainDataRecord`.
-  if (!isPlainRecordObject(raw) || Object.keys(raw).length > COMMAND_KEYS.length) {
-    return COMMAND_INVALID;
-  }
-  const snapshot = snapshotPlainDataRecord(raw);
+  const snapshot = snapshotCommandRecord(raw);
   if (snapshot === null) {
     return COMMAND_INVALID;
-  }
-  const keys = Object.keys(snapshot);
-  if (keys.length > COMMAND_KEYS.length) {
-    return COMMAND_INVALID;
-  }
-  for (const key of keys) {
-    if (!COMMAND_KEYS.includes(key)) {
-      return COMMAND_INVALID;
-    }
-  }
-  for (const key of COMMAND_REQUIRED_KEYS) {
-    if (!Object.hasOwn(snapshot, key)) {
-      return COMMAND_INVALID;
-    }
   }
   const fact = readCommandFact(snapshot['fact']);
   if (!fact.ok) {
@@ -919,51 +895,24 @@ function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
   if (!note.ok) {
     return note as ShadowAttestationCommandInputParse;
   }
-  // A present `evidence` key must carry a non-empty string: an own
-  // `evidence: undefined` is a present key with no value, not an absent one.
-  let evidence: string | undefined;
-  if (Object.hasOwn(snapshot, 'evidence')) {
-    const read = readBoundedCommandText(snapshot['evidence'], MAX_ATTESTATION_EVIDENCE_LENGTH);
-    if (!read.ok) {
-      return read as ShadowAttestationCommandInputParse;
-    }
-    evidence = read.value;
+  const evidence = readOptionalEvidence(snapshot);
+  if (!evidence.ok) {
+    return evidence as ShadowAttestationCommandInputParse;
   }
-  // Authority is checked for presence and shape here, but a missing or blank
-  // value passes through as `''`: the use case owns the `authority-required`
-  // refusal, so the CLI can hand the flag through and still get the typed
-  // exit-1 refusal rather than a usage error.
-  let authority = '';
-  if (snapshot['authority'] !== undefined) {
-    const read = readBoundedCommandText(snapshot['authority'], MAX_ATTESTATION_AUTHORITY_LENGTH);
-    if (!read.ok) {
-      return read;
-    }
-    authority = read.value;
+  const authority = readOptionalAuthority(snapshot);
+  if (!authority.ok) {
+    return authority;
   }
-  const expectedRevision = snapshot['expectedRevision'];
-  if (
-    typeof expectedRevision !== 'number' ||
-    !Number.isSafeInteger(expectedRevision) ||
-    expectedRevision < 0 ||
-    expectedRevision > MAX_REVISION
-  ) {
+  const expectedRevision = readExpectedRevision(snapshot['expectedRevision']);
+  if (!expectedRevision.ok) {
     return COMMAND_INVALID;
   }
-  const operationId = snapshot['operationId'];
-  if (typeof operationId !== 'string' || !ATTESTATION_OPERATION_ID_PATTERN.test(operationId)) {
+  const operationId = readOperationId(snapshot['operationId']);
+  if (!operationId.ok) {
     return COMMAND_INVALID;
   }
-  // The deadline is validated here so the use case never has to reach back
-  // into the raw request object: every field it reads comes from this
-  // snapshot, so no getter or Proxy `get` trap can run after parsing.
-  const deadlineIso = snapshot['deadlineIso'];
-  if (
-    deadlineIso !== undefined &&
-    (typeof deadlineIso !== 'string' ||
-      deadlineIso.length > MAX_ATTESTATION_DEADLINE_LENGTH ||
-      !isZonedIsoDateTime(deadlineIso))
-  ) {
+  const deadlineIso = readDeadlineIso(snapshot['deadlineIso']);
+  if (!deadlineIso.ok) {
     return COMMAND_INVALID;
   }
   return {
@@ -971,13 +920,126 @@ function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
     value: {
       fact: fact.value as ShadowAttestationFact,
       note: note.value,
-      ...(evidence === undefined ? {} : { evidence }),
-      expectedRevision,
-      operationId,
-      authority,
-      ...(deadlineIso === undefined ? {} : { deadlineIso: deadlineIso as string }),
+      ...(evidence.value === undefined ? {} : { evidence: evidence.value }),
+      expectedRevision: expectedRevision.value,
+      operationId: operationId.value,
+      authority: authority.value,
+      ...(deadlineIso.value === undefined ? {} : { deadlineIso: deadlineIso.value }),
     },
   };
+}
+
+/**
+ * The plain-data snapshot every field read below consumes. The key count is
+ * read before any traversal: once the cheap plain-record shape check passes,
+ * an object carrying more own enumerable keys than the capped key set is
+ * refused without snapshotting a single field. The accepted `O(K)` engine
+ * bound of `Object.keys`/`Reflect.ownKeys` (where `K` is the target's
+ * own-property count) is paid on this single enumeration, capped at
+ * `COMMAND_KEYS.length` + the symbol/extra-key refusal inside
+ * `snapshotPlainDataRecord`. Every own key must sit inside `COMMAND_KEYS`
+ * (so `__proto__`, `constructor` and `prototype` own keys are refused) and
+ * every required key must be present. Returns `null` for anything that is
+ * not a plain record within the caps.
+ */
+function snapshotCommandRecord(raw: unknown): Record<string, unknown> | null {
+  if (!isPlainRecordObject(raw) || Object.keys(raw).length > COMMAND_KEYS.length) {
+    return null;
+  }
+  const snapshot = snapshotPlainDataRecord(raw);
+  if (snapshot === null) {
+    return null;
+  }
+  const keys = Object.keys(snapshot);
+  if (keys.length > COMMAND_KEYS.length) {
+    return null;
+  }
+  for (const key of keys) {
+    if (!COMMAND_KEYS.includes(key)) {
+      return null;
+    }
+  }
+  for (const key of COMMAND_REQUIRED_KEYS) {
+    if (!Object.hasOwn(snapshot, key)) {
+      return null;
+    }
+  }
+  return snapshot;
+}
+
+/** A read that yields a value possibly absent. */
+type OptionalCommandFieldRead =
+  | { readonly ok: true; readonly value: string | undefined }
+  | { readonly ok: false; readonly reason: 'invalid-input' | 'secret-shaped' | 'unknown-fact' };
+
+/**
+ * A present `evidence` key must carry a non-empty string: an own
+ * `evidence: undefined` is a present key with no value, not an absent one.
+ * Cost: linear in `MAX_ATTESTATION_EVIDENCE_LENGTH`.
+ */
+function readOptionalEvidence(snapshot: Record<string, unknown>): OptionalCommandFieldRead {
+  if (!Object.hasOwn(snapshot, 'evidence')) {
+    return { ok: true, value: undefined };
+  }
+  const read = readBoundedCommandText(snapshot['evidence'], MAX_ATTESTATION_EVIDENCE_LENGTH);
+  if (!read.ok) {
+    return read;
+  }
+  return { ok: true, value: read.value };
+}
+
+/**
+ * Authority is checked for shape here, but a missing or blank value passes
+ * through as `''`: the use case owns the `authority-required` refusal, so
+ * the CLI can hand the flag through and still get the typed exit-1 refusal
+ * rather than a usage error. Cost: linear in `MAX_ATTESTATION_AUTHORITY_LENGTH`.
+ */
+function readOptionalAuthority(snapshot: Record<string, unknown>): CommandFieldRead {
+  if (snapshot['authority'] === undefined) {
+    return { ok: true, value: '' };
+  }
+  return readBoundedCommandText(snapshot['authority'], MAX_ATTESTATION_AUTHORITY_LENGTH);
+}
+
+/** A safe non-negative integer within `MAX_REVISION`. Cost: O(1). */
+function readExpectedRevision(value: unknown): { readonly ok: true; readonly value: number } | { readonly ok: false } {
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > MAX_REVISION
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
+/** A string matching `ATTESTATION_OPERATION_ID_PATTERN`. Cost: O(1). */
+function readOperationId(value: unknown): { readonly ok: true; readonly value: string } | { readonly ok: false } {
+  if (typeof value !== 'string' || !ATTESTATION_OPERATION_ID_PATTERN.test(value)) {
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * The optional deadline, validated here so the use case never has to reach
+ * back into the raw request object: every field it reads comes from this
+ * snapshot, so no getter or Proxy `get` trap can run after parsing. Cost:
+ * O(1) beyond the `MAX_ATTESTATION_DEADLINE_LENGTH` bound.
+ */
+function readDeadlineIso(value: unknown): { readonly ok: true; readonly value: string | undefined } | { readonly ok: false } {
+  if (value === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (
+    typeof value !== 'string' ||
+    value.length > MAX_ATTESTATION_DEADLINE_LENGTH ||
+    !isZonedIsoDateTime(value)
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, value };
 }
 
 type CommandFieldRead =

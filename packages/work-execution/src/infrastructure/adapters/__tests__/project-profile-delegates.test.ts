@@ -18,6 +18,7 @@ function makeProfile(overrides: Partial<ProjectProfileView> = {}): ProjectProfil
     clones: { here: { path: '/srv/clone', worktreeRoot: '/srv/worktree' } },
     gateProcedures: ['verify-head'],
     revision: 3,
+    defaultBranch: null,
     ...overrides,
   };
 }

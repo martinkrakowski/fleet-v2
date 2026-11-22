@@ -144,6 +144,12 @@ export function isMergeSafeId(value: unknown): value is string {
   if (typeof value !== 'string') {
     return false;
   }
+  // UTF-16 length is a lower bound on the UTF-8 byte count, so a string with
+  // more code units than the byte cap cannot fit: refuse it before ANY
+  // encoding (and before `trim`, which also copies the whole string).
+  if (value.length > ID_MAX_BYTES) {
+    return false;
+  }
   if (value.trim().length === 0) {
     return false;
   }
@@ -227,6 +233,24 @@ export function readMergeQueueEntryRecord(input: unknown): MergeQueueEntryRead {
     }
     const versionDescriptor = Reflect.getOwnPropertyDescriptor(input, 'version');
     let snapshot: Record<string, unknown> | null;
+    // The own-key count is checked BEFORE the exact-key walk: a record with
+    // more own keys than its schema allows is refused here, with its own
+    // message, so the unbounded-key hostile case is answered by this bounded
+    // count refusal rather than by the disallowed-key refusal below.
+    const expectedKeys =
+      versionDescriptor === undefined
+        ? LEGACY_ENTRY_KEYS
+        : versionDescriptor.value === MERGE_QUEUE_ENTRY_VERSION
+          ? ENTRY_KEYS
+          : versionDescriptor.value === MERGE_QUEUE_ENTRY_V2_VERSION
+            ? V2_ENTRY_KEYS
+            : null;
+    if (
+      expectedKeys !== null &&
+      Reflect.ownKeys(input).length > expectedKeys.length
+    ) {
+      return refusal('malformed', 'MergeQueueEntry exceeds its schema key count');
+    }
     if (versionDescriptor === undefined) {
       snapshot = readExactPlainRecord(input, LEGACY_ENTRY_KEYS);
       if (snapshot === null) {
@@ -259,7 +283,7 @@ export function readMergeQueueEntryRecord(input: unknown): MergeQueueEntryRead {
 
 type RepositoryRead =
   | { readonly ok: true; readonly ref: MergeQueueRepositoryRef }
-  | { readonly ok: false };
+  | { readonly ok: false; readonly keyCountExceeded?: true };
 
 function isRepositorySegment(value: unknown): boolean {
   if (typeof value !== 'string' || !REPOSITORY_SEGMENT_PATTERN.test(value)) {
@@ -272,6 +296,12 @@ function isRepositorySegment(value: unknown): boolean {
 }
 
 function readRepository(repository: unknown): RepositoryRead {
+  // The own-key count is checked BEFORE the exact-key walk, with its own
+  // message at the caller, so the unbounded-key hostile case is answered by
+  // this bounded count refusal rather than by the disallowed-key refusal.
+  if (isPlainObject(repository) && Reflect.ownKeys(repository as object).length > 2) {
+    return { ok: false, keyCountExceeded: true };
+  }
   const snapshot = readExactPlainRecord(repository, ['owner', 'repo']);
   if (snapshot === null || !isRepositorySegment(snapshot.owner) || !isRepositorySegment(snapshot.repo)) {
     return { ok: false };
@@ -298,7 +328,12 @@ function readValidatedSnapshot(snapshot: Record<string, unknown>): MergeQueueEnt
 
   const repository = readRepository(snapshot.repository);
   if (!repository.ok) {
-    return refusal('malformed', 'MergeQueueEntry repository must have valid owner and repo');
+    return refusal(
+      'malformed',
+      repository.keyCountExceeded === true
+        ? 'MergeQueueEntry repository exceeds its schema key count'
+        : 'MergeQueueEntry repository must have valid owner and repo',
+    );
   }
 
   let veto: MergeQueueVetoRecord | null = null;

@@ -612,7 +612,7 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     });
   });
 
-  it('never runs a hostile getter on the request and refuses it as invalid-request', async () => {
+  it('refuses an accessor on projectId as invalid-request before any field is read', async () => {
     const requestRepo = seededRepo();
     let calls = 0;
     const hostile = { ...validRequest() };
@@ -624,9 +624,10 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
       enumerable: true,
     });
     const result = await resolveRaw(useCase(requestRepo), hostile);
-    // The accessor's value reads as undefined through its own descriptor, so
-    // the projectId is missing: a typed refusal, and the getter never ran.
-    expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+    // BL02g fix round: the accessor is refused through its own descriptor via
+    // the one shared helper before ANY field — projectId included — is read,
+    // so the shadow path is never reached and the getter never ran.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(calls).toBe(0);
   });
 
@@ -706,6 +707,383 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
       projectId: 7,
     });
     expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+  });
+
+  // Fix round 1 (run-01M7TWG5VV9RJPWEPT9GQWKNEG): the exported boundary never
+  // throws on a malformed non-object input — null, undefined, or a wrong
+  // primitive where a request object is due are typed `invalid-request`
+  // refusals, never exceptions.
+  it('returns a typed invalid-request refusal for a null request instead of throwing', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), null);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('returns a typed invalid-request refusal for an undefined request instead of throwing', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), undefined);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('returns a typed invalid-request refusal for a primitive where a request object is due', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), 42);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('keeps main throw on missing required fields of a well-formed object (preserved behaviour)', async () => {
+    const requestRepo = seededRepo();
+    // The fix covers only malformed non-object inputs. A well-formed object
+    // missing its required fields keeps main's exact throw (CO14b brief,
+    // preserved behaviour).
+    await expect(
+      resolveRaw(useCase(requestRepo), { projectId: 'proj-1', actionScope: 'host:restart' }),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+  });
+
+  // Fix round 2 (run-01M7TWG5VV9RJPWEPT9GQWKNEG): the NON-shadow validation
+  // reads the descriptor-safe snapshot values, never the original request, so
+  // a throwing getter cannot escape as an exception and a Proxy `get` trap
+  // never runs for the validation.
+  function nonShadowRequest(): Record<string, unknown> {
+    return {
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-1',
+      repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+      pullRequestNumber: 1,
+    };
+  }
+
+  function nonShadowRepo(): InMemoryCoordinationRequestRepository {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    requestRepo.saveRequest({
+      id: 'req-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      proposalDigest: 'digest-1',
+      policyRevision: 'aaaaaaaaaaaa',
+      decisionRevision: 'policy:merge@aaaaaaaaaaaa',
+      grantId: 'grant-1',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-02T00:00:00.000Z',
+      updatedAtIso: '2026-11-02T00:00:00.000Z',
+      mergeGrant: {
+        repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+        pullRequestNumber: 1,
+      },
+    });
+    return requestRepo;
+  }
+
+  it('never runs a hostile projectId getter on a non-shadow request and refuses it as invalid-request', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'projectId', {
+      get() {
+        calls += 1;
+        throw new Error('hostile projectId getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    // The accessor is refused through its own descriptor, which never runs
+    // the getter, and the validation reads the descriptor value only.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a hostile expectedHeadSha getter on a non-shadow request and refuses it as invalid-request', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'expectedHeadSha', {
+      get() {
+        calls += 1;
+        throw new Error('hostile expectedHeadSha getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  // BL02g fix round: a setter-only own accessor on a snapshotted field
+  // snapshots to `undefined` exactly like an omitted field, so it must be
+  // refused as invalid-request through its own descriptor (which never runs
+  // the setter) instead of surviving to the missing-required-field throw.
+  it('refuses a setter-only projectId accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'projectId', {
+      set() {
+        calls += 1;
+        throw new Error('hostile projectId setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a setter-only actionScope accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'actionScope', {
+      set() {
+        calls += 1;
+        throw new Error('hostile actionScope setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  // BL02g fix round: EVERY snapshotted field — required or optional — goes
+  // through the one shared descriptor helper, so ANY own accessor (a getter
+  // OR a setter) on ANY field the snapshot copies is refused as
+  // invalid-request before any grant lookup runs. A set-only accessor
+  // snapshots to `undefined` exactly like an omitted field, so without the
+  // shared refusal a release retry carrying a setter-only `resumeActionId`
+  // could skip its resumable grant and fall through to an unrelated approved
+  // grant.
+  const SNAPSHOTTED_FIELDS = [
+    'projectId',
+    'actionScope',
+    'expectedHeadSha',
+    'authorizationGrantId',
+    'attemptId',
+    'releaseRoot',
+    'resumeActionId',
+    'repository',
+    'pullRequestNumber',
+  ] as const;
+
+  const ACCESSOR_KINDS = ['getter-only', 'setter-only', 'getter+setter'] as const;
+
+  function requestWithAccessor(
+    field: (typeof SNAPSHOTTED_FIELDS)[number],
+    kind: (typeof ACCESSOR_KINDS)[number],
+  ): Record<string, unknown> {
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, field, {
+      ...(kind !== 'setter-only'
+        ? {
+            get() {
+              throw new Error(`hostile ${field} getter ran`);
+            },
+          }
+        : {}),
+      ...(kind !== 'getter-only'
+        ? {
+            set() {
+              throw new Error(`hostile ${field} setter ran`);
+            },
+          }
+        : {}),
+      enumerable: true,
+    });
+    return hostile;
+  }
+
+  function countingRepo(): { repo: CoordinationRequestRepositoryPort; grantLookups: () => number } {
+    const base = nonShadowRepo();
+    let grantLookups = 0;
+    const repo: CoordinationRequestRepositoryPort = {
+      saveRequest: (record) => base.saveRequest(record),
+      findRequestById: (id) => base.findRequestById(id),
+      findRequestByGrantId: (grantId) => {
+        grantLookups += 1;
+        return base.findRequestByGrantId(grantId);
+      },
+      listRequests: (projectId) => {
+        grantLookups += 1;
+        return base.listRequests(projectId);
+      },
+    };
+    return { repo, grantLookups: () => grantLookups };
+  }
+
+  it.each(SNAPSHOTTED_FIELDS.flatMap((field) => ACCESSOR_KINDS.map((kind) => ({ field, kind }))))(
+    'refuses an own $kind accessor on snapshotted $field as invalid-request without resolving any grant',
+    async ({ field, kind }) => {
+      const { repo, grantLookups } = countingRepo();
+      const result = await resolveRaw(
+        new ResolveActionAuthorizationUseCase({ requestRepo: repo }),
+        requestWithAccessor(field, kind),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+      expect(grantLookups()).toBe(0);
+    },
+  );
+
+  // BL02g fix round: absence stays absence. A request whose optional fields
+  // are simply not present (no own property at all) carries no accessor and
+  // still resolves exactly as before.
+  it('resolves a request whose optional fields are absent as own properties exactly as before', async () => {
+    const request = {
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-1',
+      repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+      pullRequestNumber: 1,
+    };
+    const result = await resolveRaw(useCase(nonShadowRepo()), request);
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: 'grant-1',
+      requestId: 'req-1',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      policyRevision: 'aaaaaaaaaaaa',
+    });
+  });
+
+  it('refuses a setter-only expectedHeadSha accessor as invalid-request without running the setter', async () => {
+    let calls = 0;
+    const hostile = { ...nonShadowRequest() };
+    Object.defineProperty(hostile, 'expectedHeadSha', {
+      set() {
+        calls += 1;
+        throw new Error('hostile expectedHeadSha setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), hostile);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('authorizes a non-shadow Proxy over a valid request exactly like the plain data', async () => {
+    let gets = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      get(target, key, receiver) {
+        gets += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    // A plain-data proxy yields exactly the plain data's result, and the
+    // validation reads the required fields through their own descriptors, so
+    // no `get` trap fires for the validation itself.
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(gets).toBe(0);
+  });
+
+  it('refuses a hostile Proxy on the non-shadow path as invalid-request without throwing', async () => {
+    const proxy = new Proxy(nonShadowRequest(), {
+      get() {
+        throw new Error('hostile proxy get');
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile proxy descriptor');
+      },
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  // BL02g fix round: a descriptor trap that throws only for `releaseRoot` —
+  // an OPTIONAL field with no own property on the request — is never
+  // consulted: the shared helper inspects only the keys the snapshot copied,
+  // so absence (no own property at all) stays absent and the request resolves
+  // exactly like the plain data. A throwing trap for a key the snapshot
+  // copied is still the typed invalid-request refusal.
+  it('resolves a Proxy whose descriptor trap throws only for the absent optional releaseRoot exactly like the plain data', async () => {
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'releaseRoot') {
+          throw new Error('hostile proxy releaseRoot descriptor');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+  });
+
+  // BL02g fix round: the snapshot reads each snapshotted field's own
+  // descriptor EXACTLY ONCE, so a descriptor trap that would throw only on a
+  // LATER inspection (the old second read) is never consulted: the request
+  // resolves exactly like its plain data.
+  it('consults each snapshotted field descriptor exactly once, so a trap throwing only on a later actionScope inspection never fires', async () => {
+    let actionScopeDescriptorCalls = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'actionScope') {
+          actionScopeDescriptorCalls += 1;
+          if (actionScopeDescriptorCalls > 1) {
+            throw new Error('hostile proxy actionScope descriptor');
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(actionScopeDescriptorCalls).toBe(1);
+  });
+
+  // BL02g fix round (TOCTOU): a Proxy can report an accessor descriptor on
+  // the snapshot read and a data descriptor on a second inspection, so the
+  // accessor refusal and the snapshotted value must both derive from the ONE
+  // descriptor read per snapshotted field.
+  it('refuses a Proxy reporting an accessor for resumeActionId on the first descriptor read only, consulting that field exactly once', async () => {
+    let resumeDescriptorCalls = 0;
+    const proxy = new Proxy({ ...nonShadowRequest(), resumeActionId: 'act-1' }, {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'resumeActionId') {
+          resumeDescriptorCalls += 1;
+          if (resumeDescriptorCalls === 1) {
+            return {
+              get: () => 'act-1',
+              set: undefined,
+              enumerable: true,
+              configurable: true,
+            };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(resumeDescriptorCalls).toBe(1);
+  });
+
+  it('never invokes a throwing get trap on a non-shadow Proxy whose getOwnPropertyDescriptor forwards normally', async () => {
+    let gets = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      get() {
+        gets += 1;
+        throw new Error('hostile proxy get');
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(gets).toBe(0);
   });
 });
 
@@ -859,6 +1237,36 @@ describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
       { releaseRoot: '/srv/fleet/other' },
     );
     expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
+
+  // BL02g fix round: an own accessor on the non-required `releaseRoot` — a
+  // getter or a setter — is refused as `invalid-request` through its own
+  // descriptor, never run. A setter-only accessor snapshots to `undefined`
+  // exactly like an omitted field, so without the descriptor check it would
+  // silently agree with any recorded root; the refusal must fire before the
+  // recorded request is located and must not read as a root mismatch.
+  it('refuses a setter-only releaseRoot accessor on a release resolve as invalid-request, without running the setter', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord());
+    let calls = 0;
+    const hostile: Record<string, unknown> = {
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+    };
+    Object.defineProperty(hostile, 'releaseRoot', {
+      set() {
+        calls += 1;
+        throw new Error('hostile releaseRoot setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo,
+      computeDigest: digest,
+    }).resolveActionAuthorization(hostile as never);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
   });
 
   // RR1 fix round: `releaseRootsAgree` is pinned to exact string equality on
@@ -1192,5 +1600,127 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
       computeDigest,
     }).execute(RESUME_REQUEST);
     expect(result.outcome).toBe('authorized');
+  });
+
+  // #4g: a retry after a crash between the consumption and the release's
+  // write must resolve through the resumable grant even when a second,
+  // unrelated approved grant sits at the same coordinates, so the second
+  // grant is never spent by the retry.
+  function digestBoundReleaseRecordWithNonce(
+    nonce: string,
+    grantId: string,
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    const coordinates = {
+      scope: 'release:install',
+      projectId: 'project-atlas',
+      expectedHeadSha: 'abc123',
+      releaseRoot: '/srv/fleet/releases',
+      nonce,
+    };
+    return digestBoundReleaseRecord({
+      grantId,
+      releaseNonce: nonce,
+      id: `release-grant-${createHash('sha256').update(JSON.stringify(coordinates)).digest('hex')}`,
+      ...overrides,
+    });
+  }
+
+  const RETRY_REQUEST = {
+    projectId: 'project-atlas',
+    actionScope: 'release:install',
+    expectedHeadSha: 'abc123',
+    releaseRoot: '/srv/fleet/releases',
+    resumeActionId: 'action-1',
+  };
+
+  it('prefers the matching resumable release grant over a second approved grant on retry', async () => {
+    const signer = createSignedDecisionFixture();
+    const resumable = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    await signer.writeApprovedAnswer(resumable);
+    const second = digestBoundReleaseRecordWithNonce('fedcba9876543210fedcba9876543210', 'grant-10');
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(resumable, second),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RETRY_REQUEST);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-9', requestId: resumable.id });
+  });
+
+  it('still prefers a second approved grant when the retry names no resumable consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    const second = digestBoundReleaseRecordWithNonce('fedcba9876543210fedcba9876543210', 'grant-10');
+    await signer.writeApprovedAnswer(second);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed, second),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute({ ...RETRY_REQUEST, resumeActionId: 'action-2' });
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-10' });
+  });
+
+  it('blocks a release retry whose resume action id matches no recorded consumption', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('other-action')],
+    });
+    await signer.writeApprovedAnswer(consumed);
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(RETRY_REQUEST);
+    expect(result).toEqual({
+      outcome: 'blocked',
+      reason: 'no recorded decision authorizes release:install for project-atlas',
+    });
+  });
+
+  it('refuses a wrong-primitive resumeActionId (a number where a string is due) without authorizing', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute({ ...RETRY_REQUEST, resumeActionId: 7 });
+    expect(result).toEqual({
+      outcome: 'blocked',
+      reason: 'no recorded decision authorizes release:install for project-atlas',
+    });
+  });
+
+  it('refuses a getter-carrying actionScope on a release retry as invalid-request without running the getter', async () => {
+    const signer = createSignedDecisionFixture();
+    const consumed = digestBoundReleaseRecordWithNonce('0123456789abcdef0123456789abcdef', 'grant-9', {
+      state: 'completed',
+      consumptions: [resumeConsumption('action-1')],
+    });
+    let getterCalls = 0;
+    const request = {
+      ...RETRY_REQUEST,
+      get actionScope(): string {
+        getterCalls += 1;
+        return 'release:install';
+      },
+    };
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo: repositoryWith(consumed),
+      decisionTransport: signer.deps.decisionTransport,
+      computeDigest,
+    }).execute(request);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(getterCalls).toBe(0);
   });
 });

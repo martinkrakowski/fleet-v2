@@ -183,7 +183,10 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     expect(otherRoot).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
   });
 
-  it('refuses, never throws, when the request carries a throwing own releaseRoot getter', async () => {
+  // BL02g fix round: ANY own accessor on `releaseRoot` — a getter or a
+  // setter — is refused by the resolve as `invalid-request` through its own
+  // descriptor (the getter never runs), not read as an absent root.
+  it('refuses, never throws, a request whose own releaseRoot accessor is refused as invalid-request', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     const head = '4444444444444444444444444444444444444444';
     const hostileGrant = {
@@ -224,7 +227,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     }).resolveActionAuthorization(
       hostile({ projectId: 'proj-1', actionScope: 'release:install', expectedHeadSha: head }),
     );
-    expect(resolved).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     const consumed = await new RecordAuthorizationConsumptionUseCase({
       requestRepo: repo,
       ...signer.deps,

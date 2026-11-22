@@ -363,29 +363,68 @@ describe('SpdSpeak candidate list traversal (hostile input)', () => {
     await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
   });
 
-  it('refuses a capped-length list with arbitrarily many extra own enumerable properties without materializing the key set', async () => {
-    // An array of length <= SPD_SAY_MAX_CANDIDATES can still carry an
-    // arbitrary number of extra own string properties; the traversal must be
-    // refused without ever materializing the whole key set. Prove it by
-    // breaking Reflect.ownKeys: if the traversal still called it, the result
-    // would degrade to a spawn failure instead of a typed refusal.
+  it('never enumerates or reads the extra own properties of a capped-length list', async () => {
+    // A capped-length list can still carry an arbitrarily large number of
+    // extra own properties. Refusing them would cost at least one step per
+    // own key — unbounded, since even `for...in` materializes the object's
+    // own key list before its loop body can reject the first extra key — so
+    // the bounded traversal must instead make them unreachable: no
+    // enumeration primitive runs on the list, and only `length` and the
+    // indices `0 .. length-1` are read, each by own descriptor. Prove it by
+    // breaking every enumeration primitive ON the hostile list and by giving
+    // each extra property an accessor whose getter must never run.
     const hostile: string[] = ['/bin/sh'];
+    let extraReads = 0;
     for (let index = 0; index < 50_000; index += 1) {
       Object.defineProperty(hostile, `extra-${String(index)}`, {
-        value: '/evil/bin',
         enumerable: true,
-        writable: true,
         configurable: true,
+        get() {
+          extraReads += 1;
+          return '/evil/bin';
+        },
       });
     }
-    const ownKeys = vi.spyOn(Reflect, 'ownKeys').mockImplementation(() => {
-      throw new Error('unbounded key materialization');
-    });
+    const originalOwnKeys = Reflect.ownKeys;
+    const originalKeys = Object.keys;
+    const originalEntries = Object.entries;
+    const originalValues = Object.values;
+    const originalNames = Object.getOwnPropertyNames;
+    const originalSymbols = Object.getOwnPropertySymbols;
+    const breakOnHostile = (original: (source: object) => unknown) => {
+      return (source: unknown): unknown => {
+        if (source === hostile) {
+          throw new Error('unbounded key enumeration');
+        }
+        return original(source as object);
+      };
+    };
+    const spies = [
+      vi.spyOn(Reflect, 'ownKeys').mockImplementation(breakOnHostile(originalOwnKeys)),
+      vi.spyOn(Object, 'keys').mockImplementation(breakOnHostile(originalKeys)),
+      vi.spyOn(Object, 'entries').mockImplementation(breakOnHostile(originalEntries)),
+      vi.spyOn(Object, 'values').mockImplementation(breakOnHostile(originalValues)),
+      vi.spyOn(Object, 'getOwnPropertyNames').mockImplementation(breakOnHostile(originalNames)),
+      vi.spyOn(Object, 'getOwnPropertySymbols').mockImplementation(breakOnHostile(originalSymbols)),
+    ];
+    const runFiles: string[][] = [];
     try {
-      const adapter = speakAdapter(hostile);
-      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+      const adapter = speakAdapter(hostile, {
+        isExecutable: (candidate: string) => candidate === '/bin/sh',
+        run: async (file: string, args: readonly string[]) => {
+          runFiles.push([file, ...args]);
+          return runAnswer({ error: undefined, exitCode: 0 });
+        },
+      });
+      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual({ outcome: 'spoken' });
+      // Only the validated candidate reaches a probe and a run; the extra
+      // properties' values (`/evil/bin`) are never read.
+      expect(runFiles).toEqual([['/bin/sh', 'all clear']]);
+      expect(extraReads).toBe(0);
     } finally {
-      ownKeys.mockRestore();
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
     }
   });
 
@@ -403,18 +442,40 @@ describe('SpdSpeak candidate list traversal (hostile input)', () => {
     await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
   });
 
-  it('refuses an inherited enumerable key on a capped candidate list', async () => {
+  it('never reads an inherited enumerable key on a capped candidate list', async () => {
     const hostile: string[] = ['/bin/sh'];
+    let inheritedReads = 0;
     Object.defineProperty(Object.getPrototypeOf(hostile), 'extra', {
-      value: '/evil/bin',
       enumerable: true,
-      writable: true,
       configurable: true,
+      get() {
+        inheritedReads += 1;
+        return '/evil/bin';
+      },
     });
+    const originalOwnKeys = Reflect.ownKeys;
+    const ownKeys = vi.spyOn(Reflect, 'ownKeys').mockImplementation((source: unknown) => {
+      if (source === hostile) {
+        throw new Error('unbounded key enumeration');
+      }
+      return originalOwnKeys(source as object);
+    });
+    const runFiles: string[][] = [];
     try {
-      const adapter = speakAdapter(hostile);
-      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual(SPD_REFUSED);
+      const adapter = speakAdapter(hostile, {
+        isExecutable: (candidate: string) => candidate === '/bin/sh',
+        run: async (file: string, args: readonly string[]) => {
+          runFiles.push([file, ...args]);
+          return runAnswer({ error: undefined, exitCode: 0 });
+        },
+      });
+      // The inherited key is never enumerated and never read, so it can
+      // never reach a probe or run its getter.
+      await expect(adapter.speak({ sentence: 'all clear' })).resolves.toEqual({ outcome: 'spoken' });
+      expect(runFiles).toEqual([['/bin/sh', 'all clear']]);
+      expect(inheritedReads).toBe(0);
     } finally {
+      ownKeys.mockRestore();
       delete (Object.getPrototypeOf(hostile) as Record<string, unknown>).extra;
     }
   });

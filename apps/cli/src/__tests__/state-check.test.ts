@@ -189,7 +189,13 @@ describe('fleet-v2 state', () => {
     const invalidDir = makeTempDir();
     await fs.writeFile(
       path.join(invalidDir, 'work-orders.json'),
-      JSON.stringify([{ id: 'wo-1', revision: 1 }, { id: 'wo-2', revision: 1, baseBranch: 'release' }]),
+      // RP1: the work-order store parser accepts any safe branch name
+      // (e.g. a profile defaultBranch like `staging`), so the unparsable
+      // value here is one that fails `isSafeWorkOrderBranchName`.
+      JSON.stringify([
+        { id: 'wo-1', revision: 1 },
+        { id: 'wo-2', revision: 1, baseBranch: 'bad..branch' },
+      ]),
     );
     const invalid = mockIo();
     const invalidCode = await runCli(['--state-dir', invalidDir, 'state', 'check'], invalid.io);

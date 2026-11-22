@@ -13,7 +13,7 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
-import { parseBaseBranch } from '../../domain/base-branch.js';
+import { isSafeWorkOrderBranchName } from '../../domain/base-branch.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
@@ -41,9 +41,9 @@ function isWorkOrderRecord(value: unknown): value is WorkOrderRecord {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
   if (typeof candidate.id !== 'string' || typeof candidate.revision !== 'number') return false;
-  // An own baseBranch must parse: an absent key (including { id, revision }) stays
-  // valid, a present unparsable value makes the record fail validation (CB1).
-  if (Object.hasOwn(candidate, 'baseBranch') && parseBaseBranch(candidate.baseBranch) === undefined) {
+  // An own baseBranch must be a safe branch name: an absent key (including { id, revision })
+  // stays valid, a present unsafe value makes the record fail validation (CB1, RP1).
+  if (Object.hasOwn(candidate, 'baseBranch') && !isSafeWorkOrderBranchName(candidate.baseBranch)) {
     return false;
   }
   return true;

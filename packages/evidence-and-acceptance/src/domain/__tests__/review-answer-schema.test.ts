@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_FINDING_FILE_LENGTH,
   MAX_FINDING_SUMMARY_LENGTH,
+  MAX_REVIEW_REPLY_LENGTH,
   MAX_STRUCTURED_FINDINGS,
   containsReviewSecretShape,
   extractSingleTrailingJsonFence,
@@ -411,5 +412,127 @@ describe('extractSingleTrailingJsonFence', () => {
       kind: 'single',
       jsonText: '{"verdict":"PASS","findings":[]}',
     });
+  });
+});
+
+describe('extractSingleTrailingJsonFence: glued closing fence (RV1)', () => {
+  it('closes a glued fence on the live PASS reply and validates its object', () => {
+    const stripped = '```json\n{"verdict":"PASS","findings":[]}```';
+    const extracted = extractSingleTrailingJsonFence(stripped);
+    if (extracted.kind !== 'single') {
+      return;
+    }
+    expect(extracted).toEqual({
+      kind: 'single',
+      jsonText: '{"verdict":"PASS","findings":[]}',
+    });
+    expect(validateReviewAnswerObject(JSON.parse(extracted.jsonText)))
+      .toEqual({ ok: true, value: { verdict: 'PASS', findings: [] } });
+  });
+
+  it('closes a glued fence on the live FAIL reply with findings and trailing whitespace', () => {
+    const stripped =
+      '```json\n{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/a.ts","line":1,"summary":"broken"}]}``` \n';
+    const extracted = extractSingleTrailingJsonFence(stripped);
+    expect(extracted.kind).toBe('single');
+    if (extracted.kind !== 'single') {
+      return;
+    }
+    expect(extracted.jsonText).toBe(
+      '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/a.ts","line":1,"summary":"broken"}]}',
+    );
+    expect(validateReviewAnswerObject(JSON.parse(extracted.jsonText))).toEqual({
+      ok: true,
+      value: {
+        verdict: 'FAIL',
+        findings: [finding('blocker', 'src/a.ts', 1, 'broken')],
+      },
+    });
+  });
+
+  it('closes a glued fence when the body carries interior lines and blank lines follow', () => {
+    const stripped = '```json\n{\n"verdict":"PASS",\n"findings":[]\n}```\n\n';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({
+      kind: 'single',
+      jsonText: '{\n"verdict":"PASS",\n"findings":[]\n}',
+    });
+  });
+
+  it('returns invalid when text follows a glued closing fence on the same line', () => {
+    const stripped = '```json\n{"verdict":"PASS","findings":[]}``` extra';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid when a non-blank line follows the glued closing fence line', () => {
+    const stripped = '```json\n{"verdict":"PASS","findings":[]}```\ntrailing prose';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid when the glued closing backtick run is shorter than the opening fence', () => {
+    const stripped = '````json\n{"verdict":"PASS","findings":[]}```';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid for a tilde json fence with glued backticks', () => {
+    const stripped = '~~~json\n{"verdict":"PASS","findings":[]}```';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid for a non-json fence with glued backticks', () => {
+    const stripped = '```ts\nconst x = 1;```';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid for two json fences even when the second has a glued close', () => {
+    const stripped =
+      '```json\n{"verdict":"PASS","findings":[]}\n```\n```json\n{"verdict":"FAIL","findings":[]}```';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid for a standalone four-space-indented closing fence', () => {
+    const stripped = '```json\n{"verdict":"PASS","findings":[]}\n    ```';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({ kind: 'invalid' });
+  });
+
+  it('returns invalid for non-string hostile reply inputs without throwing', () => {
+    const hostile: unknown[] = [
+      null,
+      undefined,
+      42,
+      true,
+      {},
+      // eslint-disable-next-line no-sparse-arrays -- the array-hole input is the point of the test
+      [, 'a'],
+      { length: 2, 0: 'a', 1: 'b' },
+      Object.defineProperty({}, 'length', {
+        get() {
+          throw new Error('boom');
+        },
+        enumerable: true,
+      }),
+    ];
+    for (const bad of hostile) {
+      expect(() => extractSingleTrailingJsonFence(bad as never), typeof bad).not.toThrow();
+      expect(extractSingleTrailingJsonFence(bad as never)).toEqual({ kind: 'invalid' });
+    }
+  });
+
+  it('returns invalid when the reply length exceeds MAX_REVIEW_REPLY_LENGTH', () => {
+    const oversized = '```json\n{"verdict":"PASS","findings":[]}```' + 'x'.repeat(MAX_REVIEW_REPLY_LENGTH);
+    expect(extractSingleTrailingJsonFence(oversized)).toEqual({ kind: 'invalid' });
+  });
+
+  it('refuses a "__proto__" key parsed from a glued fence without mutating Object.prototype', () => {
+    const stripped = '```json\n{"__proto__":{},"verdict":"PASS","findings":[]}```';
+    const extracted = extractSingleTrailingJsonFence(stripped);
+    expect(extracted.kind).toBe('single');
+    if (extracted.kind !== 'single') {
+      return;
+    }
+    expect(validateReviewAnswerObject(JSON.parse(extracted.jsonText))).toEqual({
+      ok: false,
+      reason: 'unparseable-verdict',
+    });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });

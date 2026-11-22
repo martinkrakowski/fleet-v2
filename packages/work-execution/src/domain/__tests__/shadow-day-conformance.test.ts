@@ -914,6 +914,33 @@ describe('hostile input', () => {
     expect(calls).toBe(0);
   });
 
+  it('refuses a symbol own key on the runs list', () => {
+    const runs: unknown[] = [conforming(1, 1, iso(DAY, 12)).run];
+    Object.defineProperty(runs, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+    expect(evaluate(shell({ runs }))).toEqual(refused());
+  });
+
+  it('refuses a non-enumerable extra own key on the runs list', () => {
+    const runs: unknown[] = [conforming(1, 1, iso(DAY, 12)).run];
+    Object.defineProperty(runs, 'hidden', { value: 1, enumerable: false, configurable: true, writable: true });
+    expect(evaluate(shell({ runs }))).toEqual(refused());
+  });
+
+  it('refuses a list-level accessor element on the runs list', () => {
+    let calls = 0;
+    const runs: unknown[] = [conforming(1, 1, iso(DAY, 12)).run];
+    Object.defineProperty(runs, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return conforming(1, 1, iso(DAY, 12)).run;
+      },
+    });
+    expect(evaluate(shell({ runs }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
   it('never runs a getter on the root', () => {
     let calls = 0;
     const input = shell();

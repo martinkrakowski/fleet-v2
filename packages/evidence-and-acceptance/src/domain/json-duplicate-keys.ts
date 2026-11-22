@@ -48,6 +48,17 @@ const isWhitespace = (char: string): boolean => char === ' ' || char === '\t' ||
 
 const isNumberStart = (char: string): boolean => char === '-' || (char >= '0' && char <= '9');
 
+/** JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no leading zeros, no stray digits. */
+const numberPattern = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/;
+
+/** Accept only exact JSON literals or a well-formed JSON number; reject truncated or malformed tokens. */
+function isValidPrimitiveToken(token: string): boolean {
+  if (token === 'true' || token === 'false' || token === 'null') {
+    return true;
+  }
+  return numberPattern.test(token);
+}
+
 /** Decode one JSON string body (without the surrounding quotes) the way `JSON.parse` would. */
 function decodeStringBody(body: string): string {
   let out = '';
@@ -237,6 +248,7 @@ export function checkJsonDuplicateKeys(text: unknown): JsonDuplicateKeyCheckResu
         if (state !== 'expect-root-value' && state !== 'expect-value') {
           return { ok: false, reason: 'invalid-json' };
         }
+        const tokenStart = index;
         while (index < text.length) {
           const tokenChar = text[index];
           if (
@@ -247,6 +259,10 @@ export function checkJsonDuplicateKeys(text: unknown): JsonDuplicateKeyCheckResu
             break;
           }
           index += 1;
+        }
+        const token = text.slice(tokenStart, index);
+        if (!isValidPrimitiveToken(token)) {
+          return { ok: false, reason: 'invalid-json' };
         }
         const tokenTop = stack[stack.length - 1];
         if (tokenTop !== undefined && !tokenTop.isObject) {

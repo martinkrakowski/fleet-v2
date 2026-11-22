@@ -280,6 +280,98 @@ describe('work-order register --base-branch (CB1)', () => {
     expect(inspection.outcome).toBe('found');
     expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('chain/example');
   });
+
+  it('rerun supersedes a stored non-main/chain order on a profile whose defaultBranch is main', async () => {
+    // A work order registered before the RP1 fix may hold a profile base such
+    // as `staging`; superseding it must not turn that stored base into an
+    // explicit-base refusal.
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-base-branch-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await registerProfile(runtime);
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-base-branch-8',
+      projectId: 'example-project',
+      taskId: 'task-1',
+      laneId: 'lane-8',
+      repository: 'https://example.com/example.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/example-eight/**'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'stopped',
+      baseBranch: 'staging',
+      revision: 1,
+      createdAtIso: '2026-11-20T08:00:00.000Z',
+      updatedAtIso: '2026-11-20T08:00:00.000Z',
+    });
+
+    const rerun = await cli(runtime, [
+      'work-order',
+      'rerun',
+      '--from',
+      'wo-base-branch-8',
+      '--work-order-id',
+      'wo-base-branch-9',
+      '--yes',
+    ]);
+    expect(rerun.code).toBe(0);
+    expect(JSON.parse(rerun.out).outcome).toBe('registered');
+
+    const inspection = await inspectOrder(runtime, 'wo-base-branch-9');
+    expect(inspection.outcome).toBe('found');
+    expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('main');
+  });
+
+  it('rerun supersedes a stored non-main/chain order on a profile whose defaultBranch is chain/example', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-base-branch-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await registerProfile(runtime);
+
+    const edited = await cli(runtime, [
+      'projects',
+      'edit',
+      'example-project',
+      '--default-branch',
+      'chain/example',
+      '--yes',
+    ]);
+    expect(edited.code).toBe(0);
+
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-base-branch-10',
+      projectId: 'example-project',
+      taskId: 'task-1',
+      laneId: 'lane-10',
+      repository: 'https://example.com/example.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/example-ten/**'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'stopped',
+      baseBranch: 'staging',
+      revision: 1,
+      createdAtIso: '2026-11-20T08:00:00.000Z',
+      updatedAtIso: '2026-11-20T08:00:00.000Z',
+    });
+
+    const rerun = await cli(runtime, [
+      'work-order',
+      'rerun',
+      '--from',
+      'wo-base-branch-10',
+      '--work-order-id',
+      'wo-base-branch-11',
+      '--yes',
+    ]);
+    expect(rerun.code).toBe(0);
+    expect(JSON.parse(rerun.out).outcome).toBe('registered');
+
+    const inspection = await inspectOrder(runtime, 'wo-base-branch-11');
+    expect(inspection.outcome).toBe('found');
+    expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('chain/example');
+  });
 });
 
 describe('work-order register --pull-request-title (CP1A1)', () => {

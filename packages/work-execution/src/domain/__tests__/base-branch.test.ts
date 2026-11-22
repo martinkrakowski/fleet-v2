@@ -85,7 +85,7 @@ describe('resolveWorkOrderBaseBranch and resolveLaneRunBaseBranch', () => {
     const inherited = Object.create({ baseBranch: 'chain/inherited' }) as { baseBranch?: string };
     expect(resolveWorkOrderBaseBranch(inherited as never)).toBe(DEFAULT_BASE_BRANCH);
 
-    expect(resolveWorkOrderBaseBranch(workOrderRecord({ baseBranch: 'release' } as never))).toBe(
+    expect(resolveWorkOrderBaseBranch(workOrderRecord({ baseBranch: 'bad..branch' } as never))).toBe(
       DEFAULT_BASE_BRANCH,
     );
     expect(resolveWorkOrderBaseBranch(workOrderRecord({ baseBranch: 'chain/example' }))).toBe(
@@ -102,6 +102,13 @@ describe('WorkOrder baseBranch (lane CB1)', () => {
     expect(order.getBaseBranch()).toBe('chain/example');
   });
 
+  it('round-trips a profile base such as staging and getBaseBranch returns it (RP1)', () => {
+    const record = workOrderRecord({ baseBranch: 'staging' });
+    const order = WorkOrder.fromRecord(record);
+    expect(order.toRecord()).toEqual(record);
+    expect(order.getBaseBranch()).toBe('staging');
+  });
+
   it('round-trips a record without the key and getBaseBranch reads main', () => {
     const record = workOrderRecord();
     const order = WorkOrder.fromRecord(record);
@@ -111,7 +118,7 @@ describe('WorkOrder baseBranch (lane CB1)', () => {
   });
 
   it('throws the fixed message for a bad own value and never echoes it', () => {
-    expect(() => WorkOrder.fromRecord(workOrderRecord({ baseBranch: 'release' } as never))).toThrow(
+    expect(() => WorkOrder.fromRecord(workOrderRecord({ baseBranch: 'bad..branch' } as never))).toThrow(
       'WorkOrder baseBranch must be main or chain/<lowercase-dashes>',
     );
     expect(() => WorkOrder.fromRecord(workOrderRecord({ baseBranch: 'main' }))).not.toThrow();

@@ -19,6 +19,13 @@ export interface ProjectProfileView {
    * once. Absent means the profile declares no cap.
    */
   readonly maxConcurrentLanes?: number | null;
+
+  /**
+   * RP1: the profile's declared default base branch. `null` when the profile
+   * declares none; work orders registered without an explicit base branch
+   * resolve against it.
+   */
+  readonly defaultBranch?: string | null;
 }
 
 export interface ProjectProfileReadPort {

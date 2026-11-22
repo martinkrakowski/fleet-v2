@@ -122,6 +122,7 @@ class FakeStore implements ReleaseStorePort {
   async repoint(input: {
     root: string;
     sha: string;
+    opId?: string;
     fence?: () => Promise<boolean>;
   }): Promise<ReleaseStoreWriteResult | { outcome: 'fenced' }> {
     this.calls.push(`repoint ${input.sha}`);
@@ -132,6 +133,8 @@ class FakeStore implements ReleaseStorePort {
       return { outcome: 'fenced' };
     }
     this.current = input.sha;
+    // CO14b #4c: the marker of which operation last wrote `current`.
+    this.lastCurrentOp = { sha: input.sha, opId: input.opId ?? null };
     return { outcome: 'ok' };
   }
 
@@ -264,6 +267,28 @@ class FakeStore implements ReleaseStorePort {
       }
     }
     return { outcome: 'none' };
+  }
+
+  /**
+   * CO14b #4c: the store-level marker of which operation last wrote
+   * `current`, as `repoint` records it. Null until the first opId-carrying
+   * repoint; the flags script the failure modes the use case must refuse.
+   */
+  lastCurrentOp: { sha: string; opId: string | null } | null = null;
+  lastCurrentOpUnreadable = false;
+  lastCurrentOpThrows = false;
+
+  async readLastCurrentOp(): Promise<{ outcome: 'read'; opId: string | null; sha: string } | { outcome: 'none' } | { outcome: 'unreadable' }> {
+    if (this.lastCurrentOpThrows) {
+      throw new Error('unreadable marker');
+    }
+    if (this.lastCurrentOpUnreadable) {
+      return { outcome: 'unreadable' };
+    }
+    if (this.lastCurrentOp === null) {
+      return { outcome: 'none' };
+    }
+    return { outcome: 'read', sha: this.lastCurrentOp.sha, opId: this.lastCurrentOp.opId };
   }
 }
 
@@ -1103,6 +1128,9 @@ describe('ManageReleaseUseCase', () => {
     const opId = store.newOperationId();
     store.current = current;
     store.operations.set(`rollback-${sha}`, { opId, claimed: false, repointed: true });
+    // CO14b #4c: a genuinely landed repoint also recorded the store-level
+    // marker naming this operation, exactly as the real adapter does.
+    store.lastCurrentOp = { sha, opId };
     return opId;
   }
 
@@ -1160,6 +1188,9 @@ describe('ManageReleaseUseCase', () => {
       const store = new ScriptedListStore([build('a', 1), build('b', 2), build('c', 3)], [C, B]);
       const xOpId = store.newOperationId();
       store.operations.set(`rollback-${B}`, { opId: xOpId, claimed: false, repointed: true });
+      // X's repoint genuinely landed, so the store-level marker (CO14b #4c)
+      // names exactly this operation at this sha.
+      store.lastCurrentOp = { sha: B, opId: xOpId };
       const useCase = new ManageReleaseUseCase({
         store,
         lease: new FakeLease(null),
@@ -1673,6 +1704,175 @@ describe('ManageReleaseUseCase', () => {
     expect(rolled).toMatchObject({ outcome: 'applied', action: 'rollback', target: B, current: B });
     expect(consumes).toEqual([`release-rollback-${B}-${opId}`]);
     expect(store.current).toBe(B);
+  });
+
+  /**
+   * CO14b #4c: a store whose optional `readLastCurrentOp` port method is
+   * absent entirely -- the real adapter always provides it, but the port
+   * declares it optional, so a missing method must be fail-closed, never
+   * "no marker".
+   */
+  function storeWithoutMarker(): { store: FakeStore; opId: string } {
+    const base = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C);
+    const store = new Proxy(base, {
+      get(target, key, receiver) {
+        if (key === 'readLastCurrentOp') {
+          return undefined;
+        }
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as FakeStore;
+    const opId = seedCrashedRollback(store, B, D); // a marked intent current has moved off
+    return { store, opId };
+  }
+
+  it('refuses store-unreadable when readLastCurrentOp is missing for a marked rollback intent (CO14b #4c)', async () => {
+    const { store, opId } = storeWithoutMarker();
+    const useCase = round14UseCase(store, recordingGrants([]));
+    const result = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(store.current).toBe(D);
+    expect(store.calls.filter((call) => call.startsWith('repoint '))).toEqual([]);
+    expect(store.completed).not.toContain(opId);
+  });
+
+  it('refuses store-unreadable when readLastCurrentOp is unreadable or throws (CO14b #4c)', async () => {
+    const storeUnreadable = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], D);
+    seedCrashedRollback(storeUnreadable, B, D);
+    storeUnreadable.lastCurrentOpUnreadable = true;
+    const thrown = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], D);
+    seedCrashedRollback(thrown, B, D);
+    thrown.lastCurrentOpThrows = true;
+    for (const store of [storeUnreadable, thrown]) {
+      const result = await manage(
+        round14UseCase(store, recordingGrants([])),
+        applyRequest({ action: 'rollback', sha: null, source: null }),
+      );
+      // Never a throw out of manageRelease (which would be `failed`): a typed refusal.
+      expect(result).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+      expect(store.current).toBe(D);
+      expect(store.operations.size).toBe(1);
+      expect(store.calls.filter((call) => call.startsWith('repoint '))).toEqual([]);
+    }
+  });
+
+  it('concurrent apply rollback refuses driver-lease-live before cancelling a live marked intent (CO14b #4b-1)', async () => {
+    // A stale marked rollback intent (current has moved on to D) and a LIVE
+    // driver lease: the pre-#4b-1 retire inside resolveTarget would have
+    // cancelled the intent and its claim before the lease check ever ran.
+    const store = new SpyStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], D);
+    const staleOpId = seedCrashedRollback(store, B, D);
+    const useCase = new ManageReleaseUseCase({
+      store,
+      lease: new FakeLease(LIVE_LEASE),
+      authorization: recordingGrants([]),
+      executor: new FakeExecutor(),
+      nowIso: () => NOW,
+      env: () => ({ PATH: '/usr/bin' }),
+      stateDir: STATE_DIR,
+    });
+    const result = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
+    expect(store.cancelCalls).toBe(0);
+    expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId: staleOpId,
+      sha: B,
+      repointed: true,
+    });
+    expect(store.calls).toEqual([]);
+  });
+
+  it('unauthorized apply rollback refuses before retiring a stale intent (CO14b #4b-1)', async () => {
+    // No recorded grant at all: the deferred retire must never run, so the
+    // stale intent and its claim survive an unauthorized request untouched.
+    const store = new SpyStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], D);
+    const staleOpId = seedCrashedRollback(store, B, D);
+    const { useCase } = make({ store });
+    const result = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+    expect(store.cancelCalls).toBe(0);
+    expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId: staleOpId,
+      sha: B,
+      repointed: true,
+    });
+    expect(store.calls).toEqual([]);
+  });
+
+  it(
+    'marked rollback intent is not adopted after an unrelated swap to the same sha even when swap ' +
+      'cleanup failed (CO14b #4c)',
+    async () => {
+      // Oldest-to-newest: A, B, C. A rollback to B crashes right after its
+      // own repoint (marked, marker names it, current is B), before prune or
+      // complete.
+      class SwapCleanupFails extends FakeStore {
+        failNext = false;
+        cancelCalls = 0;
+        async cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+          this.cancelCalls += 1;
+          if (this.failNext) {
+            return { outcome: 'unreadable' };
+          }
+          return super.cancelOperation(input);
+        }
+      }
+      const store = new SwapCleanupFails([build('a', 1), build('b', 2), build('c', 3)], C);
+      const crashedOpId = seedCrashedRollback(store, B, B);
+      const consumes: string[] = [];
+      const useCase = round14UseCase(store, recordingGrants(consumes));
+
+      // An unrelated, separately authorized swap to that SAME sha B. Its own
+      // repoint (idempotent, current is already B) rewrites the store-level
+      // marker under the SWAP's operation id, but its proactive cleanup of
+      // the stale marked rollback intent fails -- the intent stays open.
+      store.failNext = true;
+      const swapped = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
+      expect(swapped).toMatchObject({ outcome: 'applied', target: B, current: B });
+      expect(store.cancelCalls).toBe(1);
+      // The marker now names the swap's own operation, never the crashed one's.
+      const swapOpId = store.lastCurrentOp?.opId ?? '';
+      expect(store.lastCurrentOp).toEqual({ sha: B, opId: swapOpId });
+      expect(swapOpId).toMatch(/^[0-9a-f]{32}$/);
+      expect(swapOpId).not.toBe(crashedOpId);
+      store.failNext = false;
+
+      // The next rollback: current === B (the intent's sha) but the marker
+      // names the SWAP, not the crashed rollback. Under the pre-#4c check
+      // (`current === open.sha` alone) the spent intent would be adopted and
+      // a no-op `applied` would replay its spent grant. Fixed, it is stale:
+      // it is retired after authorization, and the rollback really repoints
+      // to previousBuild(B) === A under a fresh grant and a fresh opId.
+      const rolled = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(rolled).toMatchObject({ outcome: 'applied', action: 'rollback', target: A, current: A });
+      expect(store.current).toBe(A);
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({ outcome: 'none' });
+      expect(store.cancelCalls).toBe(2); // the deferred retire of the crashed intent
+      expect(store.calls.filter((call) => call.startsWith('repoint '))).toEqual([`repoint ${B}`, `repoint ${A}`]);
+      // The spent grant of the crashed attempt is never replayed: the two
+      // consumptions are the unrelated swap's own and this fresh rollback's
+      // own, each under its own new opId -- never the crashed one's.
+      expect(consumes).toHaveLength(2);
+      expect(consumes.some((id) => id.includes(crashedOpId))).toBe(false);
+    },
+  );
+
+  it('a failing retire of a stale marked intent refuses store-unreadable and never opens a second intent (CO14b #4b-1)', async () => {
+    class FailingRetire extends FakeStore {
+      async cancelOperation(): Promise<ReleaseStoreWriteResult> {
+        return { outcome: 'unreadable' };
+      }
+    }
+    const store = new FailingRetire([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], D);
+    seedCrashedRollback(store, B, D);
+    const result = await manage(round14UseCase(store, recordingGrants([])), applyRequest({ action: 'rollback', sha: null, source: null }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(store.operations.size).toBe(1);
+    expect(store.current).toBe(D);
+    expect(store.calls.filter((call) => call.startsWith('repoint '))).toEqual([]);
   });
 
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {

@@ -11,6 +11,8 @@
 
 import { isValidHostName } from '@fleet/shared';
 
+import { isSafeWorkOrderBranchName } from '../../domain/base-branch.js';
+
 import type {
   ProjectProfileReadPort,
   ProjectProfileView,
@@ -94,6 +96,24 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
     throw malformed(projectId);
   }
   const laneCap = profile.maxConcurrentLanes;
+  let defaultBranch: string | null = null;
+  for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
+    if (Object.getOwnPropertyDescriptor(profile, key) !== undefined) {
+      throw malformed(projectId);
+    }
+  }
+  const branchDescriptor = Object.getOwnPropertyDescriptor(profile, 'defaultBranch');
+  if (branchDescriptor !== undefined) {
+    if (!('value' in branchDescriptor)) {
+      throw malformed(projectId);
+    }
+    if (branchDescriptor.value !== undefined && branchDescriptor.value !== null) {
+      if (!isSafeWorkOrderBranchName(branchDescriptor.value)) {
+        throw malformed(projectId);
+      }
+      defaultBranch = branchDescriptor.value;
+    }
+  }
   return {
     projectId: profile.projectId,
     status: profile.status,
@@ -101,6 +121,7 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
     clones,
     gateProcedures: profile.gateProcedures,
     revision: profile.revision as number,
+    defaultBranch,
     ...(laneCap !== undefined && laneCap !== null ? { maxConcurrentLanes: laneCap as number } : {}),
   };
 }

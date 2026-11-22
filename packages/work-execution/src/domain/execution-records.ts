@@ -9,7 +9,6 @@ import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 import type { AttemptOutcomeValue } from './value-objects/AttemptOutcome.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
-import type { BaseBranchValue } from './base-branch.js';
 import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
 import { pullRequestRefError } from './lane-plan-sidecar.js';
 
@@ -120,12 +119,13 @@ export interface WorkOrderRecord {
   /** Terminal work order this one supersedes; absent on records that start a new lineage. */
   readonly supersedesWorkOrderId?: string;
   /**
-   * The base branch the lane works against (`main`, or a `chain/<name>`;
-   * lane CB1). Set once at registration and never changed afterwards;
-   * optional only for records stored before CB1 — read it through
-   * `resolveWorkOrderBaseBranch`, which treats an absent value as `main`.
+   * The base branch the lane works against (lane CB1; RP1 also allows the
+   * active profile's `defaultBranch`, e.g. `staging`). Set once at
+   * registration and never changed afterwards; optional only for records
+   * stored before CB1 — read it through `resolveWorkOrderBaseBranch`, which
+   * treats an absent value as `main`.
    */
-  readonly baseBranch?: BaseBranchValue;
+  readonly baseBranch?: string;
   /** Optional pull-request title given at registration; absent when none was given. */
   readonly pullRequestTitle?: string;
 }

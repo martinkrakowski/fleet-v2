@@ -58,10 +58,14 @@ describe('resolveProfileDefaultBranch', () => {
     });
   });
 
-  it('resolves staging from active profile defaultBranch when request.baseBranch is absent', () => {
+  it('refuses a safe but unsupported defaultBranch such as staging with unsupported-profile-base', () => {
     expect(resolveProfileDefaultBranch({ defaultBranch: 'staging' })).toEqual({
-      ok: true,
-      baseBranch: 'staging',
+      ok: false,
+      reason: 'unsupported-profile-base',
+    });
+    expect(resolveProfileDefaultBranch({ defaultBranch: 'release/2026.11' })).toEqual({
+      ok: false,
+      reason: 'unsupported-profile-base',
     });
   });
 
@@ -86,7 +90,7 @@ describe('resolveProfileDefaultBranch', () => {
     ]) {
       expect(resolveProfileDefaultBranch({ defaultBranch: value })).toEqual({
         ok: false,
-        reason: 'invalid-profile-default-branch',
+        reason: 'malformed-profile',
       });
     }
   });
@@ -146,7 +150,7 @@ describe('resolveProfileDefaultBranch', () => {
     // A 1,000,000-character string of safe-looking characters is still refused.
     expect(resolveProfileDefaultBranch({ defaultBranch: 'a'.repeat(1_000_000) })).toEqual({
       ok: false,
-      reason: 'invalid-profile-default-branch',
+      reason: 'malformed-profile',
     });
   });
 });

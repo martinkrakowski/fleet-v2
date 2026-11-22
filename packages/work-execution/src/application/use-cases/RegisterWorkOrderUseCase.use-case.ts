@@ -436,6 +436,11 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         // RP1: with no explicit `request.baseBranch`, the active profile's
         // `defaultBranch` decides. A malformed profile or an unsafe declared
         // branch refuses the registration with a typed reason; nothing is written.
+        // RP1 fix: a declared branch that is neither `main` nor `chain/<name>`
+        // (for example `staging`) is refused `unsupported-profile-base` here,
+        // so nothing non-main/chain is ever persisted and the stored-record
+        // parsers (resolveWorkOrderBaseBranch, resolveLaneRunBaseBranch) stay
+        // able to read every stored record.
         const resolved = resolveProfileDefaultBranch(profile);
         if (!resolved.ok) {
           return { outcome: 'refused', reason: resolved.reason };

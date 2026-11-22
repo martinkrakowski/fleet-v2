@@ -106,7 +106,7 @@ export type RegisterWorkOrderResult =
         | 'intent-digest-mismatch'
         | 'store-unavailable'
         | 'malformed-profile'
-        | 'invalid-profile-default-branch';
+        | 'unsupported-profile-base';
     }
   | { readonly outcome: 'rejected'; readonly reason: string };
 

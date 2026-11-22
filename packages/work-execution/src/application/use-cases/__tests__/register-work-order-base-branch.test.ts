@@ -12,6 +12,7 @@ import type {
   ProjectProfileView,
 } from '../../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
+import { ProjectProfileReadAdapter } from '../../../infrastructure/adapters/ProjectProfileReadAdapter.adapter.js';
 import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.js';
 
 class FakeWorkOrderRepo implements WorkOrderRepositoryPort {
@@ -98,7 +99,7 @@ describe('RegisterWorkOrderUseCase profile defaultBranch (RP1)', () => {
     expect(workOrderRepo.orders.get('wo-proj-1')?.baseBranch).toBe('main');
   });
 
-  it('resolves staging from active profile defaultBranch when request.baseBranch is absent', async () => {
+  it('refuses a staging profile defaultBranch with unsupported-profile-base and writes nothing', async () => {
     const workOrderRepo = new FakeWorkOrderRepo();
     const useCase = new RegisterWorkOrderUseCase({
       workOrderRepo,
@@ -107,11 +108,9 @@ describe('RegisterWorkOrderUseCase profile defaultBranch (RP1)', () => {
       ),
     });
     const result = await useCase.registerWorkOrder(validRequest());
-    expect(result).toEqual({
-      outcome: 'registered',
-      workOrder: expect.objectContaining({ id: 'wo-1', baseBranch: 'staging' }),
-    });
-    expect(workOrderRepo.orders.get('wo-1')?.baseBranch).toBe('staging');
+    expect(result).toEqual({ outcome: 'refused', reason: 'unsupported-profile-base' });
+    // The refused registration must not persist the unsupported base.
+    expect(workOrderRepo.orders.size).toBe(0);
   });
 
   it('prefers explicit request.baseBranch over profile defaultBranch', async () => {
@@ -159,28 +158,42 @@ describe('RegisterWorkOrderUseCase profile defaultBranch (RP1)', () => {
     expect(missing).toEqual({ outcome: 'rejected', reason: expect.stringContaining('no profile') });
   });
 
-  it('refuses empty, non-string, oversized, and unsafe profile defaultBranch values', async () => {
+  it('refuses empty, non-string, oversized, and unsafe profile defaultBranch values through the real adapter', async () => {
+    // Finding RP1-4: the malformed defaultBranch cases run through the real
+    // ProjectProfileReadAdapter, which throws on them and produces
+    // malformed-profile at the use case; no hand-built profile view is used.
+    for (const defaultBranch of ['', '   ', 42, true, '../x', '-x', 'a..b', 'x.lock', 'a//b', 'a'.repeat(201)]) {
+      const workOrderRepo = new FakeWorkOrderRepo();
+      const useCase = new RegisterWorkOrderUseCase({
+        workOrderRepo,
+        profileRead: new ProjectProfileReadAdapter({
+          inspect: async () => ({
+            outcome: 'found',
+            profile: { ...profileView(), defaultBranch },
+          }),
+        }),
+      });
+      const result = await useCase.registerWorkOrder(validRequest());
+      expect(result).toEqual({ outcome: 'refused', reason: 'malformed-profile' });
+      expect(workOrderRepo.orders.size).toBe(0);
+    }
+  });
+
+  it('refuses a chain-shaped but unsupported profile defaultBranch through the real adapter', async () => {
+    // `staging` is a safe name the adapter maps through; the registration
+    // check, not the adapter, refuses it as unsupported-profile-base.
     const workOrderRepo = new FakeWorkOrderRepo();
     const useCase = new RegisterWorkOrderUseCase({
       workOrderRepo,
-      profileRead: new FakeProfileRead(
-        new Map([['proj-1', profileView({ defaultBranch: 'a'.repeat(1_000_000) })]]),
-      ),
+      profileRead: new ProjectProfileReadAdapter({
+        inspect: async () => ({
+          outcome: 'found',
+          profile: { ...profileView(), defaultBranch: 'staging' },
+        }),
+      }),
     });
-    const oversized = await useCase.registerWorkOrder(validRequest());
-    expect(oversized).toEqual({
-      outcome: 'refused',
-      reason: 'invalid-profile-default-branch',
-    });
-
-    for (const defaultBranch of ['', '   ', 42, true, '../x', '-x', 'a..b', 'x.lock', 'a//b']) {
-      const refusing = new RegisterWorkOrderUseCase({
-        workOrderRepo: new FakeWorkOrderRepo(),
-        profileRead: new FakeProfileRead(new Map([['proj-1', profileView({ defaultBranch } as never)]])),
-      });
-      const result = await refusing.registerWorkOrder(validRequest());
-      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-profile-default-branch' });
-    }
+    const result = await useCase.registerWorkOrder(validRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'unsupported-profile-base' });
     expect(workOrderRepo.orders.size).toBe(0);
   });
 

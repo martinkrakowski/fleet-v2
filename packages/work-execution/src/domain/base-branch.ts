@@ -99,7 +99,7 @@ export function isSafeWorkOrderBranchName(value: unknown): value is string {
 
 export type ProfileDefaultBranchResult =
   | { readonly ok: true; readonly baseBranch: string }
-  | { readonly ok: false; readonly reason: 'malformed-profile' | 'invalid-profile-default-branch' };
+  | { readonly ok: false; readonly reason: 'malformed-profile' | 'unsupported-profile-base' };
 
 const FORBIDDEN_PROFILE_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
 
@@ -108,8 +108,12 @@ const FORBIDDEN_PROFILE_KEYS = ['__proto__', 'constructor', 'prototype'] as cons
  * Nothing throws and no accessor ever runs: the profile is validated as a
  * plain record with no prototype-polluting own keys, and `defaultBranch` is
  * read only through its own property descriptor. An absent, `undefined` or
- * `null` `defaultBranch` falls back to `main`; any other value must be a safe
- * branch name or the profile is refused with a typed reason.
+ * `null` `defaultBranch` falls back to `main`; a non-safe value is a malformed
+ * profile, and a safe value that is not `main` or `chain/<name>` is refused
+ * with a typed reason — the rest of the system (LaneRun, WorkspacePort,
+ * StartLaneRunUseCase, PlanRelaunchUseCase) supports only those two shapes
+ * until slice RP1b, so a `staging` base is refused here rather than persisted
+ * and later silently coerced to `main`.
  */
 export function resolveProfileDefaultBranch(profile: unknown): ProfileDefaultBranchResult {
   try {
@@ -132,9 +136,16 @@ export function resolveProfileDefaultBranch(profile: unknown): ProfileDefaultBra
       return { ok: true, baseBranch: DEFAULT_BASE_BRANCH };
     }
     if (isSafeWorkOrderBranchName(descriptor.value)) {
-      return { ok: true, baseBranch: descriptor.value };
+      // RP1: only `main` and `chain/<name>` have downstream support; a safe
+      // but unsupported declared branch (for example `staging`) is refused
+      // here so it is never persisted and never coerced to `main` later.
+      const parsed = parseBaseBranch(descriptor.value);
+      if (parsed === undefined) {
+        return { ok: false, reason: 'unsupported-profile-base' };
+      }
+      return { ok: true, baseBranch: parsed };
     }
-    return { ok: false, reason: 'invalid-profile-default-branch' };
+    return { ok: false, reason: 'malformed-profile' };
   } catch {
     return { ok: false, reason: 'malformed-profile' };
   }

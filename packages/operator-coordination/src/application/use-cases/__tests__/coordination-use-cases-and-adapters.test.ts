@@ -1746,12 +1746,16 @@ describe('ResolveActionAuthorizationUseCase', () => {
     await expect(
       new ResolveActionAuthorizationUseCase().execute(request),
     ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
-    await expect(
-      new ResolveActionAuthorizationUseCase({
+    // Fix round 1 (run-01M7TWG5VV9RJPWEPT9GQWKNEG): a configured runtime
+    // refuses a malformed non-object input (undefined) with a typed refusal
+    // instead of throwing; only the unconfigured station and the missing
+    // required fields of a well-formed object keep the Not implemented throw.
+    expect(
+      await new ResolveActionAuthorizationUseCase({
         requestRepo: new StubRequestRepository(),
         ...createSignedDecisionFixture().deps,
       }).execute(undefined),
-    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+    ).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     await expect(
       new ResolveActionAuthorizationUseCase({
         requestRepo: new StubRequestRepository(),

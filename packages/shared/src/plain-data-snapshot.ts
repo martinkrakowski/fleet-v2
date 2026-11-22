@@ -180,6 +180,16 @@ function normalizeTrustedLimits(
   return { ok: true, limits: resolved };
 }
 
+function snapNumber(value: number, path: string | null): PlainDataSnapshot {
+  if (!Number.isFinite(value)) {
+    return refusal('non-finite-number', path);
+  }
+  if (Object.is(value, -0)) {
+    return refusal('negative-zero', path);
+  }
+  return { ok: true, value };
+}
+
 function snap(
   value: unknown,
   isProxy: IsProxy,
@@ -198,14 +208,11 @@ function snap(
   if (value === null) {
     return { ok: true, value };
   }
-  if (typeof value === 'boolean' || typeof value === 'number') {
-    if (typeof value === 'number' && !Number.isFinite(value)) {
-      return refusal('non-finite-number', path);
-    }
-    if (typeof value === 'number' && Object.is(value, -0)) {
-      return refusal('negative-zero', path);
-    }
+  if (typeof value === 'boolean') {
     return { ok: true, value };
+  }
+  if (typeof value === 'number') {
+    return snapNumber(value, path);
   }
   if (typeof value === 'string') {
     return value.length > limits.maxStringLength

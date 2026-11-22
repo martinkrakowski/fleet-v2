@@ -1,3 +1,4 @@
+import { builtinModules } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { types } from 'node:util';
 import { describe, expect, it } from 'vitest';
@@ -596,31 +597,29 @@ describe('snapshotPlainData', () => {
     // `node:`-prefixed specifiers and bare Node builtin specifiers
     // (including subpath imports such as `fs/promises`).
     const BUILTINS = [
-      'node:',
-      'fs',
-      'path',
-      'os',
-      'child_process',
-      'net',
-      'http',
-      'https',
-      'crypto',
-      'stream',
-      'util',
-      'events',
-      'url',
-      'buffer',
-      'process',
-      'vm',
-      'worker_threads',
+      ...new Set(
+        builtinModules.map((module) => module.replace(/^node:/, '')),
+      ),
     ];
+    const escapeRegex = (name: string): string =>
+      name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Each builtin matches as `<name>` or `node:<name>`, and the name must be
+    // followed by a specifier boundary: a closing quote or `/` (for subpaths
+    // such as `fs/promises`). This keeps package-name prefixes
+    // (`path-to-regexp`), relative paths (`./fs`), and substrings
+    // (`osmosis`) from matching.
+    const BUILTIN_ALTERNATIVES = BUILTINS.flatMap((builtin) => [
+      escapeRegex(builtin),
+      `node:${escapeRegex(builtin)}`,
+    ]).join('|');
+    const BUILTIN_NAME = `(?:${BUILTIN_ALTERNATIVES})(?=['"/])`;
     const NODE_SPECIFIER_PATTERN = new RegExp(
-      BUILTINS.flatMap((builtin) => [
-        `import\\s*[(\\s'"]*['"]${builtin}[^'"]*['"]`,
-        `import\\s+[^'"]*\\s+from\\s*['"]${builtin}[^'"]*['"]`,
-        `require\\s*\\(\\s*['"]${builtin}[^'"]*['"]`,
-        `export\\s+[^'"]*\\s+from\\s*['"]${builtin}[^'"]*['"]`,
-      ]).join('|'),
+      [
+        `import\\s*[(\\s'"]*['"]${BUILTIN_NAME}`,
+        `import\\s+[^'"]*\\s+from\\s*['"]${BUILTIN_NAME}`,
+        `require\\s*\\(\\s*['"]${BUILTIN_NAME}`,
+        `export\\s+[^'"]*\\s+from\\s*['"]${BUILTIN_NAME}`,
+      ].join('|'),
       'g',
     );
 
@@ -667,6 +666,30 @@ describe('snapshotPlainData', () => {
       const source = readFileSync(new URL('../plain-data-snapshot.ts', import.meta.url), 'utf8');
       const matches = source.match(NODE_SPECIFIER_PATTERN);
       expect(matches).toBeNull();
+    });
+
+    it('self-test: the guard catches bare, node:-prefixed, and subpath builtin specifiers', () => {
+      const caught = [
+        "import assert from 'assert';",
+        "import 'fs/promises';",
+        'require("node:child_process");',
+      ];
+      for (const form of caught) {
+        expect(NODE_SPECIFIER_PATTERN.test(form)).toBe(true);
+        NODE_SPECIFIER_PATTERN.lastIndex = 0;
+      }
+    });
+
+    it('self-test: the guard ignores package-name prefixes, relative paths, and substrings', () => {
+      const safe = [
+        "import 'path-to-regexp';",
+        "import x from './fs';",
+        "import y from 'osmosis';",
+      ];
+      for (const form of safe) {
+        expect(NODE_SPECIFIER_PATTERN.test(form)).toBe(false);
+        NODE_SPECIFIER_PATTERN.lastIndex = 0;
+      }
     });
   });
 });

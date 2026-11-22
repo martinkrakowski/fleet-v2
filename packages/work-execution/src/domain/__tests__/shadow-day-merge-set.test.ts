@@ -81,6 +81,36 @@ describe('evaluateShadowMergeSet (S1)', () => {
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
   });
 
+  it('an own symbol key on events is invalid-input (Object.keys used to ignore it)', () => {
+    const events = [shellEvent()];
+    Object.defineProperty(events, Symbol('extra'), { value: 1, enumerable: true });
+    const input = dayInput({ shell: { events, unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual({ status: 'unknown', reason: 'invalid-input', mergesCompared: 0, excludedBatchMerges: 0, compared: 0, divergences: 0 });
+  });
+
+  it('a non-enumerable extra own key on results is invalid-input (Object.keys used to ignore it)', () => {
+    const results = [fleetResult()];
+    Object.defineProperty(results, 'extra', { value: 1, enumerable: false });
+    const input = dayInput({ fleet: { results, entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toEqual({ status: 'unknown', reason: 'invalid-input', mergesCompared: 0, excludedBatchMerges: 0, compared: 0, divergences: 0 });
+  });
+
+  it('an accessor element refuses the whole entries list before any element reader runs', () => {
+    let calls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, 0, {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return fleetEntry();
+      },
+    });
+    accessorList.length = 1;
+    const input = dayInput({ fleet: { results: [fleetResult()], entries: accessorList } });
+    expect(evaluateShadowMergeSet(input)).toEqual({ status: 'unknown', reason: 'invalid-input', mergesCompared: 0, excludedBatchMerges: 0, compared: 0, divergences: 0 });
+    expect(calls).toBe(0);
+  });
+
   it('fails with merge-set-divergence for a fleet would-merge the shell never actually merged', () => {
     const input = dayInput({ shell: { events: [], unknownLines: 0 } });
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });

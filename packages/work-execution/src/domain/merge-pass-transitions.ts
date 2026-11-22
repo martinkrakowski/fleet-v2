@@ -77,6 +77,27 @@ function validated(entry: unknown): MergeQueueEntryRecord | null {
   return read.ok ? read.record : null;
 }
 
+/**
+ * Refuse a Proxy stand-in: the structured-clone serializer refuses any Proxy
+ * exotic object — root or nested — the clone probe rejects the Proxy itself
+ * (full trap-free refusal arrives with the shared snapshotPlainData (PX1)
+ * adoption). Called
+ * only AFTER `readMergeQueueEntryRecord`'s descriptor walk has proved the
+ * raw entry plain and bounded: every accessor is refused from its own
+ * descriptor (so the probe reads no getter), and arrays, sparse arrays,
+ * array-like objects, extra keys and prototype-polluting keys are refused
+ * pre-traversal (so the serializer never materializes unbounded input). On
+ * that proved-bounded data the probe costs a constant walk.
+ */
+function isCloneableEntry(raw: unknown): boolean {
+  try {
+    structuredClone(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function next(entry: MergeQueueEntryRecord, changes: Partial<MergeQueueEntryRecord>): MergeEntryBuild {
   const read = readMergeQueueEntryRecord({ ...entry, ...changes, revision: entry.revision + 1 });
   return read.ok ? { ok: true, record: read.record } : { ok: false, reason: 'invalid-entry' };
@@ -158,6 +179,49 @@ export function buildParkedEntry(entry: unknown, input: ParkInput): MergeEntryBu
       attempt: input.nextAttempt,
       notBeforeIso: input.notBeforeIso,
     });
+  } catch {
+    return { ok: false, reason: 'invalid-entry' };
+  }
+}
+
+/**
+ * Release one shadow-parked entry back to `queued` at `cutover switch`
+ * (SH24a): the attempt history is preserved, the park reason and
+ * `notBeforeIso` are cleared, and the revision moves exactly one. An ordinary
+ * park only — a `veto-hold` never persists under shadow, so it is never
+ * released here. The entry is read through own data-property descriptors
+ * FIRST (`readMergeQueueEntryRecord`): arrays, sparse arrays, array-like
+ * objects, extra keys, prototype-polluting keys and any accessor are refused
+ * pre-traversal from their descriptors, so a throwing or tracked getter is
+ * never invoked (its call count stays 0) and no unbounded input is ever
+ * materialized. Only after that walk has proved the entry plain and bounded
+ * does the structured-clone probe run (`isCloneableEntry`), refusing a
+ * supplied root or nested Proxy as a stand-in while the clone probe rejects
+ * the Proxy itself (full trap-free refusal arrives with the shared
+ * snapshotPlainData (PX1) adoption). Cost bound: linear in a constant — one validated read
+ * of the fixed-shape entry record and one rebuilt record.
+ */
+export function buildReleasedParkEntry(entry: unknown): MergeEntryBuild {
+  try {
+    const current = validated(entry);
+    if (current === null) {
+      return { ok: false, reason: 'invalid-entry' };
+    }
+    // Probe second: after the descriptor walk proved the entry plain and
+    // bounded, the structured-clone probe refuses a Proxy stand-in (its
+    // serializer rejects the Proxy before reading through it), and reads no
+    // getter (accessors were refused from their descriptors). Full trap-free
+    // refusal arrives with the shared snapshotPlainData (PX1) adoption.
+    if (!isCloneableEntry(entry)) {
+      return { ok: false, reason: 'invalid-entry' };
+    }
+    if (terminal(current)) {
+      return { ok: false, reason: 'terminal-entry' };
+    }
+    if (current.state !== 'parked' || current.reason === null || current.reason === 'veto-hold') {
+      return { ok: false, reason: 'invalid-input' };
+    }
+    return next(current, { state: 'queued', reason: null, notBeforeIso: null });
   } catch {
     return { ok: false, reason: 'invalid-entry' };
   }

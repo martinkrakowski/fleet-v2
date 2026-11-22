@@ -38,7 +38,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
-import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
+import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import type {
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
@@ -78,7 +78,11 @@ const HEAD12_B = 'b'.repeat(12);
 // verifies.
 const PROSE = '# brief\n';
 const DEFAULT_MANIFEST_JSON = JSON.stringify({ acceptanceChecks: ['check-1'] });
-const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+// BL04: the digests are the SHA-256 package digests the review adapter
+// recomputes (`computeBriefPackageDigest` with the composition root's
+// `sha256HexDigest`), so a real adapter bound into a harness verifies the
+// brief-check binding instead of refusing it.
+const digestFor = (json: string): string => sha256HexDigest(PROSE + '\n' + json);
 const SHA = digestFor(DEFAULT_MANIFEST_JSON);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 
@@ -364,6 +368,9 @@ async function makeHarness(
       admit: async () => ({ outcome: 'admitted' }),
     },
     newUlid: makeUlidMinter(),
+    // BL04: the frozen reads verify with the same SHA-256 the review adapter
+    // recomputes, so a real adapter bound into a harness accepts the binding.
+    computeDigest: sha256HexDigest,
     ...(options.wireSameFamily === false ? {} : { sameModelFamily: (left: string, right: string) => sameFamilyImpl(left, right) }),
     ...(options.wireReviewRequest === false
       ? {}
@@ -555,6 +562,8 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       implementerModel: 'model-example-1',
       reviewerModel: 'review-model-1',
       briefText: PROSE,
+      briefManifestRaw: DEFAULT_MANIFEST_JSON,
+      briefPackageDigest: SHA,
       nowIso: LATER,
     });
     expect(harness.openRequests).toHaveLength(1);

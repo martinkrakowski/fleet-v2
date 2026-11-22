@@ -1,18 +1,33 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_RECORD_SCHEMA_VERSION,
   CUTOVER_SHADOW_CRITERIA,
   CUTOVER_SHADOW_MIN_MERGES,
+  MAX_CUTOVER_JOURNAL_ENTRIES,
+  MAX_SHADOW_PARKS_PER_SWITCH,
+  CUTOVER_SWITCH_JOURNAL_RESERVE,
+  RETIREMENT_LEDGER_MAX_TEXT_BYTES,
+  buildShadowParkJournalPayload,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
   canonicalCutoverSwitchPayload,
+  checkCutoverJournalCapacity,
+  checkCutoverJournalReplayCapacity,
   cutoverJournalKey,
+  cutoverShadowParkKey,
   isWithinCutoverRollbackWindow,
   readCutoverRecord,
   readCutoverShadowEvidence,
+  readCutoverShadowParkPayload,
+  readCutoverShadowParkRecord,
+  readRetirementLedger,
 } from '../cutover-records.js';
+import { MERGE_QUEUE_ENTRY_VERSION } from '../merge-queue-records.js';
 
 const DIGEST = 'a'.repeat(64);
 const SWITCHED = '2026-11-01T10:00:00.000Z';
@@ -609,5 +624,928 @@ describe('readCutoverShadowEvidence', () => {
   it('never echoes input values in its result', () => {
     const text = JSON.stringify(readCutoverShadowEvidence({ days: 'sentinel-days', merges: CUTOVER_SHADOW_MIN_MERGES }, NOW));
     expect(text).not.toContain('sentinel-days');
+  });
+});
+
+const RETIREMENT_INVALID = { ok: false, reason: 'invalid-ledger' } as const;
+
+/** A complete ledger over the pinned §1 scripts, every row verified. */
+function verifiedRows(): Array<{ script: string; verified: boolean; evidenceLink: string }> {
+  return CUTOVER_RETIREMENT_SCRIPTS.map((script, index) => ({
+    script,
+    verified: true,
+    evidenceLink: `evidence/retirement-${index}.md`,
+  }));
+}
+
+function ledger(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { schemaVersion: 1, rows: verifiedRows(), ...overrides };
+}
+
+function rowOverrides(index: number, overrides: Record<string, unknown>): unknown[] {
+  const rows = verifiedRows();
+  rows[index] = { ...rows[index], ...overrides };
+  return rows;
+}
+
+/** Replace row `index` with a getter whose value is the original field value. */
+function withRowGetter(index: number, key: string, calls: { count: number }): unknown[] {
+  const rows = verifiedRows();
+  const value = (rows[index] as Record<string, unknown>)[key];
+  const target = rows[index] as Record<string, unknown>;
+  Object.defineProperty(target, key, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      calls.count += 1;
+      return value;
+    },
+  });
+  return rows;
+}
+
+describe('CUTOVER_RETIREMENT_SCRIPTS', () => {
+  it('matches the §1 Train and Lane table Script column in the cutover plan, in exact membership and order', () => {
+    const plan = readFileSync(
+      new URL('../../../../../docs/planning/2026-11-03_cutover-plan.md', import.meta.url),
+      'utf8',
+    );
+    const inventoryStart = plan.indexOf('## 1. Inventory');
+    const inventoryEnd = plan.indexOf('## 2. Gaps', inventoryStart);
+    expect(inventoryStart).toBeGreaterThan(0);
+    expect(inventoryEnd).toBeGreaterThan(inventoryStart);
+    const tableScripts = plan
+      .slice(inventoryStart, inventoryEnd)
+      .split('\n')
+      .map((line) => /^\| `([^`]+)`/.exec(line)?.[1])
+      .filter((script): script is string => script !== undefined && /^(train|lane)\//.test(script));
+    expect(tableScripts.length).toBe(68);
+    expect([...CUTOVER_RETIREMENT_SCRIPTS]).toEqual(tableScripts);
+  });
+});
+
+describe('readRetirementLedger', () => {
+  it('reads a complete verified ledger and always builds a fresh result object', () => {
+    const raw = ledger();
+    const result = readRetirementLedger(raw);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.ledger.schemaVersion).toBe(1);
+    expect(result.ledger.rows).toEqual(verifiedRows());
+    // An identity echo of the input would fail these: the ledger is freshly built.
+    expect(result.ledger).not.toBe(raw);
+    expect(result.ledger.rows).not.toBe(raw.rows);
+    expect(result.ledger.rows[0]).not.toBe((raw.rows as unknown[])[0]);
+    (raw.rows as unknown[])[0] = { script: 'mutated', verified: true, evidenceLink: 'x' };
+    expect(JSON.stringify(result.ledger.rows[0])).not.toContain('mutated');
+    // A reader returning a constant verdict would fail these: the ok verdict is
+    // distinct from every refusal code the same input family produces.
+    expect(readRetirementLedger(ledger({ rows: [] }))).toEqual({ ok: false, reason: 'empty-ledger' });
+    expect(readRetirementLedger(ledger({ schemaVersion: 2 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: false }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+  });
+
+  it('refuses null as invalid-ledger', () => {
+    expect(readRetirementLedger(null)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses undefined as invalid-ledger', () => {
+    expect(readRetirementLedger(undefined)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a wrong primitive (a number, a string, a boolean) as invalid-ledger', () => {
+    expect(readRetirementLedger(42)).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger('str')).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(true)).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a non-array object where the rows list is due as invalid-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: { length: 68, 0: verifiedRows()[0] } }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: {} }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a sparse rows array (an array hole) as invalid-ledger', () => {
+    const rows = verifiedRows();
+    delete (rows[3] as unknown as { script?: string }).script;
+    const sparse = new Array(68);
+    for (let i = 0; i < 68; i += 1) {
+      if (i !== 3) sparse[i] = rows[i];
+    }
+    expect(readRetirementLedger(ledger({ rows: sparse }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses an array-like object standing in for rows as invalid-ledger', () => {
+    const arrayLike = Object.assign(Object.create(null), { length: 68, 0: verifiedRows()[0], 1: verifiedRows()[1] });
+    expect(readRetirementLedger(ledger({ rows: arrayLike }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses an enormous rows length (2**32 - 1) before any traversal as invalid-ledger', () => {
+    const rows = [] as unknown[];
+    Object.defineProperty(rows, 'length', { value: 2 ** 32 - 1 });
+    const descriptorReads = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+    try {
+      expect(readRetirementLedger(ledger({ rows }))).toEqual(RETIREMENT_INVALID);
+      // The bound is settled before any descriptor walk over the rows.
+      expect(descriptorReads.mock.calls.length).toBeLessThan(10);
+    } finally {
+      descriptorReads.mockRestore();
+    }
+  });
+
+  it('refuses rows longer than RETIREMENT_LEDGER_MAX_ROWS as invalid-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: new Array(256 + 1) }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses a getter on the root and on a row item, and never invokes either', () => {
+    const calls = { count: 0 };
+    const rootWithGetter = ledger() as Record<string, unknown>;
+    const rowsValue = rootWithGetter.rows;
+    Object.defineProperty(rootWithGetter, 'rows', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls.count += 1;
+        return rowsValue;
+      },
+    });
+    expect(readRetirementLedger(rootWithGetter)).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: withRowGetter(0, 'script', calls) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: withRowGetter(1, 'verified', calls) }))).toEqual(RETIREMENT_INVALID);
+    expect(calls.count).toBe(0);
+  });
+
+  it('refuses a transparent Proxy over a valid ledger as invalid-ledger, without firing a get trap', () => {
+    const TRAPS = [
+      'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+      'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+    ] as const;
+    const calls: string[] = [];
+    const handler: Record<string, (...args: unknown[]) => unknown> = {};
+    for (const trap of TRAPS) {
+      handler[trap] = (...args) => {
+        calls.push(trap);
+        return (Reflect as unknown as Record<string, (...args: unknown[]) => unknown>)[trap](...args);
+      };
+    }
+    const proxy = new Proxy(ledger() as object, handler as ProxyHandler<object>);
+    expect(readRetirementLedger(proxy)).toEqual(RETIREMENT_INVALID);
+    expect(calls.filter((trap) => trap === 'get')).toEqual([]);
+  });
+
+  it('refuses a Proxy standing in for the rows array itself, without firing its get trap', () => {
+    // The hostile case itself: rows is a Proxy over a valid array, and its get
+    // trap is hostile code. Every earlier check must settle without it —
+    // `length` is only ever taken from a getOwnPropertyDescriptor read.
+    const gets: Array<PropertyKey> = [];
+    const proxy = new Proxy(verifiedRows() as unknown[], {
+      get(_target, key, receiver) {
+        gets.push(key);
+        return Reflect.get(_target, key, receiver);
+      },
+    });
+    expect(readRetirementLedger(ledger({ rows: proxy }))).toEqual(RETIREMENT_INVALID);
+    expect(gets).toEqual([]);
+  });
+
+  it('refuses a prototype-polluting own key produced by JSON.parse as invalid-ledger', () => {
+    const rows = JSON.stringify(verifiedRows());
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      const parsed = JSON.parse(`{"rows":${rows},"${key}":{}}`);
+      expect(readRetirementLedger(parsed)).toEqual(RETIREMENT_INVALID);
+    }
+  });
+
+  it('refuses missing, extra and wrong-typed row keys as invalid-ledger', () => {
+    const missingKey = verifiedRows();
+    delete (missingKey[0] as { evidenceLink?: string }).evidenceLink;
+    expect(readRetirementLedger(ledger({ rows: missingKey }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: undefined }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { extra: 1 }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: 'yes' }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: 7 }) }))).toEqual(RETIREMENT_INVALID);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: 7 }) }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses text exceeding RETIREMENT_LEDGER_MAX_TEXT_BYTES as invalid-ledger', () => {
+    const longLink = 'e'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES + 1);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: longLink }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+    // A script is pinned, so an over-long pinned name cannot exist; an over-long
+    // non-pinned name is still refused as invalid-ledger by the byte bound.
+    const longScript = 't'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES + 1);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: longScript }) }))).toEqual(RETIREMENT_INVALID);
+    // An astral-plane string sits at the UTF-16 bound but exceeds the UTF-8 byte bound.
+    const astral = '\u{1F600}'.repeat(RETIREMENT_LEDGER_MAX_TEXT_BYTES / 2);
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: astral }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+  });
+
+  it('refuses duplicate script as invalid-ledger', () => {
+    const rows = verifiedRows();
+    const duplicate = { ...rows[0], evidenceLink: 'other.md' };
+    rows.splice(1, 1, duplicate);
+    expect(readRetirementLedger(ledger({ rows }))).toEqual(RETIREMENT_INVALID);
+  });
+
+  it('refuses missing or extra script row as invalid-ledger', () => {
+    // Missing: a pinned script never appears.
+    const missing = verifiedRows().slice(1);
+    expect(readRetirementLedger(ledger({ rows: missing }))).toEqual(RETIREMENT_INVALID);
+    // Extra: an unknown script replaces a pinned one.
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { script: 'lane/not-pinned.sh' }) }))).toEqual(
+      RETIREMENT_INVALID,
+    );
+  });
+
+  it('reports newer schemaVersion as unknown-version', () => {
+    expect(readRetirementLedger(ledger({ schemaVersion: 2 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    expect(readRetirementLedger(ledger({ schemaVersion: 99 }))).toEqual({ ok: false, reason: 'unknown-version' });
+    for (const bad of [0, -1, 1.5, '1', null, true]) {
+      expect(readRetirementLedger(ledger({ schemaVersion: bad }))).toEqual(RETIREMENT_INVALID);
+    }
+  });
+
+  it('refuses empty rows array as empty-ledger', () => {
+    expect(readRetirementLedger(ledger({ rows: [] }))).toEqual({ ok: false, reason: 'empty-ledger' });
+  });
+
+  it('refuses unverified row or blank evidenceLink as row-unverified', () => {
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { verified: false }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: '   ' }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+    expect(readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: '' }) }))).toEqual({
+      ok: false,
+      reason: 'row-unverified',
+    });
+  });
+
+  it('refuses secret-shaped script or evidenceLink as secret-shaped', () => {
+    // The fake token material is assembled at runtime so this source file never
+    // matches the diff-check's github-token pattern; the runtime value still
+    // exercises the secret-shaped refusal.
+    const token = `ghp_${'A'.repeat(24)}`;
+    expect(
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { script: `lane/${token}.sh` }) })),
+    ).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(
+      readRetirementLedger(ledger({ rows: rowOverrides(0, { evidenceLink: `evidence/${token}` }) })),
+    ).toEqual({ ok: false, reason: 'secret-shaped' });
+  });
+});
+
+// SW2a1: the shadow-park record, its digest-keyed journal key, the journal
+// capacity pre-check, and the `veto-hold` exclusion (SH24a).
+
+const PARK_DIGEST = 'a'.repeat(32);
+const PARK_HEAD = '0123456789abcdef0123456789abcdef01234567';
+const PARK_ID = '01JD' + '1'.padStart(22, '0');
+const PARK_NOT_BEFORE = '2026-11-05T12:00:00.000Z';
+
+function parkedEntry(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: MERGE_QUEUE_ENTRY_VERSION,
+    entryId: PARK_ID,
+    repository: { owner: 'fleet', repo: 'v2' },
+    repoDigest: '0123456789ab',
+    pullRequest: 7,
+    headOid: PARK_HEAD,
+    state: 'parked',
+    reason: 'checks',
+    attempt: 2,
+    notBeforeIso: PARK_NOT_BEFORE,
+    enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+    enqueuedBy: 'conductor',
+    supersedes: null,
+    runId: null,
+    attemptId: null,
+    workOrderId: null,
+    tier: 2,
+    verifiedHeadOid: null,
+    verifiedBy: null,
+    policyRevision: null,
+    premergeReceiptHeadOid: null,
+    veto: null,
+    mergeCommitOid: null,
+    mergedAtIso: null,
+    revision: 3,
+    ...overrides,
+  };
+}
+
+function parkRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    entryId: PARK_ID,
+    repository: { owner: 'fleet', repo: 'v2' },
+    pullRequest: 7,
+    headOid: PARK_HEAD,
+    reason: 'checks',
+    attempt: 2,
+    notBeforeIso: null,
+    ...overrides,
+  };
+}
+
+/** Hostile shapes every record-shape reader must refuse without traversing. */
+function hostileShapes(): readonly unknown[] {
+  const sparse: unknown[] = [];
+  sparse[3] = 'x';
+  return [
+    null,
+    undefined,
+    7,
+    'x',
+    true,
+    { not: 'the shape' },
+    sparse,
+    { length: 1, 0: 'x' },
+    { length: 2 ** 32 - 1, 0: 'x' },
+    new Array(2 ** 32 - 1),
+  ];
+}
+
+/** A copy of `target` whose `key` is a counting getter that is never expected to run. */
+function withCountingGetter(
+  target: Record<string, unknown>,
+  key: string,
+  options: { enumerable?: boolean } = { enumerable: true },
+): { value: Record<string, unknown>; calls: () => number } {
+  let count = 0;
+  const copy = { ...target };
+  Object.defineProperty(copy, key, {
+    enumerable: options.enumerable,
+    get() {
+      count += 1;
+      return target[key];
+    },
+  });
+  return { value: copy, calls: () => count };
+}
+
+/** A transparent proxy whose `get` trap is counted and never expected to run. */
+function withGetCountingProxy(target: Record<string, unknown>): { value: unknown; gets: () => number } {
+  let count = 0;
+  const proxied = new Proxy(target, {
+    get(t, key, recv) {
+      count += 1;
+      return Reflect.get(t, key, recv);
+    },
+  });
+  return { value: proxied, gets: () => count };
+}
+
+/** `base` plus the polluting own keys `__proto__`, `constructor` and `prototype` (via JSON.parse). */
+function withPollutingKeys(base: Record<string, unknown>): unknown {
+  const inner = JSON.stringify(base).slice(1, -1);
+  return JSON.parse(`{"__proto__":{},"constructor":1,"prototype":1,${inner}}`);
+}
+
+/** Every Proxy trap name; a handler built from this list sees whatever a validator does to the Proxy. */
+const PARK_TRAPS = [
+  'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+  'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+] as const;
+
+/** A transparent Proxy over `target` that records every trap name the validator runs. */
+function recordingProxy(target: Record<string, unknown>): { value: unknown; calls: () => string[] } {
+  const calls: string[] = [];
+  const handler: Record<string, (...args: unknown[]) => unknown> = {};
+  for (const trap of PARK_TRAPS) {
+    handler[trap] = (...args: unknown[]) => {
+      calls.push(trap);
+      return (Reflect as unknown as Record<string, (...args: unknown[]) => unknown>)[trap](...args);
+    };
+  }
+  return { value: new Proxy(target, handler as ProxyHandler<Record<string, unknown>>), calls: () => calls };
+}
+
+/** A Proxy whose every trap throws. */
+function throwingTrapsProxy(target: Record<string, unknown>): unknown {
+  const handler: Record<string, () => never> = {};
+  for (const trap of PARK_TRAPS) {
+    handler[trap] = () => {
+      throw new Error('trap');
+    };
+  }
+  return new Proxy(target, handler as ProxyHandler<Record<string, unknown>>);
+}
+
+/** A revoked Proxy: every internal method throws. */
+function revokedProxy(target: Record<string, unknown>): unknown {
+  const { proxy, revoke } = Proxy.revocable(target, {});
+  revoke();
+  return proxy;
+}
+
+describe('cutoverShadowParkKey', () => {
+  it('builds a 44-char digest key from a 32-hex digest and a revision', () => {
+    expect(cutoverShadowParkKey(PARK_DIGEST, 1)).toEqual({
+      ok: true,
+      key: `cutover/shadow-park-${PARK_DIGEST}@1`,
+    });
+    // The `shadow-park-<digest>` segment is 44 chars, so the whole key fits
+    // `CUTOVER_KEY`'s 64-char segment even at the maximum revision digits.
+    expect(`shadow-park-${PARK_DIGEST}`).toHaveLength(44);
+    expect((cutoverShadowParkKey(PARK_DIGEST, 1_000_000_000) as { key: string }).key.length).toBeLessThanOrEqual(64);
+    expect(cutoverShadowParkKey(PARK_DIGEST, 1_000_000_000)).toEqual({
+      ok: true,
+      key: `cutover/shadow-park-${PARK_DIGEST}@1000000000`,
+    });
+  });
+
+  it('refuses an invalid digest as invalid-park-key', () => {
+    for (const digest of [
+      null,
+      undefined,
+      7,
+      true,
+      [],
+      'a'.repeat(31),
+      'a'.repeat(33),
+      'A'.repeat(32),
+      'g'.repeat(32),
+      `${PARK_DIGEST} extra`,
+    ]) {
+      expect(cutoverShadowParkKey(digest, 1)).toEqual({ ok: false, reason: 'invalid-park-key' });
+    }
+  });
+
+  it('refuses an out-of-range or mistyped revision as invalid-park-key', () => {
+    for (const revision of [null, undefined, '1', 1.5, 0, -1, NaN, Infinity, 1_000_000_001, {}]) {
+      expect(cutoverShadowParkKey(PARK_DIGEST, revision)).toEqual({ ok: false, reason: 'invalid-park-key' });
+    }
+  });
+
+  it('refuses a getter or a proxy digest without reading it as invalid-park-key', () => {
+    const holder = withCountingGetter({ digest: PARK_DIGEST }, 'digest');
+    expect(cutoverShadowParkKey(holder.value, 1)).toEqual({ ok: false, reason: 'invalid-park-key' });
+    expect(holder.calls()).toBe(0);
+    const proxied = withGetCountingProxy({ digest: PARK_DIGEST });
+    expect(cutoverShadowParkKey(proxied.value, 1)).toEqual({ ok: false, reason: 'invalid-park-key' });
+    expect(proxied.gets()).toBe(0);
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid input refused, valid input shaped', () => {
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(cutoverShadowParkKey('A'.repeat(32), 0).ok).toBe(false);
+    expect(cutoverShadowParkKey(null, 1).ok).toBe(false);
+    // An identity echo (returning the input) fails the shaped-success assertions.
+    expect(cutoverShadowParkKey(PARK_DIGEST, 1)).not.toEqual(PARK_DIGEST);
+    expect(cutoverShadowParkKey(PARK_DIGEST, 1)).toEqual({
+      ok: true,
+      key: `cutover/shadow-park-${PARK_DIGEST}@1`,
+    });
+  });
+});
+
+describe('buildShadowParkJournalPayload', () => {
+  it('builds the record and canonical payload for an ordinary parked entry', () => {
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    expect(built).toEqual({
+      ok: true,
+      record: {
+        entryId: PARK_ID,
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 7,
+        headOid: PARK_HEAD,
+        reason: 'checks',
+        attempt: 2,
+        notBeforeIso: PARK_NOT_BEFORE,
+      },
+      canonicalPayload: JSON.stringify({
+        entryId: PARK_ID,
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 7,
+        headOid: PARK_HEAD,
+        reason: 'checks',
+        attempt: 2,
+        notBeforeIso: PARK_NOT_BEFORE,
+        revision: 3,
+      }),
+    });
+  });
+
+  it('refuses a non-parked entry or a veto-hold park as not-shadow-park', () => {
+    expect(buildShadowParkJournalPayload(parkedEntry({ state: 'queued', reason: null, notBeforeIso: null }))).toEqual({
+      ok: false,
+      reason: 'not-shadow-park',
+    });
+    expect(buildShadowParkJournalPayload(parkedEntry({ state: 'ready', reason: null }))).toEqual({
+      ok: false,
+      reason: 'not-shadow-park',
+    });
+    expect(buildShadowParkJournalPayload(parkedEntry({ reason: 'veto-hold' }))).toEqual({
+      ok: false,
+      reason: 'not-shadow-park',
+    });
+  });
+
+  it('refuses malformed entries as invalid-park-entry without throwing', () => {
+    for (const bad of hostileShapes()) {
+      expect(buildShadowParkJournalPayload(bad)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    }
+  });
+
+  it('refuses a getter on the entry as invalid-park-entry without ever running it', () => {
+    // The descriptor walk reads the accessor's own descriptor and refuses it
+    // from there; the structured-clone probe runs only after the entry is
+    // proved plain and bounded, so the getter is never invoked at all.
+    const entry = withCountingGetter(parkedEntry(), 'state');
+    expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(entry.calls()).toBe(0);
+  });
+
+  it('refuses a non-enumerable getter on the entry without running it as invalid-park-entry', () => {
+    // A non-enumerable accessor is refused by the descriptor walk (the key
+    // must be an enumerable data property), so the getter is never run.
+    const entry = withCountingGetter(parkedEntry(), 'state', { enumerable: false });
+    expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(entry.calls()).toBe(0);
+  });
+
+  it('refuses a proxy entry with no get trap run as invalid-park-entry', () => {
+    const entry = withGetCountingProxy(parkedEntry());
+    expect(buildShadowParkJournalPayload(entry.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(entry.gets()).toBe(0);
+  });
+
+  it('refuses a recording Proxy as invalid-park-entry, asserting only that its get trap never ran', () => {
+    // The shape/descriptor validation runs first; the structured-clone probe
+    // then refuses the Proxy (full trap-free refusal arrives with the shared
+    // snapshotPlainData (PX1) adoption) — the assertions below check exactly
+    // that no `get` trap ran, so no value can be read through the Proxy.
+    const proxy = recordingProxy(parkedEntry());
+    expect(buildShadowParkJournalPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    expect(proxy.calls()).not.toContain('get');
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
+    for (const hostile of [throwingTrapsProxy(parkedEntry()), revokedProxy(parkedEntry())]) {
+      expect(buildShadowParkJournalPayload(hostile)).toEqual({ ok: false, reason: 'invalid-park-entry' });
+    }
+  });
+
+  it('refuses prototype-polluting own keys as invalid-park-entry', () => {
+    expect(buildShadowParkJournalPayload(withPollutingKeys(parkedEntry()))).toEqual({
+      ok: false,
+      reason: 'invalid-park-entry',
+    });
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(buildShadowParkJournalPayload(null).ok).toBe(false);
+    expect(buildShadowParkJournalPayload(parkedEntry({ reason: 'veto-hold' })).ok).toBe(false);
+    // An identity echo (returning the entry) fails the shaped-success assertions.
+    expect(buildShadowParkJournalPayload(parkedEntry())).not.toEqual(parkedEntry());
+    expect(buildShadowParkJournalPayload(parkedEntry()).ok).toBe(true);
+  });
+});
+
+describe('readCutoverShadowParkRecord', () => {
+  it('reads a stored shadowPark record', () => {
+    expect(readCutoverShadowParkRecord(parkRecord())).toEqual({
+      ok: true,
+      record: {
+        entryId: PARK_ID,
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 7,
+        headOid: PARK_HEAD,
+        reason: 'checks',
+        attempt: 2,
+        notBeforeIso: null,
+      },
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ notBeforeIso: PARK_NOT_BEFORE })).ok).toBe(true);
+  });
+
+  it('refuses malformed records as invalid-park-record without throwing', () => {
+    for (const bad of hostileShapes()) {
+      expect(readCutoverShadowParkRecord(bad)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+    // Extra or missing keys.
+    expect(readCutoverShadowParkRecord({ ...parkRecord(), extra: 1 })).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    const missing = parkRecord();
+    delete (missing as Record<string, unknown>).reason;
+    expect(readCutoverShadowParkRecord(missing)).toEqual({ ok: false, reason: 'invalid-park-record' });
+  });
+
+  it('refuses unbounded or traversal owner and repo segments as invalid-park-record', () => {
+    expect(readCutoverShadowParkRecord(parkRecord({ repository: { owner: 'a'.repeat(101), repo: 'v2' } }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ repository: { owner: 'fleet', repo: '..' } }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ repository: { owner: 'fleet', repo: '.' } }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses a secret-shaped field as invalid-park-record', () => {
+    const token = `ghp_${'A'.repeat(24)}`;
+    expect(readCutoverShadowParkRecord(parkRecord({ entryId: token }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ repository: { owner: token, repo: 'v2' } }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses a veto-hold reason, a bad attempt and an invalid notBeforeIso as invalid-park-record', () => {
+    expect(readCutoverShadowParkRecord(parkRecord({ reason: 'veto-hold' }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ reason: 'bogus' }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ attempt: -1 }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ attempt: 1.5 }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ notBeforeIso: 'yesterday' }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ notBeforeIso: 7 }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses mistyped entryId, pullRequest or headOid as invalid-park-record', () => {
+    expect(readCutoverShadowParkRecord(parkRecord({ entryId: 'a'.repeat(257) }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ pullRequest: 0 }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ pullRequest: 1.5 }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+    expect(readCutoverShadowParkRecord(parkRecord({ headOid: '0123456789ABCDEF0123456789ABCDEF01234567' }))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses a getter on the record as invalid-park-record without ever running it', () => {
+    // The descriptor walk reads the accessor's own descriptor and refuses it
+    // from there; the structured-clone probe runs only after the record is
+    // proved plain and bounded, so the getter is never invoked at all.
+    const record = withCountingGetter(parkRecord(), 'entryId');
+    expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(record.calls()).toBe(0);
+  });
+
+  it('refuses a non-enumerable getter on the record without running it as invalid-park-record', () => {
+    // A non-enumerable accessor is refused by the descriptor walk (the key
+    // must be an enumerable data property), so the getter is never run.
+    const record = withCountingGetter(parkRecord(), 'entryId', { enumerable: false });
+    expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(record.calls()).toBe(0);
+  });
+
+  it('refuses a proxy record with no get trap run as invalid-park-record', () => {
+    const record = withGetCountingProxy(parkRecord());
+    expect(readCutoverShadowParkRecord(record.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(record.gets()).toBe(0);
+  });
+
+  it('refuses a recording Proxy as invalid-park-record, asserting only that its get trap never ran', () => {
+    // The shape/descriptor validation runs first; the structured-clone probe
+    // then refuses the Proxy (full trap-free refusal arrives with the shared
+    // snapshotPlainData (PX1) adoption) — the assertions below check exactly
+    // that no `get` trap ran, so no value can be read through the Proxy.
+    const proxy = recordingProxy(parkRecord());
+    expect(readCutoverShadowParkRecord(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(proxy.calls()).not.toContain('get');
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and a revoked Proxy', () => {
+    for (const hostile of [throwingTrapsProxy(parkRecord()), revokedProxy(parkRecord())]) {
+      expect(readCutoverShadowParkRecord(hostile)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+  });
+
+  it('refuses prototype-polluting own keys as invalid-park-record', () => {
+    expect(readCutoverShadowParkRecord(withPollutingKeys(parkRecord()))).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(readCutoverShadowParkRecord(parkRecord({ reason: 'veto-hold' })).ok).toBe(false);
+    expect(readCutoverShadowParkRecord(null).ok).toBe(false);
+    // An identity echo (returning the record) fails the shaped-success assertions.
+    expect(readCutoverShadowParkRecord(parkRecord())).not.toEqual(parkRecord());
+    expect(readCutoverShadowParkRecord(parkRecord()).ok).toBe(true);
+  });
+});
+
+describe('checkCutoverJournalCapacity', () => {
+  it('accepts counts within the cap, including the boundary', () => {
+    expect(checkCutoverJournalCapacity(0, 0)).toEqual({ ok: true });
+    expect(checkCutoverJournalCapacity(MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE - MAX_SHADOW_PARKS_PER_SWITCH, MAX_SHADOW_PARKS_PER_SWITCH)).toEqual({ ok: true });
+    expect(checkCutoverJournalCapacity(9990, 6)).toEqual({ ok: true });
+  });
+
+  it('refuses more parks than MAX_SHADOW_PARKS_PER_SWITCH as too-many-shadow-parks', () => {
+    expect(checkCutoverJournalCapacity(0, MAX_SHADOW_PARKS_PER_SWITCH + 1)).toEqual({
+      ok: false,
+      reason: 'too-many-shadow-parks',
+    });
+  });
+
+  it('refuses a total past MAX_CUTOVER_JOURNAL_ENTRIES as journal-capacity-exceeded', () => {
+    expect(
+      checkCutoverJournalCapacity(
+        MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE - MAX_SHADOW_PARKS_PER_SWITCH + 1,
+        MAX_SHADOW_PARKS_PER_SWITCH,
+      ),
+    ).toEqual({ ok: false, reason: 'journal-capacity-exceeded' });
+    expect(checkCutoverJournalCapacity(MAX_CUTOVER_JOURNAL_ENTRIES, 0)).toEqual({
+      ok: false,
+      reason: 'journal-capacity-exceeded',
+    });
+  });
+
+  it('refuses invalid counts as invalid-capacity-input', () => {
+    for (const bad of [null, undefined, '1', 1.5, NaN, Infinity, -1, {}, new Proxy({}, {})]) {
+      expect(checkCutoverJournalCapacity(bad, 0)).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+      expect(checkCutoverJournalCapacity(0, bad)).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+    }
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(checkCutoverJournalCapacity(NaN, NaN).ok).toBe(false);
+    expect(checkCutoverJournalCapacity(0, MAX_SHADOW_PARKS_PER_SWITCH + 1).ok).toBe(false);
+    // An identity echo (returning the inputs) fails the shaped-success assertions.
+    expect(checkCutoverJournalCapacity(0, 0)).not.toEqual(0);
+    expect(checkCutoverJournalCapacity(0, 0)).toEqual({ ok: true });
+  });
+});
+
+describe('readCutoverShadowParkPayload (stored-payload round trip)', () => {
+  it('reads back the canonical payload a park wrote, record and revision intact', () => {
+    // The hostile case itself: the exact bytes the journal would store.
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    const stored = JSON.parse(built.canonicalPayload) as unknown;
+    const read = readCutoverShadowParkPayload(stored);
+    expect(read).toEqual({
+      ok: true,
+      record: built.record,
+      revision: 3,
+    });
+  });
+
+  it('refuses the 8-key payload with the 7-key record reader (documented)', () => {
+    // The finding this reader fixes: the stored payload carries `revision`,
+    // so the 7-key record reader must keep refusing it.
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    expect(readCutoverShadowParkRecord(JSON.parse(built.canonicalPayload) as unknown)).toEqual({
+      ok: false,
+      reason: 'invalid-park-record',
+    });
+  });
+
+  it('refuses a malformed revision or a missing key as invalid-park-record without throwing', () => {
+    const built = buildShadowParkJournalPayload(parkedEntry());
+    if (!built.ok) {
+      throw new Error('expected a valid shadow park');
+    }
+    for (const bad of [
+      { ...built.record, revision: -1 },
+      { ...built.record, revision: 1.5 },
+      { ...built.record, revision: '3' },
+      built.record,
+    ]) {
+      expect(readCutoverShadowParkPayload(bad)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+  });
+
+  it('refuses hostile shapes as invalid-park-record without throwing', () => {
+    for (const bad of hostileShapes()) {
+      expect(readCutoverShadowParkPayload(bad)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    }
+  });
+
+  it('refuses a recording Proxy as invalid-park-record, asserting only that its get trap never ran', () => {
+    const proxy = recordingProxy({ ...parkRecord(), revision: 3 });
+    expect(readCutoverShadowParkPayload(proxy.value)).toEqual({ ok: false, reason: 'invalid-park-record' });
+    expect(proxy.calls()).not.toContain('get');
+  });
+});
+
+describe('checkCutoverJournalReplayCapacity', () => {
+  const keys = (digests: readonly string[], revision: number): string[] =>
+    digests.map((digest) => (cutoverShadowParkKey(digest, revision) as { key: string }).key);
+
+  it('counts only parks not already present in the journal, by journal key', () => {
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)], 1);
+    const journaled = keys(['a'.repeat(32)], 1);
+    expect(checkCutoverJournalReplayCapacity(9990, pending, journaled)).toEqual({
+      ok: true,
+      parkCount: 2,
+    });
+  });
+
+  it('a replay of the same pass does not exceed capacity: every park already journaled answers ok at a full journal', () => {
+    // The journal is already at its cap: a fresh park of ANY of these would
+    // exceed it, but the replay re-presents parks its earlier pass already
+    // journaled, so none counts and the verdict stays `ok` — the same pass
+    // re-run never exceeds capacity.
+    const full = MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE;
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32)], 7);
+    expect(checkCutoverJournalCapacity(full, 1)).toEqual({ ok: false, reason: 'journal-capacity-exceeded' });
+    expect(checkCutoverJournalReplayCapacity(full, pending, pending)).toEqual({ ok: true, parkCount: 0 });
+  });
+
+  it('still refuses capacity when an un-journaled park would exceed the journal', () => {
+    const full = MAX_CUTOVER_JOURNAL_ENTRIES - CUTOVER_SWITCH_JOURNAL_RESERVE;
+    const pending = keys(['a'.repeat(32), 'b'.repeat(32)], 7);
+    const journaled = keys(['a'.repeat(32)], 7);
+    expect(checkCutoverJournalReplayCapacity(full, pending, journaled)).toEqual({
+      ok: false,
+      reason: 'journal-capacity-exceeded',
+    });
+  });
+
+  it('refuses hostile inputs as invalid-capacity-input without throwing', () => {
+    const good = keys(['a'.repeat(32)], 1);
+    for (const bad of [
+      null,
+      undefined,
+      'cutover/shadow-park-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1',
+      { length: 1, 0: good[0] },
+      new Proxy([good[0]], {}),
+      [good[0], good[0]],
+      ['not-a-key'],
+      [`cutover/shadow-park-${'a'.repeat(32)}@0`],
+      [`cutover/shadow-park-${'a'.repeat(32)}@${1_000_000_001}`],
+      [7],
+    ]) {
+      expect(checkCutoverJournalReplayCapacity(0, bad, [])).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+      // A duplicate journaled key is harmless (the journal holds a key once,
+      // so the Set dedupes it): only the pending list must be duplicate-free.
+      const duplicated = Array.isArray(bad) && bad.length === 2 && bad[0] === bad[1];
+      if (!duplicated) {
+        expect(checkCutoverJournalReplayCapacity(0, [], bad)).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+      }
+    }
+  });
+
+  it('refuses a pending list longer than the journal as invalid-capacity-input', () => {
+    const digest = 'a'.repeat(32);
+    const tooMany = Array.from({ length: MAX_CUTOVER_JOURNAL_ENTRIES + 1 }, (_, i) =>
+      (cutoverShadowParkKey(digest, i + 1) as { key: string }).key);
+    expect(checkCutoverJournalReplayCapacity(0, tooMany, [])).toEqual({ ok: false, reason: 'invalid-capacity-input' });
+  });
+
+  it('a constant verdict or an identity echo would fail: invalid refused, valid shaped', () => {
+    const pending = keys(['a'.repeat(32)], 1);
+    // A constant `{ ok: true }` verdict fails the refused assertions.
+    expect(checkCutoverJournalReplayCapacity(NaN, pending, []).ok).toBe(false);
+    expect(checkCutoverJournalReplayCapacity(0, ['junk'], []).ok).toBe(false);
+    // An identity echo (returning the inputs) fails the shaped-success assertions.
+    expect(checkCutoverJournalReplayCapacity(0, pending, [])).toEqual({ ok: true, parkCount: 1 });
+    expect(checkCutoverJournalReplayCapacity(0, pending, pending)).toEqual({ ok: true, parkCount: 0 });
   });
 });

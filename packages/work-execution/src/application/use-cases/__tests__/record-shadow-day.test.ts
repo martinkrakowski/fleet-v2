@@ -2594,6 +2594,10 @@ describe('RecordShadowDayUseCase', () => {
     expect(twinResult.recorded.S4).toBe('pass');
     const twinRecord = twin.evidence.stored?.days.find((entry) => entry.day === DAY);
     for (const criterion of ['S1', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(dayRecord?.verdicts[criterion]).toBeDefined();
+      expect(twinRecord?.verdicts[criterion]).toBeDefined();
+      expect(typeof dayRecord?.verdicts[criterion]?.digest).toBe('string');
+      expect(typeof twinRecord?.verdicts[criterion]?.digest).toBe('string');
       expect(dayRecord?.verdicts[criterion]?.digest).toBe(twinRecord?.verdicts[criterion]?.digest);
     }
   });
@@ -3309,18 +3313,22 @@ describe('RecordShadowDayUseCase', () => {
   it('records S5 as fail (carry-decision-differs) when a resolvable lax carry sits next to unresolved decisions', async () => {
     // Any resolvable lax carry still fails the day even when other decisions
     // are unresolved; the unresolved ones ride along as diagnostics only.
-    const mixedFixture = carryFixture();
-    mixedFixture.shellLines.push(
-      ...shellCarryPair(`${DAY}T10:04:00Z`, `${DAY}T10:05:00Z`, 13, HEAD_A, '1'.repeat(40), true),
+    // PR 12's shell log says `not carried` while the resolver answers
+    // `'carry'` — a true lax carry — and that difference fails the day.
+    const HEAD_1 = '1'.repeat(40);
+    const laxFixture = cleanFixture(DAY);
+    laxFixture.shellLines.push(
+      ...shellCarryPair(`${DAY}T09:04:00Z`, `${DAY}T09:05:00Z`, 12, HEAD_B, HEAD_D, false),
+      ...shellCarryPair(`${DAY}T10:04:00Z`, `${DAY}T10:05:00Z`, 13, HEAD_A, HEAD_1, true),
     );
-    const harness = wiredHarness(mixedFixture, {});
-    setPremergeCarry(harness, prMapPremergeCarry({ 12: 'no-carry', 13: 'unknown' }));
+    const harness = wiredHarness(laxFixture, {});
+    setPremergeCarry(harness, prMapPremergeCarry({ 12: 'carry', 13: 'unknown' }));
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
     expectRecorded(result);
     expect(result.recorded.S5).toBe('fail');
     expect(result.premergeCarry).toEqual({
       unresolvedCount: 1,
-      unresolvedIds: [`13@${'1'.repeat(12)}`],
+      unresolvedIds: [`13@${HEAD_1.slice(0, 12)}`],
     });
     const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
     expect(dayRecord?.verdicts.S5).toEqual({
@@ -3329,6 +3337,29 @@ describe('RecordShadowDayUseCase', () => {
       digest: expectedS5Digest(DAY, 'fail', 'carry-decision-differs', 1),
       recordedAtIso: RECORDED_AT_ISO,
     });
+  });
+
+  it('refuses a rerun whose premergeCarry answers change from unknown to carry with verdict-conflict and leaves the ledger untouched', async () => {
+    // The first run's resolver answers `unknown` for every decision, so S5
+    // records a pass with `compared: 0`. A rerun where the same decisions
+    // resolve to `'carry'` records `compared: 1` — a different digest for the
+    // same day — so the re-run is a deliberate verdict-conflict, never a
+    // silent overwrite.
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('unknown'));
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S5).toBe('pass');
+    expect(first.premergeCarry).toEqual({ unresolvedCount: 1, unresolvedIds: [`12@${HEAD_D.slice(0, 12)}`] });
+    const before = harness.evidence.stored;
+
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+    expect(harness.evidence.stored?.revision).toBe(1);
   });
 
   it('aborts with deadline-exceeded when the deadline is reached before premergeCarry calls', async () => {
@@ -3459,6 +3490,7 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(result);
     expect(result.outcome).toBe('unchanged');
     expect(result.recorded.S5).toBe('pass');
+    expect(result.premergeCarry).toEqual({ unresolvedCount: 0, unresolvedIds: [] });
     expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
     expect(harness.evidence.stored).toEqual(afterFirst);
   });
@@ -3483,6 +3515,10 @@ describe('RecordShadowDayUseCase', () => {
     const withoutDay = without.evidence.stored?.days.find((entry) => entry.day === DAY);
     const withDay = withResolver.evidence.stored?.days.find((entry) => entry.day === DAY);
     for (const criterion of ['S1', 'S4', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(withDay?.verdicts[criterion]).toBeDefined();
+      expect(withoutDay?.verdicts[criterion]).toBeDefined();
+      expect(typeof withDay?.verdicts[criterion]?.digest).toBe('string');
+      expect(typeof withoutDay?.verdicts[criterion]?.digest).toBe('string');
       expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
     }
   });
@@ -3949,6 +3985,10 @@ describe('RecordShadowDayUseCase', () => {
     const withoutDay = without.evidence.stored?.days.find((entry) => entry.day === DAY);
     const withDay = withOneTime.evidence.stored?.days.find((entry) => entry.day === DAY);
     for (const criterion of ['S1', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(withDay?.verdicts[criterion]).toBeDefined();
+      expect(withoutDay?.verdicts[criterion]).toBeDefined();
+      expect(typeof withDay?.verdicts[criterion]?.digest).toBe('string');
+      expect(typeof withoutDay?.verdicts[criterion]?.digest).toBe('string');
       expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
     }
   });

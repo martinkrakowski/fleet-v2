@@ -1105,6 +1105,36 @@ describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
     expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
   });
 
+  // BL02g fix round: an own accessor on the non-required `releaseRoot` — a
+  // getter or a setter — is refused as `invalid-request` through its own
+  // descriptor, never run. A setter-only accessor snapshots to `undefined`
+  // exactly like an omitted field, so without the descriptor check it would
+  // silently agree with any recorded root; the refusal must fire before the
+  // recorded request is located and must not read as a root mismatch.
+  it('refuses a setter-only releaseRoot accessor on a release resolve as invalid-request, without running the setter', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord());
+    let calls = 0;
+    const hostile: Record<string, unknown> = {
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+    };
+    Object.defineProperty(hostile, 'releaseRoot', {
+      set() {
+        calls += 1;
+        throw new Error('hostile releaseRoot setter ran');
+      },
+      enumerable: true,
+    });
+    const result = await new ResolveActionAuthorizationUseCase({
+      requestRepo,
+      computeDigest: digest,
+    }).resolveActionAuthorization(hostile as never);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
   // RR1 fix round: `releaseRootsAgree` is pinned to exact string equality on
   // the normalized roots. A case-insensitive comparison or a `startsWith`
   // prefix comparison must fail these near-miss cases, not authorize them.

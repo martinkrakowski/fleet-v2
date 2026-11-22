@@ -72,13 +72,6 @@ function blocked(reason: string): ResolveActionAuthorizationResult {
 }
 
 /**
- * A marker standing in for a `releaseRoot` whose own descriptor on the
- * incoming request is an accessor: never a coordinate, so `readReleaseRoot`
- * classifies it as invalid and the release roots check fails closed.
- */
-const HOSTILE_RELEASE_ROOT = Symbol('hostile-release-root');
-
-/**
  * A descriptor-safe snapshot of the request's nested `repository`. A nested
  * plain object is copied with own data descriptors only (no getter ever runs,
  * so an accessor on `repository.owner` or `repository.repo` collapses to
@@ -148,12 +141,6 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // value is `undefined` exactly like an omitted field, so it must be
     // refused the same way. A plain-data `actionScope`
     // — every ordinary request — reads exactly as before from the snapshot.
-    // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
-    // throw for a single key while the snapshot above succeeded (the trap
-    // threw only after the snapshot's own descriptor calls). Every descriptor
-    // inspection on the original input is therefore wrapped: a throw is the
-    // same typed `invalid-request` refusal the malformed-input path uses,
-    // never an exception escaping the resolve.
     // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
     // throw for a single key while the snapshot above succeeded (the trap
     // threw only after the snapshot's own descriptor calls). Every descriptor
@@ -233,16 +220,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       ...snapshot,
       repository: snapshotRepository(snapshot['repository']),
     } as unknown as ResolveActionAuthorizationRequest;
-    // `releaseRoot` is not a required field, so a hostile accessor on it
-    // survives the validation above; the snapshot collapses it to
-    // `undefined` (absent), which would silently agree with an absent
-    // recorded root. Preserve the descriptor-safe invalidity the old
-    // `input` alias carried: `readReleaseRoot(request)` classifies the
-    // marker below as invalid, so the roots check fails closed with
-    // `release-grant-root-mismatch` exactly as before. The descriptor
-    // inspection never invokes the getter or a `get` trap.
-    // BL02g fix round: this inspection is wrapped like every other descriptor
-    // read on `input`; a throwing trap is a typed refusal, not an exception.
+    // `releaseRoot` is not a required field, so an own accessor on it
+    // survives the validation above. BL02g fix round: ANY own accessor on
+    // `releaseRoot` — a getter or a setter — is refused as
+    // `invalid-request` before the recorded request is even located. A
+    // set-only accessor snapshots to `undefined` exactly like an omitted
+    // field, so it would otherwise silently agree with an absent recorded
+    // root; refusing any accessor keeps every accessor-carrying
+    // `releaseRoot` failing closed through its own descriptor, which never
+    // invokes the getter, the setter or a `get` trap.
     // BL02g fix round: this inspection is wrapped like every other descriptor
     // read on `input`; a throwing trap is a typed refusal, not an exception.
     let releaseRootDescriptor: PropertyDescriptor | undefined;
@@ -251,8 +237,11 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     } catch {
       return blocked('invalid-request');
     }
-    if (releaseRootDescriptor !== undefined && releaseRootDescriptor.get !== undefined) {
-      (request as unknown as Record<string, unknown>)['releaseRoot'] = HOSTILE_RELEASE_ROOT;
+    if (
+      releaseRootDescriptor !== undefined &&
+      (releaseRootDescriptor.get !== undefined || releaseRootDescriptor.set !== undefined)
+    ) {
+      return blocked('invalid-request');
     }
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {

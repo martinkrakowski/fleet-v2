@@ -1017,11 +1017,11 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(result.outcome).toBe('authorized');
   });
 
-  // BL02g fix round: a Proxy whose trap throws for `actionScope` only on a
-  // later descriptor inspection (the snapshot's own call succeeded) must hit
-  // the same typed refusal at the `actionScope` descriptor inspection, not
-  // throw out of the resolve.
-  it('refuses a non-shadow Proxy whose descriptor trap throws for actionScope on the later inspection as invalid-request without throwing', async () => {
+  // BL02g fix round: the snapshot reads each snapshotted field's own
+  // descriptor EXACTLY ONCE, so a descriptor trap that would throw only on a
+  // LATER inspection (the old second read) is never consulted: the request
+  // resolves exactly like its plain data.
+  it('consults each snapshotted field descriptor exactly once, so a trap throwing only on a later actionScope inspection never fires', async () => {
     let actionScopeDescriptorCalls = 0;
     const proxy = new Proxy(nonShadowRequest(), {
       getOwnPropertyDescriptor(target, prop) {
@@ -1034,8 +1034,38 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
         return Reflect.getOwnPropertyDescriptor(target, prop);
       },
     });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(actionScopeDescriptorCalls).toBe(1);
+  });
+
+  // BL02g fix round (TOCTOU): a Proxy can report an accessor descriptor on
+  // the snapshot read and a data descriptor on a second inspection, so the
+  // accessor refusal and the snapshotted value must both derive from the ONE
+  // descriptor read per snapshotted field.
+  it('refuses a Proxy reporting an accessor for resumeActionId on the first descriptor read only, consulting that field exactly once', async () => {
+    let resumeDescriptorCalls = 0;
+    const proxy = new Proxy({ ...nonShadowRequest(), resumeActionId: 'act-1' }, {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'resumeActionId') {
+          resumeDescriptorCalls += 1;
+          if (resumeDescriptorCalls === 1) {
+            return {
+              get: () => 'act-1',
+              set: undefined,
+              enumerable: true,
+              configurable: true,
+            };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
     const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(resumeDescriptorCalls).toBe(1);
   });
 
   it('never invokes a throwing get trap on a non-shadow Proxy whose getOwnPropertyDescriptor forwards normally', async () => {

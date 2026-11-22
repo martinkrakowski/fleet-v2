@@ -92,37 +92,56 @@ function snapshotRepository(value: unknown): unknown {
 }
 
 /**
- * BL02g fix round: the ONE shared descriptor helper every snapshotted field
- * goes through. An own accessor (a getter OR a setter) on ANY field the
- * snapshot copied — required or optional (`resumeActionId`, `releaseRoot`,
+ * BL02g fix round: snapshots the request with EXACTLY ONE own-descriptor read
+ * per snapshotted field, so both the accessor refusal and the snapshotted
+ * value derive from the same single descriptor and a Proxy cannot report an
+ * accessor descriptor on the snapshot read and a data descriptor on a second
+ * inspection (TOCTOU). An own accessor (a getter OR a setter) on ANY snapshotted
+ * field — required or optional (`resumeActionId`, `releaseRoot`,
  * `repository`, `pullRequestNumber`, `attemptId`, every field) — is refused,
  * because a set-only accessor snapshots to `undefined` exactly like an
  * omitted field and would otherwise silently read as absent (a release retry
  * could skip its resumable grant and fall through to an unrelated approved
  * grant). Absence (no own property at all) stays absent and still resolves as
  * before. Inspecting a descriptor never runs a getter, a setter or a `get`
- * trap. Every descriptor inspection on the original input is wrapped: a
- * hostile Proxy's `getOwnPropertyDescriptor` trap throwing is the same typed
- * refusal, signalled by returning the offending key. Returns the first
- * accessor-carrying field name, or null when every snapshotted field is plain
- * data.
+ * trap. The snapshot shape is `readPlainObjectLoose`'s (unknown keys copied,
+ * null-prototype, symbol keys and a non-plain prototype refused as null);
+ * a trap that throws propagates and the caller turns it into the same typed
+ * refusal. Returns the snapshot plus the first accessor-carrying field name,
+ * or null when every snapshotted field is plain data.
  */
-function findOwnAccessorField(
-  snapshot: Record<string, unknown>,
+function readRequestSnapshot(
   input: object,
-): string | null {
-  for (const key of Object.keys(snapshot)) {
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(input, key);
-    } catch {
-      return key;
-    }
-    if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
-      return key;
-    }
+): { snapshot: Record<string, unknown> | null; accessorField: string | null } {
+  if (Array.isArray(input)) {
+    return { snapshot: null, accessorField: null };
   }
-  return null;
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { snapshot: null, accessorField: null };
+  }
+  // The snapshot is built on a null prototype: an own `__proto__` key on the
+  // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
+  // as an ordinary data property instead of mutating the snapshot's
+  // prototype, so the snapshot reads exactly like main reads any other body.
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  let accessorField: string | null = null;
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== 'string') {
+      return { snapshot: null, accessorField: null };
+    }
+    // EXACTLY ONE descriptor read per snapshotted field: both the accessor
+    // refusal and the copied value derive from this single descriptor.
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (descriptor === undefined || !descriptor.enumerable) {
+      return { snapshot: null, accessorField: null };
+    }
+    if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+      accessorField = key;
+    }
+    out[key] = descriptor.value;
+  }
+  return { snapshot: out, accessorField };
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -161,20 +180,22 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // request) can run before the request is frozen. A throwing trap during
     // the snapshot is a hostile proxy: a typed refusal, never an exception.
     let snapshot: Record<string, unknown> | null = null;
+    let accessorField: string | null = null;
     try {
-      snapshot = readPlainObjectLoose(input);
+      ({ snapshot, accessorField } = readRequestSnapshot(input));
     } catch {
       return blocked('invalid-request');
     }
     // BL02g fix round: a set-only accessor is an accessor too — its snapshot
     // value is `undefined` exactly like an omitted field, so it must be
     // refused the same way. Every snapshotted field — required or optional —
-    // now goes through the one shared `findOwnAccessorField` helper, so no
-    // field can be missed: ANY own accessor on ANY field the snapshot copied
-    // is a typed `invalid-request` refusal, checked before any field —
-    // including the routing `actionScope` — is read. A plain-data request
-    // — every ordinary request — reads exactly as before from the snapshot.
-    if (snapshot !== null && findOwnAccessorField(snapshot, input) !== null) {
+    // went through the single descriptor read above, so no field can be
+    // missed and no field is read twice: ANY own accessor on ANY field the
+    // snapshot copied is a typed `invalid-request` refusal, checked before
+    // any field — including the routing `actionScope` — is read. A
+    // plain-data request — every ordinary request — reads exactly as before
+    // from the snapshot.
+    if (snapshot !== null && accessorField !== null) {
       return blocked('invalid-request');
     }
     const scope =
@@ -217,8 +238,8 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
       // BL02g fix round: the accessor check for this field already ran through
-      // the one shared `findOwnAccessorField` helper above, alongside every
-      // other snapshotted field. Only the required-field presence check stays.
+      // the single descriptor read in `readRequestSnapshot` above, alongside
+      // every other snapshotted field. Only the required-field presence check stays.
       if (!isFilled(snapshot[field])) {
         throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
       }
@@ -234,9 +255,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     } as unknown as ResolveActionAuthorizationRequest;
     // BL02g fix round: an own accessor on the optional `releaseRoot` (and on
     // every other optional snapshotted field — `resumeActionId` included) is
-    // already refused by the one shared `findOwnAccessorField` helper above,
-    // so the separate releaseRoot-only inspection is gone. No accessor can
-    // survive to the recorded-request lookup.
+    // already refused by the single descriptor read in `readRequestSnapshot`
+    // above, so the separate releaseRoot-only inspection is gone. No accessor
+    // can survive to the recorded-request lookup.
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {
       return blocked(

@@ -133,7 +133,14 @@ The rollback window is 14 days (`CUTOVER_ROLLBACK_WINDOW_DAYS`).
 
 `cutover retire` is mounted. It requires `--expected-revision` and `--operation-id`, with optional `--now-iso` and `--deadline-iso`. A bare `cutover retire` exits 2. With no stored `switched` record it refuses `not-switched` (exit 1) and writes no journal. After the 14-day rollback window it saves `retired` and lifts a train pause the cutover itself set.
 
-S13 (every §1 cutover-plan ledger row has an evidence link / `verified`) moved from the shadow switch window to this retirement gate per owner decision 2026-11-18: `cutover switch` reads S1–S12 only, and the §1-ledger verification in `cutover retire` is a deferred follow-up unit (`TODO(retirement-ledger)` in `ManageCutoverUseCase`).
+S13 (every §1 cutover-plan ledger row has an evidence link / `verified`) moved from the shadow switch window to this retirement gate per owner decision 2026-11-18, and is implemented (BL14b): `cutover switch` reads S1–S12 only, and `cutover retire` now demands the §1 cutover-plan retirement ledger at `<stateDir>/cutover-retirement-ledger.json` before it writes anything. The ledger is read only (no lock, no quarantine; a symlink or an over-large file is refused) and must record one row per script in the §1 inventory of `docs/planning/2026-11-03_cutover-plan.md`, each row `{ script, verified, evidenceLink }` with `verified` true and a non-empty `evidenceLink`. Fail-closed codes (all exit 1, no writes, no path echo):
+
+- `refused` `retirement-ledger-absent` — the reader is not wired (in-memory mode) or the ledger file does not exist.
+- `refused` `retirement-ledger-failed` — the ledger is empty, or a present row is unverified or has no evidence link.
+- `unknown` `retirement-ledger-unreadable` — the file cannot be parsed or read, or its shape is not exactly one row per §1 script (a missing, extra or duplicated script row, over-long or secret-shaped text).
+- `unknown` `retirement-ledger-unknown-version` — the ledger's `schemaVersion` is a newer schema than this build reads.
+
+A past `--deadline-iso` is `unknown` `deadline-exceeded` before the ledger is read.
 
 `LegacyTrainStateReadAdapter` stays while shadow report and merge import read the shell state directory.
 

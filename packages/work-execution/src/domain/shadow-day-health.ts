@@ -20,7 +20,7 @@ import { LANE_RUN_JOURNAL_OUTCOMES } from './lane-run-journal.js';
 import type { LaneRunJournalOutcome } from './lane-run-journal.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 
 /** The plan's DT §3.1 tick floor: about half the ~1,440 ticks a 60-second day produces. */
 export const SHADOW_MIN_TICKS_PER_DAY = 720;
@@ -53,55 +53,6 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const UNKNOWN = (reason: string): ShadowCriterionEvaluation => ({ status: 'unknown', reason });
 const FAIL = (reason: string): ShadowCriterionEvaluation => ({ status: 'fail', reason });
 const PASS = (reason: string): ShadowCriterionEvaluation => ({ status: 'pass', reason });
-
-/**
- * One array validated by `readBoundedArray`: the array itself, plus the
- * length already read from its own property descriptor. Every caller uses
- * THIS length for its iteration bound and never reads `.length` on `array`
- * again: a plain `.length` property read on a Proxy-wrapped array invokes
- * its `get` trap, which can lie (report a shorter length than the real one,
- * or zero), letting a caller silently skip entries it should have walked —
- * turning a real failure into a false pass, or hiding a starved tail.
- */
-interface BoundedArray {
-  readonly array: readonly unknown[];
-  readonly length: number;
-}
-
-/**
- * The capped element count of a real, dense array, or null for any stand-in.
- * Reads only the `length` own descriptor and `Object.keys` (no values), so no
- * getter and no Proxy `get` trap ever runs; an oversized or sparse array is
- * refused from its length alone, before any element is touched. Returns the
- * length read from the descriptor alongside the array (see `BoundedArray`):
- * no caller may read `.length` on the returned array as a plain property
- * access again.
- */
-function readBoundedArray(value: unknown, cap: number): BoundedArray | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    !Number.isSafeInteger(lengthDescriptor.value) ||
-    lengthDescriptor.value > cap
-  ) {
-    return null;
-  }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
-    return null;
-  }
-  return { array: value as readonly unknown[], length: lengthDescriptor.value };
-}
-
-/** The own data-property element at `index`; a hole or an accessor reads as undefined. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
-}
 
 /** A real UTC calendar day `YYYY-MM-DD`, or null. */
 function readUtcDay(value: unknown): string | null {
@@ -208,11 +159,15 @@ function withTickHealthCounts(template: ShadowCriterionEvaluation, counts: TickH
  * D-1 23:00Z to D+1 00:00Z (assembled by the caller; never re-derived here).
  * Cost: linear in the capped input plus sorting each job's events and the
  * bounded in-day tick timestamps — at
- * most `SHADOW_MAX_HEALTH_ITEMS` records are walked or sorted, and an
- * oversized, sparse or non-dense `events` array is refused from its own
- * `length` before any element is traversed. Every value is read through
+ * most `SHADOW_MAX_HEALTH_ITEMS` records are walked or sorted. Array reads
+ * go through `readBoundedDenseArray`, whose cost is the accepted engine
+ * bound: an `O(1)` length/prototype pre-gate, the `O(K)` bound of the single
+ * `Reflect.ownKeys` call (K = the target's own-property count), then an
+ * `O(cap)` per-index descriptor traversal over `SHADOW_MAX_HEALTH_ITEMS` —
+ * so an oversized, sparse, extra-keyed or accessor-backed `events` array is
+ * refused before any element is validated. Every value is read through
  * its own property descriptor, so no getter ever runs and a Proxy stand-in
- * either is refused or yields exactly the plain data's verdict. Never
+ * yields exactly the verdict of the data its own reflection reports. Never
  * throws, never echoes the input.
  */
 export function evaluateShadowTickHealth(input: unknown): ShadowTickHealthEvaluation {
@@ -235,16 +190,15 @@ function judgeDayTickHealth(input: unknown): ShadowTickHealthEvaluation {
   if (day === null) {
     return withTickHealthCounts(UNKNOWN('invalid-input'), ZERO_TICK_HEALTH_COUNTS);
   }
-  const events = readBoundedArray(snapshot.events, SHADOW_MAX_HEALTH_ITEMS);
+  const events = readBoundedDenseArray(snapshot.events, SHADOW_MAX_HEALTH_ITEMS);
   if (events === null) {
     return withTickHealthCounts(UNKNOWN('daemon-events-invalid'), ZERO_TICK_HEALTH_COUNTS);
   }
   const jobEvents: DaemonEventRecord[] = [];
-  // `events.length` below is the length `readBoundedArray` already read
-  // from the descriptor, never a plain `.length` read on `events.array`
-  // (which may be a Proxy whose `get` trap can lie about it).
+  // `events.array` is a fresh dense copy this module created, so plain
+  // indexed reads here can never run a getter or a Proxy `get` trap.
   for (let index = 0; index < events.length; index += 1) {
-    const read = readDaemonEventRecord(ownElement(events.array, index));
+    const read = readDaemonEventRecord(events.array[index]);
     if (!read.ok) {
       return withTickHealthCounts(UNKNOWN('daemon-events-invalid'), ZERO_TICK_HEALTH_COUNTS);
     }
@@ -679,13 +633,17 @@ function stateIntegrityResult(
  * false fail. Malformed entries anywhere in `journal` — even outside `D` —
  * still refuse as `invalid-input` before any scoping.
  *
- * Cost: linear in the capped input (`SHADOW_MAX_HEALTH_ITEMS`): at most that
+ * Cost: the accepted engine bound of `Reflect.ownKeys` (the `O(1)`
+ * length/prototype pre-gate, then `O(K)` in the target's own-property count
+ * K, then `O(cap)` element traversal over `SHADOW_MAX_HEALTH_ITEMS`): at
+ * most that
  * many journal entries are walked (once, plus one constant-time `Date.parse`
- * per entry for the bounds), and an oversized, sparse or non-dense `journal`
+ * per entry for the bounds), and an oversized, sparse, extra-keyed or
+ * accessor-backed `journal`
  * is refused from its own `length` descriptor before any entry is traversed.
  * Every value is read through its own property descriptor, so no getter ever
- * runs and a Proxy stand-in either is refused or yields exactly the plain
- * data's verdict. Never throws, never echoes the input.
+ * runs and a Proxy stand-in yields exactly the verdict of the data its own
+ * reflection reports. Never throws, never echoes the input.
  */
 export function evaluateShadowStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation {
   try {
@@ -744,16 +702,15 @@ function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation 
       stateBad: stateCheck.bad,
     });
   }
-  const journal = readBoundedArray(snapshot.journal, SHADOW_MAX_HEALTH_ITEMS);
+  const journal = readBoundedDenseArray(snapshot.journal, SHADOW_MAX_HEALTH_ITEMS);
   if (journal === null) {
     return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
   const entries: SampledJournalEntry[] = [];
-  // `journal.length` below is the length `readBoundedArray` already read
-  // from the descriptor, never a plain `.length` read on `journal.array`
-  // (which may be a Proxy whose `get` trap can lie about it).
+  // `journal.array` is a fresh dense copy this module created, so plain
+  // indexed reads here can never run a getter or a Proxy `get` trap.
   for (let index = 0; index < journal.length; index += 1) {
-    const entry = readSampledEntry(ownElement(journal.array, index), index);
+    const entry = readSampledEntry(journal.array[index], index);
     if (entry === null) {
       return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
     }

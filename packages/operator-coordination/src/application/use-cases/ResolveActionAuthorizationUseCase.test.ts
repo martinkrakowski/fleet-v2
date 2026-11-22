@@ -331,6 +331,13 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
       expectedHeadSha: '',
       policyRevision: 'pol-rev-1',
     });
+    // An authorized resolve consumes nothing and binds no attempt: the stored
+    // record is exactly the one the fixture saved — same revision, no
+    // `grantAttemptId` key at all, no consumptions.
+    const stored = await requestRepo.findRequestById(REQUEST_ID);
+    expect(stored).toEqual(record);
+    expect(stored).not.toHaveProperty('grantAttemptId');
+    expect(stored).toMatchObject({ revision: 1, consumptions: [] });
   });
 
   it('blocks with project-id-required on an empty projectId (never Not implemented)', async () => {
@@ -601,8 +608,9 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     });
     const result = await resolveRaw(useCase(requestRepo), proxy);
     // A plain-data proxy yields exactly the plain data's result, and the
-    // `get` trap is the only one consulted.
-    expect(gets).toBeGreaterThanOrEqual(0);
+    // `get` trap count is pinned: the resolve must read the request only
+    // through its own snapshot, so no `get` trap runs at all.
+    expect(gets).toBe(0);
     expect(result).toEqual({
       outcome: 'authorized',
       grantId: GRANT_ID,

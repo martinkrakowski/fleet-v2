@@ -1092,7 +1092,10 @@ function readStoredShadowEvidence(
  * coverage (CO30c fix round). Exported for the cutover-switch regression
  * tests. A top-level `driver-lease-live` flag refuses as
  * `conductor-driver-live`: the driver lease is held right now, so a driver is
- * still active. The top-level `conductor-halted` flag is different — the code
+ * still active. A top-level `driver-lease-unknown` flag is unreadable instead
+ * (CO30c follow-up): the lease state could not be read, so the gate cannot
+ * tell whether a driver is active and never passes on that doubt. The
+ * top-level `conductor-halted` flag is different — the code
  * reads it from the halt marker, which means the conductor is halted, not
  * that a driver is active — so it does not refuse this gate (an unreadable
  * halt marker already answers `unreadable` through a non-`inventoried`
@@ -1114,6 +1117,12 @@ export function summarizeInventoryForCutover(
   // (`lease-unreadable`) and answers `unreadable` above.
   if (result.riskFlags.some((flag) => flag.code === 'driver-lease-live')) {
     return { status: 'refused', reason: 'conductor-driver-live' };
+  }
+  // CO30c follow-up: an unknown driver-lease state is not evidence of a live
+  // driver, but neither is it evidence of an idle one — the gate answers
+  // `unreadable` rather than passing on a state it could not read.
+  if (result.riskFlags.some((flag) => flag.code === 'driver-lease-unknown')) {
+    return { status: 'unreadable' };
   }
   let unrecorded = 0;
   let unknownListings = 0;
@@ -1595,6 +1604,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
             return { status: 'unreadable' };
           }
           const clones: RelaunchCloneRef[] = [];
+          // CO30c follow-up: two active profiles may declare the same clone
+          // (same host, path and worktree root). Deduplicating by that triple
+          // keeps the inventory from listing one clone twice — which would
+          // double the declared count and fail the partial-coverage check
+          // against itself.
+          const seenClones = new Set<string>();
           for (const profile of active) {
             const entries = Object.entries(profile.clones);
             // CO30c fix round: an active profile with no clone coverage is
@@ -1605,6 +1620,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
               return { status: 'unreadable' };
             }
             for (const [cloneHost, clone] of entries) {
+              const cloneKey = `${cloneHost}\u0000${clone.path}\u0000${clone.worktreeRoot}`;
+              if (seenClones.has(cloneKey)) {
+                continue;
+              }
+              seenClones.add(cloneKey);
               clones.push({
                 projectId: profile.projectId,
                 hostName: cloneHost,

@@ -52,7 +52,6 @@ export type RevokeOwnerGrantRefusal =
   | 'grant-wrong-scope'
   | 'grant-already-revoked'
   | 'grant-not-revocable'
-  | 'invalid-now-iso'
   | 'shadow-import-clock-unavailable'
   | 'revision-conflict';
 

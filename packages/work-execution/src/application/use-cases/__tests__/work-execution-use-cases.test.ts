@@ -538,12 +538,16 @@ describe('RegisterWorkOrderUseCase', () => {
     expect(result.outcome === 'registered' && result.workOrder.projectId).toBe('proj-1');
   });
 
-  it('propagates an error thrown by the profile port and saves nothing', async () => {
+  it('refuses a throwing profile port with malformed-profile and saves nothing', async () => {
     const repo = makeWorkOrderRepo();
     const profileRead = new FakeProfileRead(null, new Error('adapter exploded'));
     const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo, profileRead });
 
-    await expect(useCase.registerWorkOrder(validWorkOrderRequest())).rejects.toThrow('adapter exploded');
+    // RP1: a profile read that throws is a malformed profile, refused typed.
+    await expect(useCase.registerWorkOrder(validWorkOrderRequest())).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'malformed-profile',
+    });
     expect(repo.orders.size).toBe(0);
   });
 

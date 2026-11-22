@@ -22,10 +22,10 @@ import {
   parseWorkOrderRisk,
 } from '../../domain/execution-records.js';
 import type { PlanRef, WorkOrderRecord } from '../../domain/execution-records.js';
-import type { BaseBranchValue } from '../../domain/base-branch.js';
 import {
   DEFAULT_BASE_BRANCH,
   parseBaseBranch,
+  resolveProfileDefaultBranch,
 } from '../../domain/base-branch.js';
 import {
   HOLD_INTENT_ID_PATTERN,
@@ -211,20 +211,21 @@ function normalizeStoredPath(path: unknown): string | null {
  * record every time, including the default.
  */
 type RegisteredBaseBranch =
-  | { readonly accepted: true; readonly value: BaseBranchValue }
-  | { readonly accepted: false };
+  | { accepted: true; value: string; fromProfile: boolean }
+  | { accepted: false };
 
 function registeredBaseBranch(request: RegisterWorkOrderRequest): RegisteredBaseBranch {
   // An explicit `undefined` (a CLI flag omitted via `optStr`) is absent, the
-  // same as a missing key.
+  // same as a missing key. It is marked `fromProfile` so an active profile's
+  // `defaultBranch` may decide it later (RP1); with no profile read it stays `main`.
   if (request.baseBranch === undefined) {
-    return { accepted: true, value: DEFAULT_BASE_BRANCH };
+    return { accepted: true, value: DEFAULT_BASE_BRANCH, fromProfile: true };
   }
   const parsed = parseBaseBranch(request.baseBranch);
   if (parsed === undefined) {
     return { accepted: false };
   }
-  return { accepted: true, value: parsed };
+  return { accepted: true, value: parsed, fromProfile: false };
 }
 
 /** A string field that is absent or a bounded string free of secret shapes; anything else is untrustworthy. */
@@ -416,12 +417,36 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     }
 
     if (deps.profileRead) {
-      const profile = await deps.profileRead.readProjectProfile(projectId);
+      let profile: Awaited<ReturnType<typeof deps.profileRead.readProjectProfile>>;
+      try {
+        profile = await deps.profileRead.readProjectProfile(projectId);
+      } catch {
+        return { outcome: 'refused', reason: 'malformed-profile' };
+      }
+      if (profile === undefined) {
+        return { outcome: 'refused', reason: 'malformed-profile' };
+      }
       if (profile === null) {
         return {
           outcome: 'rejected',
           reason: `project ${projectId} has no profile; register it with 'fleet-v2 projects add', or 'fleet-v2 projects adopt' when it already has work orders`,
         };
+      }
+      if (baseBranchDecision.accepted && baseBranchDecision.fromProfile) {
+        // RP1: with no explicit `request.baseBranch`, the active profile's
+        // `defaultBranch` decides. A malformed profile or an unsafe declared
+        // branch refuses the registration with a typed reason; nothing is written.
+        // RP1 fix: a declared branch that is neither `main` nor `chain/<name>`
+        // (for example `staging`) is refused `unsupported-profile-base` here,
+        // so nothing non-main/chain is ever persisted and the stored-record
+        // parsers (resolveWorkOrderBaseBranch, resolveLaneRunBaseBranch) stay
+        // able to read every stored record.
+        const resolved = resolveProfileDefaultBranch(profile);
+        if (!resolved.ok) {
+          return { outcome: 'refused', reason: resolved.reason };
+        }
+        baseBranchDecision.fromProfile = false;
+        baseBranchDecision.value = resolved.baseBranch;
       }
       if (profile.status !== 'active') {
         return {

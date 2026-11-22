@@ -47,6 +47,12 @@ export type ManageReleaseRefusal =
   | /** The grant was consumed before the build, and the build then failed; a retry resumes the same operation. */ 'build-failed-grant-spent'
   | /** Another run holds this operation (same action, sha and root). */ 'release-in-progress'
   | 'verify-failed'
+  | /**
+     * The repoint failed and the previous current-op marker could not be
+     * restored either; the marker state around `current` is unknown and the
+     * store refuses rather than let any marker claim an operation that did
+     * not land.
+     */ 'store-restore-failed'
   | 'store-unreadable'
   | 'failed';
 

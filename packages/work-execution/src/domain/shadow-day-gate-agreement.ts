@@ -7,7 +7,7 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
-import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
+import { isCalendarDateTime, readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 import { compareShadowGateVerdicts } from './shadow-comparators.js';
 import type { ShadowComparisonResult, ShadowDivergence } from './shadow-comparators.js';
 import type { ShadowCriterionEvaluation, ShadowCriterionStatus } from './shadow-evidence-ledger.js';
@@ -71,11 +71,6 @@ interface CalendarDay {
   readonly windowStartMs: number;
   readonly dayStartMs: number;
   readonly endMs: number;
-}
-
-interface BoundedArray {
-  readonly array: readonly unknown[];
-  readonly length: number;
 }
 
 interface ValidHead {
@@ -148,51 +143,8 @@ function isSettledGate(ciGate: ShadowGateCiState): boolean {
 }
 
 /**
- * Cost: O(1) descriptor reads. Returns the length when it is a safe integer
- * in `0..cap`, otherwise null. An accessor length is refused here, and an
- * over-cap length returns before the caller looks at any index.
+ * Cost: O(1). Year 2000-9999, so `Date.UTC` cannot hit its two-digit-year trap.
  */
-function cappedLength(descriptor: PropertyDescriptor | undefined, cap: number): number | null {
-  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
-    return null;
-  }
-  const { value } = descriptor;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > cap) {
-    return null;
-  }
-  return value;
-}
-
-/**
- * Cost: O(1) plus one key listing of a length already known to be within
- * `cap`. A real dense array, or null. The length comes from its own
- * descriptor, never from a `.length` read, so a Proxy `get` trap cannot
- * shorten the walk. Over-cap lengths return before `Object.keys`.
- */
-function readBoundedArray(value: unknown, cap: number): BoundedArray | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const length = cappedLength(Object.getOwnPropertyDescriptor(value, 'length'), cap);
-  if (length === null) {
-    return null;
-  }
-  if (Object.keys(value).length !== length) {
-    return null;
-  }
-  return { array: value, length };
-}
-
-/** Cost: O(1). One own descriptor read; a hole or an accessor yields undefined and its getter does not run. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
-    return undefined;
-  }
-  return descriptor.value;
-}
-
-/** Cost: O(1). Year 2000-9999, so `Date.UTC` cannot hit its two-digit-year trap. */
 function isSupportedYear(year: number): boolean {
   return year >= 2000 && year <= 9999;
 }
@@ -239,17 +191,23 @@ function readHead(raw: unknown): ValidHead | null {
 
 /**
  * Cost: linear in the capped length, at most `SHADOW_GATE_MAX_HEADS`
- * descriptor reads. Null when the value is not a dense array within the cap
- * or any element is out of shape. The cap is applied before the loop.
+ * descriptor reads; the accepted `O(K)` engine bound of `Reflect.ownKeys`
+ * (where `K` is the target's own-property count) is paid once per array
+ * inside `readBoundedDenseArray`, after its `O(1)` length/prototype
+ * pre-gate. Null when the value is not a real, dense array of
+ * `Array.prototype` within the cap — a subclassed array, a hole, an
+ * accessor, a non-enumerable index, a symbol key, a foreign own key or an
+ * over-cap length is refused — or any element is out of shape. The cap is
+ * applied before the walk.
  */
 function readHeads(value: unknown): readonly ValidHead[] | null {
-  const bounded = readBoundedArray(value, SHADOW_GATE_MAX_HEADS);
+  const bounded = readBoundedDenseArray(value, SHADOW_GATE_MAX_HEADS);
   if (bounded === null) {
     return null;
   }
   const heads: ValidHead[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const head = readHead(ownElement(bounded.array, index));
+    const head = readHead(bounded.array[index]);
     if (head === null) {
       return null;
     }
@@ -523,9 +481,13 @@ function judgeShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation
  * `no-settled-heads` (owner decision 2026-11-18): never `fail`
  * (`too-few-agreeing-heads`) and never `pass`.
  *
- * Cost: linear in the capped input — at most `SHADOW_GATE_MAX_HEADS` heads
- * are read, deduplicated and compared, and an oversized, sparse or non-dense
- * `heads` array is refused from its own `length` before any element is read.
+ * Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)` engine
+ * bound of `Reflect.ownKeys` (where `K` is the target's own-property count),
+ * then `O(cap)` element traversal — at most `SHADOW_GATE_MAX_HEADS` heads
+ * are read, deduplicated and compared, and an oversized, sparse,
+ * accessor-carrying, non-enumerable-index, symbol-keyed, foreign-keyed or
+ * subclassed `heads` array is refused from its own `length` and prototype
+ * before any element is read.
  * Every value is taken from its own property descriptor, so no getter ever
  * runs and a Proxy stand-in either is refused or yields exactly the plain
  * data's verdict. Never throws. The result carries a status, a reason code

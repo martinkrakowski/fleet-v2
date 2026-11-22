@@ -180,6 +180,33 @@ describe('shadow evidence ledger (SH1)', () => {
       readFailure({ revision: 1, days: sparse }, 'invalid-ledger');
     });
 
+    it('refuses a symbol own key on the days array with invalid-ledger', () => {
+      const days: unknown[] = [{ day: D1, releaseSha: null, mergesCompared: null, verdicts: {} }];
+      Object.defineProperty(days, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+      readFailure({ revision: 1, days }, 'invalid-ledger');
+    });
+
+    it('refuses a non-enumerable extra own key on the days array with invalid-ledger', () => {
+      const days: unknown[] = [{ day: D1, releaseSha: null, mergesCompared: null, verdicts: {} }];
+      Object.defineProperty(days, 'hidden', { value: 1, enumerable: false, configurable: true, writable: true });
+      readFailure({ revision: 1, days }, 'invalid-ledger');
+    });
+
+    it('refuses the whole days list when an accessor element is present with invalid-ledger', () => {
+      const days: unknown[] = [{ day: D1, releaseSha: null, mergesCompared: null, verdicts: {} }];
+      let accessorCalls = 0;
+      Object.defineProperty(days, 0, {
+        enumerable: true,
+        configurable: true,
+        get: () => {
+          accessorCalls += 1;
+          return { day: D1, releaseSha: null, mergesCompared: null, verdicts: {} };
+        },
+      });
+      readFailure({ revision: 1, days }, 'invalid-ledger');
+      expect(accessorCalls).toBe(0);
+    });
+
     it('refuses more than 31 days with invalid-ledger', () => {
       const days = Array.from({ length: SHADOW_LEDGER_MAX_DAYS + 1 }, (_, index) => ({
         day: dateOn(index),

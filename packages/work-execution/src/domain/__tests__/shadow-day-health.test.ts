@@ -325,6 +325,51 @@ describe('evaluateShadowTickHealth (S12)', () => {
     });
   });
 
+  it('an own symbol key on events is daemon-events-invalid (Object.keys used to ignore it)', () => {
+    const events = cleanDay(720);
+    Object.defineProperty(events, Symbol('extra'), { value: 1, enumerable: true });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'unknown',
+      reason: 'daemon-events-invalid',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+  });
+
+  it('a non-enumerable extra own key on events is daemon-events-invalid (Object.keys used to ignore it)', () => {
+    const events = cleanDay(720);
+    Object.defineProperty(events, 'extra', { value: 1, enumerable: false });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'unknown',
+      reason: 'daemon-events-invalid',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+  });
+
+  it('an accessor element refuses the whole events list before any item reader runs', () => {
+    let calls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, 0, {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return jobEvent({});
+      },
+    });
+    accessorList.length = 1;
+    expect(s12(dayInput(accessorList))).toEqual({
+      status: 'unknown',
+      reason: 'daemon-events-invalid',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(calls).toBe(0);
+  });
+
   it('reports computed budgetOverruns and starvedJobs on too-few-ticks', () => {
     const events = Array.from({ length: 10 }, (_, i) => jobEvent({
       eventId: eventId(i + 1),
@@ -595,6 +640,39 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     expect(evaluateShadowStateIntegrity(stateInput())).toEqual(
       s9Eval('pass', 'state-consistent', { stateChecked: 5 }),
     );
+  });
+
+  it('an own symbol key on journal is invalid-input (Object.keys used to ignore it)', () => {
+    const journal = [journalEntry('lane:k1', 'intent', null, SAMPLE_AT)];
+    Object.defineProperty(journal, Symbol('extra'), { value: 1, enumerable: true });
+    expect(evaluateShadowStateIntegrity(stateInput({ journal }))).toEqual(
+      s9Eval('unknown', 'invalid-input'),
+    );
+  });
+
+  it('a non-enumerable extra own key on journal is invalid-input (Object.keys used to ignore it)', () => {
+    const journal = [journalEntry('lane:k1', 'intent', null, SAMPLE_AT)];
+    Object.defineProperty(journal, 'extra', { value: 1, enumerable: false });
+    expect(evaluateShadowStateIntegrity(stateInput({ journal }))).toEqual(
+      s9Eval('unknown', 'invalid-input'),
+    );
+  });
+
+  it('an accessor element refuses the whole journal list before any entry reader runs', () => {
+    let calls = 0;
+    const accessorList: unknown[] = [];
+    Object.defineProperty(accessorList, 0, {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return journalEntry('lane:k1', 'intent', null, SAMPLE_AT);
+      },
+    });
+    accessorList.length = 1;
+    expect(evaluateShadowStateIntegrity(stateInput({ journal: accessorList }))).toEqual(
+      s9Eval('unknown', 'invalid-input'),
+    );
+    expect(calls).toBe(0);
   });
 
   it('fails state-check-failed when stateCheck.bad is 1', () => {

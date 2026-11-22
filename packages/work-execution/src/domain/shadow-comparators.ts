@@ -168,6 +168,22 @@ function makeDivergence(key: string, code: ShadowDivergenceCode, fleet: string |
   return Object.freeze({ key, code, fleet, shell });
 }
 
+// A Proxy can rig its `getOwnPropertyDescriptor` trap to report a length that
+// disagrees with everything its `get` path reports (commit 6e50a07a tried to
+// catch this by cross-checking index descriptors, but a Proxy can lie
+// consistently across `length` and index descriptors). The two read paths are
+// separate traps, so the descriptor length is accepted only when the object's
+// own `get` path reports the same value. A plain array's `length` is always a
+// data property, so this read never runs a getter; a Proxy `get` trap that
+// throws or disagrees is a refusal.
+function readsConsistentLength(input: readonly unknown[], length: number): boolean {
+  try {
+    return (input as { length?: unknown }).length === length;
+  } catch {
+    return false;
+  }
+}
+
 function collectSide(side: 'fleet' | 'shell', input: unknown, validate: ItemValidator, divergences: ShadowDivergence[]): readonly ValidatedEntry[] {
   if (!Array.isArray(input)) {
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
@@ -193,19 +209,9 @@ function collectSide(side: 'fleet' | 'shell', input: unknown, validate: ItemVali
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }
-  // The length itself was read through `getOwnPropertyDescriptor`, which on a
-  // Proxy is the hostile `getOwnPropertyDescriptor` trap (a plain array's
-  // `length` is non-configurable but writable, so the trap may report any
-  // value without breaking the engine's invariants). A reported length is
-  // therefore accepted only when the index descriptors the object itself
-  // exposes agree with it: a plain array owns exactly the indices below its
-  // length (holes included), so index `length - 1` must exist and index
-  // `length` must not. A proxy that reports length 0 over a one-item array
-  // still exposes index 0 here, and the list is refused instead of silently
-  // compared as empty.
-  const beyondEnd = Object.getOwnPropertyDescriptor(input, length);
-  const last = length > 0 ? Object.getOwnPropertyDescriptor(input, length - 1) : undefined;
-  if (beyondEnd !== undefined || (length > 0 && last === undefined)) {
+  // Refused before any traversal: a Proxy whose descriptor trap lies about the
+  // list's length cannot make its `get` path agree with the lie.
+  if (!readsConsistentLength(input, length)) {
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }

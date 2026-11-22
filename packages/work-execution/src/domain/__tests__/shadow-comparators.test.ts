@@ -506,7 +506,10 @@ describe('shadow comparators', () => {
     expect(lengthReads).toBe(0);
   });
 
-  it('a Proxy over an array side with a lying length trap yields exactly the plain-data result', () => {
+  it('a Proxy over an array side with a lying get length trap is refused', () => {
+    // The descriptor path reports the real length (2) while the get trap
+    // reports 0: the two read paths disagree, so the list is refused instead
+    // of compared against the trap's fiction.
     const items = [
       { pullRequest: 1, headOid: FIRST_HEAD },
       { pullRequest: 2, headOid: SECOND_HEAD },
@@ -518,15 +521,11 @@ describe('shadow comparators', () => {
       },
     });
     const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: items });
-    expect(result).toEqual({
-      kind: 'merge-set',
-      equal: true,
-      compared: 2,
-      fleetCount: 2,
-      shellCount: 2,
-      divergences: [],
-      truncated: false,
-    });
+    expect(result.equal).toBe(false);
+    expect(result.fleetCount).toBe(0);
+    expect(result.divergences).toContainEqual(
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    );
   });
 
   it('a Proxy whose getOwnPropertyDescriptor trap lies about length cannot hide its item from an empty shell list', () => {
@@ -563,6 +562,28 @@ describe('shadow comparators', () => {
     expect(result.divergences).toContainEqual({
       key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null,
     });
+  });
+
+  it('a Proxy whose descriptor trap lies consistently about length and indices is refused', () => {
+    // The descriptor trap returns `length: 0` AND `undefined` for index 0:
+    // the lies agree with each other across every descriptor read, so no
+    // check inside the descriptor path can catch it. The object's `get` path
+    // still reports the real length (1), so the two read paths disagree and
+    // the list is refused before any traversal.
+    const items = [{ pullRequest: 1, headOid: FIRST_HEAD }];
+    const proxy = new Proxy(items, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') return { value: 0, writable: true, enumerable: false, configurable: false };
+        if (key === '0') return undefined;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = compareShadowMergeSets({ fleet: proxy as unknown as readonly ShadowMergeSetItem[], shell: [] });
+    expect(result.equal).toBe(false);
+    expect(result.fleetCount).toBe(0);
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-list', code: 'invalid-item', fleet: null, shell: null },
+    ]);
   });
 
   it('a Proxy whose get trap would return a fake fleet list never runs the trap', () => {

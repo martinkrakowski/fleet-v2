@@ -36,16 +36,32 @@ export interface ReviewRequest {
   readonly policyRevision: string;
   readonly implementerModel: string;
   readonly reviewerModel: string;
-  /** The frozen brief; forwarded with `kind: 'brief-check'` and required for an active `kind: 'brief-verify'`, capped at 64 KiB. */
+  /**
+   * The frozen brief; forwarded with `kind: 'brief-check'` and required for an
+   * active `kind: 'brief-verify'`, capped at 64 KiB. When it is supplied for a
+   * `brief-check`, it also binds: `briefManifestRaw` and `briefPackageDigest`
+   * below are then required, and the adapter recomputes the package digest
+   * before a reviewer is called.
+   */
   readonly briefText?: string;
   /**
-   * Required for an active `kind: 'brief-verify'`: the raw manifest bytes the
+   * Required for an active `kind: 'brief-verify'`, and required whenever a
+   * `brief-check` request carries `briefText`: the raw manifest bytes the
    * frozen brief digest covers. The frozen-brief digest is
    * `computeBriefPackageDigest({ prose, manifestRaw })` — `prose + '\n' +
    * manifestRaw` — so a `brief-verify` request that carries only the prose
    * can never be bound to the subject's `briefPackageDigest` and is refused.
    */
   readonly briefManifestRaw?: string;
+  /**
+   * Required whenever a `brief-check` request carries `briefText`: the frozen
+   * brief's package digest the attempt recorded. The adapter recomputes
+   * `computeBriefPackageDigest({ prose: briefText, manifestRaw:
+   * briefManifestRaw })` and refuses unless it equals this digest (and the
+   * attempt's own recorded `briefDigest`, when its repository is bound), so
+   * the reviewer never sees brief text unbound to the frozen package.
+   */
+  readonly briefPackageDigest?: string;
   /** Only forwarded with a chain subject: the scope in a few words (no path, no diff text), capped at 2 KiB. */
   readonly diffSummary?: string;
   readonly nowIso?: string;

@@ -551,11 +551,13 @@ describe('LaneRunRepositoryAdapter file read-back, quarantine and file name', ()
     expect(kept).toBe(garbage);
   });
 
-  it('refuses file names that collide with another store or are unsafe', async () => {
-    const colliding = new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName: 'run-journal.json' });
-    await expect(colliding.list()).rejects.toThrow(/collides with another store/);
+  it('refuses file names that collide with another store or are unsafe at construction', () => {
+    expect(() => new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName: 'run-journal.json' })).toThrow(
+      /collides with another store/,
+    );
 
-    const escaping = new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName: '../x.json' });
-    await expect(escaping.list()).rejects.toThrow(/unsafe state file name/);
+    expect(() => new LaneRunRepositoryAdapter({ stateDir: tempDir, fileName: '../x.json' })).toThrow(
+      /unsafe state file name/,
+    );
   });
 });

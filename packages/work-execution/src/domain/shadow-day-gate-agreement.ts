@@ -7,7 +7,7 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
-import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
+import { isCalendarDateTime, readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 import { compareShadowGateVerdicts } from './shadow-comparators.js';
 import type { ShadowComparisonResult, ShadowDivergence } from './shadow-comparators.js';
 import type { ShadowCriterionEvaluation, ShadowCriterionStatus } from './shadow-evidence-ledger.js';
@@ -48,6 +48,8 @@ export type ShadowGateAgreementEvaluation = ShadowCriterionEvaluation & {
   readonly falsePasses: number;
   readonly stricterFails: number;
   readonly unsettled: number;
+  /** True only when the comparator's divergence list was truncated. */
+  readonly truncated: boolean;
 };
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -62,17 +64,13 @@ interface GateCounts {
   readonly falsePasses: number;
   readonly stricterFails: number;
   readonly unsettled: number;
+  readonly truncated: boolean;
 }
 
 interface CalendarDay {
   readonly windowStartMs: number;
   readonly dayStartMs: number;
   readonly endMs: number;
-}
-
-interface BoundedArray {
-  readonly array: readonly unknown[];
-  readonly length: number;
 }
 
 interface ValidHead {
@@ -101,9 +99,10 @@ const ZERO_COUNTS: GateCounts = Object.freeze({
   falsePasses: 0,
   stricterFails: 0,
   unsettled: 0,
+  truncated: false,
 });
 
-/** Cost: O(1). Copies the five counts onto a frozen result and returns it. */
+/** Cost: O(1). Copies the counts onto a frozen result and returns it. */
 function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateCounts): ShadowGateAgreementEvaluation {
   return Object.freeze({
     status,
@@ -113,6 +112,7 @@ function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateC
     falsePasses: counts.falsePasses,
     stricterFails: counts.stricterFails,
     unsettled: counts.unsettled,
+    truncated: counts.truncated,
   });
 }
 
@@ -143,51 +143,8 @@ function isSettledGate(ciGate: ShadowGateCiState): boolean {
 }
 
 /**
- * Cost: O(1) descriptor reads. Returns the length when it is a safe integer
- * in `0..cap`, otherwise null. An accessor length is refused here, and an
- * over-cap length returns before the caller looks at any index.
+ * Cost: O(1). Year 2000-9999, so `Date.UTC` cannot hit its two-digit-year trap.
  */
-function cappedLength(descriptor: PropertyDescriptor | undefined, cap: number): number | null {
-  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
-    return null;
-  }
-  const { value } = descriptor;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > cap) {
-    return null;
-  }
-  return value;
-}
-
-/**
- * Cost: O(1) plus one key listing of a length already known to be within
- * `cap`. A real dense array, or null. The length comes from its own
- * descriptor, never from a `.length` read, so a Proxy `get` trap cannot
- * shorten the walk. Over-cap lengths return before `Object.keys`.
- */
-function readBoundedArray(value: unknown, cap: number): BoundedArray | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const length = cappedLength(Object.getOwnPropertyDescriptor(value, 'length'), cap);
-  if (length === null) {
-    return null;
-  }
-  if (Object.keys(value).length !== length) {
-    return null;
-  }
-  return { array: value, length };
-}
-
-/** Cost: O(1). One own descriptor read; a hole or an accessor yields undefined and its getter does not run. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
-    return undefined;
-  }
-  return descriptor.value;
-}
-
-/** Cost: O(1). Year 2000-9999, so `Date.UTC` cannot hit its two-digit-year trap. */
 function isSupportedYear(year: number): boolean {
   return year >= 2000 && year <= 9999;
 }
@@ -234,17 +191,23 @@ function readHead(raw: unknown): ValidHead | null {
 
 /**
  * Cost: linear in the capped length, at most `SHADOW_GATE_MAX_HEADS`
- * descriptor reads. Null when the value is not a dense array within the cap
- * or any element is out of shape. The cap is applied before the loop.
+ * descriptor reads; the accepted `O(K)` engine bound of `Reflect.ownKeys`
+ * (where `K` is the target's own-property count) is paid once per array
+ * inside `readBoundedDenseArray`, after its `O(1)` length/prototype
+ * pre-gate. Null when the value is not a real, dense array of
+ * `Array.prototype` within the cap — a subclassed array, a hole, an
+ * accessor, a non-enumerable index, a symbol key, a foreign own key or an
+ * over-cap length is refused — or any element is out of shape. The cap is
+ * applied before the walk.
  */
 function readHeads(value: unknown): readonly ValidHead[] | null {
-  const bounded = readBoundedArray(value, SHADOW_GATE_MAX_HEADS);
+  const bounded = readBoundedDenseArray(value, SHADOW_GATE_MAX_HEADS);
   if (bounded === null) {
     return null;
   }
   const heads: ValidHead[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const head = readHead(ownElement(bounded.array, index));
+    const head = readHead(bounded.array[index]);
     if (head === null) {
       return null;
     }
@@ -404,20 +367,25 @@ function hasIncompleteDivergence(divergences: readonly ShadowDivergence[]): bool
   return false;
 }
 
-/** Cost: O(1). Agreeing is `compared` minus the tallied divergence kinds. */
-function countsFrom(compared: number, tallies: DivergenceTally, unsettled: number): GateCounts {
+/**
+ * Cost: O(1). When the comparison was truncated, `agreeing` is `0` — a
+ * truncated head is never counted as agreeing. Otherwise `agreeing` is
+ * `compared` minus the tallied divergence kinds.
+ */
+function countsFrom(compared: number, tallies: DivergenceTally, unsettled: number, truncated: boolean): GateCounts {
   return {
     compared,
-    agreeing: compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers,
+    agreeing: truncated ? 0 : compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers,
     falsePasses: tallies.falsePasses,
     stricterFails: tallies.stricterFails,
     unsettled,
+    truncated,
   };
 }
 
 /** Cost: O(1) once the tallies exist. False pass on D outranks the agreeing-head floor. */
 function decide(compared: number, tallies: DivergenceTally, unsettled: number): ShadowGateAgreementEvaluation {
-  const counts = countsFrom(compared, tallies, unsettled);
+  const counts = countsFrom(compared, tallies, unsettled, false);
   if (tallies.falsePassOnDay) {
     return evaluation('fail', 'gate-false-pass', counts);
   }
@@ -430,9 +398,11 @@ function decide(compared: number, tallies: DivergenceTally, unsettled: number): 
 /**
  * Cost: linear in the comparator's listed divergences. Truncation stays
  * fail-closed (`unknown/gate-comparison-incomplete`) and carries a fresh
- * result whose counts are what the comparator computed: `compared`, the
- * divergence tallies up to the cap, and the unsettled count. A listed code
- * that means the two sides were not the heads just built contributes no counts.
+ * result with `truncated: true`, `agreeing: 0` — a truncated head is never
+ * counted as agreeing — and counts that are what the comparator computed:
+ * `compared`, the lower-bound divergence tallies up to `SHADOW_DIVERGENCE_MAX`,
+ * and the unsettled count. A listed code that means the two sides were not
+ * the heads just built contributes no counts.
  */
 function verdictFromComparison(
   comparison: ShadowComparisonResult,
@@ -451,7 +421,7 @@ function verdictFromComparison(
     return evaluation(
       'unknown',
       'gate-comparison-incomplete',
-      countsFrom(comparison.compared, tallies, unsettled),
+      countsFrom(comparison.compared, tallies, unsettled, true),
     );
   }
   return decide(comparison.compared, tallies, unsettled);
@@ -511,13 +481,21 @@ function judgeShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation
  * `no-settled-heads` (owner decision 2026-11-18): never `fail`
  * (`too-few-agreeing-heads`) and never `pass`.
  *
- * Cost: linear in the capped input — at most `SHADOW_GATE_MAX_HEADS` heads
- * are read, deduplicated and compared, and an oversized, sparse or non-dense
- * `heads` array is refused from its own `length` before any element is read.
+ * Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)` engine
+ * bound of `Reflect.ownKeys` (where `K` is the target's own-property count),
+ * then `O(cap)` element traversal — at most `SHADOW_GATE_MAX_HEADS` heads
+ * are read, deduplicated and compared, and an oversized, sparse,
+ * accessor-carrying, non-enumerable-index, symbol-keyed, foreign-keyed or
+ * subclassed `heads` array is refused from its own `length` and prototype
+ * before any element is read.
  * Every value is taken from its own property descriptor, so no getter ever
  * runs and a Proxy stand-in either is refused or yields exactly the plain
  * data's verdict. Never throws. The result carries a status, a reason code
- * and counts only — never a head oid or any other input value.
+ * and counts only — never a head oid or any other input value. A result
+ * whose comparison was truncated carries `truncated: true` and `agreeing: 0`
+ * (truncated heads are never counted as agreeing) with lower-bound divergence
+ * counts up to `SHADOW_DIVERGENCE_MAX`; every non-truncated result and every
+ * refusal carries `truncated: false`.
  */
 export function evaluateShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation {
   try {

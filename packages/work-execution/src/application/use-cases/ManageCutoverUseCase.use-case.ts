@@ -23,6 +23,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import {
+  CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_SHADOW_CRITERIA,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
@@ -30,6 +31,7 @@ import {
   cutoverJournalKey,
   isWithinCutoverRollbackWindow,
   readCutoverShadowEvidence,
+  readRetirementLedger,
   type CutoverRecord,
 } from '../../domain/cutover-records.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
@@ -78,6 +80,17 @@ export interface ManageCutoverDependencies {
     | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
     | { readonly status: 'unreadable' }
     | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' }
+  >;
+  /**
+   * BL14b, optional: the stored §1 cutover-plan retirement ledger the retire
+   * move demands. The production runtime wires it only over durable state; a
+   * missing reader is a refusal, never a pass.
+   */
+  readonly readRetirementLedger?: () => Promise<
+    | { readonly status: 'ok'; readonly ledger: unknown }
+    | { readonly status: 'absent' }
+    | { readonly status: 'unreadable' }
+    | { readonly status: 'unknown-version' }
   >;
 }
 
@@ -906,6 +919,48 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     return null;
   }
 
+  /**
+   * The BL14b retirement-ledger gate: a missing reader or an absent ledger is
+   * a refusal, every outcome fails closed, and every failure is a typed result
+   * written before any intent, record or pause write.
+   */
+  private async retirementLedgerFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const reader = this.deps.readRetirementLedger;
+    if (reader === undefined) {
+      return refuse('retirement-ledger-absent');
+    }
+    const read = await this.guarded(deadlineIso, reader);
+    if (read.kind === 'deadline') return unknown('deadline-exceeded');
+    // A read that starts before the deadline but completes after it must not
+    // pass the gate: the deadline is rechecked against the clock once the
+    // reader has returned, failing closed.
+    if (this.deadlineReached(deadlineIso)) return unknown('deadline-exceeded');
+    if (read.kind === 'threw') return unknown('retirement-ledger-unreadable');
+    if (read.value.status === 'absent') return refuse('retirement-ledger-absent');
+    if (read.value.status === 'unreadable') return unknown('retirement-ledger-unreadable');
+    if (read.value.status === 'unknown-version') return unknown('retirement-ledger-unknown-version');
+    const verdict = readRetirementLedger(read.value.ledger);
+    if (!verdict.ok) {
+      // Fail closed: every parser reason is a refusal or an unknown, never a
+      // pass, and never a write.
+      if (verdict.reason === 'unknown-version') return unknown('retirement-ledger-unknown-version');
+      if (verdict.reason === 'empty-ledger' || verdict.reason === 'row-unverified') {
+        return refuse('retirement-ledger-failed');
+      }
+      return unknown('retirement-ledger-unreadable');
+    }
+    // Retire proceeds only when the ledger read is ok AND every pinned §1
+    // script carries a row with verified true. The parser already requires the
+    // exact row set; this re-check fails closed if it ever did not.
+    const verifiedScripts = new Set(
+      verdict.ledger.rows.filter((row) => row.verified === true).map((row) => row.script),
+    );
+    if (CUTOVER_RETIREMENT_SCRIPTS.some((script) => !verifiedScripts.has(script))) {
+      return refuse('retirement-ledger-failed');
+    }
+    return null;
+  }
+
   /** Unknown lane coverage is never a pass: only an exact zero of unrecorded lanes proceeds. */
   private async unrecordedLanesFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
     const counter = this.deps.countUnrecordedLanes;
@@ -1083,13 +1138,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const { record } = cutover;
 
     const normalizedNowIso = normalizeIso(nowIso);
-    // TODO(retirement-ledger): verify §1 cutover-plan ledger rows (S13) in a follow-up unit.
     // The record, clock and window preconditions run on every pass: `nowIso` is
     // not part of the intent digest, so a retry must re-decide the rollback
     // window against the request's own clock, never trust the earlier pass.
     const precondition = this.retireStatePrecondition(record, expectedRevision, normalizedNowIso);
     if (precondition !== null) {
       return precondition;
+    }
+    const ledgerFailure = await this.retirementLedgerFailure(deadlineIso);
+    if (ledgerFailure !== null) {
+      return ledgerFailure;
     }
     const intentFailure = await this.appendIntentUnlessRecorded(
       journal.intent,

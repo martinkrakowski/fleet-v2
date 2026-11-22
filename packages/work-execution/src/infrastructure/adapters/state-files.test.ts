@@ -1037,11 +1037,9 @@ describe('daemon state file descriptors', () => {
 
   it('MergeQueueRepositoryAdapter refuses configured file names that collide with other stores', async () => {
     for (const name of ['lane-plans.json', 'killall-halt.json', 'killall-train-pause.json']) {
-      await expect(
-        new MergeQueueRepositoryAdapter({ stateDir: tempDir, fileName: name }).listMergeEntries({
-          deadlineIso: new Date(Date.now() + 60_000).toISOString(),
-        }),
-      ).rejects.toThrow('MergeQueueRepositoryAdapter refuses a fileName that collides with another store');
+      expect(
+        () => new MergeQueueRepositoryAdapter({ stateDir: tempDir, fileName: name }),
+      ).toThrow('MergeQueueRepositoryAdapter refuses a fileName that collides with another store');
     }
   });
 });

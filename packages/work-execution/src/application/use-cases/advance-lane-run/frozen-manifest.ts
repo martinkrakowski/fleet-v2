@@ -22,11 +22,12 @@ export type FrozenManifestRead =
 /**
  * A conducted attempt's frozen brief read with its digest verified (SEC-3b):
  * like `FrozenManifestRead`, but `verified` also carries the exact prose bytes
- * the digest covered, so a caller needs only this one read for both the
- * manifest's required checks and the brief text handed to a reviewer.
+ * and the raw manifest bytes the digest covered, so a caller needs only this
+ * one read for both the manifest's required checks and the brief text and
+ * manifest handed to a reviewer for digest binding (BL04).
  */
 export type FrozenBriefRead =
-  | { readonly kind: 'verified'; readonly prose: string; readonly manifest: Record<string, unknown> }
+  | { readonly kind: 'verified'; readonly prose: string; readonly manifestRaw: string; readonly manifest: Record<string, unknown> }
   | { readonly kind: 'absent' }
   | { readonly kind: 'unverified' };
 
@@ -98,7 +99,9 @@ export async function readFrozenBriefAtHostVerified(
   if (manifest === null) {
     return { kind: 'unverified' };
   }
-  return { kind: 'verified', prose, manifest };
+  // BL04: the raw manifest bytes travel with the prose so the caller can bind
+  // the brief text to the frozen package digest without a second read.
+  return { kind: 'verified', prose, manifestRaw, manifest };
 }
 
 /**

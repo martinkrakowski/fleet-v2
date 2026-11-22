@@ -18,7 +18,8 @@
 
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
@@ -124,6 +125,7 @@ import {
   ListLaneRunsUseCase,
   RecordShadowDayUseCase,
   evaluateShadowGrantCoverage,
+  RETIREMENT_LEDGER_MAX_BYTES,
   ShadowAttestationAdapter,
   ShadowEvidenceAdapter,
   WORK_EXECUTION_STATE_FILES,
@@ -1628,6 +1630,50 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         }
       }
     : undefined;
+  // BL14b: the §1 cutover-plan retirement ledger the retire move demands.
+  // Read-only: no lock, no quarantine. A symlink is refused from its lstat, an
+  // over-long file from its stat, a parse or read failure is `unreadable`, a
+  // newer schemaVersion is `unknown-version`, and a missing file is `absent`.
+  // In-memory mode has no durable ledger, so the reader stays undefined and
+  // the use case refuses `retirement-ledger-absent`.
+  const readRetirementLedger = durableCutover
+    ? async (): Promise<
+        | { readonly status: 'ok'; readonly ledger: unknown }
+        | { readonly status: 'absent' }
+        | { readonly status: 'unreadable' }
+        | { readonly status: 'unknown-version' }
+      > => {
+        const path = join(stateDir, 'cutover-retirement-ledger.json');
+        try {
+          const linked = lstatSync(path);
+          if (!linked.isFile()) {
+            return { status: 'unreadable' };
+          }
+          if (statSync(path).size > RETIREMENT_LEDGER_MAX_BYTES) {
+            return { status: 'unreadable' };
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(readFileSync(path, 'utf8'));
+          } catch {
+            return { status: 'unreadable' };
+          }
+          if (
+            typeof parsed === 'object' &&
+            parsed !== null &&
+            !Array.isArray(parsed) &&
+            typeof (parsed as Record<string, unknown>).schemaVersion === 'number' &&
+            Number.isSafeInteger((parsed as Record<string, unknown>).schemaVersion) &&
+            ((parsed as Record<string, unknown>).schemaVersion as number) > 1
+          ) {
+            return { status: 'unknown-version' };
+          }
+          return { status: 'ok', ledger: parsed };
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { status: 'absent' } : { status: 'unreadable' };
+        }
+      }
+    : undefined;
   const manageCutover = new ManageCutoverUseCase({
     cutoverRepo: cutoverRecordRepository,
     cutoverJournal,
@@ -1641,6 +1687,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: daemon.now,
     ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
     ...(countUnrecordedLanes === undefined ? {} : { countUnrecordedLanes }),
+    ...(readRetirementLedger === undefined ? {} : { readRetirementLedger }),
   });
 
   const reviewLocator = reviewLocatorRef.locator;

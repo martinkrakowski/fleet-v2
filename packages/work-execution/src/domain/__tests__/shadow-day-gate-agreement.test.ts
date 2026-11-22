@@ -67,6 +67,7 @@ function verdict(
     falsePasses: 0,
     stricterFails: 0,
     unsettled: 0,
+    truncated: false,
     ...counts,
   };
 }
@@ -260,7 +261,8 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
 
   it('more divergences than SHADOW_DIVERGENCE_MAX is unknown/gate-comparison-incomplete', () => {
     // The comparator lists only SHADOW_DIVERGENCE_MAX divergences. `compared`
-    // stays the full total, so agreeing is the remainder past that cap.
+    // stays the full total, but a truncated head is never counted as agreeing:
+    // the result is `truncated: true` with `agreeing: 0`.
     const headCount = SHADOW_DIVERGENCE_MAX + 1;
     const heads = Array.from({ length: headCount }, (_, index) =>
       head(index + 1, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
@@ -268,8 +270,9 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
       verdict('unknown', 'gate-comparison-incomplete', {
         compared: headCount,
-        agreeing: headCount - SHADOW_DIVERGENCE_MAX,
+        agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
+        truncated: true,
       }),
     );
   });
@@ -284,18 +287,38 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     expect(fewer).toEqual(
       verdict('unknown', 'gate-comparison-incomplete', {
         compared: SHADOW_DIVERGENCE_MAX + 1,
-        agreeing: 1,
+        agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
+        truncated: true,
       }),
     );
     expect(more).toEqual(
       verdict('unknown', 'gate-comparison-incomplete', {
         compared: SHADOW_DIVERGENCE_MAX + 2,
-        agreeing: 2,
+        agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
+        truncated: true,
       }),
     );
     expect(fewer).not.toEqual(more);
+  });
+
+  it('mixed truncated divergences plus agreeing heads are unknown/gate-comparison-incomplete with agreeing 0', () => {
+    // 51 diverging heads (all false passes) plus 30 agreeing heads spread
+    // over the window. The comparator truncates at SHADOW_DIVERGENCE_MAX, so
+    // the 30 agreeing heads are never counted: `agreeing` is 0.
+    const diverging = Array.from({ length: SHADOW_DIVERGENCE_MAX + 1 }, (_, index) =>
+      head(index + 1, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
+    );
+    const heads = [...diverging, ...agreeing(SHADOW_GATE_MIN_AGREEING_HEADS, SHADOW_DIVERGENCE_MAX + 2)];
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
+      verdict('unknown', 'gate-comparison-incomplete', {
+        compared: SHADOW_DIVERGENCE_MAX + 1 + SHADOW_GATE_MIN_AGREEING_HEADS,
+        agreeing: 0,
+        falsePasses: SHADOW_DIVERGENCE_MAX,
+        truncated: true,
+      }),
+    );
   });
 
   it('an empty heads list is unknown/no-settled-heads', () => {
@@ -368,6 +391,33 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     const enormous: unknown[] = [];
     Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
     expect(evaluateShadowGateAgreement(gateInput(enormous))).toEqual(INVALID);
+  });
+
+  it('a symbol own key on the heads list is unknown/invalid-input', () => {
+    const heads: unknown[] = agreeing(1);
+    Object.defineProperty(heads, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+  });
+
+  it('a non-enumerable extra own key on the heads list is unknown/invalid-input', () => {
+    const heads: unknown[] = agreeing(1);
+    Object.defineProperty(heads, 'extra', { value: 1, enumerable: false, configurable: true, writable: true });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+  });
+
+  it('a list-level accessor element refuses the heads list (unknown/invalid-input)', () => {
+    const heads: unknown[] = agreeing(1);
+    let accessorCalls = 0;
+    Object.defineProperty(heads, 0, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        accessorCalls += 1;
+        return head(1);
+      },
+    });
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(INVALID);
+    expect(accessorCalls).toBe(0);
   });
 
   it('a getter on the root never runs', () => {

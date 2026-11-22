@@ -190,6 +190,8 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     const temp = path.join(input.root, `.${CURRENT_NAME}.${randomSuffix()}.tmp`);
     const opsDir = path.join(input.root, OPS_DIR);
     const markerPath = path.join(opsDir, CURRENT_OP_NAME);
+    let previousMarker: string | null = null;
+    let markerWritten = false;
     try {
       const existing = await lstatOrNull(path.join(input.root, CURRENT_NAME));
       if (existing !== null && !existing.isSymbolicLink()) {
@@ -207,7 +209,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       // marker claiming a repoint that did not land (fail-closed: a failed
       // repoint must not appear to be the operation that last wrote
       // `current`).
-      const previousMarker = await readSmall(markerPath);
+      previousMarker = await readSmall(markerPath);
       await fs.symlink(input.sha, temp);
       await fs.mkdir(opsDir, { recursive: true });
       await writeAtomically(
@@ -215,6 +217,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
         CURRENT_OP_NAME,
         JSON.stringify({ version: 1, sha: input.sha, opId: input.opId ?? null }),
       );
+      markerWritten = true;
       if (input.fence !== undefined && !(await passesFence(input.fence))) {
         await fs.rm(temp, { force: true }).catch(() => undefined);
         if (previousMarker === null) {
@@ -229,6 +232,13 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       return { outcome: 'ok' };
     } catch {
       await fs.rm(temp, { force: true }).catch(() => undefined);
+      if (markerWritten) {
+        if (previousMarker === null) {
+          await fs.rm(markerPath, { force: true }).catch(() => undefined);
+        } else {
+          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker).catch(() => undefined);
+        }
+      }
       return { outcome: 'unreadable' };
     }
   }

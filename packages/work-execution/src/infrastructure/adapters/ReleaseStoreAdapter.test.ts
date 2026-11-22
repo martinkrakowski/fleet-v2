@@ -403,6 +403,50 @@ describe('ReleaseStoreAdapter', () => {
     expect((await fs.readdir(path.join(root, A))).includes('.fleet-release-verified')).toBe(true);
   });
 
+  it('repoint restores the previous current-op.json marker when the rename fails', async () => {
+    const blockingFence = async () => {
+      // Replace `current` with a non-empty directory so the pre-rename
+      // `list`/`lstatOrNull` checks pass but `fs.rename` fails.
+      await fs.rm(path.join(targetRoot, 'current'), { force: true });
+      await fs.mkdir(path.join(targetRoot, 'current', 'nested'), { recursive: true });
+      return true;
+    };
+    // Case 1: a previous marker exists and must be restored.
+    let targetRoot = root;
+    await verified('a', 1);
+    await verified('b', 2);
+    expect(await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) })).toEqual({ outcome: 'ok' });
+    expect(await adapter.repoint({ root, sha: B, opId: 'b'.repeat(32), fence: blockingFence })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({
+      outcome: 'read',
+      sha: A,
+      opId: 'a'.repeat(32),
+    });
+    // Case 2: no previous marker exists, so the new marker must be removed.
+    const root2 = path.join(tempDir, 'releases-2');
+    targetRoot = root2;
+    const prepared2 = await adapter.prepare({ root: root2, sha: A });
+    if (prepared2.outcome !== 'prepared') {
+      throw new Error('prepare refused for root2');
+    }
+    const entry2 = path.join(prepared2.buildDir, 'apps', 'cli', 'dist');
+    await fs.mkdir(entry2, { recursive: true });
+    await fs.writeFile(path.join(entry2, 'bin.js'), '// cli\n');
+    expect(
+      await adapter.markVerified({ root: root2, sha: A, buildId: prepared2.buildId, builtAtIso: at(1) }),
+    ).toEqual({ outcome: 'ok' });
+    expect(
+      await adapter.repoint({ root: root2, sha: A, opId: 'a'.repeat(32), fence: blockingFence }),
+    ).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp({ root: root2 })).toEqual({ outcome: 'none' });
+    expect(
+      await adapter.repoint({ root: root2, sha: A, opId: 'a'.repeat(32), fence: blockingFence }),
+    ).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.readLastCurrentOp({ root: root2 })).toEqual({ outcome: 'none' });
+  });
+
   it('readLastCurrentOp returns none when no marker exists', async () => {
     await verified('a', 1);
     expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });

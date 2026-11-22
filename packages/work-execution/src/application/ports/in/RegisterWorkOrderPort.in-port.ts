@@ -104,7 +104,9 @@ export type RegisterWorkOrderResult =
         | 'invalid-pull-request-title'
         | 'held-request-mismatch'
         | 'intent-digest-mismatch'
-        | 'store-unavailable';
+        | 'store-unavailable'
+        | 'malformed-profile'
+        | 'unsupported-profile-base';
     }
   | { readonly outcome: 'rejected'; readonly reason: string };
 

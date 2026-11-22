@@ -7,8 +7,7 @@
 
 import type { PlanRef, WorkOrderRecord, WorkOrderRisk } from '../execution-records.js';
 import { resolveWorkOrderRisk } from '../execution-records.js';
-import type { BaseBranchValue } from '../base-branch.js';
-import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch, resolveWorkOrderBaseBranch } from '../base-branch.js';
+import { BASE_BRANCH_INVALID_MESSAGE, isSafeWorkOrderBranchName, resolveWorkOrderBaseBranch } from '../base-branch.js';
 import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.js';
 import { parsePullRequestTitle } from '../held-work-order.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
@@ -58,7 +57,7 @@ export class WorkOrder {
         throw new Error('WorkOrder cannot supersede itself');
       }
     }
-    if (Object.hasOwn(record, 'baseBranch') && parseBaseBranch(record.baseBranch) === undefined) {
+    if (Object.hasOwn(record, 'baseBranch') && !isSafeWorkOrderBranchName(record.baseBranch)) {
       throw new Error('WorkOrder ' + BASE_BRANCH_INVALID_MESSAGE);
     }
     if (Object.hasOwn(record, 'pullRequestTitle') && !parsePullRequestTitle(record.pullRequestTitle).ok) {
@@ -93,7 +92,7 @@ export class WorkOrder {
   }
 
   /** The registered base branch; a record stored without one is `main` (lane CB1). */
-  getBaseBranch(): BaseBranchValue {
+  getBaseBranch(): string {
     return resolveWorkOrderBaseBranch(this.record);
   }
 
@@ -129,7 +128,7 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
     planRef?: PlanRef;
     risk?: WorkOrderRisk;
     supersedesWorkOrderId?: string;
-    baseBranch?: BaseBranchValue;
+    baseBranch?: string;
     pullRequestTitle?: string;
   } = {
     id: record.id,

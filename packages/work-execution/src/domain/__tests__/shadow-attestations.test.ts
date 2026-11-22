@@ -8,6 +8,7 @@ import {
   SHADOW_ATTESTATION_FACTS,
   SHADOW_ATTESTATION_SCHEMA_VERSION,
   SHADOW_ONE_TIME_CRITERIA,
+  SHADOW_ONE_TIME_MAX_PATH_LENGTH,
   SHADOW_ONE_TIME_MAX_TESTS,
   SHADOW_ONE_TIME_REQUIREMENTS,
   evaluateShadowOneTimeCriteria,
@@ -281,6 +282,25 @@ describe('shadow attestation ledger (SH15a)', () => {
     it('never runs a getter planted as an extra enumerable property on the attestations array', () => {
       const attestations = [rawAttestation()];
       const calls = plantGetter(attestations, 'extra', 1);
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+      expect(calls()).toBe(0);
+    });
+
+    it('refuses a symbol own key on the attestations array with invalid-ledger', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      Object.defineProperty(attestations, Symbol('tag'), { value: 1, enumerable: false, configurable: true });
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('refuses a non-enumerable extra own key on the attestations array with invalid-ledger', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      Object.defineProperty(attestations, 'hidden', { value: 1, enumerable: false, configurable: true, writable: true });
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('refuses the whole attestations list when an accessor element is present (invalid-ledger)', () => {
+      const attestations: unknown[] = [rawAttestation()];
+      const calls = plantGetter(attestations, '0', rawAttestation());
       expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
       expect(calls()).toBe(0);
     });
@@ -1117,6 +1137,27 @@ describe('evaluateShadowOneTimeCriteria (SH15b)', () => {
       S11: { status: 'unknown', reason: 'invalid-input' },
     });
     expect(JSON.stringify(result).includes('sk-')).toBe(false);
+  });
+
+  it('a release-test path over SHADOW_ONE_TIME_MAX_PATH_LENGTH is invalid-input and is not echoed', () => {
+    const overCapPath = `${S2_TEST}${'x'.repeat(SHADOW_ONE_TIME_MAX_PATH_LENGTH + 1 - S2_TEST.length)}`;
+    expect(overCapPath.length).toBe(SHADOW_ONE_TIME_MAX_PATH_LENGTH + 1);
+    const input = passingInput({
+      releaseTests: [releaseTest(overCapPath), releaseTest(S10_TEST), releaseTest(S11_TEST)],
+    });
+    expectCodes(input, { S2: INVALID, S3: INVALID, S10: INVALID, S11: INVALID });
+    expect(JSON.stringify(evaluateShadowOneTimeCriteria(input)).includes(overCapPath)).toBe(false);
+  });
+
+  it('a release-test path of exactly SHADOW_ONE_TIME_MAX_PATH_LENGTH is accepted as an extra entry', () => {
+    const cappedPath = `${S2_TEST}${'x'.repeat(SHADOW_ONE_TIME_MAX_PATH_LENGTH - S2_TEST.length)}`;
+    expect(cappedPath.length).toBe(SHADOW_ONE_TIME_MAX_PATH_LENGTH);
+    expectCodes(passingInput({ releaseTests: [releaseTest(cappedPath), ...presentTests()] }), {
+      S2: PRESENT,
+      S3: PRESENT,
+      S10: PRESENT,
+      S11: PRESENT,
+    });
   });
 
   it('SHADOW_ONE_TIME_REQUIREMENTS is frozen and names exactly the reserved paths', () => {

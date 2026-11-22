@@ -8,15 +8,18 @@
  */
 
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   ActionAuthorizationAdapter,
   ConductorDriverLeaseAdapter,
+  LocalExecutor,
   ManageReleaseUseCase,
   ReleaseStoreAdapter,
   consumptionId,
@@ -43,6 +46,72 @@ const releaseGrantId = (scope: string, projectId: string, sha: string, root: str
   `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root, nonce }))}`;
 
 const NOW = '2026-11-10T10:00:00.000Z';
+
+const execGit = promisify(execFile);
+
+/**
+ * BL09 #7: the build script committed into the fixture repository. It is
+ * extracted from the archived commit by the real `git archive` + `tar -xf`
+ * steps and then run by the real local `node`, so the CLI entry that
+ * `markVerified` checks is genuinely built from the archived tree.
+ */
+const BUILD_SCRIPT = [
+  "const { mkdirSync, writeFileSync } = require('node:fs');",
+  "const { join } = require('node:path');",
+  "mkdirSync(join('apps', 'cli', 'dist'), { recursive: true });",
+  "writeFileSync(join('apps', 'cli', 'dist', 'bin.js'), '// built from the archived commit\\n');",
+  '',
+].join('\n');
+
+/** The variant that succeeds without leaving the CLI entry, so only verify can catch it. */
+const BUILD_SCRIPT_NO_OUTPUT = [
+  "const { mkdirSync } = require('node:fs');",
+  "const { join } = require('node:path');",
+  "mkdirSync(join('apps', 'cli', 'dist'), { recursive: true });",
+  '',
+].join('\n');
+
+/**
+ * BL09 #7: a real executor for the four reviewed build steps. `git archive`
+ * and `tar -xf` run for real through the `LocalExecutor`; `yarn install` is
+ * the only stand-in (the fixture declares no dependencies, and the host must
+ * not need a yarn binary); `yarn build` is rewritten to the real local
+ * `node` run of the build script the archive carried.
+ */
+class RealArchiveExecutor implements CommandExecutorPort {
+  private readonly local = new LocalExecutor();
+  readonly argvs: string[][] = [];
+  /** false substitutes a build script that leaves no CLI entry. */
+  buildWritesOutput = true;
+  async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
+    this.argvs.push([...argv]);
+    if (argv[0] === 'yarn' && argv[1] === 'install') {
+      return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+    }
+    if (argv[0] === 'yarn' && argv[1] === 'build' && options?.cwd !== undefined) {
+      const script = this.buildWritesOutput ? 'scripts/build.js' : 'scripts/build-no-output.js';
+      return this.local.run(['node', script], options);
+    }
+    return this.local.run(argv, options);
+  }
+}
+
+/** A temporary real git repository whose HEAD commit carries the build scripts; returns its head sha. */
+async function realRepo(): Promise<{ dir: string; sha: string }> {
+  const dir = await tempDir('co14b-repo-');
+  const opts = { cwd: dir } as const;
+  await execGit('git', ['-c', 'init.defaultBranch=main', 'init', dir]);
+  await execGit('git', ['config', 'user.email', 'fixture@example.invalid'], opts);
+  await execGit('git', ['config', 'user.name', 'Fixture'], opts);
+  await mkdir(join(dir, 'scripts'), { recursive: true });
+  await writeFile(join(dir, 'scripts', 'build.js'), BUILD_SCRIPT, 'utf8');
+  await writeFile(join(dir, 'scripts', 'build-no-output.js'), BUILD_SCRIPT_NO_OUTPUT, 'utf8');
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'fixture', private: true }), 'utf8');
+  await execGit('git', ['add', '.'], opts);
+  await execGit('git', ['commit', '-m', 'fixture'], opts);
+  const { stdout } = await execGit('git', ['rev-parse', 'HEAD'], opts);
+  return { dir, sha: stdout.trim() };
+}
 
 let dirs: string[] = [];
 
@@ -550,6 +619,171 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: shaA });
     // No build was started for the refused release.
     expect(h.executor.argvs).toHaveLength(installsRan);
+  });
+});
+
+/**
+ * BL09 #7: the same release install driven over a real git repository, with
+ * the real `git archive` and `tar -xf` steps and a real local `node` build
+ * script, so the CLI entry `ReleaseStoreAdapter.markVerified` checks is
+ * genuinely extracted and built from the archived commit sha.
+ */
+describe('release install over a real archive, extract, build and verify (BL09 #7)', () => {
+  const nodeBin = dirname(process.execPath);
+
+  async function realHarness(): Promise<{
+    useCase: ManageReleaseUseCase;
+    executor: RealArchiveExecutor;
+    grants: CoordinationRequestRepositoryAdapter;
+    signer: SignedDecisionFixture;
+    root: string;
+    store: ReleaseStoreAdapter;
+    repo: { dir: string; sha: string };
+  }> {
+    const stateDir = await tempDir('co14b-real-state-');
+    const root = await tempDir('co14b-real-root-');
+    const repo = await realRepo();
+    const grants = new CoordinationRequestRepositoryAdapter({ stateDir });
+    const signer = createSignedDecisionFixture({ decisionsDir: join(stateDir, 'decisions') });
+    const executor = new RealArchiveExecutor();
+    const authorization = new ActionAuthorizationAdapter({
+      resolveGrant: async (request) => {
+        const actionScope = releaseActionScope(request.actionKind);
+        if (actionScope === null) {
+          return { outcome: 'blocked', reason: 'not a release action' };
+        }
+        const result = await new ResolveActionAuthorizationUseCase({
+          requestRepo: grants,
+          ...signer.deps,
+          computeDigest: digest,
+        }).resolveActionAuthorization({
+          projectId: request.projectId,
+          actionScope,
+          expectedHeadSha: request.expectedHeadSha,
+          attemptId: request.attemptId,
+          releaseRoot: request.releaseRoot,
+          resumeActionId: request.actionId,
+        });
+        return result.outcome === 'authorized'
+          ? {
+              outcome: 'granted',
+              authorizationGrantId: result.grantId,
+              ...(result.releaseRoot !== undefined ? { releaseRoot: result.releaseRoot } : {}),
+            }
+          : { outcome: 'blocked', reason: result.reason };
+      },
+      consumeGrant: async (request) => {
+        const actionScope = releaseActionScope(request.actionKind);
+        if (actionScope === null || request.expectedHeadSha === undefined) {
+          return { outcome: 'refused', reason: 'not a release grant consumption' };
+        }
+        const result = await new RecordAuthorizationConsumptionUseCase({
+          requestRepo: grants,
+          ...signer.deps,
+          computeDigest: digest,
+        }).recordAuthorizationConsumption({
+          consumptionId: consumptionId(request.actionId),
+          grantId: request.authorizationGrantId,
+          actionId: request.actionId,
+          actionScope,
+          attemptId: request.attemptId ?? request.actionId,
+          expectedHeadSha: request.expectedHeadSha,
+          releaseRoot: request.releaseRoot,
+        });
+        return result.outcome === 'consumed'
+          ? { outcome: 'consumed', actionId: request.actionId }
+          : { outcome: 'refused', reason: result.reason };
+      },
+    });
+    const useCase = new ManageReleaseUseCase({
+      store: new ReleaseStoreAdapter(),
+      lease: new ConductorDriverLeaseAdapter({ stateDir }),
+      authorization,
+      executor,
+      nowIso: () => NOW,
+      // The local node binary must be on the child PATH: it is not /usr/bin.
+      env: () => ({ PATH: `${nodeBin}:/usr/bin` }),
+      stateDir,
+    });
+    return { useCase, executor, grants, signer, root, store: new ReleaseStoreAdapter(), repo };
+  }
+
+  const seedGrant = async (h: Awaited<ReturnType<typeof realHarness>>, record: CoordinationRequestRecord): Promise<void> => {
+    await h.grants.saveRequest(record);
+    await h.signer.writeApprovedAnswer(record);
+    await h.signer.assertApprovedAnswerReadsBackApproved(record);
+  };
+
+  it('a real git archive and tar extract produce a build verified from the archived commit sha', async () => {
+    const h = await realHarness();
+    await seedGrant(h, releaseGrant('grant-real', 'release:install', h.repo.sha, h.root));
+    const result = await h.useCase.manageRelease({
+      action: 'install',
+      root: h.root,
+      sha: h.repo.sha,
+      source: h.repo.dir,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    expect(result.outcome).toBe('applied');
+    // The archived tree was really extracted: the CLI entry exists under the
+    // build and carries the content the archived build script writes.
+    const entry = await readFile(join(h.root, h.repo.sha, 'apps', 'cli', 'dist', 'bin.js'), 'utf8');
+    expect(entry).toContain('// built from the archived commit');
+    // markVerified wrote the verification marker naming the sha.
+    expect(await readFile(join(h.root, h.repo.sha, '.fleet-release-verified'), 'utf8')).toContain(h.repo.sha);
+    // The real steps ran in order: git archive, then tar extract.
+    expect(h.executor.argvs[0].slice(0, 2)).toEqual(['git', '-c']);
+    expect(h.executor.argvs[0]).toContain('archive');
+    expect(h.executor.argvs[1][0]).toBe('tar');
+    // Install never moves `current`.
+    expect(await readlinkSha(h.root)).toBeNull();
+    expect((await h.grants.findRequestByGrantId('grant-real'))?.consumptions).toHaveLength(1);
+  });
+
+  it('a real archive whose build leaves no CLI entry is refused and installs nothing', async () => {
+    const h = await realHarness();
+    h.executor.buildWritesOutput = false;
+    await seedGrant(h, releaseGrant('grant-real', 'release:install', h.repo.sha, h.root));
+    const result = await h.useCase.manageRelease({
+      action: 'install',
+      root: h.root,
+      sha: h.repo.sha,
+      source: h.repo.dir,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
+    // The real archive and extract ran, but verification refused the build.
+    expect(h.executor.argvs[0]).toContain('archive');
+    expect(h.executor.argvs[1][0]).toBe('tar');
+    await expect(readFile(join(h.root, h.repo.sha, '.fleet-release-verified'), 'utf8')).rejects.toThrow();
+    expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
+    expect((await h.grants.findRequestByGrantId('grant-real'))?.consumptions).toHaveLength(1);
+  });
+
+  it('a missing sha makes the real git archive fail, the install is refused and no build tree is left', async () => {
+    const h = await realHarness();
+    const missing = shaOf('f');
+    await seedGrant(h, releaseGrant('grant-missing', 'release:install', missing, h.root));
+    const result = await h.useCase.manageRelease({
+      action: 'install',
+      root: h.root,
+      sha: missing,
+      source: h.repo.dir,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
+    // The sequence stopped at the failing archive step: tar never ran.
+    expect(h.executor.argvs).toHaveLength(1);
+    expect(h.executor.argvs[0]).toContain('archive');
+    expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
+    expect(await readlinkSha(h.root)).toBeNull();
+    expect((await h.grants.findRequestByGrantId('grant-missing'))?.consumptions).toHaveLength(1);
   });
 });
 

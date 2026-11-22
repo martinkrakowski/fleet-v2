@@ -49,6 +49,7 @@ export interface ConductorHaltAdapterOptions {
 const DEFAULT_FILE_NAME = 'conductor-halt.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -98,7 +99,17 @@ function stateOfRecord(record: ConductorHaltRecord | null): ConductorHaltState {
 export class ConductorHaltAdapter implements ConductorHaltPort {
   private inMemoryRecord: ConductorHaltRecord | null = null;
 
-  constructor(private readonly options: ConductorHaltAdapterOptions = {}) {}
+  constructor(private readonly options: ConductorHaltAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error('ConductorHaltAdapter refuses a fileName that collides with another store');
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('ConductorHaltAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async read(): Promise<ConductorHaltState> {
     const target = this.statePath;

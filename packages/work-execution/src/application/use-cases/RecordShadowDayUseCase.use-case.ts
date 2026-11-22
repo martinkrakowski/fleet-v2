@@ -1328,24 +1328,50 @@ function serialOfUtcDay(day: string): number {
   return Math.floor(Date.parse(`${day}T00:00:00.000Z`) / DAY_MS);
 }
 
+/** BL01: the own-key cap on the raw request snapshot (cost bound, O(1)). */
+const MAX_REQUEST_OWN_KEYS = 8;
+/** BL01: the own-key cap on the raw `repository` snapshot. */
+const MAX_REPOSITORY_OWN_KEYS = 4;
+/** Own keys that must never be read: each can reach `Object.prototype` or a constructor. */
+const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
 /**
- * OD7a2 fix round: the request is SNAPSHOT ONCE at entry. Each field is read
+ * OD7a2 fix round, extended by BL01: the request is SNAPSHOT ONCE at entry.
+ * Every own key is enumerated once (`Reflect.ownKeys`) and each field is read
  * exactly once through its own data-property descriptor
  * (`Object.getOwnPropertyDescriptor` never runs a getter and, on a plain
  * record, never a Proxy `get` trap), an accessor property is refused, and a
  * non-plain prototype (or a non-object, or a throwing Proxy descriptor trap)
- * is refused. `resolveDay` and every later use receive the snapshot — never
- * the raw request — so a `scheduled` getter that flips between reads cannot
- * pass validation and then skip the scheduled guards. Cost is O(1): a fixed
- * five-field list, one prototype check, five own-descriptor reads.
+ * is refused. BL01 adds the own-key guards BEFORE any field is read: more
+ * than `MAX_REQUEST_OWN_KEYS` own keys, any symbol key, or any
+ * prototype-polluting key (`__proto__`, `constructor`, `prototype`) is
+ * refused; unknown extra own data keys within the cap are ignored. The
+ * `repository` field, when present, is itself snapshotted the same way under
+ * `MAX_REPOSITORY_OWN_KEYS` and replaced with a fresh plain
+ * `{ owner, repo }` object validated by `isValidRepositoryRef` — so no later
+ * step ever touches the raw repository object or runs one of its getters.
+ * `resolveDay` and every later use receive the snapshot — never the raw
+ * request — so a `scheduled` getter that flips between reads cannot pass
+ * validation and then skip the scheduled guards, and a `repository` getter
+ * that swaps owners between reads cannot either. Cost is O(1), bounded by
+ * the named constants `MAX_REQUEST_OWN_KEYS` and `MAX_REPOSITORY_OWN_KEYS`:
+ * at most that many own-key enumerations and descriptor reads per object,
+ * one prototype check per object.
  */
 function snapshotRequest(request: unknown): RecordShadowDayRequest | null {
   try {
     if (!isPlainRecordObject(request)) {
       return null;
     }
+    const ownKeys = Reflect.ownKeys(request);
+    if (ownKeys.length > MAX_REQUEST_OWN_KEYS) {
+      return null;
+    }
     const snapshot: Record<string, unknown> = {};
-    for (const key of ['repository', 'legacyStateDir', 'day', 'deadlineIso', 'scheduled']) {
+    for (const key of ownKeys) {
+      if (typeof key === 'symbol' || PROTOTYPE_POLLUTING_KEYS.has(key)) {
+        return null;
+      }
       const descriptor = Object.getOwnPropertyDescriptor(request, key);
       if (descriptor === undefined) {
         continue;
@@ -1354,6 +1380,36 @@ function snapshotRequest(request: unknown): RecordShadowDayRequest | null {
         return null;
       }
       snapshot[key] = descriptor.value;
+    }
+    const rawRepository = snapshot.repository;
+    if (rawRepository !== undefined) {
+      if (!isPlainRecordObject(rawRepository)) {
+        return null;
+      }
+      const repositoryKeys = Reflect.ownKeys(rawRepository);
+      if (repositoryKeys.length > MAX_REPOSITORY_OWN_KEYS) {
+        return null;
+      }
+      const repositorySnapshot: Record<string, unknown> = {};
+      for (const key of repositoryKeys) {
+        if (typeof key === 'symbol' || PROTOTYPE_POLLUTING_KEYS.has(key)) {
+          return null;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(rawRepository, key);
+        if (descriptor === undefined) {
+          continue;
+        }
+        if (descriptor.get !== undefined || descriptor.set !== undefined) {
+          return null;
+        }
+        repositorySnapshot[key] = descriptor.value;
+      }
+      const owner = repositorySnapshot.owner;
+      const repo = repositorySnapshot.repo;
+      if (!isValidRepositoryRef({ owner, repo })) {
+        return null;
+      }
+      snapshot.repository = { owner: owner as string, repo: repo as string };
     }
     return snapshot as unknown as RecordShadowDayRequest;
   } catch {
@@ -1378,7 +1434,9 @@ function readScheduledFlag(request: RecordShadowDayRequest): boolean | 'invalid'
 export class RecordShadowDayUseCase implements RecordShadowDayPort {
   constructor(private readonly deps: RecordShadowDayDependencies) {}
 
-  async execute(request: RecordShadowDayRequest): Promise<RecordShadowDayResult> {
+  // BL01: the boundary takes `unknown` — every hostile shape is refused as a
+  // typed `invalid-request` result by `snapshotRequest`, never a throw.
+  async execute(request: unknown): Promise<RecordShadowDayResult> {
     try {
       return await this.run(request);
     } catch (error) {
@@ -1389,9 +1447,10 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
   }
 
-  private async run(rawRequest: RecordShadowDayRequest): Promise<RecordShadowDayResult> {
-    // OD7a2 fix round: the request is read once, at entry, into a plain
-    // snapshot; the raw request is never touched again.
+  private async run(rawRequest: unknown): Promise<RecordShadowDayResult> {
+    // OD7a2 fix round, extended by BL01: the request is read once, at entry,
+    // into a plain snapshot (including the repository); the raw request is
+    // never touched again.
     const request = snapshotRequest(rawRequest);
     if (request === null) {
       return refusedResult('invalid-request');
@@ -2738,7 +2797,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     return refusedResult(reason);
   }
 
-  /** The use-case answer for a compare-and-set refusal code. */
+  /**
+   * The use-case answer for a compare-and-set refusal code. BL01 note: the
+   * fall-through maps `'read-only'` to `unknownResult('ledger-busy')` —
+   * harmless against the local file adapter (a read-only flag there is the
+   * same "cannot write now" condition the busy code reports), but worth
+   * revisiting if a non-local `ShadowEvidencePort` adapter is added with a
+   * distinct read-only semantics.
+   */
   private casRefusal(reason: 'invalid-request' | 'invalid-ledger' | 'unknown-version' | 'unreadable' | 'read-only' | 'deadline-exceeded'): RecordShadowDayResult {
     if (reason === 'deadline-exceeded') {
       return unknownResult('deadline-exceeded');
@@ -2851,6 +2917,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         saved = { kind: 'threw' };
       }
       if (saved.kind === 'threw') {
+        // BL01 note: a thrown `compareAndSet` maps to
+        // `unknownResult('ledger-unreadable')` — harmless against the local
+        // file adapter (the only failure mode of a local store is "could not
+        // read or write the file"), but worth revisiting if a non-local
+        // `ShadowEvidencePort` adapter is added with distinct failure modes.
         return unknownResult('ledger-unreadable');
       }
       if (saved.value.outcome === 'saved') {

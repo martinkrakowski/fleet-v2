@@ -419,6 +419,7 @@ describe('readFrozenBriefVerified (SEC-3b)', () => {
     await expect(readFrozenBriefVerified(attempt, harness.artifactPort)).resolves.toEqual({
       kind: 'verified',
       prose: PROSE,
+      manifestRaw: DEFAULT_MANIFEST_JSON,
       manifest: MANIFEST,
     });
     // the prose is returned as read, through the recorded host
@@ -433,6 +434,7 @@ describe('readFrozenBriefVerified (SEC-3b)', () => {
     await expect(readFrozenBriefVerified(attempt, harness.artifactPort)).resolves.toEqual({
       kind: 'verified',
       prose: '  # brief with padding\n\n',
+      manifestRaw: DEFAULT_MANIFEST_JSON,
       manifest: MANIFEST,
     });
   });

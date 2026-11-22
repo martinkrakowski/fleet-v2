@@ -13,7 +13,7 @@ import { compareShadowMergeSets } from './shadow-comparators.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { SHELL_DETAIL_CODES, SHELL_TRAIN_EVENT_KINDS } from './shell-train-events.js';
 import type { ShellTrainEvent } from './shell-train-events.js';
-import { readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 
 /**
  * How far past either midnight boundary a shell merge or fleet would-merge
@@ -62,35 +62,22 @@ function evaluation(status: ShadowCriterionEvaluation, merges: number, excluded:
 
 const INVALID = (): ShadowDayMergeSetEvaluation => evaluation({ status: 'unknown', reason: 'invalid-input' }, 0, 0, 0, 0);
 
-/** The own data-property element at `index`; a hole or an accessor reads as undefined. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
-}
-
 /**
- * A real, dense array within `SHADOW_MERGE_SET_MAX_ITEMS`, or null for any
- * stand-in. Reads only the `length` own descriptor and `Object.keys` (no
- * values), so no getter and no Proxy `get` trap ever runs; an oversized,
- * sparse or accessor-backed array is refused from its length alone, before
- * any element is touched.
+ * A real, dense array within `SHADOW_MERGE_SET_MAX_ITEMS` as a fresh dense
+ * copy, or null for any stand-in. Delegates to the shared
+ * `readBoundedDenseArray`: an `O(1)` length/prototype pre-gate, the accepted
+ * `O(K)` engine bound of the single `Reflect.ownKeys` call (K = the target's
+ * own-property count) that rejects foreign named, symbol and non-enumerable
+ * keys, then an `O(cap)` per-index descriptor traversal over
+ * `SHADOW_MERGE_SET_MAX_ITEMS`. Symbol keys and non-enumerable extra keys —
+ * which the previous `Object.keys` count ignored — are now refused, and an
+ * accessor element refuses the whole list before any element reader runs.
+ * The returned `array` is a fresh dense copy this module created, so plain
+ * indexed reads on it can never run a getter or a Proxy `get` trap.
  */
 function boundedArray(value: unknown, cap: number): readonly unknown[] | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    !Number.isSafeInteger(lengthDescriptor.value) ||
-    lengthDescriptor.value > cap ||
-    Object.keys(value).length !== lengthDescriptor.value
-  ) {
-    return null;
-  }
-  return value as readonly unknown[];
+  const read = readBoundedDenseArray(value, cap);
+  return read === null ? null : read.array;
 }
 
 /** A real UTC calendar day `YYYY-MM-DD`, or null. */
@@ -244,11 +231,15 @@ function isOneWayMergeKeyFor(key: string, repoDigest: string): boolean {
  * S1, the merge set of one shadow day, over
  * `{ day, repoDigest, excludeBatchMerges, shell, fleet }`. Cost: linear in
  * the capped input — at most `SHADOW_MERGE_SET_MAX_ITEMS` events, results
- * and entries each are walked, and an oversized, sparse or non-dense array
- * is refused from its own `length` before any element is traversed. Every
+ * and entries each are walked. Each array read pays the accepted engine
+ * bound of `readBoundedDenseArray`: an `O(1)` length/prototype pre-gate,
+ * `O(K)` in the target's own-property count K for the single
+ * `Reflect.ownKeys` call, then `O(cap)` element traversal — so an oversized,
+ * sparse, extra-keyed or accessor-backed array is refused before any
+ * element is traversed. Every
  * value is read through its own property descriptor, so no getter ever runs
- * and a Proxy stand-in either is refused or yields exactly the plain data's
- * verdict. Never throws, never echoes the input.
+ * and a Proxy stand-in yields exactly the verdict of the data its own
+ * reflection reports. Never throws, never echoes the input.
  */
 export function evaluateShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
   try {
@@ -280,7 +271,7 @@ const SHELL_INCOMPLETE_PARSE: ParsedMergeSetInput = { kind: 'shell-incomplete' }
 function collectShellEvents(events: readonly unknown[]): readonly ShellTrainEvent[] | null {
   const shellEvents: ShellTrainEvent[] = [];
   for (let index = 0; index < events.length; index += 1) {
-    const event = readShellEvent(ownElement(events, index));
+    const event = readShellEvent(events[index]);
     if (event === null) {
       return null;
     }
@@ -293,7 +284,7 @@ function collectShellEvents(events: readonly unknown[]): readonly ShellTrainEven
 function collectFleetResults(results: readonly unknown[]): readonly Record<string, unknown>[] | null {
   const fleetResults: Record<string, unknown>[] = [];
   for (let index = 0; index < results.length; index += 1) {
-    const result = readFleetResult(ownElement(results, index));
+    const result = readFleetResult(results[index]);
     if (result === null) {
       return null;
     }
@@ -306,7 +297,7 @@ function collectFleetResults(results: readonly unknown[]): readonly Record<strin
 function collectFleetEntries(entries: readonly unknown[]): readonly { pullRequest: number; headOid: string }[] | null {
   const fleetEntries: { pullRequest: number; headOid: string }[] = [];
   for (let index = 0; index < entries.length; index += 1) {
-    const entry = readFleetEntry(ownElement(entries, index));
+    const entry = readFleetEntry(entries[index]);
     if (entry === null) {
       return null;
     }

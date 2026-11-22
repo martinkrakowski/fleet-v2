@@ -9,7 +9,7 @@
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { head12Of, parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_ONE_WAY_STEPS } from './lane-run-records.js';
-import { readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
@@ -223,11 +223,6 @@ interface Score {
   readonly unknownReason: string | null;
 }
 
-interface BoundedArray {
-  readonly array: readonly unknown[];
-  readonly length: number;
-}
-
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const HEAD_OID_PATTERN = /^[0-9a-f]{40}$/;
 const MIN_DAY_YEAR = 2000;
@@ -249,12 +244,16 @@ const REVIEW_RESULTS: readonly ReviewResult[] = ['pending', 'pass', 'fail', 'unk
 /**
  * S6' over `{ day, runs, merges, headMoves, headMovesIncompleteFor }`.
  * Window W is `[D-2 00:00Z, D+1 00:00Z)` and day D is `[D 00:00Z, D+1 00:00Z)`,
- * both computed with `Date.UTC`. Cost: linear in the capped input. Each list
- * is capped by `SHADOW_CONFORMANCE_MAX_RUNS`,
+ * both computed with `Date.UTC`. Cost: an `O(1)` length/prototype pre-gate,
+ * then the accepted `O(K)` engine bound of `Reflect.ownKeys` (where `K` is
+ * the target's own-property count), then `O(cap)` element traversal. Each
+ * list is capped by `SHADOW_CONFORMANCE_MAX_RUNS`,
  * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN` or
  * `SHADOW_CONFORMANCE_MAX_SHELL_FACTS`, and rule 1's walk is bounded by
- * `SHADOW_CONFORMANCE_MAX_HOPS`. An oversized, sparse or non-array list is
- * refused from its own `length` descriptor before any element is read.
+ * `SHADOW_CONFORMANCE_MAX_HOPS`. An oversized, sparse, accessor-carrying,
+ * non-enumerable-index, symbol-keyed, foreign-keyed, subclassed or
+ * non-array list is refused from its own `length` descriptor and prototype
+ * before any element is read.
  * Every value is read through its own property descriptor, so no getter
  * runs and a Proxy either is refused or yields the plain data's result
  * with no `get` trap. Never throws. Never echoes an input value. A set
@@ -886,53 +885,23 @@ function isReviewResult(value: unknown): value is ReviewResult {
 }
 
 /**
- * A dense array whose length is within `cap`, or null. Cost: constant before
- * the element loop — the length descriptor is read first, and an over-cap
- * length returns before `Object.keys` or any element. No getter and no
- * Proxy `get` trap runs.
+ * A dense array whose length is within `cap`, or null. Cost: an `O(1)`
+ * length/prototype pre-gate, then the accepted `O(K)` engine bound of
+ * `Reflect.ownKeys` (where `K` is the target's own-property count), then
+ * `O(cap)` element traversal — the length descriptor is read first, and an
+ * over-cap length returns before any key enumeration or element. No getter
+ * and no Proxy `get` trap runs.
  */
 function readCapped<T>(value: unknown, cap: number, readOne: (raw: unknown) => T | null): readonly T[] | null {
-  const bounded = boundedArray(value, cap);
+  const bounded = readBoundedDenseArray(value, cap);
   if (bounded === null) return null;
   const items: T[] = [];
   for (let index = 0; index < bounded.length; index += 1) {
-    const item = readOne(ownElement(bounded.array, index));
+    const item = readOne(bounded.array[index]);
     if (item === null) return null;
     items.push(item);
   }
   return items;
-}
-
-function boundedArray(value: unknown, cap: number): BoundedArray | null {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return null;
-  const length = ownLength(value, cap);
-  if (length === null) return null;
-  if (Object.keys(value).length !== length) return null;
-  return { array: value as readonly unknown[], length };
-}
-
-/** The array's own data `length` when it is an in-cap safe integer; otherwise null. */
-function ownLength(value: object, cap: number): number | null {
-  const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (!isCappedLength(descriptor, cap)) return null;
-  return descriptor.value;
-}
-
-function isCappedLength(descriptor: PropertyDescriptor | undefined, cap: number): descriptor is { value: number } {
-  return (
-    descriptor !== undefined &&
-    descriptor.get === undefined &&
-    typeof descriptor.value === 'number' &&
-    Number.isSafeInteger(descriptor.value) &&
-    descriptor.value >= 0 &&
-    descriptor.value <= cap
-  );
-}
-
-/** The own data-property element at `index`. A hole or an accessor reads as undefined. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
 function conformanceResult(

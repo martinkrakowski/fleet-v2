@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   MERGE_QUEUE_ENTRY_VERSION,
@@ -7,6 +7,7 @@ import {
   createUpdateSuccessorEntry,
   effectiveVerifiedHeadOid,
   findMergeQueueHead,
+  isMergeSafeId,
   orderMergeQueue,
   readMergeQueueEntryRecord,
 } from '../merge-queue-records.js';
@@ -217,7 +218,7 @@ describe('round-trip', () => {
     expect(result).toEqual({
       ok: false,
       reason: 'malformed',
-      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+      error: 'MergeQueueEntry exceeds its schema key count',
     });
   });
 });
@@ -327,7 +328,7 @@ describe('malformed refusals', () => {
   });
 
   it('refuses an extra key and a missing key', () => {
-    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry must have exactly the v1 entry keys');
+    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry exceeds its schema key count');
     const missingState = rawEntry();
     delete missingState.state;
     expectMalformed(missingState, 'MergeQueueEntry must have exactly the v1 entry keys');
@@ -389,10 +390,12 @@ describe('hostile inputs', () => {
     const input = makeEntry();
     Object.defineProperty(input, '__proto__', { value: 'polluted', enumerable: true, configurable: true });
     const result = readMergeQueueEntryRecord(input);
+    // The own `__proto__` key is an extra own key, so the bounded key-count
+    // refusal answers it with its own distinct message.
     expect(result).toEqual({
       ok: false,
       reason: 'malformed',
-      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+      error: 'MergeQueueEntry exceeds its schema key count',
     });
   });
 
@@ -707,5 +710,70 @@ describe('effectiveVerifiedHeadOid', () => {
   it('returns null when verifiedHeadOid is null or differs', () => {
     expect(effectiveVerifiedHeadOid({ headOid: HEAD, verifiedHeadOid: null, verifiedBy: null }, { requiresProcedure: false })).toBeNull();
     expect(effectiveVerifiedHeadOid({ headOid: HEAD, verifiedHeadOid: HEAD_2, verifiedBy: 'contexts' }, { requiresProcedure: false })).toBeNull();
+  });
+});
+
+describe('hostile-input bounds', () => {
+  /** A TextEncoder stand-in that counts constructions, so a test can prove
+   * the encoder is never reached on the hostile path. */
+  function stubCountingEncoder(): { calls: () => number } {
+    let count = 0;
+    class CountingTextEncoder {
+      encode(input: string = ''): Uint8Array {
+        count += 1;
+        return new Uint8Array(input.length);
+      }
+    }
+    vi.stubGlobal('TextEncoder', CountingTextEncoder);
+    return { calls: () => count };
+  }
+
+  it('refuses an oversized safe id without ever constructing the encoder', () => {
+    const encoder = stubCountingEncoder();
+    try {
+      expect(isMergeSafeId('a'.repeat(257))).toBe(false);
+      expect(encoder.calls()).toBe(0);
+      // At the cap the encoder is still consulted (multi-byte units can overflow it).
+      expect(isMergeSafeId('a'.repeat(256))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('refuses a veto receipt id longer than the cap without encoding', () => {
+    const encoder = stubCountingEncoder();
+    try {
+      const result = readMergeQueueEntryRecord(
+        rawEntry({
+          veto: { outcome: 'merge-safe', confidence: 0.5, mode: 'shadow', decisionReceiptId: 'r'.repeat(257) },
+        }),
+      );
+      expect(result.ok).toBe(false);
+      expect(encoder.calls()).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('refuses an entry record with 10,000 extra keys at the key-count check', () => {
+    const hostile = rawEntry();
+    for (let i = 0; i < 10_000; i += 1) {
+      hostile[`extra-${i}`] = i;
+    }
+    // Every expected key is present and valid, so the only possible refusal
+    // cause is the own-key count — checked before any descriptor or value read.
+    // The key-count refusal has its own distinct message; asserting it (and
+    // not a shared message) proves this bound check fired.
+    expectMalformed(hostile, 'MergeQueueEntry exceeds its schema key count');
+  });
+
+  it('refuses a nested repository record with 10,000 extra keys at the key-count check', () => {
+    const repository: Record<string, unknown> = { owner: 'fleet', repo: 'v2' };
+    for (let i = 0; i < 10_000; i += 1) {
+      repository[`extra-${i}`] = i;
+    }
+    // owner and repo are valid segments, so this refusal is the key count —
+    // its own distinct message, not the shared owner/repo refusal.
+    expectMalformed(rawEntry({ repository }), 'MergeQueueEntry repository exceeds its schema key count');
   });
 });

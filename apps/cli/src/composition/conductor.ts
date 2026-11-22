@@ -234,6 +234,9 @@ export function composeConductor(input: ComposeConductorInput) {
     // request id; an archive miss never changes the review outcome.
     archiveEvidence: (request: Parameters<typeof evidence.evidenceArchive.archiveEvidence>[0]) =>
       evidence.evidenceArchive.archiveEvidence(request),
+    // BL04: the attempt repository read a brief-check's briefText binding
+    // checks the recorded frozen-brief digest against.
+    findAttemptById: (attemptId: string) => attemptRepository.findAttemptById(attemptId),
   };
   const primaryApiReviewerModel = apiReviewerModels[0];
   const opencodeFallbackReviewerModel =

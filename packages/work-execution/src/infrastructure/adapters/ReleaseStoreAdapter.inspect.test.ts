@@ -296,20 +296,28 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
     await verifiedWith({ 'plain.test.ts': 'ok\n' });
     const buildDir = path.join(root, A);
     let swapped = false;
+    let pins = 0;
     hookRealpath(async (target) => {
-      if (!swapped && target === buildDir) {
-        swapped = true;
-        // A concurrent install replaces the whole verified tree, marker
-        // included, after the marker was accepted and before the files.
-        // Rename (as a real install does) keeps the old inode alive, so the
-        // new directory cannot reuse its identity.
-        await fs.rename(buildDir, buildDir + '.replaced-old');
-        await fs.mkdir(buildDir);
-        await fs.writeFile(
-          path.join(buildDir, '.fleet-release-verified'),
-          JSON.stringify({ version: 1, sha: A, builtAtIso: AT }),
-        );
-        await fs.writeFile(path.join(buildDir, 'plain.test.ts'), 'quarantined(\n');
+      if (target === buildDir) {
+        pins += 1;
+        // The second `realpath(buildDir)` is the post-marker pin: firing here
+        // swaps the tree in after the marker was accepted and before the
+        // files, so only `pinnedBuildDirectoryHolds`' identity check can
+        // refuse the call.
+        if (pins === 2 && !swapped) {
+          swapped = true;
+          // A concurrent install replaces the whole verified tree, marker
+          // included, after the marker was accepted and before the files.
+          // Rename (as a real install does) keeps the old inode alive, so the
+          // new directory cannot reuse its identity.
+          await fs.rename(buildDir, buildDir + '.replaced-old');
+          await fs.mkdir(buildDir);
+          await fs.writeFile(
+            path.join(buildDir, '.fleet-release-verified'),
+            JSON.stringify({ version: 1, sha: A, builtAtIso: AT }),
+          );
+          await fs.writeFile(path.join(buildDir, 'plain.test.ts'), 'quarantined(\n');
+        }
       }
     });
     expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['plain.test.ts'] })).toEqual({
@@ -373,8 +381,11 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
     const marker = path.join(root, A, '.fleet-release-verified');
     let changed = false;
     hookRealpath(async (target) => {
-      if (!changed && target === path.join(root, A)) {
+      if (!changed && target === path.join(root, A, 'plain.test.ts')) {
         changed = true;
+        // The first file resolution is already under way, so the swap lands
+        // after the marker was accepted and the files were being read: only
+        // `pinnedBuildDirectoryHolds`' marker equality can refuse the call.
         await fs.writeFile(marker, JSON.stringify({ version: 1, sha: sha('b'), builtAtIso: AT }));
       }
     });

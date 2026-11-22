@@ -16,6 +16,10 @@ export function readExactPlainRecord(value: unknown, keys: readonly string[]): R
   if (!isPlainRecordObject(value)) {
     return null;
   }
+  // Reflect.ownKeys is the one unavoidable enumeration (no API counts keys
+  // without listing them): it runs exactly once per object and the count is
+  // checked immediately, before any descriptor or value read — that immediate
+  // count refusal is the accepted bound on hostile objects with many keys.
   const ownKeys = Reflect.ownKeys(value);
   if (ownKeys.length !== keys.length) {
     return null;
@@ -146,6 +150,7 @@ export interface BoundedDenseArray {
  * every returned element still comes solely from property descriptors — a
  * probe read never enters the copy — and uncloneable data values (functions,
  * cycles) are refused by the same probe.
+ *
  * Returns the array's elements as a fresh dense copy when `value` is a
  * genuine `Array` (prototype exactly `Array.prototype`) whose own keys are
  * exactly the canonical dense indices `0..length-1` plus a plain data
@@ -207,12 +212,7 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     return null;
   }
   const length = lengthDescriptor.value;
-  if (
-    !Number.isSafeInteger(length) ||
-    length < 0 ||
-    length >= 2 ** 32 - 1 ||
-    length > cap
-  ) {
+  if (!Number.isSafeInteger(length) || length < 0 || length >= 2 ** 32 - 1 || length > cap) {
     return null;
   }
   let ownKeys: PropertyKey[];
@@ -249,7 +249,13 @@ export function readBoundedDenseArray(value: unknown, cap: number): BoundedDense
     } catch {
       return null;
     }
-    if (descriptor === undefined || descriptor.enumerable !== true || descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      !('value' in descriptor)
+    ) {
       return null;
     }
     // Use the descriptor already validated above: a Proxy could answer a

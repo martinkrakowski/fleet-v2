@@ -145,7 +145,24 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // `actionScope` therefore cannot be resolved head-free at all: it is a
     // typed refusal with a getter-call count of 0. A plain-data `actionScope`
     // — every ordinary request — reads exactly as before from the snapshot.
-    const actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+    // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
+    // throw for a single key while the snapshot above succeeded (the trap
+    // threw only after the snapshot's own descriptor calls). Every descriptor
+    // inspection on the original input is therefore wrapped: a throw is the
+    // same typed `invalid-request` refusal the malformed-input path uses,
+    // never an exception escaping the resolve.
+    // BL02g fix round: a hostile Proxy's `getOwnPropertyDescriptor` trap can
+    // throw for a single key while the snapshot above succeeded (the trap
+    // threw only after the snapshot's own descriptor calls). Every descriptor
+    // inspection on the original input is therefore wrapped: a throw is the
+    // same typed `invalid-request` refusal the malformed-input path uses,
+    // never an exception escaping the resolve.
+    let actionScopeDescriptor: PropertyDescriptor | undefined;
+    try {
+      actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+    } catch {
+      return blocked('invalid-request');
+    }
     if (actionScopeDescriptor !== undefined && actionScopeDescriptor.get !== undefined) {
       return blocked('invalid-request');
     }
@@ -216,7 +233,16 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // marker below as invalid, so the roots check fails closed with
     // `release-grant-root-mismatch` exactly as before. The descriptor
     // inspection never invokes the getter or a `get` trap.
-    const releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
+    // BL02g fix round: this inspection is wrapped like every other descriptor
+    // read on `input`; a throwing trap is a typed refusal, not an exception.
+    // BL02g fix round: this inspection is wrapped like every other descriptor
+    // read on `input`; a throwing trap is a typed refusal, not an exception.
+    let releaseRootDescriptor: PropertyDescriptor | undefined;
+    try {
+      releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
+    } catch {
+      return blocked('invalid-request');
+    }
     if (releaseRootDescriptor !== undefined && releaseRootDescriptor.get !== undefined) {
       (request as unknown as Record<string, unknown>)['releaseRoot'] = HOSTILE_RELEASE_ROOT;
     }

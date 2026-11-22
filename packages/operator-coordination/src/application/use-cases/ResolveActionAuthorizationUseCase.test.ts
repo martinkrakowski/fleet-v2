@@ -846,6 +846,45 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
 
+  // BL02g fix round: a Proxy whose `getOwnPropertyDescriptor` trap throws only
+  // for `releaseRoot` (a non-required field with no own property) passes the
+  // snapshot and the required-field checks, so the late `releaseRoot`
+  // descriptor inspection must not let the trap's throw escape as an
+  // exception: it is a typed invalid-request refusal.
+  it('refuses a non-shadow Proxy whose descriptor trap throws only for releaseRoot as invalid-request without throwing', async () => {
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'releaseRoot') {
+          throw new Error('hostile proxy releaseRoot descriptor');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  // BL02g fix round: a Proxy whose trap throws for `actionScope` only on a
+  // later descriptor inspection (the snapshot's own call succeeded) must hit
+  // the same typed refusal at the `actionScope` descriptor inspection, not
+  // throw out of the resolve.
+  it('refuses a non-shadow Proxy whose descriptor trap throws for actionScope on the later inspection as invalid-request without throwing', async () => {
+    let actionScopeDescriptorCalls = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === 'actionScope') {
+          actionScopeDescriptorCalls += 1;
+          if (actionScopeDescriptorCalls > 1) {
+            throw new Error('hostile proxy actionScope descriptor');
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
   it('never invokes a throwing get trap on a non-shadow Proxy whose getOwnPropertyDescriptor forwards normally', async () => {
     let gets = 0;
     const proxy = new Proxy(nonShadowRequest(), {

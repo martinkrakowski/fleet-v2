@@ -47,6 +47,39 @@ const STAY_MALFORMED_HISTORY: ParkEscalationDecision = { kind: 'stay-parked', re
 const STAY_MALFORMED_DIRTY: ParkEscalationDecision = { kind: 'stay-parked', reason: 'malformed-dirty-worktree-fact' };
 
 /**
+ * Reads findings[i] only through its own property descriptor: a hole or an
+ * accessor (getter/setter) is refused, so no array element getter ever runs.
+ */
+function readFindingsElement(findings: readonly unknown[], index: number): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  const descriptor = Object.getOwnPropertyDescriptor(findings, index);
+  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    return { ok: false };
+  }
+  return { ok: true, value: descriptor.value };
+}
+
+/**
+ * Validates the optional `findings` key's shape: absent, null, or a bounded
+ * array whose every element is read through its own descriptor and must be a
+ * plain record. A hole or an accessor element refuses the whole record.
+ */
+function validateFindingsShape(findings: unknown): boolean {
+  if (findings === undefined || findings === null) {
+    return true;
+  }
+  if (!Array.isArray(findings) || findings.length > PARK_FINDINGS_MAX_COUNT) {
+    return false;
+  }
+  for (let i = 0; i < findings.length; i += 1) {
+    const element = readFindingsElement(findings, i);
+    if (!element.ok || !isPlainRecordObject(element.value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * The pure park-escalation decision (CE1). Checks in this order: the parked
  * record's shape and `reason`, then the run's journal history (an earlier
  * `commit-pending` escalation is final — once per run), then the observed
@@ -67,16 +100,8 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     if (typeof reason !== 'string' || !(LANE_RUN_PARK_REASONS as readonly string[]).includes(reason)) {
       return STAY_MALFORMED_PARKED;
     }
-    const findings = parkedRecord.findings;
-    if (findings !== undefined && findings !== null) {
-      if (!Array.isArray(findings) || findings.length > PARK_FINDINGS_MAX_COUNT) {
-        return STAY_MALFORMED_PARKED;
-      }
-      for (let i = 0; i < findings.length; i += 1) {
-        if (!Object.prototype.hasOwnProperty.call(findings, i) || !isPlainRecordObject(findings[i])) {
-          return STAY_MALFORMED_PARKED;
-        }
-      }
+    if (!validateFindingsShape(parkedRecord.findings)) {
+      return STAY_MALFORMED_PARKED;
     }
     if (reason !== 'fix-no-progress') {
       return { kind: 'stay-parked', reason: 'park-reason-not-escalatable' };
@@ -91,10 +116,13 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     // entry is never skipped behind an earlier escalation marker.
     const snapshots: NonNullable<ReturnType<typeof snapshotPlainDataRecord>>[] = [];
     for (let i = 0; i < history.length; i += 1) {
-      if (!Object.prototype.hasOwnProperty.call(history, i)) {
+      // Every element is read through its own descriptor: a hole or an
+      // accessor element (getter/setter) is refused without running any getter.
+      const descriptor = Object.getOwnPropertyDescriptor(history, i);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
         return STAY_MALFORMED_HISTORY;
       }
-      const snapshot = snapshotPlainDataRecord(history[i]);
+      const snapshot = snapshotPlainDataRecord(descriptor.value);
       if (snapshot === null) {
         return STAY_MALFORMED_HISTORY;
       }

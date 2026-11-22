@@ -104,6 +104,36 @@ describe('decideParkEscalation', () => {
     ).toEqual({ kind: 'escalate', mode: 'commit-pending' });
   });
 
+  it('refuses a findings array whose element is a counter getter without ever running it', () => {
+    let reads = 0;
+    const findings: unknown[] = [
+      { findingId: 'f1', severity: 'minor', summary: 's', filePath: null, line: null },
+    ];
+    Object.defineProperty(findings, 0, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return { findingId: `f${reads}`, severity: 'minor', summary: 's', filePath: null, line: null };
+      },
+    });
+    expect(decideParkEscalation({ ...PARKED_FIX, findings }, [], DIRTY)).toEqual(STAY_PARKED_MALFORMED_PARKED);
+    expect(reads).toBe(0);
+  });
+
+  it('refuses a history array whose element is a counter getter without ever running it', () => {
+    let reads = 0;
+    const history: unknown[] = [];
+    Object.defineProperty(history, 0, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return { entryId: `e${reads}`, kind: 'result', reasonCode: 'gate-failed' };
+      },
+    });
+    expect(decideParkEscalation(PARKED_FIX, history, DIRTY)).toEqual({ kind: 'stay-parked', reason: 'malformed-history' });
+    expect(reads).toBe(0);
+  });
+
   it('returns park-reason-not-escalatable for non-fix-no-progress park reasons', () => {
     for (const reason of [
       'one-way-door', 'seat-plan-exhausted', 'blocker-after-round-2', 'ambiguous', 'artifacts-unsealed',

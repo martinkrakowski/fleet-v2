@@ -198,6 +198,14 @@ describe('decideParkEscalation', () => {
     for (const history of [[byResult], [historyEntry(), byMode], [byMode], [historyEntry(), byResult]]) {
       expect(decideParkEscalation(PARKED_FIX, history, DIRTY)).toEqual({ kind: 'stay-parked', reason: 'already-escalated' });
     }
+    // A malformed entry AFTER the escalation marker is validated first:
+    // malformed-history wins, the scan never returns already-escalated on a
+    // marker while skipping later entries.
+    expect(decideParkEscalation(PARKED_FIX, [{ mode: 'commit-pending' }, Object.create(null)], DIRTY)).toEqual({
+      kind: 'stay-parked',
+      reason: 'malformed-history',
+    });
+
     // A result naming another reason code and detail does not count as the escalation.
     expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'other' }], DIRTY)).toEqual({
       kind: 'escalate',

@@ -87,6 +87,9 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     if (history.length > PARK_ESCALATION_HISTORY_MAX) {
       return { kind: 'stay-parked', reason: 'history-too-long' };
     }
+    // Validate EVERY entry before looking for the marker, so a malformed later
+    // entry is never skipped behind an earlier escalation marker.
+    const snapshots: NonNullable<ReturnType<typeof snapshotPlainDataRecord>>[] = [];
     for (let i = 0; i < history.length; i += 1) {
       if (!Object.prototype.hasOwnProperty.call(history, i)) {
         return STAY_MALFORMED_HISTORY;
@@ -95,9 +98,16 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
       if (snapshot === null) {
         return STAY_MALFORMED_HISTORY;
       }
-      if ((snapshot.reasonCode === 'park-escalated' && snapshot.detail === 'commit-pending') || snapshot.mode === 'commit-pending') {
-        return { kind: 'stay-parked', reason: 'already-escalated' };
+      // An entry with no own enumerable data (e.g. a null-prototype empty
+      // record) carries no journal content and is malformed, so it can never
+      // be skipped behind an earlier marker.
+      if (Object.keys(snapshot).length === 0) {
+        return STAY_MALFORMED_HISTORY;
       }
+      snapshots.push(snapshot);
+    }
+    if (snapshots.some((snapshot) => (snapshot.reasonCode === 'park-escalated' && snapshot.detail === 'commit-pending') || snapshot.mode === 'commit-pending')) {
+      return { kind: 'stay-parked', reason: 'already-escalated' };
     }
     if (dirtyWorktree === undefined || dirtyWorktree === null) {
       return { kind: 'stay-parked', reason: 'missing-dirty-worktree-fact' };

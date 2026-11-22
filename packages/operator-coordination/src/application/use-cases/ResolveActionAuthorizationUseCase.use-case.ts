@@ -72,6 +72,13 @@ function blocked(reason: string): ResolveActionAuthorizationResult {
 }
 
 /**
+ * A marker standing in for a `releaseRoot` whose own descriptor on the
+ * incoming request is an accessor: never a coordinate, so `readReleaseRoot`
+ * classifies it as invalid and the release roots check fails closed.
+ */
+const HOSTILE_RELEASE_ROOT = Symbol('hostile-release-root');
+
+/**
  * A descriptor-safe snapshot of the request's nested `repository`. A nested
  * plain object is copied with own data descriptors only (no getter ever runs,
  * so an accessor on `repository.owner` or `repository.repo` collapses to
@@ -193,9 +200,26 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       }
     }
     // Past the validation every request field this use-case reads has been
-    // proved a filled string on the snapshot, so `request` is the ordinary
-    // main-path view of the (now effectively plain-data) input.
-    const request = input as ResolveActionAuthorizationRequest;
+    // proved a filled string on the snapshot. `request` is built from the
+    // descriptor-safe `snapshot` (with `snapshotRepository` re-snapshotting
+    // the nested `repository`), so no later read — `findRecordedRequest`
+    // included — ever touches `input` or invokes a `get` trap on it.
+    const request = {
+      ...snapshot,
+      repository: snapshotRepository(snapshot['repository']),
+    } as unknown as ResolveActionAuthorizationRequest;
+    // `releaseRoot` is not a required field, so a hostile accessor on it
+    // survives the validation above; the snapshot collapses it to
+    // `undefined` (absent), which would silently agree with an absent
+    // recorded root. Preserve the descriptor-safe invalidity the old
+    // `input` alias carried: `readReleaseRoot(request)` classifies the
+    // marker below as invalid, so the roots check fails closed with
+    // `release-grant-root-mismatch` exactly as before. The descriptor
+    // inspection never invokes the getter or a `get` trap.
+    const releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
+    if (releaseRootDescriptor !== undefined && releaseRootDescriptor.get !== undefined) {
+      (request as unknown as Record<string, unknown>)['releaseRoot'] = HOSTILE_RELEASE_ROOT;
+    }
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {
       return blocked(

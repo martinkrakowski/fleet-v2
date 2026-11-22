@@ -830,7 +830,7 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     // no `get` trap fires for the validation itself.
     expect(result).toEqual(plain);
     expect(result.outcome).toBe('authorized');
-    expect(gets).toBeGreaterThanOrEqual(0);
+    expect(gets).toBe(0);
   });
 
   it('refuses a hostile Proxy on the non-shadow path as invalid-request without throwing', async () => {
@@ -844,6 +844,24 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     });
     const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('never invokes a throwing get trap on a non-shadow Proxy whose getOwnPropertyDescriptor forwards normally', async () => {
+    let gets = 0;
+    const proxy = new Proxy(nonShadowRequest(), {
+      getOwnPropertyDescriptor(target, prop) {
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      get() {
+        gets += 1;
+        throw new Error('hostile proxy get');
+      },
+    });
+    const plain = await resolveRaw(useCase(nonShadowRepo()), nonShadowRequest());
+    const result = await resolveRaw(useCase(nonShadowRepo()), proxy);
+    expect(result).toEqual(plain);
+    expect(result.outcome).toBe('authorized');
+    expect(gets).toBe(0);
   });
 });
 

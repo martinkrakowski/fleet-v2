@@ -1179,9 +1179,17 @@ function stillTargets(
   return builds.some((build) => build.sha === target);
 }
 
-function repointRefusal(outcome: 'fenced' | 'not-found' | 'not-verified' | 'unreadable'): ManageReleaseRefusal {
+function repointRefusal(
+  outcome: 'fenced' | 'not-found' | 'not-verified' | 'unreadable' | 'restore-failed',
+): ManageReleaseRefusal {
   if (outcome === 'fenced') {
     return 'driver-lease-live';
+  }
+  // BL02c fix round: the adapter could neither land the repoint nor restore
+  // the previous current-op marker; that is its own refusal, never smoothed
+  // into `store-unreadable`.
+  if (outcome === 'restore-failed') {
+    return 'store-restore-failed';
   }
   return outcome === 'not-found' ? 'not-found' : 'store-unreadable';
 }

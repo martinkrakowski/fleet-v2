@@ -109,6 +109,35 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: B, opId: null });
   });
 
+  it('reports a typed restore-failed, and no current-op marker claiming the new operation, when the rename fails and restoring the previous marker fails too', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    // A prior marker naming an earlier operation is present before the failing repoint.
+    expect(await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) })).toEqual({ outcome: 'ok' });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: 'a'.repeat(32) });
+    const markerPath = path.join(root, '.release-ops', 'current-op.json');
+    const sabotage = async () => {
+      // The rename cannot land: `current` becomes a non-empty directory.
+      await fs.unlink(path.join(root, 'current'));
+      await fs.mkdir(path.join(root, 'current'));
+      await fs.mkdir(path.join(root, 'current', 'kept'));
+      // The restore write cannot land either: the marker path is a directory,
+      // so writing the previous marker over it fails (EISDIR on the atomic
+      // write's rename step).
+      await fs.rm(markerPath);
+      await fs.mkdir(markerPath);
+      return true;
+    };
+    // The new marker was already written when the rename failed; the restore
+    // of the previous marker then fails too. The result must be the distinct
+    // typed failure, never success, and the marker must not claim the new
+    // operation afterwards.
+    expect(await adapter.repoint({ root, sha: B, opId: 'b'.repeat(32), fence: sabotage })).toEqual({
+      outcome: 'restore-failed',
+    });
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'none' });
+  });
+
   it('refuses to repoint to a sha that is not a kept build', async () => {
     await verified('a', 1);
     await fs.mkdir(path.join(root, B));

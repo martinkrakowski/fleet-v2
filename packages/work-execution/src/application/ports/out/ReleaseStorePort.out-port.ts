@@ -92,7 +92,11 @@ export interface ReleaseStorePort {
    * link come first; `fence` is awaited last, and only when it answers true
    * does the one rename run, with nothing awaited in between. A false or
    * throwing fence is `fenced`: the temporary link is removed and `current`
-   * is untouched.
+   * is untouched. When the rename fails and restoring the previous
+   * current-operation marker fails too, the result is `restore-failed`: a
+   * distinct typed failure (never success), after a best-effort removal of
+   * whatever sits at the marker path so no marker claims a repoint that did
+   * not land.
    */
   repoint(input: {
     readonly root: string;
@@ -107,7 +111,7 @@ export interface ReleaseStorePort {
      */
     readonly opId?: string;
     readonly fence?: () => Promise<boolean>;
-  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }>;
+  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' } | { readonly outcome: 'restore-failed' }>;
   /**
    * CO14b #4c: read the store-level marker of which operation last wrote
    * `current` on a repoint. Read-only: never mutates state, never throws.

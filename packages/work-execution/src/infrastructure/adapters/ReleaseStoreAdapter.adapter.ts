@@ -171,7 +171,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     readonly sha: string;
     readonly opId?: string;
     readonly fence?: () => Promise<boolean>;
-  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }> {
+  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' } | { readonly outcome: 'restore-failed' }> {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'not-found' };
     }
@@ -235,8 +235,24 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (markerWritten) {
         if (previousMarker === null) {
           await fs.rm(markerPath, { force: true }).catch(() => undefined);
-        } else {
-          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker).catch(() => undefined);
+          return { outcome: 'unreadable' };
+        }
+        try {
+          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker);
+          return { outcome: 'unreadable' };
+        } catch {
+          // BL02c fix round: the restore of the previous marker failed too, so
+          // this must never be read as success, and the NEW marker (which was
+          // already written before the rename) must not keep claiming a
+          // repoint that did not land. Best-effort removal of whatever sits at
+          // the marker path -- the failed write leaves the new marker there,
+          // and a concurrent or corrupt state may have left anything -- then a
+          // distinct named reason the caller refuses on (ManageReleaseUseCase
+          // maps it to `store-restore-failed`). When even the removal fails
+          // the typed failure still stands; only the marker's absence cannot
+          // be guaranteed.
+          await fs.rm(markerPath, { force: true, recursive: true }).catch(() => undefined);
+          return { outcome: 'restore-failed' };
         }
       }
       return { outcome: 'unreadable' };

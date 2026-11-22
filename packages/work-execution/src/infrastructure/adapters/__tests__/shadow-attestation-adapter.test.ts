@@ -23,6 +23,14 @@ import {
   inspectSingleShadowAttestations,
 } from '../ShadowAttestationAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from '../state-files.js';
+import { ConductorDriverLeaseAdapter } from '../ConductorDriverLeaseAdapter.adapter.js';
+import { ConductorHaltAdapter } from '../ConductorHaltAdapter.adapter.js';
+import { ConductorPassTraceAdapter } from '../ConductorPassTraceAdapter.adapter.js';
+import { CutoverJournalAdapter } from '../CutoverJournalAdapter.adapter.js';
+import { KillallHaltMarkerAdapter } from '../KillallHaltMarkerAdapter.adapter.js';
+import { KillallTrainPauseAdapter } from '../KillallTrainPauseAdapter.adapter.js';
+import { LaneRunRepositoryAdapter } from '../LaneRunRepositoryAdapter.adapter.js';
+import { MergeQueueRepositoryAdapter } from '../MergeQueueRepositoryAdapter.adapter.js';
 
 const DIGEST = 'a'.repeat(64);
 const RELEASE_SHA = 'c'.repeat(40);
@@ -441,6 +449,24 @@ describe('ShadowAttestationAdapter', () => {
     expect(() =>
       new ShadowAttestationAdapter({ stateDir: tempDir, fileName: 'cutover-shadow-attestations-alt.json' }),
     ).not.toThrow();
+  });
+
+  it('every other store adapter refuses the shadow-attestation file name at construction', () => {
+    const constructors = [
+      ConductorDriverLeaseAdapter,
+      ConductorHaltAdapter,
+      ConductorPassTraceAdapter,
+      CutoverJournalAdapter,
+      KillallHaltMarkerAdapter,
+      KillallTrainPauseAdapter,
+      LaneRunRepositoryAdapter,
+      MergeQueueRepositoryAdapter,
+    ] as const;
+    for (const Construct of constructors) {
+      expect(() => new Construct({ stateDir: tempDir, fileName: 'cutover-shadow-attestations.json' })).toThrow(
+        /collides with another store/,
+      );
+    }
   });
 
   it('is described to `fleet-v2 state` as the single-record store cutover-shadow-attestations.json', async () => {

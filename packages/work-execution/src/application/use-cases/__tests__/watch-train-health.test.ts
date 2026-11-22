@@ -1805,6 +1805,67 @@ describe('WatchTrainHealthUseCase', () => {
     expect(speakCalls).toEqual([{ sentence: staleSentence(1) }]);
   });
 
+  it('raise-phase budget exhaustion skips speaking entirely: announced 0, no speak call, counters from the decision', async () => {
+    // 12:00:01 is one second before the decision clock 12:00:02 and shares its
+    // 10-minute bucket, so a target last raised then is not due.
+    const SAME_BUCKET_RAISED = '2026-11-16T12:00:01.000Z';
+    const deadlineIso = deadlineTightAt(5);
+    const { deps, log, speakCalls } = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(4) })) as never,
+      openItems: [
+        { rule: 'stale-queue-entry', pullRequest: 2, lastRaisedAtIso: PREVIOUS_BUCKET },
+        { rule: 'stale-queue-entry', pullRequest: 3, lastRaisedAtIso: SAME_BUCKET_RAISED },
+      ],
+      raiseBehavior: (callIndex) => {
+        if (callIndex === 1) {
+          // A success raise whose previous time is not a zoned ISO string:
+          // the early budget branch must still count it as one failure.
+          return { outcome: 'raised', reasonCode: null, previousRaisedAtIso: 'not-an-iso' };
+        }
+        if (callIndex === 2) {
+          return { outcome: 'refreshed', reasonCode: null, previousRaisedAtIso: PREVIOUS_BUCKET };
+        }
+        return { outcome: 'refreshed', reasonCode: null, previousRaisedAtIso: SAME_BUCKET_RAISED };
+      },
+    });
+    const result = await run(deps, baseRequest({ deadlineIso }));
+    // Clock reads 0..5 budget the list and raises 1..3; the read before raise 4
+    // (index 6) finds the budget exhausted, so raise 4 never starts. Raise 2 is
+    // due (previous bucket); raise 3 was last raised in the same bucket as the
+    // decision clock, so its sentence is not due.
+    const decision = decideTrainHealthAnnouncements({
+      targets: [2, 3].map((pullRequest) => ({ rule: 'stale-queue-entry', pullRequest })),
+      openItemsKnown: true,
+      openItems: [
+        { rule: 'stale-queue-entry', pullRequest: 2, lastRaisedAtIso: PREVIOUS_BUCKET },
+        { rule: 'stale-queue-entry', pullRequest: 3, lastRaisedAtIso: SAME_BUCKET_RAISED },
+      ],
+      nowIso: isoAt(2),
+    });
+    expect(decision.outcome).toBe('decided');
+    if (decision.outcome !== 'decided') {
+      return;
+    }
+    expect(decision.due).toBe(1);
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      raised: 3,
+      attentionFailures: 0,
+      announced: 0,
+      announceFailures: 1,
+      announceSuppressed: decision.suppressed,
+      announceUnspoken: decision.sentences.length,
+      budgetExhausted: true,
+    });
+    expect(speakCalls).toHaveLength(0);
+    // The exhausted announce phase takes no clock read of its own: exactly the
+    // reads for the list, the three raises and the refused fourth raise
+    // (indexes 0..6), never one more.
+    expect(log.filter((entry) => entry.kind === 'now')).toHaveLength(7);
+  });
+
   it('blind path: the watchdog-blind item last raised in the previous bucket is announced even though the raise refreshes it', async () => {
     // The clock advances one second on every read, including the read that budgets the raise.
     const made = makeDeps({

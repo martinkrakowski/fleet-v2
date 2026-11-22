@@ -81,6 +81,7 @@ export interface LaneRunRepositoryAdapterOptions {
 const DEFAULT_FILE_NAME = 'lane-runs.json';
 /** The other work-execution stores own their own files; never those. */
 const OTHER_STORE_FILE_NAMES = [
+  'cutover-shadow-attestations.json',
   'work-orders.json',
   'attempts.json',
   'journal.json',
@@ -178,7 +179,17 @@ export function parseLaneRunStateRecord(raw: unknown): LaneRunRecord | undefined
 export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
   private readonly inMemoryRuns = new Map<string, LaneRunRecord>();
 
-  constructor(private readonly options: LaneRunRepositoryAdapterOptions = {}) {}
+  constructor(private readonly options: LaneRunRepositoryAdapterOptions = {}) {
+    const { fileName } = options;
+    if (fileName !== undefined) {
+      if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
+        throw new Error('LaneRunRepositoryAdapter refuses a fileName that collides with another store');
+      }
+      if (!SAFE_FILE_NAME.test(fileName) || fileName === '.' || fileName === '..') {
+        throw new Error('LaneRunRepositoryAdapter refuses unsafe state file name');
+      }
+    }
+  }
 
   async create(record: LaneRunRecord): Promise<LaneRunRepositoryResult> {
     const validatedResult = LaneRun.create(record);

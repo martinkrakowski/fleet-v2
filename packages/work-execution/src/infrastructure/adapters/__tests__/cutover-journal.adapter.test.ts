@@ -444,6 +444,15 @@ describe('isCutoverJournalKey and SHADOW_IMPORT_KEY (GR1b)', () => {
 });
 
 describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
+  const parkFileIn = (dir: string): string => path.join(dir, 'shadow-park-journal.json');
+  const parkOptions = (dir: string, extra: { readOnly?: boolean } = {}) => ({
+    stateDir: dir,
+    fileName: 'shadow-park-journal.json',
+    shadowPark: true,
+    ...extra,
+  });
+  const parkJournalIn = (dir: string): CutoverJournalAdapter => new CutoverJournalAdapter(parkOptions(dir));
+  const memoryParkJournal = (): CutoverJournalAdapter => new CutoverJournalAdapter({ shadowPark: true });
   const parkRecord = (entryId = ulid()): CutoverShadowParkRecord => ({
     entryId,
     repository: { owner: 'fleet', repo: 'v2' },
@@ -494,7 +503,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
   });
 
   it('shadowPark instance refuses entries without a shadowPark payload', async () => {
-    const journal = new CutoverJournalAdapter({ shadowPark: true });
+    const journal = memoryParkJournal();
     const park = parkRecord();
     expect(await refusal(journal, { key: parkKeyOf(park.entryId), kind: 'intent', entryId: ulid(), recordedAtIso: NOW })).toBe('invalid-entry');
     expect(await refusal(journal, { ...parkIntent(park), shadowPark: null })).toBe('invalid-entry');
@@ -502,7 +511,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
   });
 
   it('shadowPark instance refuses malformed shadowPark records and hostile accessors without invoking getters', async () => {
-    const journal = new CutoverJournalAdapter({ shadowPark: true });
+    const journal = memoryParkJournal();
     const base = parkRecord();
     const bads: unknown[] = [
       'x',
@@ -535,7 +544,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
   });
 
   it('shadowPark instance refuses entryId digest mismatch', async () => {
-    const journal = new CutoverJournalAdapter({ shadowPark: true });
+    const journal = memoryParkJournal();
     const park = parkRecord();
     const wrong: CutoverJournalEntry = { ...parkIntent(park), key: `cutover/shadow-park-${'0'.repeat(32)}@1` };
     expect(await refusal(journal, wrong)).toBe('invalid-entry');
@@ -544,7 +553,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
   });
 
   it('shadowPark instance refuses invalid keys and oversized prefixes', async () => {
-    const journal = new CutoverJournalAdapter({ shadowPark: true });
+    const journal = memoryParkJournal();
     const park = parkRecord();
     expect(await refusal(journal, { ...parkIntent(park), key: 'cutover/not-a-park@1' })).toBe('invalid-key');
     expect(await refusal(journal, { ...parkIntent(park), key: 'relaunch/abcdef0123456789/lane-1/save' })).toBe('invalid-key');
@@ -561,9 +570,9 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
         }),
       );
     const full = await stateDir();
-    const fullFile = path.join(full, 'shadow-park-journal.json');
+    const fullFile = parkFileIn(full);
     await writeFile(fullFile, seed(limit), 'utf8');
-    const atLimit = new CutoverJournalAdapter({ stateDir: full, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const atLimit = parkJournalIn(full);
     expect(await refusal(atLimit, parkIntent())).toBe('journal-capacity-exceeded');
     expect(JSON.parse(await readFile(fullFile, 'utf8'))).toHaveLength(limit);
     // In memory: a journal at the cap is the same typed refusal, never a write.
@@ -587,32 +596,32 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
     ];
     for (const body of cases) {
       const dir = await stateDir();
-      await writeFile(path.join(dir, 'shadow-park-journal.json'), JSON.stringify(body), 'utf8');
-      const journal = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true });
+      await writeFile(parkFileIn(dir), JSON.stringify(body), 'utf8');
+      const journal = parkJournalIn(dir);
       expect(await journal.listByKeyPrefix('cutover/')).toEqual({ outcome: 'unreadable' });
       expect(await refusal(journal, parkIntent())).toBe('store-unreadable');
     }
     // An oversized file is unreadable too.
     const big = await stateDir();
-    const bigFile = path.join(big, 'shadow-park-journal.json');
+    const bigFile = parkFileIn(big);
     await writeFile(bigFile, '', 'utf8');
     await truncate(bigFile, 16 * 1024 * 1024 + 1);
-    const bigJournal = new CutoverJournalAdapter({ stateDir: big, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const bigJournal = parkJournalIn(big);
     expect(await bigJournal.listByKeyPrefix('cutover/')).toEqual({ outcome: 'unreadable' });
     expect(await refusal(bigJournal, parkIntent())).toBe('store-unreadable');
   });
 
   it('read-only shadowPark instance refuses every append with store-read-only', async () => {
     const dir = await stateDir();
-    const journal = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true, readOnly: true });
+    const journal = new CutoverJournalAdapter(parkOptions(dir, { readOnly: true }));
     expect(await refusal(journal, parkIntent())).toBe('store-read-only');
-    expect(await exists(path.join(dir, 'shadow-park-journal.json'))).toBe(false);
+    expect(await exists(parkFileIn(dir))).toBe(false);
     const inMemory = new CutoverJournalAdapter({ shadowPark: true, readOnly: true });
     expect(await refusal(inMemory, parkIntent())).toBe('store-read-only');
   });
 
   it('shadowPark instance refuses hostile inputs, throwing getters, and accessors without throwing', async () => {
-    const journal = new CutoverJournalAdapter({ shadowPark: true });
+    const journal = memoryParkJournal();
     for (const bad of [null, undefined, 5, 'x', [], new Date(), () => {}]) {
       expect(await refusal(journal, bad)).toBe('invalid-entry');
     }
@@ -648,7 +657,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
     const before = '[]';
     await writeFile(cutoverFile, before, 'utf8');
     await writeFile(intakeFile, before, 'utf8');
-    const journal = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const journal = parkJournalIn(dir);
     const park = parkRecord();
     expect(await refusal(journal, parkIntent(park))).toBe('appended');
     expect(await readFile(cutoverFile, 'utf8')).toBe(before);
@@ -659,7 +668,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
     const dir = await stateDir();
     const cutover = new CutoverJournalAdapter({ stateDir: dir });
     await cutover.append(intent());
-    const shadow = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const shadow = parkJournalIn(dir);
     const park = parkRecord();
     await shadow.append(parkIntent(park));
     const listed = await cutover.listByKeyPrefix('relaunch/');
@@ -669,11 +678,11 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
 
   it('shadowPark instance round-trips v3 records across reopen', async () => {
     const dir = await stateDir();
-    const journal = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const journal = parkJournalIn(dir);
     const park = parkRecord();
     expect(await refusal(journal, parkIntent(park))).toBe('appended');
     expect(await refusal(journal, parkResult(parkKeyOf(park.entryId), park))).toBe('appended');
-    const reopened = new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-park-journal.json', shadowPark: true });
+    const reopened = parkJournalIn(dir);
     const listed = await reopened.listByKeyPrefix('cutover/shadow-park-');
     expect(listed.outcome).toBe('listed');
     if (listed.outcome === 'listed') {
@@ -683,7 +692,7 @@ describe('CutoverJournalAdapter shadowPark mode (SW2a2)', () => {
     }
     // A duplicate intent across reopen is still refused (after the result, an intent can never follow).
     expect(await refusal(reopened, parkIntent(park))).toBe('intent-after-result');
-    const stored = JSON.parse(await readFile(path.join(dir, 'shadow-park-journal.json'), 'utf8')) as { schemaVersion: number }[];
+    const stored = JSON.parse(await readFile(parkFileIn(dir), 'utf8')) as { schemaVersion: number }[];
     expect(stored.map((record) => record.schemaVersion)).toEqual([3, 3]);
   });
 });

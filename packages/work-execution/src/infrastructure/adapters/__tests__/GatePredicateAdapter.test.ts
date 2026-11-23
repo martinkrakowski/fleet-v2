@@ -1062,12 +1062,26 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     expect(tail).toBe(['before', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]'].join('\n'));
   });
 
-  it('GD2 redacts a long base64-ish run on a line whose BEGIN was cut away, but not a hex digest', () => {
-    const blob = 'aB3+/9xQkL7mZ2'.repeat(5);
+  it('GD2 redacts a long base64-ish run, but not a hex digest', () => {
+    const blob = 'aB3k9xQkL7mZ2pR4tY6uW8eI0oA1sD5fG7hJ9' + 'kLzXcV';
+    expect(blob.length).toBe(43);
     const digest = 'abcdef0123456789'.repeat(4);
     const tail = boundedRedactedOutputTail(`${blob}\ndigest ${digest}`, undefined) as string;
     expect(tail).not.toContain(blob);
     expect(tail).toContain(digest);
+    const slashed = 'aB3k9xQkL7mZ2pR4tY6/uW8eI0oA1sD5fG7hJ9kLzXcV+=';
+    expect(boundedRedactedOutputTail(slashed, undefined)).toBe('[redacted: secret-shaped line]');
+  });
+
+  it('GD2 keeps path-shaped error locations out of the base64 redaction', () => {
+    const lines = [
+      'packages/work-execution/src/infrastructure/adapters/GatePredicateAdapter.adapter.ts(12,3): error TS2322: bad',
+      'src/infrastructure/Adapters2/GatePredicateAdapter2Handler.adapter.ts(12,3): error TS2322: bad',
+      '    at file:///home/u/work/packages/work-execution/src/Gate2Adapter/GatePredicate.test.ts:12:5',
+      '/home/u/packages/work-execution/src/infrastructure/Adapters2/Gate.ts  12:3  error  no-unused-vars',
+      'at node_modules/@scope/pkg/dist/index.js:10:2 node_modules/@scope/pkg2/Dist/Index2Handler.js',
+    ];
+    expect(boundedRedactedOutputTail(lines.join('\n'), undefined)).toBe(lines.join('\n'));
   });
 
   it('GD2 does not leak a token split by the 32 KiB cut', () => {

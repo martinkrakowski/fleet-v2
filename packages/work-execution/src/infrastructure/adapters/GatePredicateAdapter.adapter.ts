@@ -415,15 +415,23 @@ const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]*-----/;
 const PEM_END = /-----END [A-Z0-9 ]*-----/;
 const BASE64_RUN = /[A-Za-z0-9+/=]{40,}/g;
 
-/** A defensive rule: a long base64-alphabet run that is not plain hex and has real entropy. */
+/**
+ * A defensive rule for key material: a long base64-alphabet run with a digit,
+ * an upper-case and a lower-case letter, and not directly followed by `.` (a file name or extension). A
+ * path (`src/a/b.ts`) ends at its extension dot or lacks a digit or a case
+ * mix, so error locations stay readable; plain hex never qualifies.
+ */
 function hasBase64Blob(line: string): boolean {
-  const runs = line.match(BASE64_RUN);
-  if (runs === null) {
-    return false;
+  for (const match of line.matchAll(BASE64_RUN)) {
+    const run = match[0];
+    if (line[match.index + run.length] === '.') {
+      continue;
+    }
+    if (/[0-9]/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) {
+      return true;
+    }
   }
-  return runs.some(
-    (run) => !/^(?:[0-9a-f]+|[0-9A-F]+)$/.test(run) && new Set(run).size >= 10,
-  );
+  return false;
 }
 
 /** Redacts secret-shaped lines and whole PEM blocks (BEGIN through END, or to the end when END is missing). */

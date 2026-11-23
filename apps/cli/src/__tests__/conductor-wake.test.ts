@@ -57,15 +57,18 @@ describe('parseWakeSignal (K9)', () => {
   });
 
   it('returns null for hostile runtime inputs instead of throwing', () => {
-    // Cost bound: non-string JSON.parse coercion throws are caught in O(1);
-    // the happy path stays O(n) in the input length.
+    // Cost bound: the `typeof line !== 'string'` guard is O(1) and runs before
+    // JSON.parse, so no coercion happens; the happy path stays O(n) in the
+    // input length.
     expect(parseWakeSignal(null as unknown as string)).toBeNull();
     expect(parseWakeSignal(undefined as unknown as string)).toBeNull();
     expect(parseWakeSignal(123 as unknown as string)).toBeNull();
     expect(parseWakeSignal({} as unknown as string)).toBeNull();
   });
 
-  it('returns null for a throwing-getter object and a lying Proxy (throw swallowed, null returned)', () => {
+  it('returns null for a throwing-getter object and a lying Proxy without invoking any getter or trap', () => {
+    // Cost bound: the `typeof line !== 'string'` guard is O(1) and runs before
+    // JSON.parse, so no coercion (toString/valueOf/get traps) is ever reached.
     let getterCalls = 0;
     const evil = {
       get toString(): string {
@@ -73,10 +76,8 @@ describe('parseWakeSignal (K9)', () => {
         throw new Error('boom');
       },
     };
-    // parseWakeSignal has no typeof guard: JSON.parse coerces, the getter runs
-    // and throws, and the catch turns that into a typed null (never a pass).
     expect(parseWakeSignal(evil as unknown as string)).toBeNull();
-    expect(getterCalls).toBe(1);
+    expect(getterCalls).toBe(0);
 
     let trapCalls = 0;
     const lying = new Proxy(
@@ -90,10 +91,14 @@ describe('parseWakeSignal (K9)', () => {
           trapCalls += 1;
           throw new Error('boom');
         },
+        getOwnPropertyDescriptor: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
       },
     );
     expect(parseWakeSignal(lying as unknown as string)).toBeNull();
-    expect(trapCalls).toBeGreaterThan(0);
+    expect(trapCalls).toBe(0);
   });
 });
 

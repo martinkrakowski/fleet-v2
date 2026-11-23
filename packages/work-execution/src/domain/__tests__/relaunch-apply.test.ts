@@ -501,6 +501,8 @@ describe('canonicalSaveInputJson', () => {
   });
 
   it('R12: invalid inputs return null without throwing', () => {
+    // Built at runtime so no token-shaped literal exists in source.
+    const fakeToken = ['gh', 'p_', 'x'.repeat(36)].join('');
     const cases: Array<[unknown, unknown]> = [
       [DIGEST, null],
       [DIGEST, undefined],
@@ -525,10 +527,10 @@ describe('canonicalSaveInputJson', () => {
         DIGEST,
         {
           ...saveInput(),
-          recordedHost: { ...saveInput().recordedHost, host: 'token ghp_abcdefghijklmnopqrstuv' },
+          recordedHost: { ...saveInput().recordedHost, host: `token ${fakeToken}` },
         },
       ],
-      [DIGEST, { ...saveInput(), worktreePath: 'ghp_abcdefghijklmnopqrstuv secret' }],
+      [DIGEST, { ...saveInput(), worktreePath: `${fakeToken} secret` }],
       [DIGEST, { ...saveInput(), allowedPathPrefixes: ['ok', null] }],
     ];
     for (const [planDigest, input] of cases) {

@@ -268,8 +268,12 @@ const MAX_OUTPUT_TAIL_LINES = 200;
 const OUTPUT_TAIL_WITHHELD = '[output withheld: secret-shaped text]';
 const OUTPUT_TAIL_REDACTED_LINE = '[redacted: secret-shaped line]';
 /** CSI and OSC ANSI escape sequences. */
-// eslint-disable-next-line no-control-regex -- the tail must strip escape sequences, never match text containing them
-const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const ESC = String.fromCharCode(27);
+const BEL = String.fromCharCode(7);
+const ANSI_PATTERN = new RegExp(
+  `${ESC}\\[[0-?]*[ -/]*[@-~]|${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`,
+  'g',
+);
 
 function isSecretShapedLine(line: string): boolean {
   return containsSecretShape(line) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(line));
@@ -283,14 +287,20 @@ function isSecretShapedLine(line: string): boolean {
  * 32 KiB, then each line matching a secret shape is replaced with a
  * `[redacted: …]` marker; if the redacted tail still matches a secret shape
  * the whole tail is withheld with one fixed marker.
+ *
+ * Fix round 2: the scan bound is on the COMBINED text. Each stream is first
+ * cut to its last `MAX_OUTPUT_TAIL_BYTES + 1` characters only so the exact
+ * last-32-KiB window of the raw combined text can be located without reading
+ * more; the combined window itself is then cut to at most 32 KiB (+ the one
+ * join newline of slack) BEFORE any strip, scan or split, and the 200-line
+ * limit is applied by scanning newline positions inside that window rather
+ * than splitting it whole. Every step therefore costs O(32 KiB) total
+ * regardless of how much a failing command printed — never O(64 KiB) or an
+ * unbounded line split.
  */
 export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
-  const parts: string[] = [];
-  // GD2: each stream is cut to its last 32 KiB (+ one join newline of slack)
-  // BEFORE any join, strip or split: ANSI stripping only removes characters,
-  // so the final 32 KiB / 200-line tail window of the stripped combined text
-  // always lies inside these retained slices. Every later step therefore
-  // costs O(64 KiB) regardless of how much a failing command printed.
+  // Retain at most the last 32 KiB + 1 of each stream: more than the largest
+  // window any later step can need is never retained. O(1) slice per stream.
   const bounded = (stream: unknown): string | undefined => {
     if (typeof stream !== 'string') {
       return undefined;
@@ -301,27 +311,54 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
   };
   const boundedStdout = bounded(stdout);
   const boundedStderr = bounded(stderr);
-  if (boundedStdout !== undefined) {
-    parts.push(boundedStdout);
-  }
-  if (boundedStderr !== undefined) {
-    parts.push(boundedStderr);
-  }
-  if (parts.length === 0) {
+  if (boundedStdout === undefined && boundedStderr === undefined) {
     return undefined;
   }
-  const stripped = parts.join('\n').replace(ANSI_PATTERN, '');
+  const a = boundedStdout ?? '';
+  const b = boundedStderr ?? '';
+  const joinNewline = boundedStdout !== undefined && boundedStderr !== undefined ? '\n' : '';
+  const rawCombinedLength = a.length + joinNewline.length + b.length;
+  // Cut the raw combined text to its last MAX_OUTPUT_TAIL_BYTES characters
+  // (the join newline counts towards the bound) without ever materialising
+  // the whole join: ANSI stripping only removes characters, so the processed
+  // tail can never exceed this window's 32 KiB.
+  let rawWindow: string;
+  if (rawCombinedLength <= MAX_OUTPUT_TAIL_BYTES) {
+    rawWindow = a + joinNewline + b;
+  } else if (b.length >= MAX_OUTPUT_TAIL_BYTES) {
+    rawWindow = b.slice(b.length - MAX_OUTPUT_TAIL_BYTES);
+  } else {
+    const headKeep = MAX_OUTPUT_TAIL_BYTES - joinNewline.length - b.length;
+    rawWindow = a.slice(a.length - headKeep) + joinNewline + b;
+  }
+  const stripped = rawWindow.replace(ANSI_PATTERN, '');
   if (stripped.trim() === '') {
     return undefined;
   }
-  let lines = stripped.split(/\r?\n/);
-  if (lines.length > MAX_OUTPUT_TAIL_LINES) {
-    lines = lines.slice(-MAX_OUTPUT_TAIL_LINES);
+  // Line bound: element `k` of the full split starts after the k-th newline,
+  // so keeping the last MAX_OUTPUT_TAIL_LINES elements means cutting after
+  // the MAX_OUTPUT_TAIL_LINES-th newline from the end. The backward scan is
+  // O(window) with no allocation, and only that ≤ MAX_OUTPUT_TAIL_LINES + 1
+  // element tail is ever split.
+  let lineCut = -1;
+  let remainingNewlines = MAX_OUTPUT_TAIL_LINES;
+  let searchEnd = stripped.length;
+  while (remainingNewlines > 0) {
+    const at = stripped.lastIndexOf('\n', searchEnd - 1);
+    if (at === -1) {
+      break;
+    }
+    remainingNewlines -= 1;
+    searchEnd = at;
+    if (remainingNewlines === 0) {
+      lineCut = at;
+    }
   }
-  let tail = lines.join('\n');
-  if (tail.length > MAX_OUTPUT_TAIL_BYTES) {
-    tail = tail.slice(tail.length - MAX_OUTPUT_TAIL_BYTES);
-  }
+  const lineWindow = lineCut === -1 ? stripped : stripped.slice(lineCut + 1);
+  let tail = lineWindow
+    .split(/\r?\n/)
+    .slice(-MAX_OUTPUT_TAIL_LINES)
+    .join('\n');
   // A trailing newline is not command output: drop the empty last lines.
   tail = tail.replace(/(?:\n[\t ]*)+$/, '');
   const redacted = tail

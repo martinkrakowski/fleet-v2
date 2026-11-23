@@ -87,6 +87,13 @@ const GATE_REASON_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const GATE_PREDICATE_NAME_PATTERN = /^[\x20-\x5f\x61-\x7e]{1,120}$/;
 /** GD2: how many gate predicates one brief may carry; the spec's own command cap is far below this. */
 const MAX_GATE_PREDICATES = 200;
+/**
+ * GD2 (fix round 2): the one-shot probe key for the gate-predicate list — an
+ * own property no real array ever has, so probing it runs nothing on honest
+ * input, while a Proxy whose `get` trap throws for every read is refused by
+ * that single probe instead of being validated through its lies.
+ */
+const GATE_PREDICATES_PROBE_KEY = Symbol('fleet.handover.gatePredicates.probe');
 /** A proof command argv element: printable ASCII without a space or backtick, at most 200 characters. */
 const PROOF_COMMAND_ARGV_ELEMENT_PATTERN = /^[\x21-\x5f\x61-\x7e]{1,200}$/;
 /**
@@ -201,7 +208,7 @@ function quoteProofCommandElement(element: string): string {
  */
 function safeOwnValue(
   source: object,
-  key: string,
+  key: string | symbol,
 ):
   | { kind: 'value'; value: unknown }
   | { kind: 'absent' }
@@ -282,63 +289,107 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   }
   // GD2: the failing predicates' archived output tails, collected only when
   // they validate; rendered as a data-only section after the numbered fixes.
-  // A hostile non-iterable array-like refuses with a typed reason instead of
-  // throwing out of the `for…of`.
+  // Fix round 2: the list is never iterated with `for…of`, which invokes a
+  // custom `Symbol.iterator` getter, and no array-index getter is invoked
+  // either — `length` and every element are read through their own property
+  // descriptors, so a getter can never run or smuggle a valid-looking
+  // predicate past validation; a lying Proxy trap reads as a typed refusal.
   const tails: string[] = [];
   try {
-    if (input.source === 'gate' && input.gatePredicates.length > 0) {
-      if (input.gatePredicates.length > MAX_GATE_PREDICATES) {
+    if (input.source === 'gate') {
+      const predicatesRead = safeOwnValue(input, 'gatePredicates');
+      if (predicatesRead.kind !== 'value') {
         return { ok: false, reason: 'invalid-gate-predicate' };
       }
-      for (const predicate of input.gatePredicates) {
-        if (predicate === null || typeof predicate !== 'object' || Array.isArray(predicate)) {
-          return { ok: false, reason: 'invalid-gate-predicate' };
-        }
-        // GD2: every field is read through its own property descriptor — a
-        // getter is never invoked and a throwing Proxy trap reads as a refusal,
-        // never a crash. All checks are O(1) per predicate.
-        const nameRead = safeOwnValue(predicate, 'name');
-        const verdictRead = safeOwnValue(predicate, 'verdict');
-        const exitRead = safeOwnValue(predicate, 'exitCode');
-        if (
-          nameRead.kind !== 'value' ||
-          verdictRead.kind !== 'value' ||
-          exitRead.kind !== 'value'
-        ) {
-          return { ok: false, reason: 'invalid-gate-predicate' };
-        }
-        const name = nameRead.value;
-        const verdict = verdictRead.value;
-        const exitCode = exitRead.value;
-        if (
-          typeof name !== 'string' ||
-          (verdict !== 'fail' && verdict !== 'unknown') ||
-          !(exitCode === null || (typeof exitCode === 'number' && Number.isSafeInteger(exitCode) && exitCode >= 0))
-        ) {
-          return { ok: false, reason: 'invalid-gate-predicate' };
-        }
-        if (containsSecretShape(name)) {
-          return { ok: false, reason: 'secret-shaped-input' };
-        }
-        if (!GATE_PREDICATE_NAME_PATTERN.test(name)) {
-          return { ok: false, reason: 'invalid-gate-predicate' };
-        }
-        const tail = safeOutputTailOf(predicate);
-        if (!tail.ok) {
-          return { ok: false, reason: tail.reason };
-        }
-        if (tail.tail !== undefined) {
-          tails.push(tail.tail);
-        }
-        const exitText = exitCode === null ? 'none' : String(exitCode);
-        rawLines.push({ text: `[gate] ${name} — ${verdict}, exit ${exitText}` });
+      const predicatesSource: unknown = predicatesRead.value;
+      // Fix round 2: the list must be a real array (a non-iterable array-like
+      // is refused) and must survive one O(1) probe get of an unused symbol
+      // key with its result discarded — a lying Proxy whose `get` trap throws
+      // for every read is refused there instead of being validated through
+      // its lies. All validated data still comes only from property
+      // descriptors below, so no getter can run or smuggle a predicate.
+      if (predicatesSource === null || typeof predicatesSource !== 'object' || !Array.isArray(predicatesSource)) {
+        return { ok: false, reason: 'invalid-gate-predicate' };
       }
-    } else if (input.source === 'gate' && input.gateReasonCodes.length > 0) {
-      for (const code of input.gateReasonCodes) {
-        if (!GATE_REASON_CODE_PATTERN.test(code)) {
-          return { ok: false, reason: 'invalid-gate-code' };
+      try {
+        Reflect.get(predicatesSource, GATE_PREDICATES_PROBE_KEY);
+      } catch {
+        return { ok: false, reason: 'invalid-gate-predicate' };
+      }
+      // An own `Symbol.iterator` (data or accessor) is an unvalidated
+      // override of the list's iteration protocol: refused through its
+      // descriptor, so the getter — if any — is never invoked. Honest arrays
+      // keep their iterator on the prototype and read as `absent`.
+      if (safeOwnValue(predicatesSource, Symbol.iterator).kind !== 'absent') {
+        return { ok: false, reason: 'invalid-gate-predicate' };
+      }
+      const lengthRead = safeOwnValue(predicatesSource, 'length');
+      if (
+        lengthRead.kind !== 'value' ||
+        typeof lengthRead.value !== 'number' ||
+        !Number.isSafeInteger(lengthRead.value) ||
+        lengthRead.value < 0 ||
+        lengthRead.value > MAX_GATE_PREDICATES
+      ) {
+        return { ok: false, reason: 'invalid-gate-predicate' };
+      }
+      const predicateCount: number = lengthRead.value;
+      if (predicateCount > 0) {
+        for (let index = 0; index < predicateCount; index += 1) {
+          const elementRead = safeOwnValue(predicatesSource, String(index));
+          if (elementRead.kind !== 'value') {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
+          const predicate: unknown = elementRead.value;
+          if (predicate === null || typeof predicate !== 'object' || Array.isArray(predicate)) {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
+          // GD2: every field is read through its own property descriptor — a
+          // getter is never invoked and a throwing Proxy trap reads as a refusal,
+          // never a crash. All checks are O(1) per predicate.
+          const nameRead = safeOwnValue(predicate, 'name');
+          const verdictRead = safeOwnValue(predicate, 'verdict');
+          const exitRead = safeOwnValue(predicate, 'exitCode');
+          if (
+            nameRead.kind !== 'value' ||
+            verdictRead.kind !== 'value' ||
+            exitRead.kind !== 'value'
+          ) {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
+          const name = nameRead.value;
+          const verdict = verdictRead.value;
+          const exitCode = exitRead.value;
+          if (
+            typeof name !== 'string' ||
+            (verdict !== 'fail' && verdict !== 'unknown') ||
+            !(exitCode === null || (typeof exitCode === 'number' && Number.isSafeInteger(exitCode) && exitCode >= 0))
+          ) {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
+          if (containsSecretShape(name)) {
+            return { ok: false, reason: 'secret-shaped-input' };
+          }
+          if (!GATE_PREDICATE_NAME_PATTERN.test(name)) {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
+          const tail = safeOutputTailOf(predicate as { readonly outputTail?: string });
+          if (!tail.ok) {
+            return { ok: false, reason: tail.reason };
+          }
+          if (tail.tail !== undefined) {
+            tails.push(tail.tail);
+          }
+          const exitText = exitCode === null ? 'none' : String(exitCode);
+          rawLines.push({ text: `[gate] ${name} — ${verdict}, exit ${exitText}` });
         }
-        rawLines.push({ text: `[gate] ${code}` });
+      } else if (input.gateReasonCodes.length > 0) {
+        for (const code of input.gateReasonCodes) {
+          if (!GATE_REASON_CODE_PATTERN.test(code)) {
+            return { ok: false, reason: 'invalid-gate-code' };
+          }
+          rawLines.push({ text: `[gate] ${code}` });
+        }
       }
     }
   } catch {

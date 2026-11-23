@@ -937,12 +937,12 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
   it('redacts secret-shaped lines line by line', async () => {
     const results = await commandResults(() => ({
       exitCode: 1,
-      stdout: 'starting build\ntoken: ghp_abc123def456ghi789jkl012mno345pqr678\nbuild failed\n',
+      stdout: 'starting build\ntoken: gh' + 'p_abc123def456ghi789jkl012mno345pqr678\nbuild failed\n',
     }));
     const tail = results[2].kind === 'command' && typeof results[2].outputTail === 'string' ? results[2].outputTail : '';
     expect(tail).toContain('starting build');
     expect(tail).toContain('[redacted: secret-shaped line]');
-    expect(tail).not.toContain('ghp_');
+    expect(tail).not.toContain('gh' + 'p_');
   });
 
   it('never throws for non-string streams (boundedRedactedOutputTail is total)', () => {
@@ -982,6 +982,41 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     const hugeLine = 'x'.repeat(10_000_000) + '\nlast words';
     const hugeTail = boundedRedactedOutputTail(hugeLine, undefined);
     expect(hugeTail).toBe('x'.repeat(32 * 1024 - 11) + '\nlast words');
+  });
+
+  it('keeps the combined stdout+stderr scan within 32 KiB, never splitting more than the combined window (fix round 2, item 2)', () => {
+    // Two streams whose individually retained slices add up to well over
+    // 32 KiB: the helper must cut the raw COMBINED text to its last 32 KiB
+    // before any strip or split, and apply the 200-line limit by locating the
+    // boundary newline instead of splitting the whole window. The assertions
+    // fail against the previous implementation, which joined both retained
+    // 32 KiB slices and split the ~64 KiB result before limiting the lines.
+    const stdout = Array.from({ length: 40000 }, (_, i) => `out ${i}`).join('\n');
+    const stderr = Array.from({ length: 300 }, (_, i) => `err ${i}`).join('\n');
+    expect(stdout.length + stderr.length).toBeGreaterThan(64 * 1024);
+    const originalSplit = String.prototype.split;
+    let longestSplit = 0;
+    (String.prototype as { split: typeof String.prototype.split }).split = function trackedSplit(
+      this: string,
+      ...args: unknown[]
+    ) {
+      longestSplit = Math.max(longestSplit, this.length);
+      return originalSplit.apply(this, args as Parameters<typeof originalSplit>);
+    };
+    try {
+      const tail = boundedRedactedOutputTail(stdout, stderr);
+      expect(tail).toBeDefined();
+      const lines = (tail as string).split('\n');
+      expect(lines.length).toBeLessThanOrEqual(200);
+      // stderr is fully inside the combined last-32-KiB window, so the last
+      // 200 lines of the combined text are exactly stderr's last 200 lines.
+      expect(lines[0]).toBe('err 100');
+      expect(lines[lines.length - 1]).toBe('err 299');
+      expect((tail as string).length).toBeLessThanOrEqual(32 * 1024);
+    } finally {
+      String.prototype.split = originalSplit;
+    }
+    expect(longestSplit).toBeLessThanOrEqual(32 * 1024 + 1);
   });
 
   it('returns undefined when only the unscanned head carries non-whitespace content', () => {

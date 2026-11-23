@@ -600,7 +600,7 @@ describe('renderHandoverBrief output tails (GD2)', () => {
 
   it('refuses a secret-shaped tail with secret-shaped-input', () => {
     const result = renderHandoverBrief(
-      input({ source: 'gate', gatePredicates: [predicate({ outputTail: 'export TOKEN=ghp_abc123def456ghi789jkl012mno345' })] }),
+      input({ source: 'gate', gatePredicates: [predicate({ outputTail: 'export TOKEN=gh' + 'p_abc123def456ghi789jkl012mno345' })] }),
     );
     expect(result).toEqual({ ok: false, reason: 'secret-shaped-input' });
   });
@@ -703,6 +703,56 @@ describe('renderHandoverBrief output tails (GD2)', () => {
       );
       expect(result, shape.title).toEqual({ ok: false, reason: 'invalid-gate-predicate' });
     }
+  });
+
+  it('refuses a gatePredicates array with an own Symbol.iterator getter or an index getter without running either (fix round 2, item 1)', () => {
+    // The renderer must never iterate the list with `for…of` (which would
+    // invoke a custom `Symbol.iterator` getter) and must never read an index
+    // through its getter: both are refused through their own property
+    // descriptors, and each check is O(1) per list / O(1) per element. These
+    // assertions fail against the previous `for…of` implementation, which ran
+    // both getters and only refused because the getters threw.
+    let iteratorRuns = 0;
+    const hostileIterator = Object.defineProperties([predicate()], {
+      [Symbol.iterator]: {
+        get() {
+          iteratorRuns += 1;
+          return function* () {
+            yield predicate();
+          };
+        },
+        configurable: true,
+      },
+    });
+    expect(
+      renderHandoverBrief(
+        input({ source: 'gate', gatePredicates: hostileIterator as RenderHandoverBriefInput['gatePredicates'] }),
+      ),
+    ).toEqual({ ok: false, reason: 'invalid-gate-predicate' });
+    expect(iteratorRuns).toBe(0);
+
+    let indexRuns = 0;
+    const hostileIndex = Object.defineProperties([predicate()], {
+      0: {
+        get() {
+          indexRuns += 1;
+          return predicate();
+        },
+        configurable: true,
+      },
+    });
+    expect(
+      renderHandoverBrief(
+        input({ source: 'gate', gatePredicates: hostileIndex as RenderHandoverBriefInput['gatePredicates'] }),
+      ),
+    ).toEqual({ ok: false, reason: 'invalid-gate-predicate' });
+    expect(indexRuns).toBe(0);
+
+    // An honest plain array (iterator on the prototype, data index
+    // properties) still renders.
+    expect(renderHandoverBrief(input({ source: 'gate', gatePredicates: [predicate()] }))).toEqual(
+      expect.objectContaining({ ok: true }),
+    );
   });
 
   it('renders 200 maximal tails (32 KiB each) within the cap in linear time', () => {

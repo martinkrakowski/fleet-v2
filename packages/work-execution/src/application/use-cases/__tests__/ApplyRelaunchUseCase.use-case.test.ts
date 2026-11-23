@@ -2387,6 +2387,73 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     await refused({ runJournalResult: new Map([[RUN_A, new Array(201).fill(conductEntry(RUN_A, 'running'))]]) }); // over-sized
   });
 
+  it('AR3b-11 (fix round 2): a journal answer that is only map-shaped — a Map.prototype child with own has/get accessors, an overridden method, or a Proxy get trap returning forged entries — refuses stale-plan-state before the grant is spent, and its own getter never runs (cost: O(1) prototype + two descriptor reads, O(1) per requested run id)', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+    ];
+    const refused = async (runJournalResult: unknown): Promise<void> => {
+      const deps = makeDeps({
+        plan, entries,
+        live: { run: null, runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])], runJournalResult },
+      });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: inputs }))).toEqual({
+        outcome: 'refused', reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    };
+    // A map-shaped object with own `has`/`get` accessors: the accessor is
+    // refused through its own descriptor, so the getter never runs.
+    let getterReads = 0;
+    const accessorMap = Object.create(Map.prototype, {
+      [RUN_A]: { get(): unknown {
+        getterReads += 1;
+        return [conductEntry(RUN_A, 'running')];
+      } },
+    });
+    Object.defineProperty(accessorMap, 'has', {
+      enumerable: true, configurable: true,
+      get(): unknown {
+        getterReads += 1;
+        return Map.prototype.has;
+      },
+    });
+    await refused(accessorMap);
+    expect(getterReads).toBe(0);
+    // A map-shaped object whose `get` is an own override supplying a forged
+    // entry list is refused the same way: the override never runs.
+    let overrideReads = 0;
+    const forged = Object.create(Map.prototype, {
+      has: { value: Map.prototype.has },
+      get: { value(): unknown {
+        overrideReads += 1;
+        return [conductEntry(RUN_A, 'running')];
+      } },
+    });
+    await refused(forged);
+    expect(overrideReads).toBe(0);
+    // A Proxy over a genuine Map whose `get` trap returns a forged entry
+    // list is refused too: the genuine method invocation fails the Proxy's
+    // missing internal slot, so the trap is never consulted.
+    let trapReads = 0;
+    const trapped = new Proxy(new Map([[RUN_A, [conductEntry(RUN_A, 'running')]]]), {
+      get(target, property, receiver): unknown {
+        // An `await` of a promise resolving to the proxy reads `then`
+        // through the trap; only a forged `get`/`has` read would matter.
+        if (property === 'get' || property === 'has') {
+          trapReads += 1;
+          return () => [conductEntry(RUN_A, 'running')];
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await refused(trapped);
+    expect(trapReads).toBe(0);
+  });
+
   it('AR3b-9 (fix round 1): a run record outside the full LaneRunRecord grammar — a wrong version, a string attemptIds, an extra own key, a polluting own key — refuses stale-plan-state before the grant is spent (cost: one bounded full-record validation per run, O(runs))', async () => {
     const { plan, inputs } = handoffPlan(3);
     const digest = plan.planDigest;

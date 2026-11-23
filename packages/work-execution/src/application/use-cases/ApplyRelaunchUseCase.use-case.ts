@@ -1067,12 +1067,46 @@ function readAdoptAttemptId(adoptInput: ApplyRelaunchAdoptInput | undefined): st
   return typeof id === 'string' && id !== '' ? id : null;
 }
 
+type MapMethod = (this: Map<unknown, unknown>, key: unknown) => unknown;
+
+/**
+ * `has` or `get` of a journal answer, validated through the value's own
+ * property descriptors (fix round 2): the prototype must be exactly
+ * `Map.prototype`, and any own `has`/`get` must be a data property whose
+ * value is the genuine `Map.prototype` method — an accessor is refused
+ * without ever running it, and an override is refused. The method is
+ * returned as `Map.prototype`'s own, so the caller invokes it with the
+ * answer as receiver: a genuine `Map` reads its real `[[MapData]]`, while
+ * a map-like fake or a `Proxy` (no `[[MapData]]`, whatever its traps
+ * return) throws an incompatible-receiver error and can never supply
+ * forged journal entries. Cost: O(1) per method, two descriptor reads.
+ */
+function journalMapMethod(
+  value: object,
+  name: 'has' | 'get',
+): MapMethod {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  if (descriptor !== undefined) {
+    if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+      throw new Error('journal map method is an accessor');
+    }
+    if (descriptor.value !== Map.prototype[name]) {
+      throw new Error('journal map method is overridden');
+    }
+  }
+  return Map.prototype[name] as MapMethod;
+}
+
 /**
  * The run journals of `runIds`, from `journalsForRuns` (one store read when
  * `listForRuns` exists), validated without running any getter: the answer
  * must be a genuine `Map` holding a bounded dense array of well-formed
- * stored entries for every requested id. Cost: O(runs × entries) validated
- * reads, each bounded. `null` on any throw, missing id or malformed entry.
+ * stored entries for every requested id. `has` and `get` are validated
+ * through own descriptors and invoked only as the genuine `Map.prototype`
+ * methods (fix round 2), so an own getter is never executed and an
+ * overridden method can never supply forged entries. Cost: O(runs ×
+ * entries) validated reads, each bounded. `null` on any throw, missing id
+ * or malformed entry.
  */
 async function readReconciledJournals(
   runJournal: RunJournalRunReads,
@@ -1081,14 +1115,20 @@ async function readReconciledJournals(
   let journalMap: unknown;
   try {
     journalMap = await journalsForRuns(runJournal, runIds);
-    // `instanceof`, `has` and `get` each consult a trap a Proxy may make
-    // throw, so the whole inspection is inside the same refusal guard: any
-    // throw is a malformed answer, never a propagated error.
-    if (!(journalMap instanceof Map)) return null;
+    // The prototype read, the descriptor reads and the method invocations
+    // each consult a trap a Proxy may make throw (and a Proxy receiver
+    // fails the genuine method's internal-slot requirement), so the whole
+    // inspection is inside the same refusal guard: any throw is a
+    // malformed answer, never a propagated error.
+    if (typeof journalMap !== 'object' || journalMap === null) return null;
+    if (Object.getPrototypeOf(journalMap) !== Map.prototype) return null;
+    const has = journalMapMethod(journalMap, 'has');
+    const get = journalMapMethod(journalMap, 'get');
+    const receiver = journalMap as Map<unknown, unknown>;
     const out = new Map<string, readonly LaneRunJournalEntryRecord[]>();
     for (const runId of runIds) {
-      if (!journalMap.has(runId)) return null;
-      const dense = readBoundedDenseArray(journalMap.get(runId), MAX_RECONCILED_ENTRIES);
+      if (has.call(receiver, runId) !== true) return null;
+      const dense = readBoundedDenseArray(get.call(receiver, runId), MAX_RECONCILED_ENTRIES);
       if (dense === null) return null;
       const entries: LaneRunJournalEntryRecord[] = [];
       for (const item of dense.array) {

@@ -348,6 +348,20 @@ function completedResult(
   } as ManageCutoverResult;
 }
 
+/**
+ * `snapshotPlainDataRecord` without the throw: a hostile record (a revoked
+ * Proxy, or one whose reflection traps throw) must read as unreadable, not
+ * escape as an exception. Cost is the snapshot's own `O(K)` own-keys walk;
+ * there is no extra pass, so the bound is unchanged.
+ */
+function trySnapshot(value: unknown): Record<string, unknown> | null {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
 /** Whether two validated shadow-park records name the same park, field for field (SW2b2). */
 function sameShadowParkRecord(left: CutoverShadowParkRecord, right: CutoverShadowParkRecord): boolean {
   return (
@@ -958,12 +972,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
 
     const policy = await this.guarded(deadlineIso, () => this.deps.mergePolicy!.readMergePolicy());
     if (policy.kind === 'deadline') return unknown('deadline-exceeded');
-    if (policy.kind === 'threw' || policy.value.outcome !== 'known') return unknown('merge-policy-unreadable');
-    const repositoryList = readBoundedDenseArray(policy.value.repositories, MAX_MERGE_POLICY_REPOS);
+    // A null/undefined answer, or a hostile record whose reflection throws or
+    // hides a getter, is unreadable — never dereferenced directly.
+    const policySnapshot =
+      policy.kind === 'value' ? trySnapshot(policy.value) : null;
+    if (policySnapshot === null || policySnapshot.outcome !== 'known') return unknown('merge-policy-unreadable');
+    const repositoryList = readBoundedDenseArray(policySnapshot.repositories, MAX_MERGE_POLICY_REPOS);
     if (repositoryList === null) return unknown('merge-policy-unreadable');
     const shadowRepos = new Set<string>();
     for (const repo of repositoryList.array) {
-      const snapshot = snapshotPlainDataRecord(repo);
+      const snapshot = trySnapshot(repo);
       if (
         snapshot === null ||
         typeof snapshot.repositoryKey !== 'string' ||
@@ -1016,22 +1034,36 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
 
     const journalList = await this.guarded(deadlineIso, () => this.deps.shadowParkJournal!.listByKeyPrefix(''));
     if (journalList.kind === 'deadline') return unknown('deadline-exceeded');
-    if (journalList.kind === 'threw' || journalList.value.outcome !== 'listed') return unknown('journal-unreadable');
-    const existing = readBoundedDenseArray(journalList.value.entries, MAX_SHADOW_PARK_JOURNAL_ENTRIES);
+    if (journalList.kind === 'threw') return unknown('journal-unreadable');
+    // A null/undefined response, or a hostile one whose own keys throw, is an
+    // unreadable journal — never dereferenced directly.
+    const journalSnapshot = trySnapshot(journalList.value);
+    if (journalSnapshot === null || journalSnapshot.outcome !== 'listed') return unknown('journal-unreadable');
+    const existing = readBoundedDenseArray(journalSnapshot.entries, MAX_SHADOW_PARK_JOURNAL_ENTRIES);
     if (existing === null) return unknown('journal-unreadable');
+    // Every listed entry is snapshotted before its fields are read, so a null
+    // element or a throwing `key`/`kind` getter cannot escape the match loop.
+    const entrySnapshots: Array<Record<string, unknown> | null> = existing.array.map((element) => trySnapshot(element));
+    if (entrySnapshots.some((entrySnapshot) => entrySnapshot === null)) return unknown('journal-unreadable');
+    const listedEntries = entrySnapshots.filter((entrySnapshot): entrySnapshot is Record<string, unknown> => entrySnapshot !== null);
+    const findRecorded = (parkKey: string): Record<string, unknown> | null => {
+      for (const entrySnapshot of listedEntries) {
+        if (entrySnapshot.kind !== 'intent') continue;
+        if (entrySnapshot.key === parkKey) return entrySnapshot;
+      }
+      return null;
+    };
 
     let newParksCount = 0;
     for (const park of planned) {
-      const recorded = existing.array.find(
-        (e) => (e as CutoverJournalEntry).key === park.parkKey && (e as CutoverJournalEntry).kind === 'intent',
-      ) as CutoverJournalEntry | undefined;
-      if (recorded === undefined) {
+      const entrySnapshot = findRecorded(park.parkKey);
+      if (entrySnapshot === null) {
         newParksCount += 1;
         continue;
       }
       park.recordedIntent = true;
-      const parkRead = readCutoverShadowParkRecord(recorded.shadowPark);
-      if (!parkRead.ok || recorded.digest !== park.priorDigest || !sameShadowParkRecord(parkRead.record, park.record)) {
+      const parkRead = readCutoverShadowParkRecord(entrySnapshot.shadowPark);
+      if (!parkRead.ok || entrySnapshot.digest !== park.priorDigest || !sameShadowParkRecord(parkRead.record, park.record)) {
         return refuse('park-digest-mismatch');
       }
     }

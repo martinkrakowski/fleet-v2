@@ -485,6 +485,23 @@ export function composeExecution(input: ComposeExecutionInput) {
       }
       return { outcome: result.outcome, reason: result.reason };
     },
+    // AR3a: the relaunch-apply grant's head-free resolve, answered by the
+    // coordination use case behind the composition root. Head-free: the
+    // request carries the empty head and the plan digest it is bound to.
+    // `grantId` is a non-secret handle; no secret-shaped value is ever echoed.
+    authorizeRelaunchApply: async (request) => {
+      const result = await coordination.resolveActionAuthorization.resolveActionAuthorization({
+        projectId: 'relaunch',
+        actionScope: 'relaunch:apply',
+        expectedHeadSha: '',
+        authorizationGrantId: request.grantId,
+        proposalDigest: request.planDigest,
+      });
+      if (result.outcome === 'authorized') {
+        return { outcome: 'authorized', grantId: result.grantId };
+      }
+      return { outcome: result.outcome, reason: result.reason };
+    },
   });
 
   const executionObservation = new ExecutionObservationAdapter({

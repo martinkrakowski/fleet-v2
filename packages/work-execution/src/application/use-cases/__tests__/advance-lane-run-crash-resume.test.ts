@@ -406,6 +406,11 @@ async function makeHarness(
         return collectAnswer(request);
       },
     },
+    // SN1: collect requires the commit step for every runner; the reconcile
+    // fakes here never need it to do anything but answer not-applicable.
+    commitEditOnlyAttempt: {
+      commitEditOnlyAttempt: async () => ({ outcome: 'not-applicable' }),
+    },
     evaluateAttemptGate: {
       evaluateAttemptGate: async (request) => {
         gateRequests.push(request);

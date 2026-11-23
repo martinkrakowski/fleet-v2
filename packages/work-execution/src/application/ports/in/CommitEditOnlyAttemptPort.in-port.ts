@@ -8,6 +8,7 @@ export interface CommitEditOnlyAttemptRequest {
 export const COMMIT_EDIT_ONLY_REFUSALS = [
   'attempt-missing', 'not-ended', 'no-allowed-prefixes', 'brief-changed', 'diff-findings',
   'head-moved', 'detached-head', 'ref-moved', 'outside-allowed-paths',
+  'merge-state-present', 'staged-content-findings',
 ] as const;
 export type CommitEditOnlyRefusal = (typeof COMMIT_EDIT_ONLY_REFUSALS)[number];
 

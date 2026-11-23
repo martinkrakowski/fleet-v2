@@ -56,6 +56,13 @@ export interface CommitLaneOutputRequest {
    * staging is never committed; at least one non-empty string is required.
    */
   readonly allowedPathPrefixes: readonly string[];
+  /**
+   * SN1: the secret re-scan of the content that is staged, run after staging
+   * and before the commit is written. `findings` refuses the commit and
+   * `error` is an unknown (nothing is committed either way). Absent: the
+   * path re-check alone applies.
+   */
+  readonly verifyStagedContent?: () => Promise<'clean' | 'findings' | 'error'>;
   /** The attempt's recorded runner block: the commit runs on that host's executor. */
   readonly recordedHost?: AttemptRunnerRecord | null;
 }
@@ -65,7 +72,11 @@ export type CommitLaneOutputRefusal =
   | 'outside-allowed-paths'
   | 'head-moved'
   | 'detached-head'
-  | 'ref-moved';
+  | 'ref-moved'
+  /** A merge, rebase or cherry-pick is in progress in the worktree: nothing is staged or committed. */
+  | 'merge-state-present'
+  /** The staged content re-scan found a finding: nothing is committed. */
+  | 'staged-content-findings';
 
 export type CommitLaneOutputResult =
   | { readonly outcome: 'committed'; readonly headCommit: string; readonly branchRef: string }
@@ -305,6 +316,24 @@ export type ResetWorktreeToHeadResult =
   | { readonly outcome: 'error'; readonly reason: string };
 
 /**
+ * SN1: the request to remove untracked files (`git clean -fd`) from one
+ * worktree after its tracked edits were preserved elsewhere, so a refused
+ * dispatch's untracked residue never leaks into the next attempt's worktree.
+ * Tracked paths are never touched.
+ */
+export interface RemoveUntrackedFilesRequest {
+  /** The attempt's recorded worktree root (absolute). */
+  readonly worktreePath: string;
+  /** The attempt's recorded runner block: the clean runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+export type RemoveUntrackedFilesResult =
+  | { readonly outcome: 'removed' }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'git-refused' }
+  | { readonly outcome: 'error'; readonly reason: string };
+
+/**
  * GB3: the request to verify whether a preserved patch matches the worktree
  * (`git apply --check -R <patchPath>`).
  */
@@ -445,6 +474,14 @@ export interface WorkspacePort {
    * are unchanged.
    */
   resetWorktreeToHead?(request: ResetWorktreeToHeadRequest): Promise<ResetWorktreeToHeadResult>;
+
+  /**
+   * SN1: remove untracked files (`git clean -fd`) from one worktree, after
+   * its tracked edits were preserved. Never touches tracked paths; a non-zero
+   * git exit is a refusal, a run without an exit code or with an error
+   * (a timeout included) is an error.
+   */
+  removeUntrackedFiles?(request: RemoveUntrackedFilesRequest): Promise<RemoveUntrackedFilesResult>;
 
   /** Read a text file from the worktree, locally or remotely. Returns null if missing. */
   readWorktreeFile?(

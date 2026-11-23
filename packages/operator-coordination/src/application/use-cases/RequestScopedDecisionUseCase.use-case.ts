@@ -24,6 +24,11 @@ import {
   isShadowImportActionScope,
   parseShadowImportGrant,
   releaseGrantDigestPayload,
+  isRelaunchApplyActionScope,
+  isStrictIsoInstant,
+  relaunchApplyDigestPayload,
+  RELAUNCH_APPLY_DIGEST_PREFIX,
+  RELAUNCH_APPLY_CLOCK_SKEW_MS,
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
@@ -86,6 +91,10 @@ type DecisionStep<T> =
   | { readonly result: RequestScopedDecisionResult }
   | { readonly value: T };
 
+function rejectedStep(reason: string): { readonly result: RequestScopedDecisionResult } {
+  return { result: { outcome: 'rejected', reason } };
+}
+
 /** The release-root read the domain helper returns. */
 type ReleaseRootRead = ReturnType<typeof readReleaseRoot>;
 
@@ -97,6 +106,7 @@ interface ValidatedDecisionRequest {
   readonly releaseRootValue: string | undefined;
   readonly isReleaseScope: boolean;
   readonly isShadowScope: boolean;
+  readonly isRelaunchScope: boolean;
 }
 
 type ShadowImportGrantEvaluation =
@@ -322,6 +332,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         releaseRootValue,
         isReleaseScope,
         isShadowScope: isShadowImportActionScope(request.actionScope.trim()),
+        isRelaunchScope: isRelaunchApplyActionScope(request.actionScope.trim()),
       },
     };
   }
@@ -341,6 +352,28 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     deps: RequestScopedDecisionDependencies,
     scope: ValidatedDecisionRequest,
   ): DecisionStep<string> {
+    if (scope.isRelaunchScope) {
+      // AR3a: the grant's creation instant is bound into the request id (and
+      // so under the owner's signature), so the requester names it — but it is
+      // only accepted inside a narrow window around the trusted clock, never a
+      // far-future instant that would make the grant outlive its TTL.
+      if (deps.shadowImportClock === undefined) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-clock-unavailable' } };
+      }
+      const trusted = deps.shadowImportClock.nowIso();
+      const claimed = scope.request.nowIso;
+      if (claimed === undefined || claimed === null || claimed === '') {
+        return { value: trusted };
+      }
+      if (
+        !isStrictIsoInstant(trusted) ||
+        !isStrictIsoInstant(claimed) ||
+        Math.abs(Date.parse(claimed) - Date.parse(trusted)) > RELAUNCH_APPLY_CLOCK_SKEW_MS
+      ) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-created-at-out-of-window' } };
+      }
+      return { value: claimed };
+    }
     if (!scope.isShadowScope) {
       return { value: isFilled(scope.request.nowIso) ? scope.request.nowIso : new Date().toISOString() };
     }
@@ -374,33 +407,63 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (scope.isShadowScope) {
       const grantEvaluation = evaluateShadowImportGrant(scope.request, nowIso, deps.computeDigest);
       if (!grantEvaluation.ok) {
-        return { result: { outcome: 'rejected', reason: grantEvaluation.reason } };
+        return rejectedStep(grantEvaluation.reason);
       }
       shadowImportGrant = grantEvaluation.grant;
     }
-    if (scope.isReleaseScope) {
-      if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
-        return { result: { outcome: 'rejected', reason: 'release-expected-head-required' } };
-      }
-      if (deps.computeDigest === undefined) {
-        return { result: { outcome: 'rejected', reason: 'release-grant-digest-unavailable' } };
-      }
-      const payloadResult = releaseGrantDigestPayload({
-        actionScope: scope.request.actionScope.trim(),
-        projectId: scope.request.projectId.trim(),
-        expectedHeadSha: scope.request.expectedHeadSha.trim(),
-        releaseRoot: scope.releaseRootValue,
-        nonce: readReleaseNonce(scope.request),
-      });
-      if (!payloadResult.ok) {
-        return { result: { outcome: 'rejected', reason: payloadResult.code } };
-      }
-      const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${deps.computeDigest(payloadResult.value)}`;
-      if (scope.request.requestId.trim() !== expectedRequestId) {
-        return { result: { outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' } };
-      }
+    const bindingReason =
+      (scope.isRelaunchScope ? this.relaunchBindingRejection(deps, scope, nowIso) : null) ??
+      (scope.isReleaseScope ? this.releaseBindingRejection(deps, scope) : null);
+    if (bindingReason !== null) {
+      return rejectedStep(bindingReason);
     }
     return { value: shadowImportGrant };
+  }
+
+  /** The relaunch-apply request id must be the digest of its exact coordinates; a rejection reason or null. */
+  private relaunchBindingRejection(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+    nowIso: string,
+  ): string | null {
+    if (deps.computeDigest === undefined) {
+      return 'relaunch-apply-digest-unavailable';
+    }
+    const expectedRelaunchId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${deps.computeDigest(
+      relaunchApplyDigestPayload({
+        projectId: scope.request.projectId.trim(),
+        proposalDigest: scope.request.proposalDigest.trim(),
+        createdAtIso: nowIso,
+      }),
+    )}`;
+    return scope.request.requestId.trim() === expectedRelaunchId
+      ? null
+      : 'relaunch-apply-request-digest-mismatch';
+  }
+
+  /** A release grant needs its head and a request id bound to its exact coordinates; a reason or null. */
+  private releaseBindingRejection(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+  ): string | null {
+    if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
+      return 'release-expected-head-required';
+    }
+    if (deps.computeDigest === undefined) {
+      return 'release-grant-digest-unavailable';
+    }
+    const payloadResult = releaseGrantDigestPayload({
+      actionScope: scope.request.actionScope.trim(),
+      projectId: scope.request.projectId.trim(),
+      expectedHeadSha: scope.request.expectedHeadSha.trim(),
+      releaseRoot: scope.releaseRootValue,
+      nonce: readReleaseNonce(scope.request),
+    });
+    if (!payloadResult.ok) {
+      return payloadResult.code;
+    }
+    const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${deps.computeDigest(payloadResult.value)}`;
+    return scope.request.requestId.trim() === expectedRequestId ? null : 'release-grant-request-digest-mismatch';
   }
 
   /**
@@ -496,7 +559,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       revision: recorded.revision + 1,
       // A shadow request's moment is the trusted clock's, never the
       // request-supplied one; ordinary decisions keep main's behaviour.
-      updatedAtIso: scope.isShadowScope
+      updatedAtIso: scope.isShadowScope || scope.isRelaunchScope
         ? nowIso
         : isFilled(scope.request.nowIso)
           ? scope.request.nowIso

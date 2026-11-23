@@ -21,9 +21,16 @@ import {
   readReleaseNonce,
   releaseRootsAgree,
   isShadowImportActionScope,
+  isRelaunchApplyActionScope,
+  isStrictIsoInstant,
+  relaunchApplyDigestPayload,
+  RELAUNCH_APPLY_DIGEST_PREFIX,
   isSignedDecisionRequired,
   releaseGrantDigestPayload,
   RELEASE_GRANT_DIGEST_PREFIX,
+  RELAUNCH_APPLY_ACTION_SCOPE,
+  RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS,
+  RELAUNCH_APPLY_PROJECT_ID,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   shadowImportDigestPayload,
@@ -67,6 +74,53 @@ function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/**
+ * Enormous-input bounds for the relaunch-apply resolve. A legitimate request
+ * carries a project id of at most a handful of characters and a grant handle
+ * well under this cap; anything longer cannot match and is refused with a
+ * length test — O(1) — before any unbounded `.trim()` copy or scan runs, so
+ * the whole resolve stays O(1) in the input size.
+ */
+const MAX_RELAUNCH_PROJECT_ID_LENGTH = 64;
+const MAX_RELAUNCH_GRANT_ID_LENGTH = 256;
+
+/**
+ * Prototype-polluting own keys. A request body carrying any of these as an own
+ * property (as `JSON.parse('{"__proto__":{...}}')` produces) is refused with a
+ * typed `invalid-request` result — never copied onto any snapshot object, so
+ * `Object.prototype` can never be reached, let alone mutated.
+ */
+const PROTOTYPE_POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
+
+// A plain object that carries an own `length` or own index key is an
+// array-like disguised as a record; the relaunch reader refuses it with two
+// O(1) descriptor reads (never a key walk).
+const ARRAY_LIKE_KEYS: readonly string[] = ['length', '0'];
+
+
+/**
+ * The fixed field names the relaunch-apply resolve reads. The relaunch path
+ * never enumerates the request: each field is read by name with exactly one
+ * `Object.getOwnPropertyDescriptor` call — O(1) per field, four fields, so the
+ * whole read is O(1) regardless of how many other own keys the request body
+ * carries, and no key list is ever materialized.
+ */
+const RELAUNCH_REQUEST_FIELDS: readonly string[] = [
+  'actionScope',
+  'projectId',
+  'authorizationGrantId',
+  'proposalDigest',
+];
+
+/**
+ * Enormous-input bound for the descriptor-safe request snapshot: at most this
+ * many own keys are ever copied. Every legitimate request carries a fixed
+ * handful of fields, so a body carrying more own keys than this is hostile
+ * bulk; refusing it at the cap keeps the snapshot — and every resolve path
+ * that reads it, the relaunch-apply one included — O(1) in the input size.
+ */
+const MAX_SNAPSHOT_OWN_KEYS = 32;
+
 function blocked(reason: string): ResolveActionAuthorizationResult {
   return { outcome: 'blocked', reason };
 }
@@ -105,43 +159,239 @@ function snapshotRepository(value: unknown): unknown {
  * grant). Absence (no own property at all) stays absent and still resolves as
  * before. Inspecting a descriptor never runs a getter, a setter or a `get`
  * trap. The snapshot shape is `readPlainObjectLoose`'s (unknown keys copied,
- * null-prototype, symbol keys and a non-plain prototype refused as null);
- * a trap that throws propagates and the caller turns it into the same typed
+ * null-prototype, symbol keys and a non-plain prototype refused as null); an
+ * own-key count past `MAX_SNAPSHOT_OWN_KEYS` is refused as null too, so no
+ * hostile bulk can make the snapshot loop cost proportional to its size.
+ * A trap that throws propagates and the caller turns it into the same typed
  * refusal. Returns the snapshot plus the first accessor-carrying field name,
  * or null when every snapshotted field is plain data.
  */
 function readRequestSnapshot(
   input: object,
-): { snapshot: Record<string, unknown> | null; accessorField: string | null } {
+  preRead?: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined },
+): RequestSnapshotRead {
   if (Array.isArray(input)) {
-    return { snapshot: null, accessorField: null };
+    return refusedSnapshot();
   }
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) {
-    return { snapshot: null, accessorField: null };
+    return refusedSnapshot();
   }
-  // The snapshot is built on a null prototype: an own `__proto__` key on the
-  // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
-  // as an ordinary data property instead of mutating the snapshot's
-  // prototype, so the snapshot reads exactly like main reads any other body.
+  // Prototype-polluting own keys are refused outright: a request body that
+  // carries `__proto__` (or `constructor`/`prototype`) as an own property is
+  // hostile bulk, and the hostile-input rules require it to be refused with a
+  // typed result — copying it onto a null-prototype snapshot would leave the
+  // key readable on the snapshot and one spread away from pollution.
+  const polluting = firstOwnKeyAmong(input, PROTOTYPE_POLLUTING_KEYS);
+  if (polluting !== null) {
+    return refusedSnapshot({ pollutingKey: polluting });
+  }
+  return copyRequestSnapshotFields(input, preRead);
+}
+
+type RequestSnapshotRead = {
+  snapshot: Record<string, unknown> | null;
+  accessorField: string | null;
+  keyBoundExceeded: boolean;
+  pollutingKey: string | null;
+};
+
+function refusedSnapshot(
+  overrides: { readonly keyBoundExceeded?: boolean; readonly pollutingKey?: string } = {},
+): RequestSnapshotRead {
+  return {
+    snapshot: null,
+    accessorField: null,
+    keyBoundExceeded: overrides.keyBoundExceeded ?? false,
+    pollutingKey: overrides.pollutingKey ?? null,
+  };
+}
+
+/** The first of `keys` that `input` carries as an own property, or null; one descriptor read per key. */
+function firstOwnKeyAmong(input: object, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    if (Object.getOwnPropertyDescriptor(input, key) !== undefined) {
+      return key;
+    }
+  }
+  return null;
+}
+
+/**
+ * EXACTLY ONE descriptor read per snapshotted field: a field whose descriptor
+ * was already read once by the O(1) routing read is reused, never consulted a
+ * second time.
+ */
+function readSnapshotDescriptor(
+  input: object,
+  key: string,
+  preRead: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined } | undefined,
+): PropertyDescriptor | undefined {
+  return preRead !== undefined && key === preRead.key
+    ? preRead.descriptor
+    : Object.getOwnPropertyDescriptor(input, key);
+}
+
+function copyRequestSnapshotFields(
+  input: object,
+  preRead: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined } | undefined,
+): RequestSnapshotRead {
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let accessorField: string | null = null;
+  // Enormous-input bound: a legitimate request carries a fixed handful of own
+  // fields; a body with more own keys than this cap is hostile bulk whose only
+  // possible effect is to make the snapshot loop itself cost O(input size).
+  // Counting to the cap is O(1), and exceeding it is the same typed refusal
+  // every other hostile shape gets, on every path that reads the snapshot.
+  let ownKeyCount = 0;
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string') {
-      return { snapshot: null, accessorField: null };
+      return refusedSnapshot();
     }
-    // EXACTLY ONE descriptor read per snapshotted field: both the accessor
-    // refusal and the copied value derive from this single descriptor.
-    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (ownKeyCount >= MAX_SNAPSHOT_OWN_KEYS) {
+      return refusedSnapshot({ keyBoundExceeded: true });
+    }
+    ownKeyCount += 1;
+    const descriptor = readSnapshotDescriptor(input, key, preRead);
     if (descriptor === undefined || !descriptor.enumerable) {
-      return { snapshot: null, accessorField: null };
+      return refusedSnapshot();
     }
     if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
       accessorField = key;
     }
     out[key] = descriptor.value;
   }
-  return { snapshot: out, accessorField };
+  return { snapshot: out, accessorField, keyBoundExceeded: false, pollutingKey: null };
+}
+
+/**
+ * AR3a fix round 2: reads the relaunch-apply request's fixed fields WITHOUT
+ * enumerating the body. Cost bound: O(1) — a fixed handful of named
+ * `Object.getOwnPropertyDescriptor` calls (four request fields plus the
+ * prototype-polluting key names), each of which is a single hash lookup; no
+ * key list is ever materialized and no per-key loop ever runs, so the read
+ * cost never scales with the number of own keys the body carries. Extra own
+ * keys beyond the fixed fields are simply never read: nothing copies them,
+ * nothing spreads the request, so hostile bulk is inert by construction
+ * rather than counted.
+ *
+ * An own accessor (getter or setter) on any relaunch field, or a
+ * non-enumerable own field, is refused with null — the same typed
+ * `invalid-request` refusal the descriptor-safe snapshot gives the other
+ * paths. A prototype-polluting own key (`__proto__`, `constructor`,
+ * `prototype`) is refused with null too, so a relaunch-apply request that
+ * carries one can never authorize. A trap that throws propagates; the caller
+ * turns it into the same typed refusal.
+ */
+function readRelaunchRequestFields(
+  input: object,
+): {
+  actionScope: unknown;
+  projectId: unknown;
+  authorizationGrantId: unknown;
+  proposalDigest: unknown;
+} | null {
+  if (firstOwnKeyAmong(input, PROTOTYPE_POLLUTING_KEYS) !== null) {
+    return null;
+  }
+  if (firstOwnKeyAmong(input, ARRAY_LIKE_KEYS) !== null) {
+    return null;
+  }
+  const fields: Record<string, unknown> = {};
+  for (const field of RELAUNCH_REQUEST_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, field);
+    if (descriptor === undefined) {
+      fields[field] = undefined;
+      continue;
+    }
+    if (!descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    fields[field] = descriptor.value;
+  }
+  return fields as {
+    actionScope: unknown;
+    projectId: unknown;
+    authorizationGrantId: unknown;
+    proposalDigest: unknown;
+  };
+}
+
+/**
+ * Cost bound: O(1) — a fixed count of field reads and one bounded 64-hex
+ * pattern test; nothing scales with input size. Every string field is
+ * length-checked against its enormous-input bound BEFORE it is trimmed or
+ * pattern-tested, so hostile bulk is refused by a constant-time length test,
+ * never by work proportional to its size. The grant id and the plan digest
+ * are non-secret handles, but neither is ever echoed into a refusal reason.
+ */
+function checkRelaunchRequestFields(
+  request: ResolveActionAuthorizationRequest,
+):
+  | { readonly ok: true; readonly grantId: string }
+  | { readonly ok: false; readonly block: ResolveActionAuthorizationResult } {
+  if (
+    typeof request.projectId !== 'string' ||
+    request.projectId.length > MAX_RELAUNCH_PROJECT_ID_LENGTH ||
+    !isFilled(request.projectId) ||
+    request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID
+  ) {
+    return { ok: false, block: blocked('grant-wrong-project') };
+  }
+  if (
+    typeof request.authorizationGrantId !== 'string' ||
+    request.authorizationGrantId.length > MAX_RELAUNCH_GRANT_ID_LENGTH ||
+    !isFilled(request.authorizationGrantId)
+  ) {
+    return { ok: false, block: blocked('grant-missing') };
+  }
+  if (
+    typeof request.proposalDigest !== 'string' ||
+    request.proposalDigest.length !== 64 ||
+    !/^[0-9a-f]{64}$/.test(request.proposalDigest)
+  ) {
+    return { ok: false, block: blocked('invalid-request') };
+  }
+  return { ok: true, grantId: request.authorizationGrantId.trim() };
+}
+
+/** The stored relaunch-apply record must hold the relaunch scope, project and the requested plan digest. */
+function checkRelaunchGrantRecord(
+  candidate: CoordinationRequest,
+  refreshed: CoordinationRequestRecord,
+  request: ResolveActionAuthorizationRequest,
+): ResolveActionAuthorizationResult | null {
+  if (candidate.getActionScope() !== RELAUNCH_APPLY_ACTION_SCOPE || refreshed.expectedHeadSha !== null) {
+    return blocked('grant-wrong-scope');
+  }
+  if (refreshed.projectId !== RELAUNCH_APPLY_PROJECT_ID) {
+    return blocked('grant-wrong-project');
+  }
+  if (refreshed.proposalDigest !== request.proposalDigest) {
+    return blocked('grant-digest-mismatch');
+  }
+  return null;
+}
+
+/**
+ * The expiry is measured with the trusted clock alone: a request-supplied
+ * `nowIso` can never revive an expired grant. The boundary is exclusive —
+ * exactly `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days after creation is already
+ * expired.
+ */
+function checkRelaunchExpiry(createdAtIso: string, nowIso: string): ResolveActionAuthorizationResult | null {
+  const createdAtMs = Date.parse(createdAtIso);
+  const nowMs = Date.parse(nowIso);
+  if (!isStrictIsoInstant(createdAtIso)) {
+    return blocked('grant-expired');
+  }
+  if (createdAtMs > nowMs) {
+    return blocked('grant-created-in-future');
+  }
+  if (!Number.isFinite(createdAtMs) || nowMs >= createdAtMs + RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000) {
+    return blocked('grant-expired');
+  }
+  return null;
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -166,6 +416,43 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (typeof input !== 'object' || input === null) {
       return blocked('invalid-request');
     }
+    // AR3a fix round 2: the relaunch-apply route is decided and resolved with
+    // O(1) named descriptor reads alone — the request body is never
+    // enumerated here, so no key list is ever materialized and no per-key
+    // work can scale with the body's size. A throwing trap on any descriptor
+    // read is a hostile Proxy and a typed refusal, never an exception.
+    // The single `actionScope` descriptor read below is REUSED by the
+    // snapshot on the non-relaunch paths, so every snapshotted field keeps
+    // its exactly-once descriptor consultation.
+    let scopeDescriptor: PropertyDescriptor | undefined;
+    try {
+      if (!Array.isArray(input)) {
+        const prototype = Object.getPrototypeOf(input);
+        if (prototype === Object.prototype || prototype === null) {
+          scopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+          if (
+            scopeDescriptor !== undefined &&
+            (!scopeDescriptor.enumerable ||
+              scopeDescriptor.get !== undefined ||
+              scopeDescriptor.set !== undefined)
+          ) {
+            return blocked('invalid-request');
+          }
+          const scopeValue = scopeDescriptor === undefined ? undefined : scopeDescriptor.value;
+          if (typeof scopeValue === 'string' && isRelaunchApplyActionScope(scopeValue.trim())) {
+            const relaunchFields = readRelaunchRequestFields(input);
+            if (relaunchFields === null) {
+              return blocked('invalid-request');
+            }
+            return this.resolveRelaunchApply(
+              relaunchFields as unknown as ResolveActionAuthorizationRequest,
+            );
+          }
+        }
+      }
+    } catch {
+      return blocked('invalid-request');
+    }
     // Standing shadow import grant (owner decision 2026-11-18): the resolve
     // is head-free — the grant is bound by its digest-bound request id, its
     // exact repository and its capped expiry, never by a commit. Its clock is
@@ -181,9 +468,27 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // the snapshot is a hostile proxy: a typed refusal, never an exception.
     let snapshot: Record<string, unknown> | null = null;
     let accessorField: string | null = null;
+    let keyBoundExceeded = false;
+    let pollutingKey: string | null = null;
     try {
-      ({ snapshot, accessorField } = readRequestSnapshot(input));
+      ({ snapshot, accessorField, keyBoundExceeded, pollutingKey } = readRequestSnapshot(input, {
+        key: 'actionScope',
+        descriptor: scopeDescriptor,
+      }));
     } catch {
+      return blocked('invalid-request');
+    }
+    // AR3a fix round 2: a request body carrying a prototype-polluting own key
+    // is refused with the typed `invalid-request` answer on every path — the
+    // key is never copied onto any snapshot object.
+    if (pollutingKey !== null) {
+      return blocked('invalid-request');
+    }
+    // Enormous-input refusal: a body carrying more own keys than the snapshot
+    // cap is hostile bulk on every resolve path, and its routing field cannot
+    // be trusted to name its own refusal, so the typed `invalid-request`
+    // answer comes first, before any scope is read.
+    if (keyBoundExceeded) {
       return blocked('invalid-request');
     }
     // BL02g fix round: a set-only accessor is an accessor too — its snapshot
@@ -215,6 +520,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         repository: snapshotRepository(snapshot['repository']),
       };
       return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
+    }
+    if (isRelaunchApplyActionScope(scope)) {
+      if (snapshot === null) {
+        return blocked('invalid-request');
+      }
+      // AR3a: the relaunch-apply resolve is head-free like the shadow import
+      // one. It reads only the descriptor-safe snapshot — never the original
+      // request — so no getter or Proxy trap can run after the freeze.
+      return this.resolveRelaunchApply(snapshot as unknown as ResolveActionAuthorizationRequest);
     }
     // Fix round 3 (BL02g): the non-shadow validation reads no field off the
     // original request. The emptiness check and the required-field values come
@@ -478,38 +792,20 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (requestedRepository === null) {
       return blocked('grant-wrong-repository');
     }
-    if (this.deps?.shadowImportClock === undefined) {
-      return blocked('clock-unavailable');
+    const trustedNow = this.readTrustedNow();
+    if (!trustedNow.ok) {
+      return trustedNow.block;
     }
-    const nowIso = this.deps.shadowImportClock.nowIso();
-    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
-      return blocked('invalid-now-iso');
-    }
-    if (this.deps.computeDigest === undefined) {
+    const { nowIso } = trustedNow;
+    const computeDigest = this.deps?.computeDigest;
+    if (computeDigest === undefined) {
       return blocked('digest-unavailable');
     }
-    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
-    if (recorded === null) {
-      return blocked('grant-missing');
+    const loaded = await this.loadApprovedHeadFreeGrant(grantId);
+    if (!loaded.ok) {
+      return loaded.block;
     }
-    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
-    if (refreshedResult.refusalReason !== undefined) {
-      // A pinned owner-key refusal blocks before any grant state is checked.
-      return blocked(refreshedResult.refusalReason);
-    }
-    const refreshed = refreshedResult.record;
-    if (refreshed.state === 'cancelled') {
-      return blocked('grant-revoked');
-    }
-    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
-      return blocked('grant-not-approved');
-    }
-    let candidate: CoordinationRequest;
-    try {
-      candidate = CoordinationRequest.fromRecord(refreshed);
-    } catch {
-      return blocked('grant-wrong-scope');
-    }
+    const { refreshed, candidate } = loaded;
     if (
       candidate.getActionScope() !== SHADOW_IMPORT_ACTION_SCOPE ||
       !candidate.canAuthorizeShadowImport(SHADOW_IMPORT_ACTION_SCOPE)
@@ -522,7 +818,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     const payloadResult = shadowImportDigestPayload(shadowGrant);
     const expectedRequestId = payloadResult.ok
-      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`
+      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${computeDigest.call(this.deps, payloadResult.value)}`
       : null;
     if (!payloadResult.ok || candidate.getId() !== expectedRequestId) {
       return blocked('grant-digest-mismatch');
@@ -554,6 +850,129 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       expectedHeadSha: '',
       policyRevision: candidate.getPolicyRevision(),
     };
+  }
+
+  /**
+   * AR3a: the explicit head-free resolve path for a standing
+   * `relaunch:apply` grant. The grant is bound to the plan digest it names —
+   * never a commit — to the one `relaunch` project id, and to a short capped
+   * expiry of `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days measured with the
+   * injected clock alone, never a request field, so a caller cannot backdate
+   * the clock past expiry. An unwired clock fails closed. Nothing is bound
+   * and no consumption is checked: a standing grant resolves until it expires
+   * or is revoked. The grant id and the plan digest are non-secret handles,
+   * but neither is ever echoed into a refusal reason.
+   */
+  private async resolveRelaunchApply(
+    request: ResolveActionAuthorizationRequest,
+  ): Promise<ResolveActionAuthorizationResult> {
+    const fieldCheck = checkRelaunchRequestFields(request);
+    if (!fieldCheck.ok) {
+      return fieldCheck.block;
+    }
+    const { grantId } = fieldCheck;
+    const trustedNow = this.readTrustedNow();
+    if (!trustedNow.ok) {
+      return trustedNow.block;
+    }
+    const loaded = await this.loadApprovedHeadFreeGrant(grantId);
+    if (!loaded.ok) {
+      return loaded.block;
+    }
+    const { refreshed, candidate } = loaded;
+    const recordBlock = checkRelaunchGrantRecord(candidate, refreshed, request);
+    if (recordBlock !== null) {
+      return recordBlock;
+    }
+    const requestIdBlock = this.checkRelaunchRequestId(refreshed);
+    if (requestIdBlock !== null) {
+      return requestIdBlock;
+    }
+    const expiryBlock = checkRelaunchExpiry(refreshed.createdAtIso, trustedNow.nowIso);
+    if (expiryBlock !== null) {
+      return expiryBlock;
+    }
+    // A signed owner decision is re-verified before anything is authorized:
+    // the stored approved state alone is never authority.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
+    if (signatureBlock !== null) {
+      return signatureBlock;
+    }
+    return {
+      outcome: 'authorized',
+      grantId,
+      requestId: candidate.getId(),
+      expectedHeadSha: '',
+      policyRevision: candidate.getPolicyRevision(),
+    };
+  }
+
+  /** The injected clock's strict instant, or the typed refusal; a request field is never the clock. */
+  private readTrustedNow():
+    | { readonly ok: true; readonly nowIso: string }
+    | { readonly ok: false; readonly block: ResolveActionAuthorizationResult } {
+    const clock = this.deps?.shadowImportClock;
+    if (clock === undefined) {
+      return { ok: false, block: blocked('clock-unavailable') };
+    }
+    const nowIso = clock.nowIso();
+    if (!isStrictIsoInstant(nowIso)) {
+      return { ok: false, block: blocked('invalid-now-iso') };
+    }
+    return { ok: true, nowIso };
+  }
+
+  /**
+   * The shared head-free load: the recorded request for the grant id, refreshed
+   * from a verified answer, that is approved and parses as a coordination
+   * request; otherwise the typed refusal.
+   */
+  private async loadApprovedHeadFreeGrant(
+    grantId: string,
+  ): Promise<
+    | { readonly ok: true; readonly refreshed: CoordinationRequestRecord; readonly candidate: CoordinationRequest }
+    | { readonly ok: false; readonly block: ResolveActionAuthorizationResult }
+  > {
+    const recorded = (await this.deps?.requestRepo.findRequestByGrantId(grantId)) ?? null;
+    if (recorded === null) {
+      return { ok: false, block: blocked('grant-missing') };
+    }
+    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshedResult.refusalReason !== undefined) {
+      // A pinned owner-key refusal blocks before any grant state is checked.
+      return { ok: false, block: blocked(refreshedResult.refusalReason) };
+    }
+    const refreshed = refreshedResult.record;
+    if (refreshed.state === 'cancelled') {
+      return { ok: false, block: blocked('grant-revoked') };
+    }
+    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
+      return { ok: false, block: blocked('grant-not-approved') };
+    }
+    try {
+      return { ok: true, refreshed, candidate: CoordinationRequest.fromRecord(refreshed) };
+    } catch {
+      return { ok: false, block: blocked('grant-wrong-scope') };
+    }
+  }
+
+  /**
+   * The owner's signature covers the request id, not the plan digest or the
+   * creation instant: both are bound by the id's digest, recomputed here from
+   * the stored fields, so a store edit of either is refused.
+   */
+  private checkRelaunchRequestId(refreshed: CoordinationRequestRecord): ResolveActionAuthorizationResult | null {
+    const computeDigest = this.deps?.computeDigest;
+    if (computeDigest === undefined) {
+      return blocked('digest-unavailable');
+    }
+    const payload = relaunchApplyDigestPayload({
+      projectId: refreshed.projectId,
+      proposalDigest: refreshed.proposalDigest,
+      createdAtIso: refreshed.createdAtIso,
+    });
+    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${computeDigest.call(this.deps, payload)}`;
+    return refreshed.id === expectedRequestId ? null : blocked('grant-request-digest-mismatch');
   }
 
   /**

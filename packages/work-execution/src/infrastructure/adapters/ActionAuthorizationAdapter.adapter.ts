@@ -19,6 +19,8 @@ import { LANE_DIFF_SECRET_PATTERNS, readPlainRecord, SECRET_PATTERNS } from '@fl
 
 import type {
   ActionAuthorizationPort,
+  AuthorizeRelaunchApplyRequest,
+  AuthorizeRelaunchApplyResult,
   AuthorizeShadowImportRequest,
   AuthorizeShadowImportResult,
   AuthorizeUnsealedWorktreeRemovalRequest,
@@ -89,6 +91,13 @@ export interface ActionAuthorizationDelegate {
   readonly authorizeShadowImport?: (
     request: AuthorizeShadowImportRequest,
   ) => Promise<AuthorizeShadowImportResult>;
+  /**
+   * The relaunch-apply grant's head-free resolve (AR3a), answered by the
+   * coordination use case behind the composition root.
+   */
+  readonly authorizeRelaunchApply?: (
+    request: AuthorizeRelaunchApplyRequest,
+  ) => Promise<AuthorizeRelaunchApplyResult>;
 }
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
@@ -200,6 +209,12 @@ function isCleanText(value: unknown, maxLength: number): value is string {
  * it the call is a typed `authorization-unavailable`, never a hang.
  */
 export const SHADOW_IMPORT_DELEGATE_DEADLINE_MS = 15_000 as const;
+
+/**
+ * AR3a: the relaunch-apply delegate call is waited for at most this long; past
+ * it the call is a typed `authorization-unavailable`, never a hang.
+ */
+export const RELAUNCH_APPLY_DELEGATE_DEADLINE_MS = 15_000 as const;
 
 /**
  * The deadline guard, the `withBudget` pattern of `ReapLaneWorktreesUseCase`:
@@ -526,8 +541,27 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
 }
 
 /** A delegate's free-text reason, kept only when clean and bounded. */
-function cleanReason(reason: string, fallback: 'delegate-blocked' | 'delegate-refused'): string {
+function cleanReason(
+  reason: string,
+  fallback: 'delegate-blocked' | 'delegate-refused' | 'delegate-unknown',
+): string {
   return containsDisallowedOutputText(reason) ? fallback : reason;
+}
+
+/**
+ * AR3a: a delegate's free-text reason, additionally scrubbed of the requested
+ * grant id so the grant handle is never echoed back out of the adapter. The
+ * cost bound is O(1): one bounded pattern check plus one bounded `includes`
+ * over a reason already capped at `MAX_REASON_LENGTH` characters.
+ */
+function cleanRelaunchApplyReason(
+  reason: string,
+  requestedGrantId: string,
+  outcome: 'blocked' | 'unknown',
+): string {
+  const fallback = outcome === 'blocked' ? 'delegate-blocked' : 'delegate-unknown';
+  const cleaned = cleanReason(reason, fallback);
+  return cleaned.includes(requestedGrantId) ? fallback : cleaned;
 }
 
 /**
@@ -643,16 +677,83 @@ function readShadowImportRequest(request: unknown): Validated<AuthorizeShadowImp
 }
 
 /**
- * The delegate's shadow import answer. Only an authorized answer with a
- * bounded, secret-free, path-free grant handle (a non-secret id by design)
- * that matches the requested grant id is passed on; every other shape is
- * unknown, so an unreadable answer is never authority. An authorized answer
- * naming a different grant is a typed refusal, never a pass-through.
+ * AR3a: the relaunch-apply resolve request: a bounded, descriptor-safe read.
+ * Cost bound: O(1) over three bounded strings of at most 256 characters each.
+ * A non-object, a wrong-typed or oversized field, or a hostile accessor
+ * (getter, setter, throwing Proxy, `__proto__`, non-plain prototype) is
+ * refused, never thrown, and no accessor ever runs. The plan digest must be
+ * exactly 64 lowercase hex characters; the grant id is a non-secret handle
+ * but still bounded and screened.
  */
-function readShadowImportAnswer(
+function readRelaunchApplyRequest(request: unknown): Validated<AuthorizeRelaunchApplyRequest> {
+  // An own `__proto__` key is a prototype-pollution attempt, not a field the
+  // schema declares: `readPlainRecord` copies only declared keys, so without
+  // this explicit check such a request would validate clean and could be
+  // authorized. The descriptor read is O(1) and never runs an accessor; a
+  // throwing trap here is the same hostile refusal as anywhere else. The
+  // prototype itself is never written: the key is refused, not copied.
+  try {
+    // Own `__proto__` and own array-like markers (`length`, index `0`) are
+    // refused: `readPlainRecord` ignores undeclared keys, so without this an
+    // array-like plain object carrying valid fields would validate clean.
+    for (const key of ['__proto__', 'length', '0']) {
+      if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+        return { ok: false, reason: 'invalid-request' };
+      }
+    }
+  } catch {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const read = readPlainRecord(request, {
+    planDigest: { kind: 'string', maxLength: 256 },
+    grantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
+    nowIso: { kind: 'string', maxLength: 64 },
+  });
+  if (!read.ok) {
+    return { ok: false, reason: failureOf(read.reason) };
+  }
+  const value = read.value as unknown as AuthorizeRelaunchApplyRequest;
+  if (
+    !/^[0-9a-f]{64}$/.test(value.planDigest) ||
+    !isSafeId(value.grantId, MAX_GRANT_ID_LENGTH, true) ||
+    !isCleanText(value.nowIso, 64) ||
+    !isStrictInstant(value.nowIso)
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return { ok: true, value: { ...value } };
+}
+
+/**
+ * AR3a: the delegate's relaunch-apply answer. Only an authorized answer with
+ * a bounded, secret-free, path-free grant handle that matches the requested
+ * grant id is passed on; every other shape is unknown, so an unreadable
+ * answer is never authority. An authorized answer naming a different grant is
+ * a typed refusal, never a pass-through. A blocked or unknown reason is
+ * scrubbed of secret-shaped, path-shaped and grant-id text, so the grant id
+ * is never echoed.
+ */
+function readRelaunchApplyAnswer(
   answer: unknown,
   requestedGrantId: string,
-): AuthorizeShadowImportResult {
+): AuthorizeRelaunchApplyResult {
+  return readDelegateAuthorizeAnswer(answer, requestedGrantId, (reason, outcome) =>
+    cleanRelaunchApplyReason(reason, requestedGrantId, outcome),
+  );
+}
+
+/**
+ * The shared reader of a delegate's authorize answer: an authorized answer
+ * must carry a bounded, safe grant handle equal to the requested id; a
+ * blocked or unknown answer carries a reason cleaned by the caller's scrubber.
+ */
+function readDelegateAuthorizeAnswer(
+  answer: unknown,
+  requestedGrantId: string,
+  cleanBlockedReason: (reason: string, outcome: 'blocked' | 'unknown') => string,
+):
+  | { readonly outcome: 'authorized'; readonly grantId: string }
+  | { readonly outcome: 'blocked' | 'unknown'; readonly reason: string } {
   const head = readPlainRecord(answer, {
     outcome: { kind: 'literal', values: ['authorized', 'blocked', 'unknown'] },
   });
@@ -677,10 +778,24 @@ function readShadowImportAnswer(
   if (!withReason.ok) {
     return { outcome: 'unknown', reason: 'authorization-unavailable' };
   }
-  return {
-    outcome: head.value.outcome as 'blocked' | 'unknown',
-    reason: cleanReason(withReason.value.reason as string, 'delegate-blocked'),
-  };
+  const outcome = head.value.outcome as 'blocked' | 'unknown';
+  return { outcome, reason: cleanBlockedReason(withReason.value.reason as string, outcome) };
+}
+
+/**
+ * The delegate's shadow import answer. Only an authorized answer with a
+ * bounded, secret-free, path-free grant handle (a non-secret id by design)
+ * that matches the requested grant id is passed on; every other shape is
+ * unknown, so an unreadable answer is never authority. An authorized answer
+ * naming a different grant is a typed refusal, never a pass-through.
+ */
+function readShadowImportAnswer(
+  answer: unknown,
+  requestedGrantId: string,
+): AuthorizeShadowImportResult {
+  return readDelegateAuthorizeAnswer(answer, requestedGrantId, (reason) =>
+    cleanReason(reason, 'delegate-blocked'),
+  );
 }
 
 function readDelegateResolveResult(
@@ -761,6 +876,7 @@ interface ReadDelegate {
   readonly grants: Map<string, ActionAuthorizationGrantEntry> | undefined;
   readonly authorizeUnsealedWorktreeRemoval: ActionAuthorizationDelegate['authorizeUnsealedWorktreeRemoval'];
   readonly authorizeShadowImport: ActionAuthorizationDelegate['authorizeShadowImport'];
+  readonly authorizeRelaunchApply: ActionAuthorizationDelegate['authorizeRelaunchApply'];
 }
 
 /** Adapter construction options; every member is optional. */
@@ -771,6 +887,13 @@ export interface ActionAuthorizationAdapterOptions {
    * anything else falls back to the default, never to an unbounded wait.
    */
   readonly shadowImportDelegateDeadlineMs?: number;
+  /**
+   * AR3a: the relaunch-apply delegate call's deadline in milliseconds.
+   * Overrides `RELAUNCH_APPLY_DELEGATE_DEADLINE_MS` only with a positive safe
+   * integer; anything else falls back to the default, never to an unbounded
+   * wait.
+   */
+  readonly relaunchApplyDelegateDeadlineMs?: number;
 }
 
 function shadowImportDelegateDeadlineMs(options: ActionAuthorizationAdapterOptions): number {
@@ -778,6 +901,14 @@ function shadowImportDelegateDeadlineMs(options: ActionAuthorizationAdapterOptio
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
     ? value
     : SHADOW_IMPORT_DELEGATE_DEADLINE_MS;
+}
+
+/** AR3a: the relaunch-apply delegate deadline, defaulted the same bounded way. */
+function relaunchApplyDelegateDeadlineMs(options: ActionAuthorizationAdapterOptions): number {
+  const value = options.relaunchApplyDelegateDeadlineMs;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : RELAUNCH_APPLY_DELEGATE_DEADLINE_MS;
 }
 
 export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
@@ -799,6 +930,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         grants: grants instanceof Map ? grants : undefined,
         authorizeUnsealedWorktreeRemoval: this.delegate?.authorizeUnsealedWorktreeRemoval,
         authorizeShadowImport: this.delegate?.authorizeShadowImport,
+        authorizeRelaunchApply: this.delegate?.authorizeRelaunchApply,
       };
     } catch {
       return null;
@@ -911,6 +1043,41 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       return { outcome: 'unknown', reason: 'authorization-unavailable' };
     }
     return readShadowImportAnswer(answer, validated.value.grantId);
+  }
+
+  /**
+   * AR3a: the relaunch-apply grant's head-free resolve. A malformed or
+   * hostile request is blocked; an absent delegate or delegate method, a
+   * throwing delegate, a delegate whose answer never settles (bounded by
+   * `withDelegateDeadline`) or an unreadable answer is unknown — never
+   * authority. The grant id is a non-secret handle, and a blocked or unknown
+   * delegate reason is scrubbed of the grant id, secrets and paths, so the
+   * grant is never echoed.
+   */
+  async authorizeRelaunchApply(
+    request: AuthorizeRelaunchApplyRequest,
+  ): Promise<AuthorizeRelaunchApplyResult> {
+    const delegate = this.readDelegate();
+    if (delegate === null || typeof delegate.authorizeRelaunchApply !== 'function') {
+      return { outcome: 'unknown', reason: 'authorization-unavailable' };
+    }
+    const validated = readRelaunchApplyRequest(request);
+    if (!validated.ok) {
+      return { outcome: 'blocked', reason: validated.reason };
+    }
+    let answer: unknown;
+    const authorize = delegate.authorizeRelaunchApply;
+    try {
+      // Bounded: a delegate whose promise never settles is an expired
+      // deadline, a typed `authorization-unavailable`, never a hang.
+      answer = await withDelegateDeadline(
+        () => authorize(validated.value),
+        relaunchApplyDelegateDeadlineMs(this.options),
+      );
+    } catch {
+      return { outcome: 'unknown', reason: 'authorization-unavailable' };
+    }
+    return readRelaunchApplyAnswer(answer, validated.value.grantId);
   }
 
   private async resolveThroughDelegate(
@@ -1151,4 +1318,13 @@ function isResolvableGrant(grant: ActionAuthorizationGrantEntry, request: Resolv
     return true;
   }
   return RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId;
+}
+
+/** Strict ISO-8601 UTC instant whose calendar date is real (`2026-02-30` is refused). */
+function isStrictInstant(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)) {
+    return false;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 19) === value.slice(0, 19);
 }

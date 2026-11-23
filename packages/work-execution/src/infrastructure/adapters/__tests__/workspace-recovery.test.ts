@@ -284,7 +284,7 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     const racing: CommandExecutorPort = {
       run: async (argv, options) => {
         const result = await inner.run(argv, options);
-        if (argv[0] === 'git' && argv.includes('diff')) {
+        if (argv.includes('git') && argv.includes('diff')) {
           await fs.writeFile(patchPath, 'raced writer\n', 'utf8');
         }
         return result;
@@ -389,5 +389,69 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     // The ignored content survives and was not destroyed by reset
     expect(await fs.readFile(path.join(repoPath, 'dist'), 'utf8')).toBe('ignored build artifact\n');
     expect((await git(repoPath, ['rev-parse', 'HEAD'])).trim()).toBe(head);
+  });
+
+  it('SN1: preserve captures untracked files too, so reset and clean leave a clean worktree with every file in the patch', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'outside-owned.patch');
+    await fs.writeFile(path.join(repoPath, 'README.md'), '# changed\n', 'utf8');
+    await fs.mkdir(path.join(repoPath, 'newdir'), { recursive: true });
+    const secretShaped = 'token = ' + 'sk_' + 'live_' + 'x'.repeat(24) + '\n';
+    await fs.writeFile(path.join(repoPath, 'newdir', 'secret.env'), secretShaped, 'utf8');
+    const indexBefore = await git(repoPath, ['ls-files', '--stage']);
+
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const preserved = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    expect(preserved.outcome).toBe('preserved');
+    const patch = await fs.readFile(patchPath, 'utf8');
+    expect(patch).toContain('README.md');
+    expect(patch).toContain('newdir/secret.env');
+    expect(patch).toContain(secretShaped.trim());
+    // The worktree's own index is untouched and no temp index is left behind.
+    expect(await git(repoPath, ['ls-files', '--stage'])).toBe(indexBefore);
+    expect((await fs.readdir(patchesDir)).filter((name) => name.startsWith('.fleet-'))).toEqual([]);
+
+    expect((await adapter.resetWorktreeToHead({ worktreePath: repoPath })).outcome).toBe('reset');
+    expect((await adapter.removeUntrackedFiles({ worktreePath: repoPath })).outcome).toBe('removed');
+    expect((await git(repoPath, ['status', '--porcelain', '--untracked-files=all'])).trim()).toBe('');
+
+    // The patch restores both files on a clean worktree.
+    await git(repoPath, ['apply', patchPath]);
+    expect(await fs.readFile(path.join(repoPath, 'newdir', 'secret.env'), 'utf8')).toBe(secretShaped);
+    expect(await fs.readFile(path.join(repoPath, 'README.md'), 'utf8')).toBe('# changed\n');
+  });
+
+  it('SN1: a worktree with only an untracked file is preserved, not reported as nothing-to-preserve', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'untracked-only.patch');
+    await fs.writeFile(path.join(repoPath, 'only-new.txt'), 'new\n', 'utf8');
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const preserved = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    expect(preserved.outcome).toBe('preserved');
+    expect(await fs.readFile(patchPath, 'utf8')).toContain('only-new.txt');
+  });
+
+  it('SN1: a failed preserve leaves the untracked file and the tracked edit in place', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'failing.patch');
+    await fs.writeFile(path.join(repoPath, 'README.md'), '# changed\n', 'utf8');
+    await fs.writeFile(path.join(repoPath, 'only-new.txt'), 'new\n', 'utf8');
+    const failing: CommandExecutorPort = {
+      run: async (argv, options) =>
+        argv.includes('diff') && argv.includes('--cached')
+          ? { exitCode: 128, signal: null, stdout: '', stderr: 'fail' }
+          : new LocalExecutor().run(argv, options),
+    };
+    const adapter = new WorkspaceAdapter({ executor: failing });
+    const preserved = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    expect(preserved).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    expect((await git(repoPath, ['status', '--porcelain', '--untracked-files=all'])).trim().split('\n').sort()).toEqual([
+      '?? only-new.txt',
+      'M README.md',
+    ]);
+    expect(await fs.readFile(path.join(repoPath, 'only-new.txt'), 'utf8')).toBe('new\n');
   });
 });

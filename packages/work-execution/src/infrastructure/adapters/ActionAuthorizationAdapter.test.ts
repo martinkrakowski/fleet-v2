@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { ActionAuthorizationAdapter } from './ActionAuthorizationAdapter.adapter.js';
 import type {
+  AuthorizeRelaunchApplyRequest,
+  AuthorizeRelaunchApplyResult,
   AuthorizeShadowImportRequest,
   AuthorizeShadowImportResult,
 } from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
@@ -435,5 +437,267 @@ describe('ActionAuthorizationAdapter local grant map (#4g)', () => {
     expect('authorizationGrantId' in result).toBe(true);
     expect((result as { authorizationGrantId?: string }).authorizationGrantId).toBe('grant-1');
     expect(result).not.toEqual(resolveRequest());
+  });
+});
+
+function relaunchRequest(overrides: Partial<AuthorizeRelaunchApplyRequest> = {}): AuthorizeRelaunchApplyRequest {
+  return {
+    planDigest: 'a'.repeat(64),
+    grantId: 'grant-relaunch-1',
+    nowIso: '2026-11-18T00:00:00Z',
+    ...overrides,
+  };
+}
+
+describe('ActionAuthorizationAdapter.authorizeRelaunchApply (AR3a)', () => {
+  it('answers unknown authorization-unavailable when the delegate or method is absent', async () => {
+    const withoutDelegate = await new ActionAuthorizationAdapter().authorizeRelaunchApply(
+      relaunchRequest(),
+    );
+    expect(withoutDelegate).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
+    const withoutMethod = await new ActionAuthorizationAdapter({}).authorizeRelaunchApply(
+      relaunchRequest(),
+    );
+    expect(withoutMethod).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
+  });
+
+  it('answers unknown authorization-unavailable when the delegate throws', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => {
+        throw new Error('delegate blew up');
+      },
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
+  });
+
+  it('answers unknown authorization-unavailable when the delegate never settles', async () => {
+    const adapter = new ActionAuthorizationAdapter(
+      {
+        authorizeRelaunchApply: () =>
+          new Promise<AuthorizeRelaunchApplyResult>(() => {}),
+      },
+      { relaunchApplyDelegateDeadlineMs: 20 },
+    );
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
+  });
+
+  it('passes an authorized answer through with its non-secret grant handle', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'authorized', grantId: 'grant-relaunch-1' });
+  });
+
+  it('keeps a clean blocked reason from the delegate', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'blocked', reason: 'grant-expired' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-expired' });
+  });
+
+  it('strips grant id, secret-shaped, or path-shaped text from delegate blocked reason', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({
+        outcome: 'blocked',
+        reason:
+          `grant-relaunch-1 rejected: sk-` +
+          '1234567890abcdef'.repeat(2) +
+          ' at /var/fleet/state/grants.json',
+      }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    // The grant id, the secret shape and the path are all gone: the reason is
+    // the fixed fallback, never an echo of the grant.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'delegate-blocked' });
+  });
+
+  it('scrubs a grant id that is the ONLY sensitive text in a blocked reason', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({
+        outcome: 'blocked',
+        reason: 'grant grant-relaunch-1 is no longer valid',
+      }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(JSON.stringify(result)).not.toContain('grant-relaunch-1');
+    expect(result).toEqual({ outcome: 'blocked', reason: 'delegate-blocked' });
+  });
+
+  it('scrubs a grant id echoed from a delegate unknown answer', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({
+        outcome: 'unknown',
+        reason: 'cannot read grant-relaunch-1',
+      }) as unknown as AuthorizeRelaunchApplyResult,
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'delegate-unknown' });
+  });
+
+  it('refuses an authorized answer naming a different grant as grant-id-mismatch', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-B' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-id-mismatch' });
+  });
+
+  it('answers unknown for an unreadable, primitive, or getter-carrying delegate answer', async () => {
+    const getterAnswer: Record<string, unknown> = { outcome: 'authorized' };
+    Object.defineProperty(getterAnswer, 'grantId', {
+      get() {
+        throw new Error('hostile answer getter ran');
+      },
+      enumerable: true,
+    });
+    const delegates: unknown[] = [
+      null,
+      'authorized grant-relaunch-1',
+      7,
+      getterAnswer,
+      new Proxy({ outcome: 'authorized' }, {
+        get() {
+          throw new Error('hostile answer proxy');
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error('hostile answer proxy descriptor');
+        },
+      }),
+    ];
+    for (const answer of delegates) {
+      const adapter = new ActionAuthorizationAdapter({
+        authorizeRelaunchApply: async () => answer as AuthorizeRelaunchApplyResult,
+      });
+      const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+      expect(
+        result.outcome === 'unknown' &&
+          (result.reason === 'authorization-unavailable' || result.reason === 'authorization-unreadable'),
+      ).toBe(true);
+    }
+  });
+
+  it('refuses a plan digest that is not 64 lowercase hex as invalid-request', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    for (const planDigest of ['', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), 7, undefined]) {
+      const result = await adapter.authorizeRelaunchApply(
+        relaunchRequest({ planDigest: planDigest as string }) as unknown as AuthorizeRelaunchApplyRequest,
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+  });
+
+  it('refuses a null request as invalid-request without throwing', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(null as unknown as AuthorizeRelaunchApplyRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an undefined request as invalid-request without throwing', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(undefined as unknown as AuthorizeRelaunchApplyRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses a wrong-primitive request as invalid-request', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const result = await adapter.authorizeRelaunchApply(42 as unknown as AuthorizeRelaunchApplyRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an array request with a hole, an array-like, and an enormous sparse array as invalid-request', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const holed = ['grant-relaunch-1'];
+    delete holed[0];
+    const arrayLike = { length: 1, 0: 'grant-relaunch-1' };
+    const enormous: unknown[] = [];
+    (enormous as { length: number }).length = 2 ** 32 - 1;
+    for (const hostile of [holed, arrayLike, enormous]) {
+      const result = await adapter.authorizeRelaunchApply(hostile as unknown as AuthorizeRelaunchApplyRequest);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+  });
+
+  it('refuses a hostile accessor field as invalid-request without running the getter', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    let calls = 0;
+    const request: Record<string, unknown> = { ...relaunchRequest() };
+    Object.defineProperty(request, 'grantId', {
+      get() {
+        calls += 1;
+        throw new Error('hostile getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await adapter.authorizeRelaunchApply(request as unknown as AuthorizeRelaunchApplyRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a hostile Proxy request as invalid-request without throwing', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const proxy = new Proxy({ ...relaunchRequest() }, {
+      get() {
+        throw new Error('hostile proxy');
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile proxy descriptor');
+      },
+    });
+    const result = await adapter.authorizeRelaunchApply(proxy as unknown as AuthorizeRelaunchApplyRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an array-like request (own length / index) and a non-ISO nowIso as invalid-request', async () => {
+    let calls = 0;
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => {
+        calls += 1;
+        return { outcome: 'authorized', grantId: 'grant-relaunch-1' };
+      },
+    });
+    const hostile: unknown[] = [
+      { ...relaunchRequest(), length: 1 },
+      { ...relaunchRequest(), 0: 'x' },
+      relaunchRequest({ nowIso: '0' }),
+      relaunchRequest({ nowIso: '2026' }),
+    ];
+    for (const request of hostile) {
+      const result = await adapter.authorizeRelaunchApply(request as AuthorizeRelaunchApplyRequest);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+    expect(calls).toBe(0);
+  });
+
+  it('refuses an own __proto__ key as invalid-request without mutating the prototype', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
+    });
+    const hostile = JSON.parse(
+      `{"planDigest":"${'a'.repeat(64)}","grantId":"grant-relaunch-1","nowIso":"2026-11-18T00:00:00Z","__proto__":{"polluted":true}}`,
+    ) as Record<string, unknown>;
+    const result = await adapter.authorizeRelaunchApply(hostile as unknown as AuthorizeRelaunchApplyRequest);
+    // An own `__proto__` key is a prototype-pollution attempt, never an
+    // inert extra field: the request is refused, and Object.prototype is
+    // untouched either way.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });

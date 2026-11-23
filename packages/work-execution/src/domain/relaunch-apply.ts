@@ -74,24 +74,29 @@ interface SnapshotEntry {
  */
 function readLedgerEntrySnapshot(item: unknown): SnapshotEntry | null {
   if (item === null || typeof item !== 'object') return null;
-  const descriptorOf = (key: string): PropertyDescriptor | undefined | null => {
-    try {
-      return Object.getOwnPropertyDescriptor(item as object, key);
-    } catch {
-      return null;
-    }
-  };
-  const keyDescriptor = descriptorOf('key');
-  if (keyDescriptor === null || keyDescriptor === undefined || keyDescriptor.get !== undefined) return null;
-  const key: unknown = keyDescriptor.value;
-  if (typeof key !== 'string') return null;
-  const kindDescriptor = descriptorOf('kind');
-  if (kindDescriptor === null || kindDescriptor === undefined || kindDescriptor.get !== undefined) return null;
-  const outcomeDescriptor = descriptorOf('outcome');
-  if (outcomeDescriptor === null) return null;
-  if (outcomeDescriptor === undefined) return { key, kind: kindDescriptor.value, outcome: undefined };
-  if (outcomeDescriptor.get !== undefined) return null;
-  return { key, kind: kindDescriptor.value, outcome: outcomeDescriptor.value };
+  try {
+    const prototype: unknown = Object.getPrototypeOf(item);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    // Each field's descriptor is read exactly once; the refusal decision and
+    // the value both come from that one descriptor.
+    const dataDescriptor = (key: string): PropertyDescriptor | undefined | null => {
+      const descriptor = Object.getOwnPropertyDescriptor(item, key);
+      if (descriptor === undefined) return undefined;
+      if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) return null;
+      return descriptor;
+    };
+    const keyDescriptor = dataDescriptor('key');
+    if (keyDescriptor === null || keyDescriptor === undefined) return null;
+    const key: unknown = keyDescriptor.value;
+    if (typeof key !== 'string') return null;
+    const kindDescriptor = dataDescriptor('kind');
+    if (kindDescriptor === null || kindDescriptor === undefined) return null;
+    const outcomeDescriptor = dataDescriptor('outcome');
+    if (outcomeDescriptor === null) return null;
+    return { key, kind: kindDescriptor.value, outcome: outcomeDescriptor?.value };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -134,12 +139,13 @@ export function deriveAdoptStepStatus(
 function adoptStatusFrom(statuses: readonly RelaunchStepStatus[]): RelaunchApplyStepStatus {
   if (statuses.every((status) => status === 'absent')) return 'absent';
   if (statuses.every((status) => status === 'completed')) return 'completed';
-  if (statuses.includes('refused')) return 'refused';
   // Out-of-order: an earlier non-completed sub-step followed by a later
   // sub-step that has begun (any later status other than `'absent'`).
   for (let index = 0; index < statuses.length - 1; index += 1) {
     if (statuses[index] !== 'completed' && statuses[index + 1] !== 'absent') return 'inconsistent';
   }
+  // A refusal with nothing begun after it stops the adopt; ordering is checked first.
+  if (statuses.includes('refused')) return 'refused';
   // At least one sub-step is recorded, none out of order, not all completed.
   return 'partial';
 }

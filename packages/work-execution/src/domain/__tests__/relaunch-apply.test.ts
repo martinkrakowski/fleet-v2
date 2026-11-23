@@ -82,7 +82,7 @@ const holeyEntries = (): unknown => {
 };
 
 /** An array Proxy whose own-property-descriptor trap counts index reads. */
-const indexDescriptorProxy = (): { proxy: unknown; count: number } => {
+const indexDescriptorProxy = (): { proxy: unknown; readonly reads: { count: number } } => {
   const reads = { count: 0 };
   const proxy = new Proxy([] as unknown[], {
     getOwnPropertyDescriptor(_target, property) {
@@ -90,7 +90,7 @@ const indexDescriptorProxy = (): { proxy: unknown; count: number } => {
       return undefined;
     },
   });
-  return { proxy, count: reads.count };
+  return { proxy, reads };
 };
 
 /** A Proxy whose `getOwnPropertyDescriptor` trap throws, over an array. */
@@ -137,10 +137,15 @@ describe('deriveAdoptStepStatus', () => {
         LANE,
       ),
     ).toBe('refused');
-    // A refused first sub-step with later absent ones stays refused, not partial.
+    // A refusal after a completed prefix, with later sub-steps absent, stays refused, not partial.
     expect(
       deriveAdoptStepStatus(
-        [intent(allFour[1] as string), result(allFour[1] as string, 'refused')],
+        [
+          intent(allFour[0] as string),
+          result(allFour[0] as string, 'completed'),
+          intent(allFour[1] as string),
+          result(allFour[1] as string, 'refused'),
+        ],
         DIGEST,
         LANE,
       ),
@@ -193,7 +198,7 @@ describe('deriveAdoptStepStatus', () => {
     const reads = indexDescriptorProxy();
     Object.defineProperty(reads.proxy, 'length', { value: MAX_RELAUNCH_APPLY_ENTRIES + 1 });
     expect(deriveAdoptStepStatus(reads.proxy, DIGEST, LANE)).toBe('inconsistent');
-    expect(reads.count).toBe(0);
+    expect(reads.reads.count).toBe(0);
   });
 
   it('R5: accessors and throwing inspections are refused without invoking a getter', () => {
@@ -223,6 +228,76 @@ describe('deriveAdoptStepStatus', () => {
     expect(outcomeFlag.read).toBe(false);
     // A Proxy whose descriptor trap throws.
     expect(deriveAdoptStepStatus([throwingDescriptorProxy()], DIGEST, LANE)).toBe('inconsistent');
+  });
+
+  it('R5b: a custom-prototype entry is refused', () => {
+    class Custom {
+      key = adoptKey('work-order');
+      kind = 'intent';
+    }
+    expect(deriveAdoptStepStatus([new Custom()], DIGEST, LANE)).toBe('inconsistent');
+    const proto = Object.create({ inherited: true }) as Record<string, unknown>;
+    proto.key = adoptKey('work-order');
+    proto.kind = 'intent';
+    expect(deriveAdoptStepStatus([proto], DIGEST, LANE)).toBe('inconsistent');
+    // A null-prototype entry is still plain data.
+    const bare = Object.assign(Object.create(null) as Record<string, unknown>, intent(adoptKey('work-order')));
+    expect(deriveAdoptStepStatus([bare], DIGEST, LANE)).toBe('partial');
+  });
+
+  it('R5c: a setter-only accessor on key, kind or outcome is refused', () => {
+    for (const field of ['key', 'kind', 'outcome']) {
+      const entry: Record<string, unknown> = { key: adoptKey('work-order'), kind: 'intent' };
+      Object.defineProperty(entry, field, { enumerable: true, configurable: true, set() {} });
+      expect(deriveAdoptStepStatus([entry], DIGEST, LANE)).toBe('inconsistent');
+    }
+    // The review's case: a work-order intent with a setter-only outcome.
+    const intentWithSetter = { key: adoptKey('work-order'), kind: 'intent' };
+    Object.defineProperty(intentWithSetter, 'outcome', { enumerable: true, configurable: true, set() {} });
+    expect(deriveAdoptStepStatus([intentWithSetter], DIGEST, LANE)).toBe('inconsistent');
+  });
+
+  it('R5d: a getter is never invoked (counter stays 0)', () => {
+    const counter = { reads: 0 };
+    for (const field of ['key', 'kind', 'outcome']) {
+      const entry: Record<string, unknown> = { key: adoptKey('run'), kind: 'result', outcome: 'completed' };
+      Object.defineProperty(entry, field, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          counter.reads += 1;
+          return 'x';
+        },
+      });
+      expect(deriveAdoptStepStatus([entry], DIGEST, LANE)).toBe('inconsistent');
+    }
+    expect(counter.reads).toBe(0);
+  });
+
+  it('R5e: a refused sub-step followed by a later begun one is inconsistent, not refused', () => {
+    const entries = [
+      intent(adoptKey('work-order')),
+      result(adoptKey('work-order'), 'refused'),
+      intent(adoptKey('brief')),
+    ];
+    expect(deriveAdoptStepStatus(entries, DIGEST, LANE)).toBe('inconsistent');
+  });
+
+  it('R5f: a descriptor that flips between calls is read once per key', () => {
+    const traps = { key: 0, kind: 0, outcome: 0 };
+    const target = { key: adoptKey('work-order'), kind: 'intent' };
+    const proxy = new Proxy(target, {
+      getOwnPropertyDescriptor(inner, property) {
+        if (property === 'key' || property === 'kind' || property === 'outcome') traps[property] += 1;
+        const call = typeof property === 'string' && property in traps ? traps[property as keyof typeof traps] : 1;
+        if (call > 1) {
+          return { enumerable: true, configurable: true, get: () => 'flipped' };
+        }
+        return Reflect.getOwnPropertyDescriptor(inner, property);
+      },
+    });
+    expect(deriveAdoptStepStatus([proxy], DIGEST, LANE)).toBe('partial');
+    expect(traps).toEqual({ key: 1, kind: 1, outcome: 1 });
   });
 
   it('R6: the canonical step order and cost bounds hold', () => {
@@ -333,7 +408,7 @@ describe('relaunchApplyLaneProgress', () => {
       step: null,
       reason: 'invalid-steps',
     });
-    expect(reads.count).toBe(0);
+    expect(reads.reads.count).toBe(0);
   });
 });
 
@@ -551,7 +626,7 @@ describe('canonicalSaveInputJson', () => {
     const enormous = reads.proxy;
     Object.defineProperty(enormous, 'length', { value: MAX_RELAUNCH_APPLY_ENTRIES + 1 });
     expect(canonicalSaveInputJson(DIGEST, { ...saveInput(), allowedPathPrefixes: enormous })).toBeNull();
-    expect(reads.count).toBe(0);
+    expect(reads.reads.count).toBe(0);
     // A sparse policyProtectedPaths array is refused too.
     const sparsePolicy = { ...saveInput(), policyProtectedPaths: new Array<unknown>(2) };
     (sparsePolicy.policyProtectedPaths as unknown[])[0] = '.github';

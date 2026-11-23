@@ -152,11 +152,12 @@ describe('enumOf', () => {
   });
 
   it('throws CliUsageError listing all allowed values on mismatch, wrong case, whitespace, or missing key', () => {
+    // '1' is in `allowed` precisely so a converting implementation would accept
+    // the number 1 via String(1); the refusal must come from the type, not the list.
+    const allowed = ['ab', 'aB', 'c', '1'] as const;
     for (const payload of [{}, { v: undefined }, { v: '' }, { v: 'AB' }, { v: ' aB ' }, { v: 1 }, { v: 'zz' }]) {
-      expect(() => enumOf(payload as never, 'v', ['ab', 'aB', 'c'], 'ctx')).toThrowError(CliUsageError);
-      expect(() => enumOf(payload as never, 'v', ['ab', 'aB', 'c'], 'ctx')).toThrowError(
-        'ctx must be one of: ab, aB, c',
-      );
+      expect(() => enumOf(payload as never, 'v', allowed, 'ctx')).toThrowError(CliUsageError);
+      expect(() => enumOf(payload as never, 'v', allowed, 'ctx')).toThrowError('ctx must be one of: ab, aB, c, 1');
     }
   });
 });

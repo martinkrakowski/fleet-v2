@@ -203,6 +203,49 @@ describe('parseHostAudibleAlertRequest', () => {
     expect(getTraps).toBe(0);
   });
 
+  it('reads sentence via exactly one getOwnPropertyDescriptor call on (request, "sentence")', () => {
+    const request = { sentence: 'all clear' };
+    const spy = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+    const result = parseHostAudibleAlertRequest(request);
+    const calls = spy.mock.calls;
+    spy.mockRestore();
+    const matching = calls.filter(([target, key]) => target === request && key === 'sentence');
+    expect(matching.length).toBe(1);
+    expect(result).toEqual({ ok: true, sentence: 'all clear' });
+  });
+
+  it('never enumerates the request, running no enumeration or extra getters (10k extra keys)', () => {
+    const request: Record<string, unknown> = { sentence: 'all clear' };
+    let getterRuns = 0;
+    for (let i = 0; i < 10_000; i += 1) {
+      request[`extra${i}`] = i;
+    }
+    Object.defineProperty(request, 'extraGetter', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterRuns += 1;
+        return 1;
+      },
+    });
+    const spies = [
+      vi.spyOn(Object, 'getOwnPropertyNames'),
+      vi.spyOn(Object, 'keys'),
+      vi.spyOn(Object, 'entries'),
+      vi.spyOn(Object, 'values'),
+    ];
+    const ownKeysSpy = vi.spyOn(Reflect, 'ownKeys');
+    const allSpies = [...spies, ownKeysSpy];
+    const result = parseHostAudibleAlertRequest(request);
+    const allCalls = allSpies.flatMap((spy) => spy.mock.calls);
+    for (const spy of allSpies) {
+      spy.mockRestore();
+    }
+    expect(allCalls.filter(([first]) => first === request).length).toBe(0);
+    expect(getterRuns).toBe(0);
+    expect(result).toEqual({ ok: true, sentence: 'all clear' });
+  });
+
   it('refuses a Proxy over a valid request with zero getPrototypeOf traps (isProxy runs first)', () => {
     let getTraps = 0;
     let getPrototypeOfTraps = 0;
@@ -546,16 +589,27 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
     expect(runs).toBe(0);
   });
 
-  it('refuses a request with an unexpected extra own key without spawning', async () => {
+  it('tolerates an extra own key with a getter, never running the getter, and speaks', async () => {
     let runs = 0;
+    let getterRuns = 0;
+    const request: Record<string, unknown> = { sentence: 'all clear' };
+    Object.defineProperty(request, 'extra', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterRuns += 1;
+        return 1;
+      },
+    });
     const adapter = adapterWith({
       run: async () => {
         runs += 1;
         return { exitCode: 0, signal: null, stdout: '', stderr: '' };
       },
     });
-    expect(await adapter.speak({ sentence: 'all clear', extra: 1 })).toEqual(REFUSED);
-    expect(runs).toBe(0);
+    expect(await adapter.speak(request)).toEqual({ outcome: 'spoken' });
+    expect(getterRuns).toBe(0);
+    expect(runs).toBe(1);
   });
 
   it('refuses a sentence starting with a hyphen (option injection) with zero spawns', async () => {

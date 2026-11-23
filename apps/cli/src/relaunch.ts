@@ -126,8 +126,13 @@ const MAX_INPUT_JSON_CHARS = 2 * 1024 * 1024;
 /** The `--plan-digest` shape both commands require. */
 const PLAN_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
-/** `--policy-revision`'s bound: printable ASCII only, never a control character. */
-const POLICY_REVISION_PATTERN = /^[\x21-\x7e]{1,128}$/;
+/**
+ * `--policy-revision`'s bound: 1-128 identifier-safe characters only —
+ * alphanumerics plus `._:@/-` and never a leading non-alphanumeric. Shell
+ * metacharacters (`;`, backticks, `$`, quotes, spaces, ...) are refused, so
+ * the value can be interpolated into the printed operator command unquoted.
+ */
+const POLICY_REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 
 /**
  * Snapshot one untrusted payload object through its own property descriptors:
@@ -138,18 +143,23 @@ const POLICY_REVISION_PATTERN = /^[\x21-\x7e]{1,128}$/;
  * polluting own keys are refused before their values are read.
  */
 function plainPayloadSnapshot(p: unknown, label: string): Payload {
-  if (p === null || typeof p !== 'object' || Array.isArray(p)) {
+  if (p === null || typeof p !== 'object') {
     throw new CliUsageError(`${label} requires a plain object payload`);
   }
   let prototype: unknown;
   let ownKeys: PropertyKey[];
+  let isArray: boolean;
   try {
+    // Inside the guarded block: `Array.isArray` itself throws on a revoked
+    // Proxy, so it must never run outside the try (it would surface as an
+    // untyped TypeError instead of the required CliUsageError).
+    isArray = Array.isArray(p);
     prototype = Object.getPrototypeOf(p);
     ownKeys = Reflect.ownKeys(p);
   } catch {
     throw new CliUsageError(`${label} payload is not a plain object`);
   }
-  if (prototype !== Object.prototype && prototype !== null) {
+  if (isArray || (prototype !== Object.prototype && prototype !== null)) {
     throw new CliUsageError(`${label} requires a plain object payload`);
   }
   const snapshot: Payload = {};
@@ -206,9 +216,16 @@ export function parseInputsArray(
   } catch {
     throw new CliUsageError(`${flagName} is not valid JSON`);
   }
-  // The raw document is searched, not the parsed value: a polluting object
-  // key is refused by name before anything is read from the parse result.
-  if (/["'](?:__proto__|constructor|prototype)["']\s*:/.test(raw)) {
+  // The raw document is searched, and so is the parsed value re-serialized:
+  // a raw-text regex alone misses keys written as JSON escapes (for example
+  // `{"\u005f\u005fproto__": 1}`), which `JSON.parse` decodes to a real
+  // `__proto__` own key. `JSON.stringify` re-emits every own enumerable key
+  // literally, so the same key-name search catches the decoded form too
+  // (O(parsed size), bounded by the 2 MiB input cap).
+  if (
+    /["'](?:__proto__|constructor|prototype)["']\s*:/.test(raw) ||
+    /"(?:__proto__|constructor|prototype)"\s*:/.test(JSON.stringify(parsed) ?? '')
+  ) {
     throw new CliUsageError(`${flagName} carries a refused object key`);
   }
   const dense = readBoundedDenseArray(parsed, MAX_RELAUNCH_APPLY_LANES);
@@ -307,9 +324,15 @@ export const relaunchCommands: Readonly<Record<string, CommandHandler>> = {
     if (!isStrictIsoInstant(createdAtIso)) {
       throw new CliUsageError('relaunch request-grant: --now requires a strict ISO-8601 UTC instant');
     }
-    const policyRevision = optStr(snapshot, 'policyRevision') ?? 'pol-1';
-    if (!POLICY_REVISION_PATTERN.test(policyRevision)) {
-      throw new CliUsageError('relaunch request-grant: --policy-revision requires 1-128 printable characters');
+    // Strict string read: a supplied non-string (for example the number 7)
+    // is the wrong primitive and is refused, never coerced to "7".
+    const suppliedRevision = snapshot.policyRevision;
+    const policyRevision =
+      suppliedRevision === undefined ? 'pol-1' : typeof suppliedRevision === 'string' ? suppliedRevision : undefined;
+    if (policyRevision === undefined || !POLICY_REVISION_PATTERN.test(policyRevision)) {
+      throw new CliUsageError(
+        'relaunch request-grant: --policy-revision requires 1-128 identifier characters (no shell metacharacters)',
+      );
     }
     const requestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${sha256HexDigest(
       relaunchApplyDigestPayload({

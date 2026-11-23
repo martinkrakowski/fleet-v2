@@ -71,6 +71,25 @@ function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/**
+ * Enormous-input bounds for the relaunch-apply resolve. A legitimate request
+ * carries a project id of at most a handful of characters and a grant handle
+ * well under this cap; anything longer cannot match and is refused with a
+ * length test — O(1) — before any unbounded `.trim()` copy or scan runs, so
+ * the whole resolve stays O(1) in the input size.
+ */
+const MAX_RELAUNCH_PROJECT_ID_LENGTH = 64;
+const MAX_RELAUNCH_GRANT_ID_LENGTH = 256;
+
+/**
+ * Enormous-input bound for the descriptor-safe request snapshot: at most this
+ * many own keys are ever copied. Every legitimate request carries a fixed
+ * handful of fields, so a body carrying more own keys than this is hostile
+ * bulk; refusing it at the cap keeps the snapshot — and every resolve path
+ * that reads it, the relaunch-apply one included — O(1) in the input size.
+ */
+const MAX_SNAPSHOT_OWN_KEYS = 32;
+
 function blocked(reason: string): ResolveActionAuthorizationResult {
   return { outcome: 'blocked', reason };
 }
@@ -109,20 +128,26 @@ function snapshotRepository(value: unknown): unknown {
  * grant). Absence (no own property at all) stays absent and still resolves as
  * before. Inspecting a descriptor never runs a getter, a setter or a `get`
  * trap. The snapshot shape is `readPlainObjectLoose`'s (unknown keys copied,
- * null-prototype, symbol keys and a non-plain prototype refused as null);
- * a trap that throws propagates and the caller turns it into the same typed
+ * null-prototype, symbol keys and a non-plain prototype refused as null); an
+ * own-key count past `MAX_SNAPSHOT_OWN_KEYS` is refused as null too, so no
+ * hostile bulk can make the snapshot loop cost proportional to its size.
+ * A trap that throws propagates and the caller turns it into the same typed
  * refusal. Returns the snapshot plus the first accessor-carrying field name,
  * or null when every snapshotted field is plain data.
  */
 function readRequestSnapshot(
   input: object,
-): { snapshot: Record<string, unknown> | null; accessorField: string | null } {
+): {
+  snapshot: Record<string, unknown> | null;
+  accessorField: string | null;
+  keyBoundExceeded: boolean;
+} {
   if (Array.isArray(input)) {
-    return { snapshot: null, accessorField: null };
+    return { snapshot: null, accessorField: null, keyBoundExceeded: false };
   }
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) {
-    return { snapshot: null, accessorField: null };
+    return { snapshot: null, accessorField: null, keyBoundExceeded: false };
   }
   // The snapshot is built on a null prototype: an own `__proto__` key on the
   // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
@@ -130,22 +155,32 @@ function readRequestSnapshot(
   // prototype, so the snapshot reads exactly like main reads any other body.
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let accessorField: string | null = null;
+  // Enormous-input bound: a legitimate request carries a fixed handful of own
+  // fields; a body with more own keys than this cap is hostile bulk whose only
+  // possible effect is to make the snapshot loop itself cost O(input size).
+  // Counting to the cap is O(1), and exceeding it is the same typed refusal
+  // every other hostile shape gets, on every path that reads the snapshot.
+  let ownKeyCount = 0;
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string') {
-      return { snapshot: null, accessorField: null };
+      return { snapshot: null, accessorField: null, keyBoundExceeded: false };
     }
+    if (ownKeyCount >= MAX_SNAPSHOT_OWN_KEYS) {
+      return { snapshot: null, accessorField: null, keyBoundExceeded: true };
+    }
+    ownKeyCount += 1;
     // EXACTLY ONE descriptor read per snapshotted field: both the accessor
     // refusal and the copied value derive from this single descriptor.
     const descriptor = Object.getOwnPropertyDescriptor(input, key);
     if (descriptor === undefined || !descriptor.enumerable) {
-      return { snapshot: null, accessorField: null };
+      return { snapshot: null, accessorField: null, keyBoundExceeded: false };
     }
     if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
       accessorField = key;
     }
     out[key] = descriptor.value;
   }
-  return { snapshot: out, accessorField };
+  return { snapshot: out, accessorField, keyBoundExceeded: false };
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -185,9 +220,17 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // the snapshot is a hostile proxy: a typed refusal, never an exception.
     let snapshot: Record<string, unknown> | null = null;
     let accessorField: string | null = null;
+    let keyBoundExceeded = false;
     try {
-      ({ snapshot, accessorField } = readRequestSnapshot(input));
+      ({ snapshot, accessorField, keyBoundExceeded } = readRequestSnapshot(input));
     } catch {
+      return blocked('invalid-request');
+    }
+    // Enormous-input refusal: a body carrying more own keys than the snapshot
+    // cap is hostile bulk on every resolve path, and its routing field cannot
+    // be trusted to name its own refusal, so the typed `invalid-request`
+    // answer comes first, before any scope is read.
+    if (keyBoundExceeded) {
       return blocked('invalid-request');
     }
     // BL02g fix round: a set-only accessor is an accessor too — its snapshot
@@ -584,15 +627,32 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     request: ResolveActionAuthorizationRequest,
   ): Promise<ResolveActionAuthorizationResult> {
     // Cost bound: O(1) — a fixed count of field reads, one bounded 64-hex
-    // pattern test and two bounded ISO parses; nothing scales with input size.
-    if (!isFilled(request.projectId) || request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID) {
+    // pattern test and two bounded ISO parses; nothing scales with input
+    // size. Every string field is length-checked against its enormous-input
+    // bound BEFORE it is trimmed or pattern-tested, so hostile bulk is
+    // refused by a constant-time length test, never by work proportional to
+    // its size.
+    if (
+      typeof request.projectId !== 'string' ||
+      request.projectId.length > MAX_RELAUNCH_PROJECT_ID_LENGTH ||
+      !isFilled(request.projectId) ||
+      request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID
+    ) {
       return blocked('grant-wrong-project');
     }
-    if (!isFilled(request.authorizationGrantId)) {
+    if (
+      typeof request.authorizationGrantId !== 'string' ||
+      request.authorizationGrantId.length > MAX_RELAUNCH_GRANT_ID_LENGTH ||
+      !isFilled(request.authorizationGrantId)
+    ) {
       return blocked('grant-missing');
     }
     const grantId = request.authorizationGrantId.trim();
-    if (typeof request.proposalDigest !== 'string' || !/^[0-9a-f]{64}$/.test(request.proposalDigest)) {
+    if (
+      typeof request.proposalDigest !== 'string' ||
+      request.proposalDigest.length !== 64 ||
+      !/^[0-9a-f]{64}$/.test(request.proposalDigest)
+    ) {
       return blocked('invalid-request');
     }
     if (this.deps?.shadowImportClock === undefined) {

@@ -1976,6 +1976,43 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     }
   });
 
+  it('refuses a relaunch-apply request with more own keys than the snapshot bound as invalid-request', async () => {
+    const record = relaunchRecord();
+    const hostile: Record<string, unknown> = relaunchRequest();
+    // Far past the snapshot's own-key cap: hostile bulk whose only possible
+    // effect is to make the snapshot cost proportional to its size.
+    for (let i = 0; i < 64; i += 1) {
+      hostile[`filler-${i}`] = i;
+    }
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      hostile,
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses a relaunch projectId padded past the length bound as grant-wrong-project', async () => {
+    const record = relaunchRecord();
+    // Trims to exactly `relaunch`, so only the O(1) length bound — not the
+    // project comparison — can refuse it.
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ projectId: `${RELAUNCH_APPLY_PROJECT_ID}${' '.repeat(4096)}` }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+  });
+
+  it('refuses a relaunch grant id padded past the length bound as grant-missing', async () => {
+    const record = relaunchRecord();
+    // Trims to the exact recorded grant id, so only the O(1) length bound —
+    // not the grant lookup — can refuse it.
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ authorizationGrantId: `${GRANT_ID}${' '.repeat(4096)}` }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+  });
+
   it('blocks relaunch-apply with clock-unavailable when clock is absent', async () => {
     const record = relaunchRecord();
     const deps = signedDeps(repositoryWith(record), record);

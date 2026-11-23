@@ -686,6 +686,21 @@ function readShadowImportRequest(request: unknown): Validated<AuthorizeShadowImp
  * but still bounded and screened.
  */
 function readRelaunchApplyRequest(request: unknown): Validated<AuthorizeRelaunchApplyRequest> {
+  // An own `__proto__` key is a prototype-pollution attempt, not a field the
+  // schema declares: `readPlainRecord` copies only declared keys, so without
+  // this explicit check such a request would validate clean and could be
+  // authorized. The descriptor read is O(1) and never runs an accessor; a
+  // throwing trap here is the same hostile refusal as anywhere else. The
+  // prototype itself is never written: the key is refused, not copied.
+  let protoKeyDescriptor: PropertyDescriptor | undefined;
+  try {
+    protoKeyDescriptor = Object.getOwnPropertyDescriptor(request, '__proto__');
+  } catch {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  if (protoKeyDescriptor !== undefined) {
+    return { ok: false, reason: 'invalid-request' };
+  }
   const read = readPlainRecord(request, {
     planDigest: { kind: 'string', maxLength: 256 },
     grantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },

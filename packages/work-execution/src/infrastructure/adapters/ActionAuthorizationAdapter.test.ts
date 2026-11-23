@@ -653,7 +653,7 @@ describe('ActionAuthorizationAdapter.authorizeRelaunchApply (AR3a)', () => {
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
 
-  it('ignores an own __proto__ key without mutating the prototype', async () => {
+  it('refuses an own __proto__ key as invalid-request without mutating the prototype', async () => {
     const adapter = new ActionAuthorizationAdapter({
       authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),
     });
@@ -661,7 +661,10 @@ describe('ActionAuthorizationAdapter.authorizeRelaunchApply (AR3a)', () => {
       `{"planDigest":"${'a'.repeat(64)}","grantId":"grant-relaunch-1","nowIso":"2026-11-18T00:00:00Z","__proto__":{"polluted":true}}`,
     ) as Record<string, unknown>;
     const result = await adapter.authorizeRelaunchApply(hostile as unknown as AuthorizeRelaunchApplyRequest);
-    expect(result).toEqual({ outcome: 'authorized', grantId: 'grant-relaunch-1' });
+    // An own `__proto__` key is a prototype-pollution attempt, never an
+    // inert extra field: the request is refused, and Object.prototype is
+    // untouched either way.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });

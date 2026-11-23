@@ -543,6 +543,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     }),
     journal: executionJournal,
     computeDigest: sha256HexDigest,
+    // GD2: the CLI evidence archive — failed gate output tails are archived
+    // and the journal carries only their evidence references.
+    evidenceArchive: evidence.evidenceArchive,
   });
   const attemptGate = options?.attemptGate ?? composedAttemptGate;
   // PK-1: stop, the dispatch conflict stops and collect kill the attempt's

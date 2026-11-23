@@ -57,6 +57,7 @@ import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthor
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type { EvidenceArchivePort } from '@fleet/evidence-and-acceptance';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
@@ -217,6 +218,12 @@ export interface AdvanceLaneRunDependencies {
    * is never clean and keeps today's `fix-no-progress` park.
    */
   readonly worktreeInspect?: Pick<WorkspacePort, 'inspectWorktree'>;
+  /**
+   * GD2: the evidence archive a fix handover reads a failed gate's archived
+   * output tail from (read-only); absent → the handover renders without the
+   * tail and keeps the predicate name and exit code.
+   */
+  readonly evidenceArchive?: EvidenceArchivePort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

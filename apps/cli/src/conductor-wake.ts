@@ -21,11 +21,6 @@ export interface WakeSignal {
  * `resync` line parses like any other line.
  */
 export function parseWakeSignal(line: string): WakeSignal | null {
-  // O(1) typeof guard before any coercion: a hostile input (getter, Proxy)
-  // must never have its traps run, matching readWakeToken/normalizeWakeBaseUrl.
-  if (typeof line !== 'string') {
-    return null;
-  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);

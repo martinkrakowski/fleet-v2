@@ -68,9 +68,10 @@ export interface ManageCutoverDependencies {
   readonly mintEntryId: () => string;
   readonly nowIso: () => string;
   /**
-   * CO30b, optional: the shadow-evidence document the switch move demands. The
-   * production runtime leaves it undefined, and a missing reader is a refusal,
-   * never a pass.
+   * CO30b, optional: the shadow-evidence document the switch move demands.
+   * `apps/cli/src/composition.ts` binds it in durable-state mode and leaves
+   * it `undefined` only in in-memory mode, where a missing reader is still a
+   * refusal, never a pass.
    */
   readonly readShadowEvidence?: () => Promise<
     { readonly status: 'ok'; readonly evidence: unknown } | { readonly status: 'absent' } | { readonly status: 'unreadable' } | { readonly status: 'unknown-version' }

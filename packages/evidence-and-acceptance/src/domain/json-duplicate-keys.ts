@@ -59,26 +59,37 @@ function isValidPrimitiveToken(token: string): boolean {
   return numberPattern.test(token);
 }
 
-/** Decode one JSON string body (without the surrounding quotes) the way `JSON.parse` would. */
-function decodeStringBody(body: string): string {
+/**
+ * Decode one JSON string body (without the surrounding quotes) the way
+ * `JSON.parse` would, refusing what it refuses: a raw character below U+0020,
+ * a truncated `\u` escape, an unknown escape (`\x`, `\a`, `\'`, `\0`, …) and a
+ * trailing backslash all return `null`. Cost bound: one linear pass over
+ * `body`.
+ */
+function decodeStringBody(body: string): string | null {
   let out = '';
   for (let index = 0; index < body.length; index += 1) {
     const char = body[index];
     if (char !== '\\') {
+      // JSON.parse rejects raw characters below U+0020 inside strings.
+      if (char.charCodeAt(0) < 0x20) {
+        return null;
+      }
       out += char;
       continue;
     }
     index += 1;
     const escape = body[index];
     if (escape === undefined) {
-      return out;
+      return null;
     }
     if (escape === 'u') {
       const hex = body.slice(index + 1, index + 5);
-      if (/^[0-9a-fA-F]{4}$/.test(hex)) {
-        out += String.fromCharCode(parseInt(hex, 16));
-        index += 4;
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+        return null;
       }
+      out += String.fromCharCode(parseInt(hex, 16));
+      index += 4;
       continue;
     }
     switch (escape) {
@@ -103,8 +114,8 @@ function decodeStringBody(body: string): string {
         out += '\t';
         break;
       default:
-        out += escape;
-        break;
+        // `\x`, `\a`, `\'`, `\0`, … are not JSON escapes.
+        return null;
     }
   }
   return out;
@@ -112,13 +123,23 @@ function decodeStringBody(body: string): string {
 
 /**
  * Scan `text` and refuse duplicate object keys at any depth. Returns a typed
- * result and never throws: non-string or oversized input is `invalid-input`,
- * malformed JSON or trailing tokens is `invalid-json`, a repeated key in any
- * object is `duplicate-key`.
+ * result and never throws: non-string input, an invalid `maxLength`, or input
+ * over the length cap is `invalid-input`, malformed JSON (including invalid
+ * escapes and raw control characters), or trailing tokens is `invalid-json`,
+ * and a repeated key in any object is `duplicate-key`.
  */
-export function checkJsonDuplicateKeys(text: unknown): JsonDuplicateKeyCheckResult {
+export function checkJsonDuplicateKeys(
+  text: unknown,
+  maxLength: number = MAX_REVIEW_REPLY_LENGTH,
+): JsonDuplicateKeyCheckResult {
   try {
-    if (typeof text !== 'string' || text.length > MAX_REVIEW_REPLY_LENGTH) {
+    if (
+      typeof text !== 'string' ||
+      typeof maxLength !== 'number' ||
+      !Number.isFinite(maxLength) ||
+      maxLength < 0 ||
+      text.length > maxLength
+    ) {
       return { ok: false, reason: 'invalid-input' };
     }
     const stack: Frame[] = [];
@@ -159,6 +180,9 @@ export function checkJsonDuplicateKeys(text: unknown): JsonDuplicateKeyCheckResu
             return { ok: false, reason: 'invalid-json' };
           }
           const key = decodeStringBody(body);
+          if (key === null) {
+            return { ok: false, reason: 'invalid-json' };
+          }
           if (top.keys.has(key)) {
             return { ok: false, reason: 'duplicate-key' };
           }
@@ -167,6 +191,11 @@ export function checkJsonDuplicateKeys(text: unknown): JsonDuplicateKeyCheckResu
           continue;
         }
         if (state === 'expect-root-value' || state === 'expect-value') {
+          // String values are decoded too, so an invalid escape or a raw
+          // control character inside a value is refused like JSON.parse would.
+          if (decodeStringBody(body) === null) {
+            return { ok: false, reason: 'invalid-json' };
+          }
           const top = stack[stack.length - 1];
           if (top !== undefined && !top.isObject) {
             top.hadValue = true;

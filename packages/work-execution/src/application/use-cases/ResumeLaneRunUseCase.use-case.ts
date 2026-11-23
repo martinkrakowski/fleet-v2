@@ -30,6 +30,7 @@ import {
   laneRunConductEntry,
   laneRunIntentEntry,
   laneRunResultEntry,
+  planGateFailedRetry,
 } from '../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../domain/lane-run-step-facts.js';
 import { checkLaneRunResume } from '../../domain/lane-run-transitions.js';
@@ -326,6 +327,15 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', reason: check.reason };
     }
 
+    // GU2: a run parked from `gating` whose gate already failed past the retry
+    // cap stays parked: the resume is refused before any intent is appended.
+    if (record.parked !== null && record.parked.parkedFrom === 'gating') {
+      const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
+      if (plan.kind === 'cap-reached') {
+        return { outcome: 'refused', reason: 'gate-retry-cap-reached' };
+      }
+    }
+
     const built = laneRunResumeKey(runId, record.parkCount, via);
     if (!built.ok) {
       return { outcome: 'refused', reason: 'invalid-request' };
@@ -390,6 +400,28 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
         resumeDetail,
         snapshot,
       );
+    }
+
+    // GU2: a bounded operator-driven gate retry for a run parked from `gating`.
+    // A stop recorded since still wins first (no retry is minted); the minted
+    // intent makes AdvanceLaneRun re-run the gate at the same head. A replay
+    // never mints twice: once the retry intent exists without a final result
+    // the plan is `none`, and a duplicate-key append is idempotent.
+    if (record.parked.parkedFrom === 'gating' && facts.stopMode === null) {
+      const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
+      if (plan.kind === 'cap-reached') {
+        await this.appendResult(runId, firstPendingKey, 'refused', 'gate-retry-cap-reached', nowIso);
+        await this.refuseRemainingPendingResumes(runId, pending, nowIso);
+        return { outcome: 'refused', key: firstPendingKey, reason: 'gate-retry-cap-reached' };
+      }
+      if (plan.kind === 'mint') {
+        const minted = await this.deps.runJournal.append(
+          laneRunIntentEntry(this.deps.newUlid(), runId, plan.key, null, nowIso),
+        );
+        if (minted.outcome !== 'appended' && minted.reason !== 'duplicate-key') {
+          return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
+        }
+      }
     }
 
     return this.conductAndSaveResume(record, pending, facts, resumeDetail, snapshot);

@@ -490,7 +490,9 @@ export function laneRunHaltLiftExit(input: {
   return record.parked.parkedFrom;
 }
 
-export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door' | 'fix-no-progress';
+// GU2: `gate-retry-cap-reached` is never returned by `checkLaneRunResume`; only
+// ResumeLaneRun's bounded gate-retry minting refuses a resume with it.
+export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door' | 'fix-no-progress' | 'gate-retry-cap-reached';
 export type LaneRunResumeCheck =
   | { readonly ok: true; readonly to: LaneRunStateValue }
   | { readonly ok: false; readonly reason: LaneRunResumeRefusal };

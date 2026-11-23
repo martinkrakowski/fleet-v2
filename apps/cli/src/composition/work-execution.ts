@@ -627,6 +627,8 @@ export function composeExecution(input: ComposeExecutionInput) {
     // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
+    // AR3c1: the single process-tree termination adapter, reused by relaunch live apply.
+    processTreeTermination,
     attemptArtifact,
     opencodeUsage,
     briefAuthoring,

@@ -204,13 +204,13 @@ const intent = (key: string, digest: string | null = null) => ({
   digest,
 });
 
-const result = (key: string, outcome: string) => ({
+const result = (key: string, outcome: string, digest: string | null = null) => ({
   key,
   kind: 'result',
   entryId: 'entry-2',
   recordedAtIso: CLOCK_NOW,
   outcome,
-  digest: null,
+  digest,
 });
 
 const saveInput = (over: Record<string, unknown> = {}) => ({
@@ -229,6 +229,28 @@ const saveInputDigest = (planDigest: string, input: Record<string, unknown>): st
   const canonical = canonicalSaveInputJson(planDigest, input);
   if (canonical === null) throw new Error('fixture save input must canonicalize');
   return computeDigest(canonical);
+};
+
+/**
+ * The digest `adoptInputIdentity` computes for a resent adopt input: the
+ * journaled `adopt/work-order` completed result must carry exactly this, or
+ * the preflight refuses the lane (AR3c1).
+ */
+const adoptIdentityDigest = (laneId: string, input: Record<string, unknown>): string => {
+  const part = (holder: unknown, field: string): unknown =>
+    holder !== null && typeof holder === 'object' ? (holder as Record<string, unknown>)[field] : undefined;
+  return computeDigest(
+    JSON.stringify([
+      'adopt-lane-ids/1',
+      input['projectId'],
+      part(input['planRef'], 'planId'),
+      laneId,
+      part(input['workOrder'], 'workOrderId'),
+      part(input['brief'], 'briefId'),
+      part(input['attempt'], 'attemptId'),
+      part(input['run'], 'runId'),
+    ]),
+  );
 };
 
 /** A valid adopt input for the held lane; every cross-check matches the fixtures. */
@@ -528,7 +550,14 @@ const makeDeps = (over: {
             for (const sub of ADOPT_SUB_STEPS) {
               const subKey = `relaunch/${planDigest}/${laneId}/adopt/${sub}`;
               await append({ key: subKey, kind: 'intent' });
-              await append({ key: subKey, kind: 'result', outcome: 'completed' });
+              // AR3c1: the completed work-order result carries the resent
+              // input's identity digest, as the real AdoptLaneUseCase does.
+              await append({
+                key: subKey,
+                kind: 'result',
+                outcome: 'completed',
+                ...(sub === 'work-order' ? { digest: adoptIdentityDigest(laneId, request as Record<string, unknown>) } : {}),
+              });
             }
           }
           return answer;
@@ -1343,17 +1372,25 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     result(key(digest, laneId, 'save'), 'completed'),
   ];
 
-  /** All four adopt sub-steps completed for a lane. */
-  const completedAdopt = (digest: string, laneId: string): unknown[] =>
+  /**
+   * All four adopt sub-steps completed for a lane. AR3c1: when the wave
+   * resents an adopt input, the completed work-order result journals the
+   * matching identity digest, as the real AdoptLaneUseCase does.
+   */
+  const completedAdopt = (digest: string, laneId: string, input?: Record<string, unknown>): unknown[] =>
     ADOPT_SUB_STEPS.flatMap((sub) => [
       intent(adoptKey(digest, laneId, sub)),
-      result(adoptKey(digest, laneId, sub), 'completed'),
+      result(
+        adoptKey(digest, laneId, sub),
+        'completed',
+        sub === 'work-order' && input !== undefined ? adoptIdentityDigest(laneId, input) : null,
+      ),
     ]);
 
   it('U19: only the validated clone is used after validation — mutating the store plan object during the digest call cannot change the executed wave', async () => {
     const plan = livePlan('clone plan');
     const digest = plan.planDigest;
-    const entries = [...completedSave(digest, 'lane-2', saveInput()), ...completedAdopt(digest, 'lane-2')];
+    const entries = [...completedSave(digest, 'lane-2', saveInput()), ...completedAdopt(digest, 'lane-2', adoptInput())];
     const deps = makeDeps({
       plan,
       entries,
@@ -1676,10 +1713,10 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ];
       const entries = [
         ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
-        ...completedAdopt(plan.planDigest, 'lane-2'),
+        ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
-        ...completedAdopt(plan.planDigest, 'lane-3'),
+        ...completedAdopt(plan.planDigest, 'lane-3', lane3AdoptInput()),
         // lane-4's adopt is still absent: it must carry an adopt input and
         // its own adopt re-checks the cap before adoptLane runs (AR2c).
         ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
@@ -1736,9 +1773,9 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const inputs = [saveInput(), saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' })];
     const entries = [
       ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
-      ...completedAdopt(plan.planDigest, 'lane-2'),
+      ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
       ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
-      ...completedAdopt(plan.planDigest, 'lane-3'),
+      ...completedAdopt(plan.planDigest, 'lane-3', lane3AdoptInput()),
     ];
     const deps = makeDeps({ plan, entries, live: {} });
     const result = await new ApplyRelaunchUseCase(deps).applyRelaunch(
@@ -1774,9 +1811,9 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const inputs = [saveInput(), saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' })];
     const entries = [
       ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
-      ...completedAdopt(plan.planDigest, 'lane-2'),
+      ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
       ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
-      ...completedAdopt(plan.planDigest, 'lane-3'),
+      ...completedAdopt(plan.planDigest, 'lane-3', lane3AdoptInput()),
     ];
     const deps = makeDeps({ plan, entries, live: {} });
     const useCase = new ApplyRelaunchUseCase(deps);
@@ -2044,10 +2081,10 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ];
       const entries = [
         ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
-        ...completedAdopt(plan.planDigest, 'lane-2'),
+        ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
-        ...completedAdopt(plan.planDigest, 'lane-3'),
+        ...completedAdopt(plan.planDigest, 'lane-3', lane3AdoptInput()),
         // lane-4's adopt is still absent: it must carry an adopt input and
         // its own adopt re-checks the cap before adoptLane runs (AR2c).
         ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
@@ -2166,7 +2203,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       ...completedSave(digest, 'lane-3', inputs[1]!),
     ];
@@ -2206,7 +2243,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       ...completedSave(digest, 'lane-3', inputs[1]!),
     ];
@@ -2239,7 +2276,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       result(key(digest, 'lane-2', 'redispatch'), 'completed'),
       ...completedSave(digest, 'lane-3', inputs[1]!),
@@ -2268,7 +2305,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       result(key(digest, 'lane-2', 'redispatch'), 'completed'),
       ...completedSave(digest, 'lane-3', inputs[1]!),
@@ -2344,7 +2381,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const baseEntries = (): unknown[] => [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       ...completedSave(digest, 'lane-3', inputs[1]!),
     ];
@@ -2386,7 +2423,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
       ...completedSave(digest, 'lane-3', inputs[1]!),
     ];
@@ -2422,7 +2459,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
     ];
     const refused = async (runs: unknown): Promise<void> => {
@@ -2482,7 +2519,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
     ];
     const refused = async (over: Record<string, unknown>): Promise<void> => {
@@ -2504,7 +2541,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
     ];
     const refused = async (runJournalResult: unknown): Promise<void> => {
@@ -2571,7 +2608,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
     ];
     const refused = async (runs: unknown): Promise<void> => {
@@ -2597,7 +2634,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const entries = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       intent(key(digest, 'lane-2', 'redispatch')),
     ];
     const refused = async (runs: unknown, runJournalResult?: unknown): Promise<void> => {
@@ -2634,7 +2671,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const digest = plan.planDigest;
     const head = [
       ...completedSave(digest, 'lane-2', inputs[0]!),
-      ...completedAdopt(digest, 'lane-2'),
+      ...completedAdopt(digest, 'lane-2', adoptInput()),
       ...completedSave(digest, 'lane-3', inputs[1]!),
     ];
     const fullRequest = (): unknown =>

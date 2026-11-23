@@ -15,9 +15,11 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
-import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey, laneRunStopForceKey, laneRunStopKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
+import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type { AcceptanceReceiptsResult } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type {
   ConductorForgeGrantRequest,
@@ -1170,5 +1172,96 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       expect(heldHarness.forgeRequests.every((request) => request.status?.state !== 'success')).toBe(true);
       expect(heldHarness.grantRequests).toHaveLength(1);
     });
+  });
+});
+
+describe('force stop over an unread premerge wait intent (FS, BL08p)', () => {
+  async function appendStopIntent(harness: Harness, mode: 'graceful' | 'force', nowIso: string): Promise<void> {
+    const built = mode === 'force' ? laneRunStopForceKey(RUN_ID, 'web') : laneRunStopKey(RUN_ID, 'web');
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a stop key');
+    }
+    const entry = {
+      ...laneRunIntentEntry(harness.deps.newUlid(), RUN_ID, built.key, null, nowIso),
+      mode,
+      expectedRevision: 1,
+    };
+    const appended = await harness.runJournal.append(entry);
+    expect(appended.outcome).toBe('appended');
+  }
+
+  function finalResultsOn(entries: readonly LaneRunJournalEntryRecord[], key: string): readonly LaneRunJournalEntryRecord[] {
+    return entries.filter((entry) => entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous');
+  }
+
+  it('force stop transitions merging to stopped in one pass, closes the intent overtaken/intent-abandoned-by-operator, and is idempotent on replay', async () => {
+    const harness = await mergingHarness();
+    // The pending hold posts and leaves an unread premerge intent (no result).
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    await appendStopIntent(harness, 'force', LATER);
+
+    expect(await advance(harness, { nowIso: LATER })).toEqual({ outcome: 'entered', state: 'stopped' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const finals = finalResultsOn(entries, premergeKey());
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect(finals[0] !== undefined && entries.indexOf(finals[0]) < entries.length - 1).toBe(true);
+    // Replay: a stopped run is done and never writes a second result.
+    const replay = await advance(harness, { nowIso: LATER });
+    expect(replay).toMatchObject({ outcome: 'done' });
+    const afterReplay = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(afterReplay, premergeKey())).toHaveLength(1);
+  });
+
+  it('graceful stop over an unread premerge wait intent keeps waiting on premerge-pending and leaves the intent open', async () => {
+    const harness = await mergingHarness();
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    await appendStopIntent(harness, 'graceful', LATER);
+
+    expect(await advance(harness, { nowIso: LATER })).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, premergeKey())).toHaveLength(0);
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toEqual({
+      key: premergeKey(),
+      step: 'premerge',
+      reconciliation: 'unread',
+    });
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('merging');
+  });
+
+  it('force stop over an unread premerge wait intent returns journal-refused when closing the intent fails', async () => {
+    const harness = await mergingHarness();
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    await appendStopIntent(harness, 'force', LATER);
+
+    const refusing: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runJournal: {
+        append: async (entry) => {
+          if (entry.kind === 'result' && entry.key === premergeKey()) {
+            return { outcome: 'refused', reason: 'invalid-entry', detail: null };
+          }
+          return harness.runJournal.append(entry);
+        },
+        listForRun: (runId) => harness.runJournal.listForRun(runId),
+        listForKey: (key) => harness.runJournal.listForKey(key),
+      },
+    };
+    const result = await new AdvanceLaneRunUseCase(refusing).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'journal-refused' });
+    // The run never entered stopped and the intent stays open.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('merging');
+    expect(finalResultsOn(entries, premergeKey())).toHaveLength(0);
   });
 });

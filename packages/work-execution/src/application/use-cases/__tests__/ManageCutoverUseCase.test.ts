@@ -216,6 +216,8 @@ interface HarnessOptions {
   readonly stateDir?: string;
   readonly seed?: CutoverRecord | null;
   readonly daemonStatus?: ManageCutoverDependencies['daemonStatus'];
+  /** Pauses the daemon before the spies are created, so `daemonPauseWrite` starts at zero calls. */
+  readonly daemonPaused?: boolean;
 }
 
 async function harness(options: HarnessOptions = {}): Promise<Harness> {
@@ -231,6 +233,9 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     if (seed.trainPauseSetByCutover) {
       await trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     }
+  }
+  if (options.daemonPaused === true) {
+    await daemonPause.write(true, NOW);
   }
   let sequence = 0;
   const deps: ManageCutoverDependencies = {
@@ -642,7 +647,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('switch does not credit a train pause that was already paused, and a later rollback lifts nothing', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     // The pause already exists before the switch, so `set` answers `unchanged`.
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const useCase = useCaseWithReaders(h);
@@ -670,7 +675,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('switch does not credit a train pause that was already paused, and a later retire lifts nothing', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', revision: 1 });
     expect(await savedPauseOwnership(h)).toBe(false);
@@ -724,7 +729,7 @@ describe('ManageCutoverUseCase switch', () => {
       ['deadline passed', () => undefined, { outcome: 'unknown', reason: 'deadline-exceeded' }],
     ];
     for (const [label, arrange, expected] of cases) {
-      const h = await harness({ seed: null });
+      const h = await harness({ seed: null, daemonPaused: true });
       await arrange(h);
       const useCase = useCaseWithReaders(h);
       resetSpies(h);
@@ -738,8 +743,81 @@ describe('ManageCutoverUseCase switch', () => {
     }
   });
 
-  it('switch sets the train pause and saves a switched record when evidence passes and no lane is unrecorded', async () => {
+  it('refuses daemon-not-paused when daemonPauseRead returns clear, with zero writes', async () => {
+    // The daemon pause is left `clear` (the harness default): the switch gate
+    // must refuse before any pause, record or journal write.
     const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'daemon-not-paused' });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('returns unknown daemon-pause-unreadable when daemonPauseRead throws, returns unreadable, or returns a malformed value, with zero writes', async () => {
+    const boom = (): never => {
+      throw new Error('boom');
+    };
+    const cases: Array<[string, unknown]> = [
+      ['throws', { read: boom }],
+      ['unreadable', { read: async () => ({ state: 'unreadable' }) }],
+      ['null', { read: async () => null }],
+      ['bogus state', { read: async () => ({ state: 'bogus' }) }],
+    ];
+    for (const [label, reader] of cases) {
+      const h = await harness({ seed: null });
+      (h.deps as { daemonPauseRead: unknown }).daemonPauseRead = reader;
+      const useCase = useCaseWithReaders(h);
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({
+        label,
+        result: { outcome: 'unknown', reason: 'daemon-pause-unreadable' },
+      });
+      expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns unknown deadline-exceeded when deadlineIso is reached during or before daemonPauseRead, with zero writes', async () => {
+    // The clock advances past the deadline inside the daemon-status read, so
+    // the guarded daemon-pause read must answer `deadline` without ever
+    // calling `daemonPauseRead.read`.
+    const h = await harness({ seed: null });
+    (h.deps as { daemonStatus: unknown }).daemonStatus = {
+      read: async () => {
+        h.clock.now = new Date(Date.parse(NOW) + 60_000).toISOString();
+        return { status: 'missing' };
+      },
+    };
+    const pauseRead = vi.spyOn(h.daemonPause, 'read');
+    const useCase = useCaseWithReaders(h);
+    resetSpies(h);
+    const deadlineIso = new Date(Date.parse(NOW) + 30_000).toISOString();
+    expect(await useCase.execute(switchRequest({ deadlineIso }))).toEqual({
+      outcome: 'unknown',
+      reason: 'deadline-exceeded',
+    });
+    expect(pauseRead).not.toHaveBeenCalled();
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('refuses daemon-not-paused with zero writes when the marker is cleared between the preflight read and the write phase', async () => {
+    // The preflight read sees `paused`, the marker is cleared before the write
+    // phase, and the recheck before the first write must refuse with zero
+    // writes: no intent, no train-pause set, no record swap.
+    const h = await harness({ seed: null, daemonPaused: true });
+    const states = ['paused', 'clear'];
+    (h.deps as { daemonPauseRead: unknown }).daemonPauseRead = {
+      read: async () => ({ state: states.shift() ?? 'clear' }),
+    };
+    const useCase = useCaseWithReaders(h);
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'daemon-not-paused' });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('switch sets the train pause and saves a switched record when evidence passes and no lane is unrecorded', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     resetSpies(h);
     const result = await useCase.execute(switchRequest());
@@ -780,7 +858,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('switch still proceeds when the daemon is present with a failed last tick', async () => {
-    const h = await harness({ seed: null, daemonStatus: { read: async () => ({ status: 'ok', record: { exitCode: 1 } as never }) } });
+    const h = await harness({ seed: null, daemonPaused: true, daemonStatus: { read: async () => ({ status: 'ok', record: { exitCode: 1 } as never }) } });
     const useCase = useCaseWithReaders(h);
     resetSpies(h);
     expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', state: 'switched', revision: 1 });
@@ -789,7 +867,7 @@ describe('ManageCutoverUseCase switch', () => {
 
   it('finishes a switch cut short after the intent, and maps refused writes to unknown', async () => {
     // A compare-and-set that throws once leaves the intent recorded; the next pass finishes the move.
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
@@ -801,14 +879,14 @@ describe('ManageCutoverUseCase switch', () => {
     expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', trainPauseSetByCutover: true } });
 
     // A refused train-pause set is unknown and the record stays unswitched.
-    const refusedSet = await harness({ seed: null });
+    const refusedSet = await harness({ seed: null, daemonPaused: true });
     const refusedUseCase = useCaseWithReaders(refusedSet);
     refusedSet.spies.trainPauseSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'pause-unreadable' });
     expect(await refusedUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-write-failed' });
     expect(await refusedSet.repo.read()).toEqual({ status: 'missing' });
 
     // A refused compare-and-set is unknown; a conflict is a refusal.
-    const refusedCas = await harness({ seed: null });
+    const refusedCas = await harness({ seed: null, daemonPaused: true });
     const refusedCasUseCase = useCaseWithReaders(refusedCas);
     refusedCas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'unreadable' });
     expect(await refusedCasUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
@@ -816,7 +894,7 @@ describe('ManageCutoverUseCase switch', () => {
     expect(await refusedCasUseCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
 
     // A failed intent append writes no journal entry.
-    const failedAppend = await harness({ seed: null });
+    const failedAppend = await harness({ seed: null, daemonPaused: true });
     const failedAppendUseCase = useCaseWithReaders(failedAppend);
     failedAppend.spies.journalAppend.mockResolvedValueOnce({ outcome: 'refused', reason: 'store-unreadable' });
     expect(await failedAppendUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'journal-append-failed' });
@@ -861,7 +939,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('a replayed switch after a crash in the first pass lets a later rollback lift the pause the cutover set', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
@@ -873,7 +951,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('a replayed switch after a crash in the first pass lets a later retire lift the pause the cutover set', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
     await useCase.execute(switchRequest());
@@ -886,7 +964,7 @@ describe('ManageCutoverUseCase switch', () => {
   });
 
   it('a switch whose result append failed after the record save is refused revision-conflict on replay, not finished', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     const realAppend = Object.getPrototypeOf(h.journal).append as CutoverJournalAdapter['append'];
     h.spies.journalAppend.mockImplementation(async (entry) =>
@@ -920,7 +998,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   }
 
   it('a clean switch on a clear train records trainPausedBefore false in the intent digest and owns the pause, and rollback lifts it', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
     expect(await lastSetOutcome(h)).toBe('changed');
     expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
@@ -936,7 +1014,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a clean switch on a clear train owns the pause, and retire lifts it', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
     expect(await savedPauseOwnership(h)).toBe(true);
 
@@ -950,7 +1028,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a switch on an already paused train records trainPausedBefore true in the intent digest', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
     expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
@@ -960,7 +1038,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a replay after a crash between a changed set and the record save still owns the pause although it now reads paused and set answers unchanged, and rollback lifts it', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     await crashAfterSet(h, useCase);
     expect(await lastSetOutcome(h)).toBe('changed');
@@ -979,7 +1057,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a replay whose set answers changed after the first set threw owns the pause', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     h.spies.trainPauseSet.mockRejectedValueOnce(new Error('pause store gone'));
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-write-failed' });
@@ -993,7 +1071,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a first pass that read clear but whose set answers unchanged does not own the pause, and rollback lifts nothing', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     // Someone pauses the train between this pass's read and its set: the read answers `clear`.
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const read = vi.spyOn(h.trainPause, 'read').mockResolvedValueOnce({ status: 'clear' });
@@ -1013,7 +1091,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a replay whose set answers changed owns the pause even though the train was paused before the first pass and lifted by hand since', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const useCase = useCaseWithReaders(h);
     await crashAfterSet(h, useCase);
@@ -1027,7 +1105,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a replay whose set answers unchanged does not own a pause the operator set before the first pass, and rollback lifts nothing', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const useCase = useCaseWithReaders(h);
     await crashAfterSet(h, useCase);
@@ -1044,7 +1122,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('a replay over a legacy four-key-digest intent succeeds and does not own the pause when set answers unchanged', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const legacy = intentDigest();
     expect(legacy).toBe(
       sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`),
@@ -1070,7 +1148,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
 
   it('a different operation id on a key whose intent records trainPausedBefore still answers intent-digest-mismatch and writes nothing', async () => {
     for (const pausedBefore of [false, true]) {
-      const h = await harness({ seed: null });
+      const h = await harness({ seed: null, daemonPaused: true });
       if (pausedBefore) await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
       const useCase = useCaseWithReaders(h);
       await crashAfterSet(h, useCase);
@@ -1089,7 +1167,7 @@ describe('ManageCutoverUseCase switch pause ownership', () => {
   });
 
   it('an unreadable train-pause read on a replay is train-pause-unreadable, with no set call and no second intent', async () => {
-    const h = await harness({ seed: null });
+    const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);
     await crashAfterSet(h, useCase);
     vi.spyOn(h.trainPause, 'read').mockResolvedValueOnce({ status: 'unreadable' });

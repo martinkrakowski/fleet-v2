@@ -17,6 +17,10 @@
  * - JS `Array.prototype.some` skips array holes, so an already-parsed sparse
  *   array passes `jsonStrArr` with a hole in the result; this is pinned as
  *   current behaviour (see the dedicated test), not changed.
+ * - `jsonObj` passes an array-like value (typeof 'object', not a real
+ *   Array) through unchanged; pinned, not changed.
+ * - `safeJsonParse` stringifies non-string arguments per `JSON.parse`:
+ *   numbers/booleans reparse, other types yield undefined; pinned, not changed.
  * - A Proxy that lies consistently in every trap (e.g. reports arrays for
  *   `Array.isArray` and lies to `typeof`) is an accepted residual of the
  *   language; no shape check can defeat a lying Proxy.
@@ -62,6 +66,23 @@ describe('safeJsonParse', () => {
     expect(safeJsonParse('null')).toBeNull();
     expect(safeJsonParse('null')).not.toBeUndefined();
     expect(safeJsonParse('{bad')).not.toBeNull();
+  });
+
+  it('pins the non-string input behaviour: JSON.parse stringifies numbers and booleans, other types yield undefined', () => {
+    // Hostile input: a caller that bypasses the `string` type. Pinned
+    // current behaviour, not altered: JSON.parse stringifies its argument,
+    // so 42 parses to 42 and true to true (via '42' / 'true'); null becomes
+    // the document 'null' and parses to null; undefined, objects and
+    // array-likes stringify to something unparseable and yield undefined
+    // without throwing.
+    // O(n) in the stringified input length.
+    expect(safeJsonParse(42 as unknown as string)).toBe(42);
+    expect(safeJsonParse(true as unknown as string)).toBe(true);
+    expect(safeJsonParse(null as unknown as string)).toBeNull();
+    expect(safeJsonParse(undefined as unknown as string)).toBeUndefined();
+    expect(safeJsonParse({ a: 1 } as unknown as string)).toBeUndefined();
+    expect(() => safeJsonParse({ length: 1, 0: 'a' } as unknown as string)).not.toThrow();
+    expect(safeJsonParse({ length: 1, 0: 'a' } as unknown as string)).toBeUndefined();
   });
 });
 
@@ -113,9 +134,18 @@ describe('jsonStrArr', () => {
 
   it('throws CliUsageError on invalid JSON text', () => {
     // safeJsonParse returns undefined for these, which is not an array.
+    // The refusal must carry both the label and the flag name: an unlabelled
+    // error would not tell the operator which flag was wrong.
     for (const value of ['[bad', '']) {
       expect(() => jsonStrArr({ items: value }, 'items', 'Label')).toThrow(CliUsageError);
-      expect(() => jsonStrArr({ items: value }, 'items', 'Label')).toThrow(/'--items'/);
+      try {
+        jsonStrArr({ items: value }, 'items', 'Label');
+        expect.unreachable('expected CliUsageError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        expect((error as CliUsageError).message).toContain('Label');
+        expect((error as CliUsageError).message).toContain("'--items'");
+      }
     }
   });
 
@@ -190,18 +220,34 @@ describe('jsonObj', () => {
   });
 
   it('throws CliUsageError for numbers and other primitives', () => {
-    // Wrong primitives must be refused, never coerced into an object.
+    // Wrong primitives must be refused, never coerced into an object. The
+    // refusal must carry the label as well as the flag name.
     for (const value of [42, '42', true]) {
       expect(() => jsonObj({ spec: value }, 'spec', 'Label')).toThrow(CliUsageError);
-      expect(() => jsonObj({ spec: value }, 'spec', 'Label')).toThrow(/'--spec'/);
+      try {
+        jsonObj({ spec: value }, 'spec', 'Label');
+        expect.unreachable('expected CliUsageError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        expect((error as CliUsageError).message).toContain('Label');
+        expect((error as CliUsageError).message).toContain("'--spec'");
+      }
     }
   });
 
   it('throws CliUsageError on invalid JSON text', () => {
     // safeJsonParse returns undefined for these, which is not an object.
+    // The refusal must carry the label as well as the flag name.
     for (const value of ['{bad', '']) {
       expect(() => jsonObj({ spec: value }, 'spec', 'Label')).toThrow(CliUsageError);
-      expect(() => jsonObj({ spec: value }, 'spec', 'Label')).toThrow(/'--spec'/);
+      try {
+        jsonObj({ spec: value }, 'spec', 'Label');
+        expect.unreachable('expected CliUsageError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        expect((error as CliUsageError).message).toContain('Label');
+        expect((error as CliUsageError).message).toContain("'--spec'");
+      }
     }
   });
 
@@ -211,6 +257,29 @@ describe('jsonObj', () => {
     expect(() => jsonObj(payloadWithThrowingGetter('spec'), 'spec', 'Label')).toThrow(
       'getter exploded',
     );
+  });
+
+  it('pins that an array-like value passes the object check, and the own constructor key is honoured', () => {
+    // Hostile shapes, pinned current behaviour (payload.ts is not edited):
+    // - an array-like ({ length: 1, 0: 'a' }) is typeof 'object', not null
+    //   and not an Array, so it passes the object check unchanged; covering
+    //   this pins it so any future tightening is conscious.
+    // - an own 'constructor' property shadows the prototype: a non-object
+    //   under it is refused, an object under it is returned as-is.
+    expect(jsonObj({ spec: { length: 1, 0: 'a' } }, 'spec', 'Label')).toEqual({
+      length: 1,
+      0: 'a',
+    });
+    expect(() => jsonObj({ constructor: 42 }, 'constructor', 'Label')).toThrow(CliUsageError);
+    try {
+      jsonObj({ constructor: 42 }, 'constructor', 'Label');
+      expect.unreachable('expected CliUsageError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(CliUsageError);
+      expect((error as CliUsageError).message).toContain('Label');
+      expect((error as CliUsageError).message).toContain("'--constructor'");
+    }
+    expect(jsonObj({ constructor: { a: 1 } }, 'constructor', 'Label')).toEqual({ a: 1 });
   });
 });
 
@@ -269,5 +338,29 @@ describe('parseDurationOption', () => {
     expect(() => parseDurationOption(payloadWithThrowingGetter('max'), 'max', 7000)).toThrow(
       'getter exploded',
     );
+  });
+
+  it('pins the hostile-shape behaviour for null, boolean, array-like and own constructor-key payloads', () => {
+    // Hostile shapes beyond the string/number flags, pinned current
+    // behaviour (payload.ts is not edited):
+    // - null and an array-like value are neither string, number nor
+    //   boolean, so optStr yields '' (absent) and the fallback applies.
+    // - true stringifies to 'true', which the anchored regex refuses with
+    //   the raw value quoted.
+    // - an own 'constructor' key shadows the prototype and is read like
+    //   any other key: a non-duration string under it is refused, a valid
+    //   one is honoured.
+    expect(parseDurationOption({ max: null }, 'max', 7000)).toBe(7000);
+    expect(parseDurationOption({ max: { length: 1, 0: 'a' } }, 'max', 7000)).toBe(7000);
+    expect(() => parseDurationOption({ max: true }, 'max', 7000)).toThrow(CliUsageError);
+    expect(() => parseDurationOption({ max: true }, 'max', 7000)).toThrow(/'--max'/);
+    expect(() => parseDurationOption({ max: true }, 'max', 7000)).toThrow(/'true'/);
+    expect(() => parseDurationOption({ constructor: '30 x' }, 'constructor', 7000)).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseDurationOption({ constructor: '30 x' }, 'constructor', 7000)).toThrow(
+      /'--constructor'/,
+    );
+    expect(parseDurationOption({ constructor: '30m' }, 'constructor', 7000)).toBe(1_800_000);
   });
 });

@@ -967,13 +967,20 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
   });
 
   it('GD2 bounds the tail in UTF-8 bytes on a code-point boundary', () => {
-    const tail = boundedRedactedOutputTail('\u{1F600}'.repeat(20000), undefined);
+    const emojiLine = '\u{1F600}'.repeat(10);
+    const tail = boundedRedactedOutputTail(`${emojiLine}\n`.repeat(2000), undefined);
     expect(tail).toBeDefined();
     expect(Buffer.byteLength(tail as string, 'utf8')).toBeLessThanOrEqual(32 * 1024);
-    expect(tail).toBe('\u{1F600}'.repeat(8192));
-    const cjk = boundedRedactedOutputTail('\u4e2d'.repeat(20000), undefined) as string;
+    // The cut first line is partial and dropped: every kept line is whole.
+    for (const line of (tail as string).split('\n')) {
+      expect(line).toBe(emojiLine);
+    }
+    const cjkLine = '\u4e2d'.repeat(10);
+    const cjk = boundedRedactedOutputTail(`${cjkLine}\n`.repeat(2000), undefined) as string;
     expect(Buffer.byteLength(cjk, 'utf8')).toBeLessThanOrEqual(32 * 1024);
-    expect(cjk).toBe('\u4e2d'.repeat(10922));
+    for (const line of cjk.split('\n')) {
+      expect(line).toBe(cjkLine);
+    }
   });
 
   it('bounds the scan of an enormous stream to its last 200 lines and 32 KiB', () => {
@@ -991,7 +998,7 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     expect(lines[lines.length - 1]).toBe('line 119999: aaaa');
     const hugeLine = 'x'.repeat(10_000_000) + '\nlast words';
     const hugeTail = boundedRedactedOutputTail(hugeLine, undefined);
-    expect(hugeTail).toBe('x'.repeat(32 * 1024 - 11) + '\nlast words');
+    expect(hugeTail).toBe('last words');
   });
 
   it('keeps the combined stdout+stderr scan within 32 KiB, never splitting more than the combined window (fix round 2, item 2)', () => {
@@ -1036,5 +1043,55 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     // whitespace-only tail string.
     const tail = boundedRedactedOutputTail('x\n' + ' '.repeat(50000), undefined);
     expect(tail).toBeUndefined();
+  });
+  it('GD2 redacts a whole PEM block, not only its BEGIN line', () => {
+    const begin = '-----' + 'BEGIN ' + 'PRIVATE ' + 'KEY-----';
+    const end = '-----' + 'END ' + 'PRIVATE ' + 'KEY-----';
+    const body = ['Zm9vYmFyYmF6cXV4', 'quuxCORGEgraultGARPLY0123'].map((part) => part.repeat(4));
+    const tail = boundedRedactedOutputTail(['before', begin, ...body, end, 'after'].join('\n'), undefined) as string;
+    expect(tail).toContain('before');
+    expect(tail).toContain('after');
+    for (const hidden of [begin, end, ...body]) {
+      expect(tail).not.toContain(hidden);
+    }
+  });
+
+  it('GD2 redacts a PEM block with no END line to the end of the tail', () => {
+    const begin = '-----' + 'BEGIN ' + 'RSA ' + 'PRIVATE ' + 'KEY-----';
+    const tail = boundedRedactedOutputTail(['before', begin, 'bodyline-one', 'bodyline-two'].join('\n'), undefined) as string;
+    expect(tail).toBe(['before', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]'].join('\n'));
+  });
+
+  it('GD2 redacts a long base64-ish run on a line whose BEGIN was cut away, but not a hex digest', () => {
+    const blob = 'aB3+/9xQkL7mZ2'.repeat(5);
+    const digest = 'abcdef0123456789'.repeat(4);
+    const tail = boundedRedactedOutputTail(`${blob}\ndigest ${digest}`, undefined) as string;
+    expect(tail).not.toContain(blob);
+    expect(tail).toContain(digest);
+  });
+
+  it('GD2 does not leak a token split by the 32 KiB cut', () => {
+    const token = 'gh' + 'p_abc123def456ghi789jkl012mno345pqr678';
+    const total = 32 * 1024;
+    // The window is the last 32 KiB: the token starts 15 characters before the cut,
+    // so the surviving 15-character-shorter suffix must not be emitted unredacted.
+    const restLength = total + 15 - token.length;
+    const rest = `\n${'y'.repeat(restLength - 6)}\nlast`;
+    expect(rest.length).toBe(restLength);
+    const out = boundedRedactedOutputTail(`${'q'.repeat(10)}${token}${rest}`, undefined) as string;
+    expect(out).not.toContain(token.slice(15));
+    expect(out).toContain('last');
+  });
+
+  it('GD2 keeps the byte bound after redaction, even when markers are longer than the lines they replace', () => {
+    const begin = '-----' + 'BEGIN ' + 'X-----';
+    const end = '-----' + 'END ' + 'X-----';
+    const pairs = `${begin}\n${end}\n`.repeat(99);
+    const filler = 'y'.repeat(32 * 1024 - pairs.length);
+    const raw = pairs + filler;
+    expect(raw.length).toBe(32 * 1024);
+    const out = boundedRedactedOutputTail(raw, undefined) as string;
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    expect(out).not.toContain('BEGIN');
   });
 });

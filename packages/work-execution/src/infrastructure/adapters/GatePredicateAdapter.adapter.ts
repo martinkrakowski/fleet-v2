@@ -353,7 +353,16 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
     const headKeep = MAX_OUTPUT_TAIL_BYTES - joinNewline.length - b.length;
     rawWindow = a.slice(a.length - headKeep) + joinNewline + b;
   }
-  const stripped = lastUtf8Bytes(rawWindow.replace(ANSI_PATTERN, ''), MAX_OUTPUT_TAIL_BYTES);
+  // Any cut of the raw window may have split a line (and so a token): that
+  // first line is partial, its prefix lost, so it is dropped rather than
+  // scanned (a token whose prefix was cut would otherwise slip past the scan).
+  const windowCut = rawCombinedLength > MAX_OUTPUT_TAIL_BYTES;
+  const ansiFree = rawWindow.replace(ANSI_PATTERN, '');
+  let stripped = lastUtf8Bytes(ansiFree, MAX_OUTPUT_TAIL_BYTES);
+  const partialFirstLine = windowCut || stripped.length !== ansiFree.length;
+  if (partialFirstLine) {
+    stripped = dropFirstLine(stripped);
+  }
   if (stripped.trim() === '') {
     return undefined;
   }
@@ -383,16 +392,61 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
     .join('\n');
   // A trailing newline is not command output: drop the empty last lines.
   tail = tail.replace(/(?:\n[\t ]*)+$/, '');
-  const redacted = tail
-    .split(/\r?\n/)
-    .map((line) => (isSecretShapedLine(line) ? OUTPUT_TAIL_REDACTED_LINE : line))
-    .join('\n');
+  let redacted = redactTailLines(tail.split(/\r?\n/)).join('\n');
   if (isSecretShapedLine(redacted)) {
     return OUTPUT_TAIL_WITHHELD;
+  }
+  // The byte bound holds AFTER redaction: a marker can be longer than the
+  // line it replaces. Re-cut the redacted text (already safe to cut) and drop
+  // the first, possibly partial, line of the cut.
+  if (Buffer.byteLength(redacted, 'utf8') > MAX_OUTPUT_TAIL_BYTES) {
+    redacted = dropFirstLine(lastUtf8Bytes(redacted, MAX_OUTPUT_TAIL_BYTES));
   }
   return redacted;
 }
 
+/** The text after its first newline; empty when it has none. */
+function dropFirstLine(text: string): string {
+  const at = text.indexOf('\n');
+  return at === -1 ? '' : text.slice(at + 1);
+}
+
+const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]*-----/;
+const PEM_END = /-----END [A-Z0-9 ]*-----/;
+const BASE64_RUN = /[A-Za-z0-9+/=]{40,}/g;
+
+/** A defensive rule: a long base64-alphabet run that is not plain hex and has real entropy. */
+function hasBase64Blob(line: string): boolean {
+  const runs = line.match(BASE64_RUN);
+  if (runs === null) {
+    return false;
+  }
+  return runs.some(
+    (run) => !/^(?:[0-9a-f]+|[0-9A-F]+)$/.test(run) && new Set(run).size >= 10,
+  );
+}
+
+/** Redacts secret-shaped lines and whole PEM blocks (BEGIN through END, or to the end when END is missing). */
+function redactTailLines(lines: readonly string[]): string[] {
+  const out: string[] = [];
+  let inPem = false;
+  for (const line of lines) {
+    if (inPem) {
+      out.push(OUTPUT_TAIL_REDACTED_LINE);
+      if (PEM_END.test(line)) {
+        inPem = false;
+      }
+      continue;
+    }
+    if (PEM_BEGIN.test(line)) {
+      out.push(OUTPUT_TAIL_REDACTED_LINE);
+      inPem = !PEM_END.test(line);
+      continue;
+    }
+    out.push(isSecretShapedLine(line) || hasBase64Blob(line) ? OUTPUT_TAIL_REDACTED_LINE : line);
+  }
+  return out;
+}
 
 /** A predicate that could not run: unknown, never a pass. */
 function unknownResult(

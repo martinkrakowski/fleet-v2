@@ -952,12 +952,16 @@ export class RequestAttemptAcceptanceUseCase
         );
         // GD1: a retry run is granted over a congested prior run (KF-30c2) or
         // over a failed prior run (the decider's single gate-failed retry).
-        // Any other prior outcome (a pass, a non-congestion unknown, nothing
-        // stored) refuses without running anything.
+        // A failed prior run grants only that one retry (run 1); beyond it a
+        // failure no longer authorizes the next run, so a caller cannot chain
+        // failed-run retries past the intended single retry. Congestion
+        // retries keep their own chaining policy. Any other prior outcome (a
+        // pass, a non-congestion unknown, nothing stored) refuses without
+        // running anything.
         const priorEligible =
           priorRun.kind === 'completed' &&
           ((priorRun.verdict.verdict === 'unknown' && priorRun.verdict.congested === true) ||
-            priorRun.verdict.verdict === 'failed');
+            (priorRun.verdict.verdict === 'failed' && requestedRun === 1));
         if (!priorEligible) {
           return gateUnknown(
             'Unknown: gate run ' + String(requestedRun) +

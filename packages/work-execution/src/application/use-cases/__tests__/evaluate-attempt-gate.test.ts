@@ -793,6 +793,18 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     const replay = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
     expect(replay).toEqual(retry);
     expect(gate.requests).toHaveLength(2);
+
+    // GD1 round 2: the failed retry does not authorize a further run — a
+    // failed prior run grants only the one retry (run 1), so gateRun 2 is
+    // refused without running anything.
+    const refused2 = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(refused2).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Unknown: gate run 2 requires a stored congested or failed gate run 1 for head ' + HEAD_SHA,
+    });
+    expect(gate.requests).toHaveLength(2);
+    expect(journal.entries.some((entry) => entry.id.includes('/g2'))).toBe(false);
   });
 
   it('refuses gate run 2 after a stored CONGESTED run 0 because run 1 is not stored', async () => {

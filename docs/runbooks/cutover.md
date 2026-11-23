@@ -81,7 +81,7 @@ When turning shadow off, disable `fleet-v2-shadow-record-day.timer` alongside `f
 
 `cutover switch` cannot pass evidence while the recorded day is unpinned. Since SH20, `record-day` binds the recorded day to the installed `current` verified release sha (or `null` when unpinned, which still composes to `release-changed` / `shadow-evidence-absent`): a day recorded with no verified `current` release installed keeps the recorded window at `release-changed`, and the switch refuses `shadow-evidence-absent`.
 
-A window that passes the evidence gate then runs the last closed gate, `countUnrecordedLanes` (CO30c), wired in `apps/cli/src/composition.ts` over the read-only relaunch inventory and the read-only project-profile listing. Gate order: shadow evidence, lanes, daemon status, train pause. The gate:
+A window that passes the evidence gate then runs the last closed gate, `countUnrecordedLanes` (CO30c), wired in `apps/cli/src/composition.ts` over the read-only relaunch inventory and the read-only project-profile listing. Gate order: shadow evidence, lanes, daemon status, daemon pause, train pause. The gate:
 
 - refuses `unrecorded-lanes` when any listed worktree of an active profile's clone is unrecorded — idle leftovers included (relaunch apply/adopt does not exist yet, so every unrecorded worktree is lane work nothing explains). Remove leftover worktrees from the clone's `worktreeRoot` (with `git worktree remove`) before running `cutover switch`.
 - refuses `unknown` / `unrecorded-lanes-unknown` when the listed worktrees outnumber the lanes the inventory accounted for beyond each clone's own main worktree: a worktree listed outside the clone's declared `worktreeRoot` is silently dropped by the inventory, so the switch is never performed on an inventory that cannot vouch for what it did not see.
@@ -90,6 +90,30 @@ A window that passes the evidence gate then runs the last closed gate, `countUnr
 - never refuses on `unproven-lane-records`: an unproven record is listed in `relaunch inventory` output and counted there, but it does not block the switch.
 
 The gate reads only read-only store instances, so a corrupt store file is answered `unreadable` and never quarantined, and a refused or `unknown` switch writes no `cutover.json` and no `cutover-journal.json`. When every gate passes, the switch appends its intent, sets the train pause, saves the `switched` record and appends its result — a real `switched` record is reachable.
+
+### Operator sequence and shadow-park handling
+
+The switch runs while the daemon is paused, and the flip happens after it:
+
+1. `fleet-v2 daemon pause`
+2. `fleet-v2 cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex>`
+3. Set `shadow: false, unattended: true` in the installation policy (the flip).
+4. `fleet-v2 daemon resume`
+
+Two orderings are never acceptable:
+
+- Never flip before the switch: repositories already marked live when the switch runs are not shadow parks, so their parked entries are not released by the switch and are stranded parked.
+- Never resume before the flip: a resumed shadow daemon re-parks released entries silently, and a stored `switched` record cannot switch again (`not-shadow`), so the parks would never be released by a switch.
+
+Rollback is the reverse: `fleet-v2 daemon pause`, then set `unattended: false, shadow: true` (back to shadow).
+
+During `cutover switch` itself, the shadow parks are handled as follows:
+
+- The switch reads the merge policy (`daemon.mergePolicy`) and journals every ordinary `parked` entry of a shadow repository (keys `cutover/shadow-park-<digest>@<revision>`) into the separate `<stateDir>/shadow-park-journal.json` store (schema v3; `cutover-journal.json` stays schema v2), then releases each back to `queued`, clearing `notBeforeIso` and preserving the `attempt` history — so an entry already at `maxAttempts` still drops on its first live evaluation, not by the release itself.
+- Live-policy repositories (`shadow: false`) are left untouched.
+- Shadow-persisted `ready` entries and `would-drop` / `would-supersede` decisions are left to the first live pass; the switch neither replays nor releases them.
+- `vetoHoldParks` — shadow-repository `parked` entries with `reason: 'veto-hold'` — are counted and reported alongside `releasedParks` but never released by the switch.
+- `shadow-park-journal.json` uses schema v3 while `cutover-journal.json` stays v2: an older release that accepts only v1/v2 journals cannot read `shadow-park-journal.json` after a rollback, which is an accepted consequence of the separate store.
 
 Fail closed, and never treat an unknown or partial ledger as a pass:
 
@@ -123,7 +147,7 @@ Checks the operator can run today, each of which is not itself a completed switc
 
 The rollback window is 14 days (`CUTOVER_ROLLBACK_WINDOW_DAYS`).
 
-`fleet-v2 cutover rollback --expected-revision <n> --operation-id <id>` exists, with optional `--now-iso` and `--deadline-iso`. It pauses the daemon and lifts only a train pause the cutover itself set, and it requires a stored `switched` record. A record that was never switched is refused `not-switched` (exit 1). `cutover switch` is mounted and, with `countUnrecordedLanes` wired (CO30c), can write `switched` when the evidence gate, the lanes gate, the daemon gate and the train-pause gate all pass. An unreadable store is `unknown` (exit 1), not success.
+`fleet-v2 cutover rollback --expected-revision <n> --operation-id <id>` exists, with optional `--now-iso` and `--deadline-iso`. It pauses the daemon and lifts only a train pause the cutover itself set, and it requires a stored `switched` record. A record that was never switched is refused `not-switched` (exit 1). `cutover switch` is mounted and, with `countUnrecordedLanes` wired (CO30c), can write `switched` when the evidence gate, the lanes gate, the daemon-status gate, the daemon-pause gate and the train-pause gate all pass. An unreadable store is `unknown` (exit 1), not success.
 
 `fleet-v2 daemon pause` exists as its own command.
 

@@ -950,14 +950,30 @@ export class RequestAttemptAcceptanceUseCase
           expected,
           requestedRun - 1,
         );
-        const priorCongested =
+        // GD1: a retry run is granted over a congested prior run (KF-30c2) or
+        // over a failed prior run (the decider's single gate-failed retry).
+        // A failed prior run grants the next run only when it is the single
+        // gate-failed run among runs 0..n-1 (earlier runs being congestion
+        // retries), matching the decider; a second failure no longer
+        // authorizes the next run, so failed-run retries cannot be chained. Congestion
+        // retries keep their own chaining policy. Any other prior outcome (a
+        // pass, a non-congestion unknown, nothing stored) refuses without
+        // running anything.
+        let failedRuns = 0;
+        for (let run = 0; run < requestedRun; run += 1) {
+          const stored = readStoredGateOutcome(resolutionEntries, id, candidateHeadSha, expected, run);
+          if (stored.kind === 'completed' && stored.verdict.verdict === 'failed') {
+            failedRuns += 1;
+          }
+        }
+        const priorEligible =
           priorRun.kind === 'completed' &&
-          priorRun.verdict.verdict === 'unknown' &&
-          priorRun.verdict.congested === true;
-        if (!priorCongested) {
+          ((priorRun.verdict.verdict === 'unknown' && priorRun.verdict.congested === true) ||
+            (priorRun.verdict.verdict === 'failed' && failedRuns === 1));
+        if (!priorEligible) {
           return gateUnknown(
             'Unknown: gate run ' + String(requestedRun) +
-              ' requires a stored congested gate run ' + String(requestedRun - 1) +
+              ' requires a stored congested or failed gate run ' + String(requestedRun - 1) +
               ' for head ' + candidateHeadSha,
           );
         }

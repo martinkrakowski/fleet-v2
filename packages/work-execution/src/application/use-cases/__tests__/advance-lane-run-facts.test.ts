@@ -567,7 +567,7 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     expect(result).toEqual({ outcome: 'entered', state: 'brief-check' });
   });
 
-  it('test 8b: a failed gate in round 0 enters fixing', async () => {
+  it('test 8b: a failed gate in round 0 enters fixing after its one retry fails (GD1)', async () => {
     const collected = attemptFixture({
       state: 'collected',
       artifacts: {
@@ -582,6 +582,18 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     const gate = stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
     await appendIntent(harness, gate, null, NOW);
     await appendResult(harness, gate, 'completed', 'gate-failed', NOW);
+    // GD1: the round's single gate-failed run retries once under /retry1; its
+    // own failure is the second gate-failed at (round 0, head), so the retry
+    // budget is spent and the next advance enters fixing.
+    const retry1 = buildLaneRunStepKey({
+      runId: RUN_ID, round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: 1,
+    });
+    expect(retry1.ok).toBe(true);
+    if (!retry1.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    await appendIntent(harness, retry1.key, null, NOW);
+    await appendResult(harness, retry1.key, 'completed', 'gate-failed', NOW);
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'entered', state: 'fixing' });
   });

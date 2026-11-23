@@ -726,7 +726,11 @@ The relaunch group reports what a relaunch would find, read-only: relaunch
 inventory lists, per lane host, the registered clones' worktrees, the runner's
 state per worktree directory, the conductor's status and each lane's
 population (conducted, attempt-recorded, unrecorded). It writes nothing,
-journals nothing and mutates no worktree.
+journals nothing and mutates no worktree. relaunch apply runs one stored plan:
+without --apply it is a dry-run summary; with --apply --grant <id> it executes
+one wave of save/abort/adopt/redispatch under the owner grant and journals
+each step. relaunch request-grant derives the digest-bound owner grant request
+and prints the coordination commands that record and approve it.
 
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
 
@@ -752,6 +756,9 @@ Commands:
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]
+  relaunch plan [--host <name>] [--max-active-runs <n>] [--dispatch-stagger-ms <ms>] [--now <iso>] [--deadline <iso>]
+  relaunch apply --plan-digest <64 hex> [--apply] [--grant <id>] [--save-inputs <json>] [--adopt-inputs <json>] [--now <iso>] [--deadline <iso>]
+  relaunch request-grant --plan-digest <64 hex> [--now <iso>] [--policy-revision <rev>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   merge import --repository owner/repo --legacy-state-dir <path> [--apply --grant <id> --project <id>] (no --authority)
   cutover shadow report --repository owner/repo --legacy-state-dir <path>

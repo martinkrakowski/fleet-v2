@@ -137,7 +137,9 @@ describe('relaunch inventory', () => {
     const code = await runCli(['relaunch'], io, runtime);
 
     expect(code).toBe(2);
-    expect(err.join('')).toContain('Subcommands: inventory');
+    expect(err.join('')).toContain(
+      'Subcommands: apply, inventory, plan, request-grant',
+    );
   });
   it('refuses with exit 1 when the profile records cannot be read, never reporting zero hosts', async () => {
     const { io, out } = collectIo();

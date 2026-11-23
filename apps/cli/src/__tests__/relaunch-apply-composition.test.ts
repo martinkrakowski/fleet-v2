@@ -27,6 +27,20 @@ import {
 } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
+import {
+  adoptInputFor,
+  buildRelaunchApplyPlan,
+  cleanupRelaunchApplyFixtures,
+  git,
+  ATTEMPT_ID,
+  LANE_ID,
+  makeRelaunchApplyFixture,
+  mintRelaunchGrant,
+  RUN_ID,
+  saveInputFor,
+  seedAttemptRecord,
+  WORK_ORDER_ID,
+} from './relaunch-apply-fixture.js';
 
 const roots: string[] = [];
 
@@ -128,7 +142,10 @@ describe('relaunch apply composition (AR3c1)', () => {
     expect(authorize).toHaveBeenCalledTimes(1);
     expect(result.outcome).toBe('refused');
     expect(result.reason).not.toBe('stale-plan-state');
-    expect(['grant-missing', 'grant-not-approved', 'authorization-unavailable']).toContain(result.reason);
+    // AR3c2: the grant is consulted and refuses as itself; an
+    // `authorization-unavailable` here would mean the composed authorization
+    // port did not answer, which is not a grant refusal.
+    expect(['grant-missing', 'grant-not-approved']).toContain(result.reason);
   });
 
   it('refuses stale-plan-state before the grant when a live port is missing (direct ApplyRelaunchUseCase check)', async () => {
@@ -159,4 +176,59 @@ describe('relaunch apply composition (AR3c1)', () => {
     ).toEqual({ outcome: 'refused', reason: 'stale-plan-state' });
     expect(authorizeRelaunchApply).not.toHaveBeenCalled();
   });
+
+  // AR3c2: the wired `saveLaneEdits` and `adoptLane` ports are the real
+  // `SaveLaneEditsUseCase` and `AdoptLaneUseCase` adapters, not merely
+  // callables. Their live behavior is checked against the real stored plan,
+  // the real cutover journal and the real git worktree: a live wave applies,
+  // the save ref exists in the clone's git store, the adopt wrote the real
+  // work order and run records, and the journal carries the save result and
+  // the completed `adopt/work-order` result.
+  it('drives the real saveLaneEdits and adoptLane adapters through a live wave over a real worktree', async () => {
+    const fx = await makeRelaunchApplyFixture('fleet-cli-relaunch-apply-live-');
+    const plan = buildRelaunchApplyPlan();
+    const saved = await fx.runtime.execution.relaunchPlanRepository.save(plan);
+    expect(saved).toMatchObject({ outcome: 'saved' });
+    await seedAttemptRecord(fx);
+    const grantId = await mintRelaunchGrant(fx, plan.planDigest);
+
+    const result = (await fx.runtime.execution.applyRelaunch.applyRelaunch({
+      planDigest: plan.planDigest,
+      apply: true,
+      grantId,
+      nowIso: fx.nowIso,
+      saveInputs: [saveInputFor(fx)],
+      adoptInputs: [adoptInputFor(fx, plan.planDigest)],
+    })) as { outcome: string; wave?: number; reason?: string };
+
+    expect(result).toMatchObject({ outcome: 'applied', wave: 1 });
+
+    // saveLaneEdits ran for real: the save ref exists in the clone's git store.
+    const saveRefs = await git(fx.clonePath, 'for-each-ref', 'refs/fleet/saved/', '--format=%(refname)');
+    expect(saveRefs).toContain(`refs/fleet/saved/${plan.planDigest.slice(0, 12)}-${LANE_ID}`);
+
+    // adoptLane ran for real: the work order and the adopted run are in the
+    // production stores, not in any test double.
+    const workOrder = await fx.runtime.execution.workOrderRepository.findWorkOrderById(WORK_ORDER_ID);
+    expect(workOrder).not.toBeNull();
+    const run = await fx.runtime.conductor.laneRunRepository.get(RUN_ID);
+    expect(run).not.toBeNull();
+    expect(run?.workOrderId).toBe(WORK_ORDER_ID);
+    expect(run?.attemptIds[0]).toBe(ATTEMPT_ID);
+
+    // The real cutover journal holds the save result and the completed
+    // adopt/work-order result of this wave.
+    const journal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(
+      `relaunch/${plan.planDigest}/${LANE_ID}/`,
+    );
+    expect(journal.outcome).toBe('listed');
+    if (journal.outcome !== 'listed') throw new Error('unreachable');
+    const keys = journal.entries.map((entry) => `${entry.key} ${entry.kind} ${entry.outcome ?? ''}`);
+    expect(keys).toContain(`relaunch/${plan.planDigest}/${LANE_ID}/save result completed`);
+    expect(keys).toContain(`relaunch/${plan.planDigest}/${LANE_ID}/adopt/work-order result completed`);
+  });
+});
+
+afterAll(() => {
+  cleanupRelaunchApplyFixtures();
 });

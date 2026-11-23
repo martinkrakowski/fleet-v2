@@ -318,10 +318,10 @@ interface GateRetryEntrySnapshot {
 
 /**
  * A plain-data snapshot of one journal entry's planner fields, or a refusal.
- * `refused` marks an entry that is not a plain object or carries an accessor
- * (getter) property among the read fields — a getter is never run; the entry
- * is skipped instead. `polluted` marks an entry with a prototype-polluting own
- * key, which refuses the whole planner input. Cost: O(1) per entry, six descriptor reads. A proxy that
+ * `refused` marks an entry that is not a plain object (skipped). `polluted`
+ * marks an entry with a prototype-polluting own key or an accessor (get or set)
+ * among the read fields — no getter is ever run — which refuses the whole
+ * planner input. Cost: O(1) per entry, six descriptor reads. A proxy that
  * lies consistently in every trap is an accepted residual.
  */
 function snapshotGateRetryEntry(source: unknown): { readonly status: 'ok'; readonly snapshot: GateRetryEntrySnapshot } | { readonly status: 'refused' } | { readonly status: 'polluted' } {
@@ -336,21 +336,28 @@ function snapshotGateRetryEntry(source: unknown): { readonly status: 'ok'; reado
   if (Object.getOwnPropertyDescriptor(source, '__proto__') !== undefined) {
     return { status: 'polluted' };
   }
-  const read = (field: string): unknown => {
+  const values: unknown[] = [];
+  for (const field of GATE_RETRY_ENTRY_FIELDS) {
+    // Each descriptor is read once; an accessor (get or set) is hostile.
     const descriptor = Object.getOwnPropertyDescriptor(source, field);
-    return descriptor === undefined || !('value' in descriptor) ? undefined : descriptor.value;
-  };
+    if (descriptor === undefined) {
+      values.push(undefined);
+    } else if (!('value' in descriptor)) {
+      return { status: 'polluted' };
+    } else {
+      values.push(descriptor.value);
+    }
+  }
+  const [kind, key, runId, outcome, reasonCode] = values;
   return {
     status: 'ok',
     snapshot: {
-      kind: read('kind'),
-      key: read('key'),
-      runId: read('runId'),
-      outcome: read('outcome'),
-      reasonCode: read('reasonCode'),
+      kind, key, runId, outcome, reasonCode,
     },
   };
 }
+
+const GATE_RETRY_ENTRY_FIELDS = ['kind', 'key', 'runId', 'outcome', 'reasonCode'] as const;
 
 const REFUSED_GATE_RETRY_ENTRY = { status: 'refused' } as const;
 
@@ -383,7 +390,7 @@ interface GateRetryIntentInfo {
  *
  * `entries` must be a dense `Array` of at most {@link GATE_RETRY_MAX_ENTRIES}
  * plain entries (an array hole, a non-array, an enormous length or a
- * non-iterable is refused); non-plain entries are skipped. `runId` must match
+ * non-iterable is refused); non-plain entries are skipped, but an accessor slot or an entry with an accessor field refuses the whole input. `runId` must match
  * LANE_RUN_ID_PATTERN and `round` an integer 0..2. Cost: a single O(N) pass
  * over `entries` (plus O(R) map lookups, R <= LANE_RUN_MAX_RETRY).
  *
@@ -417,14 +424,12 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
     }
     const snapshots: (GateRetryEntrySnapshot | null)[] = new Array(entries.length);
     for (let index = 0; index < entries.length; index += 1) {
-      // Read each slot through its own property descriptor so a getter (an
-      // accessor at an index) is never invoked; an accessor slot is refused
-      // like any non-plain entry. A prototype-polluting own key on any entry
-      // refuses the whole input rather than being silently skipped.
+      // Read each slot through its own property descriptor (once) so a getter
+      // is never invoked; an accessor or missing slot refuses the whole input,
+      // never a partial list. So does a hostile entry (pollution, accessor field).
       const slot = Object.getOwnPropertyDescriptor(entries, index);
       if (slot === undefined || !('value' in slot)) {
-        snapshots[index] = null;
-        continue;
+        return GATE_RETRY_NONE;
       }
       const snapshotted = snapshotGateRetryEntry(slot.value);
       if (snapshotted.status === 'polluted') {

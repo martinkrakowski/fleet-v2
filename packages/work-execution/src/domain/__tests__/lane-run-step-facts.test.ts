@@ -721,6 +721,33 @@ describe('planGateFailedRetry', () => {
     expect(getterRan).toBe(false);
   });
 
+  it('refuses the whole input when an accessor slot sits beside valid gate-failed entries', () => {
+    let reads = 0;
+    const entries: unknown[] = [...failedEntries(), undefined];
+    Object.defineProperty(entries, entries.length - 1, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return intent(gateKeyOf(0, 0, HEAD, null));
+      },
+    });
+    expect(planGateFailedRetry(entries, RUN_ID, 0)).toEqual({ kind: 'none' });
+    expect(reads).toBe(0);
+  });
+
+  it('refuses the whole input when an entry has an accessor field, getter or setter, never running it', () => {
+    let reads = 0;
+    for (const accessor of [
+      { get: () => { reads += 1; return 'x'; } },
+      { set: () => { reads += 1; } },
+    ]) {
+      const hostile: Record<string, unknown> = { kind: 'intent', runId: RUN_ID };
+      Object.defineProperty(hostile, 'key', { enumerable: true, ...accessor });
+      expect(planGateFailedRetry([...failedEntries(), hostile], RUN_ID, 0)).toEqual({ kind: 'none' });
+      expect(reads).toBe(0);
+    }
+  });
+
   it('refuses the whole input when any entry carries a prototype-polluting own key, even with a valid gate-failed entry present', () => {
     const polluting = JSON.parse('{"__proto__": {}, "kind": "intent"}') as object;
     const plan = planGateFailedRetry([...failedEntries(), polluting], RUN_ID, 0);
@@ -762,7 +789,7 @@ describe('planGateFailedRetry', () => {
     }
   });
 
-  it('skips a throwing-getter entry and still plans from the plain ones', () => {
+  it('refuses the whole input for a throwing-getter entry instead of planning from the rest', () => {
     const base = gateKeyOf(0, 0, HEAD, null);
     const throwing: Record<string, unknown> = { kind: 'intent' };
     Object.defineProperty(throwing, 'key', {
@@ -772,7 +799,7 @@ describe('planGateFailedRetry', () => {
       },
     });
     const plan = planGateFailedRetry([throwing, intent(base), result(base, 'completed', 'gate-failed')], RUN_ID, 0);
-    expect(plan).toEqual({ kind: 'mint', key: base + '/retry1', retry: 1, head12: HEAD, seatIndex: 0 });
+    expect(plan).toEqual({ kind: 'none' });
   });
 
   it('stays under the cap for one or two gate-failed retries and mints the next retry', () => {

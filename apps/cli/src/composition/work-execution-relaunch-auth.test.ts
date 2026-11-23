@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -19,14 +20,20 @@ import {
 
 const DIGEST = 'a'.repeat(64);
 const GRANT_ID = 'grant-relaunch-1';
-const REQUEST_ID = 'relaunch-request-1';
+
+/** The request id binds the plan digest and creation instant (digest-bound under the owner signature). */
+function boundRequestId(createdAtIso: string, proposalDigest: string): string {
+  const payload = JSON.stringify({ scope: 'relaunch:apply', projectId: 'relaunch', proposalDigest, createdAtIso });
+  return `relaunch-apply-${createHash('sha256').update(payload).digest('hex')}`;
+}
 
 /** KEY0c1b: the ephemeral owner key the runtime under test pins. */
 const ownerKey = ephemeralOwnerKey();
 
 function relaunchRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
+  const createdAtIso = overrides.createdAtIso ?? new Date().toISOString();
   return {
-    id: REQUEST_ID,
+    id: boundRequestId(createdAtIso, overrides.proposalDigest ?? DIGEST),
     projectId: 'relaunch',
     kind: 'action-decision',
     state: 'approved',
@@ -41,8 +48,8 @@ function relaunchRecord(overrides: Partial<CoordinationRequestRecord> = {}): Coo
     deliveryStatus: 'delivered',
     deliveryGapReason: null,
     revision: 1,
-    createdAtIso: new Date().toISOString(),
-    updatedAtIso: new Date().toISOString(),
+    createdAtIso,
+    updatedAtIso: createdAtIso,
     ...overrides,
   };
 }

@@ -22,6 +22,9 @@ import {
   releaseRootsAgree,
   isShadowImportActionScope,
   isRelaunchApplyActionScope,
+  isStrictIsoInstant,
+  relaunchApplyDigestPayload,
+  RELAUNCH_APPLY_DIGEST_PREFIX,
   isSignedDecisionRequired,
   releaseGrantDigestPayload,
   RELEASE_GRANT_DIGEST_PREFIX,
@@ -94,8 +97,6 @@ const PROTOTYPE_POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor',
 // O(1) descriptor reads (never a key walk).
 const ARRAY_LIKE_KEYS: readonly string[] = ['length', '0'];
 
-/** Strict ISO-8601 UTC instant (`Date.parse` alone accepts values like "0"). */
-const STRICT_ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
 /**
  * The fixed field names the relaunch-apply resolve reads. The relaunch path
@@ -685,7 +686,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return blocked('clock-unavailable');
     }
     const nowIso = this.deps.shadowImportClock.nowIso();
-    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+    if (!isStrictIsoInstant(nowIso)) {
       return blocked('invalid-now-iso');
     }
     if (this.deps.computeDigest === undefined) {
@@ -806,11 +807,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return blocked('clock-unavailable');
     }
     const nowIso = this.deps.shadowImportClock.nowIso();
-    if (
-      typeof nowIso !== 'string' ||
-      !STRICT_ISO_INSTANT.test(nowIso) ||
-      !Number.isFinite(Date.parse(nowIso))
-    ) {
+    if (!isStrictIsoInstant(nowIso)) {
       return blocked('invalid-now-iso');
     }
     const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
@@ -844,12 +841,34 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (refreshed.proposalDigest !== request.proposalDigest) {
       return blocked('grant-digest-mismatch');
     }
+    // The owner's signature covers the request id, not the plan digest or the
+    // creation instant: both are bound by the id's digest, recomputed here
+    // from the stored fields, so a store edit of either is refused.
+    if (this.deps.computeDigest === undefined) {
+      return blocked('digest-unavailable');
+    }
+    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${this.deps.computeDigest(
+      relaunchApplyDigestPayload({
+        projectId: refreshed.projectId,
+        proposalDigest: refreshed.proposalDigest,
+        createdAtIso: refreshed.createdAtIso,
+      }),
+    )}`;
+    if (refreshed.id !== expectedRequestId) {
+      return blocked('grant-request-digest-mismatch');
+    }
     // The expiry is measured with the trusted clock alone: a request-supplied
     // `nowIso` can never revive an expired grant. The boundary is exclusive —
     // exactly `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days after creation is
     // already expired.
     const createdAtMs = Date.parse(refreshed.createdAtIso);
     const nowMs = Date.parse(nowIso);
+    if (!isStrictIsoInstant(refreshed.createdAtIso)) {
+      return blocked('grant-expired');
+    }
+    if (createdAtMs > nowMs) {
+      return blocked('grant-created-in-future');
+    }
     if (
       !Number.isFinite(createdAtMs) ||
       nowMs >= createdAtMs + RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { SHADOW_IMPORT_ACTION_SCOPE, RELAUNCH_APPLY_ACTION_SCOPE, RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS, RELAUNCH_APPLY_PROJECT_ID } from '../../domain/coordination-records.js';
+import { SHADOW_IMPORT_ACTION_SCOPE, RELAUNCH_APPLY_DIGEST_PREFIX, relaunchApplyDigestPayload, RELAUNCH_APPLY_ACTION_SCOPE, RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS, RELAUNCH_APPLY_PROJECT_ID } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { DecisionAnswer, DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 import { ResolveActionAuthorizationUseCase } from './ResolveActionAuthorizationUseCase.use-case.js';
@@ -1730,15 +1730,19 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
 describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () => {
   const CREATED_AT_ISO = '2026-11-01T00:00:00.000Z';
   const GRANT_ID = 'grant-relaunch-1';
-  const REQUEST_ID = 'relaunch-request-1';
   const PROPOSAL_DIGEST = 'a'.repeat(64);
   const SEVEN_DAYS_MS = RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000;
 
   function relaunchRecord(
     overrides: Partial<CoordinationRequestRecord> = {},
   ): CoordinationRequestRecord {
+    const bound = {
+      projectId: overrides.projectId ?? RELAUNCH_APPLY_PROJECT_ID,
+      proposalDigest: overrides.proposalDigest ?? PROPOSAL_DIGEST,
+      createdAtIso: overrides.createdAtIso ?? CREATED_AT_ISO,
+    };
     return {
-      id: REQUEST_ID,
+      id: `${RELAUNCH_APPLY_DIGEST_PREFIX}${createHash('sha256').update(relaunchApplyDigestPayload(bound)).digest('hex')}`,
       projectId: RELAUNCH_APPLY_PROJECT_ID,
       kind: 'action-decision',
       state: 'approved',
@@ -1783,8 +1787,14 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     return { requestRepo, ...signer.deps };
   }
 
-  function clockAt(nowIso: string): { shadowImportClock: { nowIso: () => string } } {
-    return { shadowImportClock: { nowIso: () => nowIso } };
+  function clockAt(nowIso: string): {
+    shadowImportClock: { nowIso: () => string };
+    computeDigest: (payload: string) => string;
+  } {
+    return {
+      shadowImportClock: { nowIso: () => nowIso },
+      computeDigest: (payload) => createHash('sha256').update(payload).digest('hex'),
+    };
   }
 
   function relaunchRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -1817,10 +1827,48 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     expect(result).toEqual({
       outcome: 'authorized',
       grantId: GRANT_ID,
-      requestId: REQUEST_ID,
+      requestId: record.id,
       expectedHeadSha: '',
       policyRevision: 'pol-relaunch-1',
     });
+  });
+
+  it('refuses a relaunch grant whose createdAtIso is in the future of the trusted clock (grant-created-in-future)', async () => {
+    const record = relaunchRecord({ createdAtIso: '2099-01-01T00:00:00.000Z' });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-created-in-future' });
+  });
+
+  it('refuses a store-edited proposalDigest even when the request names the edited digest', async () => {
+    const original = relaunchRecord();
+    const edited = { ...original, proposalDigest: 'c'.repeat(64) };
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(edited), edited), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ proposalDigest: 'c'.repeat(64) }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-request-digest-mismatch' });
+  });
+
+  it('refuses a store-edited createdAtIso that would reset the expiry', async () => {
+    const original = relaunchRecord({ createdAtIso: '2026-10-01T00:00:00.000Z' });
+    const edited = { ...original, createdAtIso: CREATED_AT_ISO };
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(edited), edited), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-request-digest-mismatch' });
+  });
+
+  it('refuses a calendar-invalid trusted-clock instant (2026-02-30)', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt('2026-02-30T00:00:00.000Z') },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-now-iso' });
   });
 
   it('authorizes 1ms before the 7-day boundary and blocks with grant-expired at and after 7 days', async () => {
@@ -1987,7 +2035,7 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     expect(result).toEqual({
       outcome: 'authorized',
       grantId: GRANT_ID,
-      requestId: REQUEST_ID,
+      requestId: record.id,
       expectedHeadSha: '',
       policyRevision: 'pol-relaunch-1',
     });

@@ -561,7 +561,7 @@ function cleanRelaunchApplyReason(
 ): string {
   const fallback = outcome === 'blocked' ? 'delegate-blocked' : 'delegate-unknown';
   const cleaned = cleanReason(reason, fallback);
-  return cleaned.includes(requestedGrantId) ? fallback : cleaned; // BROKEN: grant-echo scrub removed (prove test sensitivity)
+  return cleaned.includes(requestedGrantId) ? fallback : cleaned;
 }
 
 /**
@@ -717,7 +717,7 @@ function readRelaunchApplyRequest(request: unknown): Validated<AuthorizeRelaunch
     !/^[0-9a-f]{64}$/.test(value.planDigest) ||
     !isSafeId(value.grantId, MAX_GRANT_ID_LENGTH, true) ||
     !isCleanText(value.nowIso, 64) ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.nowIso)
+    !isStrictInstant(value.nowIso)
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
@@ -1332,4 +1332,13 @@ function isResolvableGrant(grant: ActionAuthorizationGrantEntry, request: Resolv
     return true;
   }
   return RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId;
+}
+
+/** Strict ISO-8601 UTC instant whose calendar date is real (`2026-02-30` is refused). */
+function isStrictInstant(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)) {
+    return false;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 19) === value.slice(0, 19);
 }

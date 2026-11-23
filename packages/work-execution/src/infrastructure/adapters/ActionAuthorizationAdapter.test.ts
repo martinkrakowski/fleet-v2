@@ -515,6 +515,18 @@ describe('ActionAuthorizationAdapter.authorizeRelaunchApply (AR3a)', () => {
     expect(result).toEqual({ outcome: 'blocked', reason: 'delegate-blocked' });
   });
 
+  it('scrubs a grant id that is the ONLY sensitive text in a blocked reason', async () => {
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => ({
+        outcome: 'blocked',
+        reason: 'grant grant-relaunch-1 is no longer valid',
+      }),
+    });
+    const result = await adapter.authorizeRelaunchApply(relaunchRequest());
+    expect(JSON.stringify(result)).not.toContain('grant-relaunch-1');
+    expect(result).toEqual({ outcome: 'blocked', reason: 'delegate-blocked' });
+  });
+
   it('scrubs a grant id echoed from a delegate unknown answer', async () => {
     const adapter = new ActionAuthorizationAdapter({
       authorizeRelaunchApply: async () => ({

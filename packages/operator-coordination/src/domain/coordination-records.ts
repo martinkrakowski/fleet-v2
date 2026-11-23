@@ -582,6 +582,48 @@ export const RELAUNCH_APPLY_PROJECT_ID = 'relaunch' as const;
 /** The longest time a relaunch-apply grant may live from its creation instant. */
 export const RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS = 7 as const;
 
+/** The request-id prefix of a relaunch-apply grant: `relaunch-apply-<sha256 of the digest payload>`. */
+export const RELAUNCH_APPLY_DIGEST_PREFIX = 'relaunch-apply-' as const;
+
+/**
+ * How far a requester's claimed creation instant may differ from the trusted
+ * clock at request time. The claimed instant is bound into the request id (and
+ * so under the owner's signature); it is never trusted beyond this window.
+ */
+export const RELAUNCH_APPLY_CLOCK_SKEW_MS = 300_000 as const;
+
+const STRICT_INSTANT_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
+/**
+ * Strict ISO-8601 UTC instant: the shape matches AND the calendar date is real
+ * (`2026-02-30` is refused, because it round-trips to March).
+ */
+export function isStrictIsoInstant(value: unknown): value is string {
+  if (typeof value !== 'string' || !STRICT_INSTANT_SHAPE.test(value)) {
+    return false;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 19) === value.slice(0, 19);
+}
+
+/**
+ * The canonical digest payload a relaunch-apply grant's request id is bound
+ * by. The owner's signature covers the request id but not the plan digest or
+ * the creation instant, so both are covered by being inside this payload.
+ */
+export function relaunchApplyDigestPayload(input: {
+  readonly projectId: string;
+  readonly proposalDigest: string;
+  readonly createdAtIso: string;
+}): string {
+  return JSON.stringify({
+    scope: RELAUNCH_APPLY_ACTION_SCOPE,
+    projectId: input.projectId,
+    proposalDigest: input.proposalDigest,
+    createdAtIso: input.createdAtIso,
+  });
+}
+
 /** True only for the exact relaunch apply scope; any other scope is not a relaunch apply. */
 export function isRelaunchApplyActionScope(actionScope: string): boolean {
   return actionScope === RELAUNCH_APPLY_ACTION_SCOPE;

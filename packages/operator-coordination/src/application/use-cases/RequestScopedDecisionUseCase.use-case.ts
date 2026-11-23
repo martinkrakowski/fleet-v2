@@ -24,6 +24,11 @@ import {
   isShadowImportActionScope,
   parseShadowImportGrant,
   releaseGrantDigestPayload,
+  isRelaunchApplyActionScope,
+  isStrictIsoInstant,
+  relaunchApplyDigestPayload,
+  RELAUNCH_APPLY_DIGEST_PREFIX,
+  RELAUNCH_APPLY_CLOCK_SKEW_MS,
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
@@ -97,6 +102,7 @@ interface ValidatedDecisionRequest {
   readonly releaseRootValue: string | undefined;
   readonly isReleaseScope: boolean;
   readonly isShadowScope: boolean;
+  readonly isRelaunchScope: boolean;
 }
 
 type ShadowImportGrantEvaluation =
@@ -322,6 +328,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         releaseRootValue,
         isReleaseScope,
         isShadowScope: isShadowImportActionScope(request.actionScope.trim()),
+        isRelaunchScope: isRelaunchApplyActionScope(request.actionScope.trim()),
       },
     };
   }
@@ -341,6 +348,28 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     deps: RequestScopedDecisionDependencies,
     scope: ValidatedDecisionRequest,
   ): DecisionStep<string> {
+    if (scope.isRelaunchScope) {
+      // AR3a: the grant's creation instant is bound into the request id (and
+      // so under the owner's signature), so the requester names it — but it is
+      // only accepted inside a narrow window around the trusted clock, never a
+      // far-future instant that would make the grant outlive its TTL.
+      if (deps.shadowImportClock === undefined) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-clock-unavailable' } };
+      }
+      const trusted = deps.shadowImportClock.nowIso();
+      const claimed = scope.request.nowIso;
+      if (claimed === undefined || claimed === null || claimed === '') {
+        return { value: trusted };
+      }
+      if (
+        !isStrictIsoInstant(trusted) ||
+        !isStrictIsoInstant(claimed) ||
+        Math.abs(Date.parse(claimed) - Date.parse(trusted)) > RELAUNCH_APPLY_CLOCK_SKEW_MS
+      ) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-created-at-out-of-window' } };
+      }
+      return { value: claimed };
+    }
     if (!scope.isShadowScope) {
       return { value: isFilled(scope.request.nowIso) ? scope.request.nowIso : new Date().toISOString() };
     }
@@ -377,6 +406,21 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         return { result: { outcome: 'rejected', reason: grantEvaluation.reason } };
       }
       shadowImportGrant = grantEvaluation.grant;
+    }
+    if (scope.isRelaunchScope) {
+      if (deps.computeDigest === undefined) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-digest-unavailable' } };
+      }
+      const expectedRelaunchId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${deps.computeDigest(
+        relaunchApplyDigestPayload({
+          projectId: scope.request.projectId.trim(),
+          proposalDigest: scope.request.proposalDigest.trim(),
+          createdAtIso: nowIso,
+        }),
+      )}`;
+      if (scope.request.requestId.trim() !== expectedRelaunchId) {
+        return { result: { outcome: 'rejected', reason: 'relaunch-apply-request-digest-mismatch' } };
+      }
     }
     if (scope.isReleaseScope) {
       if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
@@ -496,7 +540,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       revision: recorded.revision + 1,
       // A shadow request's moment is the trusted clock's, never the
       // request-supplied one; ordinary decisions keep main's behaviour.
-      updatedAtIso: scope.isShadowScope
+      updatedAtIso: scope.isShadowScope || scope.isRelaunchScope
         ? nowIso
         : isFilled(scope.request.nowIso)
           ? scope.request.nowIso

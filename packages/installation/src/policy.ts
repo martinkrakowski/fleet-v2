@@ -740,6 +740,8 @@ export const MERGE_POLICY_BOUNDS = Object.freeze({
   requiredContextLength: Object.freeze({ min: 1, max: 64 }),
   macosProcedureLength: Object.freeze({ min: 1, max: 200 }),
   maxAttempts: Object.freeze({ min: 1, max: 32 }),
+  /** EV1a: GitHub login bounds (1-39 characters). */
+  premergePosterLoginLength: Object.freeze({ min: 1, max: 39 }),
   checksGraceMinutes: Object.freeze({ min: 1, max: 1440 }),
   holdConfidence: Object.freeze({ min: 0, max: 1 }),
   intervalSeconds: Object.freeze({ min: 10, max: 3600 }),
@@ -780,6 +782,25 @@ export const DEFAULT_MERGE_REPOSITORY_SETTINGS = Object.freeze({
 
 const MERGE_VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const MERGE_REPOSITORY_KEY_PATTERN = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
+
+/**
+ * EV1a: a GitHub login is 1-39 characters of `A-Za-z0-9-` with no leading or
+ * trailing hyphen. The pattern cannot backtrack: the leading and trailing
+ * classes are disjoint from the middle quantifier's.
+ */
+const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+
+/**
+ * EV1a: whether `value` is a valid GitHub login. The length check runs first
+ * (O(1)), so an enormous string is refused before the regex ever executes.
+ */
+export function isValidGithubLogin(value: string): boolean {
+  if (value.length < MERGE_POLICY_BOUNDS.premergePosterLoginLength.min ||
+      value.length > MERGE_POLICY_BOUNDS.premergePosterLoginLength.max) {
+    return false;
+  }
+  return GITHUB_LOGIN_PATTERN.test(value);
+}
 
 /**
  * CO22: a prepare token never carries whitespace, an ASCII control character,
@@ -998,6 +1019,31 @@ function readMergeMacosField(
   );
 }
 
+/**
+ * EV1a: `premergePosterLogin` is absent-preserving like `prepare` — omitted on
+ * the resolved entry when the written entry omits it, so an installation
+ * without the key keeps a byte-identical `mergePolicyRevision`. The value is
+ * read through its own data property, so a getter never runs.
+ */
+function readMergePremergePosterLoginField(
+  entry: Record<string, unknown>,
+): MergeReadResult<string | undefined> {
+  if (!Object.hasOwn(entry, 'premergePosterLogin')) {
+    return mergeOk(undefined);
+  }
+  const value = readOwnDataProperty(entry, 'premergePosterLogin');
+  if (typeof value !== 'string') {
+    return MERGE_INVALID;
+  }
+  if (containsSecretShape(value)) {
+    return MERGE_SECRET;
+  }
+  if (!isValidGithubLogin(value)) {
+    return MERGE_INVALID;
+  }
+  return mergeOk(value);
+}
+
 function readMergeVetoField(
   entry: Record<string, unknown>,
   fallback: { readonly mode: MergeVetoMode; readonly holdConfidence: number },
@@ -1077,6 +1123,12 @@ function readMergeRepository(
   if (!prepare.ok) {
     return prepare;
   }
+  // EV1a: `premergePosterLogin` is absent-preserving — omitted on the resolved
+  // entry when the written entry omits it, a validated login when present.
+  const premergePosterLogin = readMergePremergePosterLoginField(entry);
+  if (!premergePosterLogin.ok) {
+    return premergePosterLogin;
+  }
   return mergeOk(
     Object.freeze({
       owner: parts.owner,
@@ -1092,6 +1144,9 @@ function readMergeRepository(
       checksGraceMinutes: checksGraceMinutes.value,
       veto: veto.value,
       ...(prepare.value !== undefined ? { prepare: prepare.value } : {}),
+      ...(premergePosterLogin.value !== undefined
+        ? { premergePosterLogin: premergePosterLogin.value }
+        : {}),
     }),
   );
 }
@@ -1278,6 +1333,11 @@ export function canonicalMergePolicyJson(input: {
       checksGraceMinutes: repository.checksGraceMinutes,
       macosProcedure: repository.macosProcedure,
       maxAttempts: repository.maxAttempts,
+      // EV1a: a login-holding repository changes the revision; an omitted one
+      // keeps the digest byte-identical to pre-EV1a revisions.
+      ...(repository.premergePosterLogin !== undefined
+        ? { premergePosterLogin: repository.premergePosterLogin }
+        : {}),
       projectId: repository.projectId,
       // CO22: a prepared repository changes the revision; an omitted one keeps
       // the digest byte-identical to pre-CO22 revisions.

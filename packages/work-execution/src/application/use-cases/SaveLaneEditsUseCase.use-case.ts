@@ -4,9 +4,10 @@
  * any abort (cutover plan CO27, §4 step 5, invariants I2 and I7). It never
  * aborts, resets, removes, checks out or pushes anything; it writes only the
  * journal and the save ref. Order: validate, read the keyed journal (a final
- * result is returned as recorded), check the runner is idle (unknown is never
- * idle), run the lane diff check, journal the intent durably, save, verify the
- * tree digest, journal the result (a failed final append preserves the outcome).
+ * result is returned as recorded), run the lane diff check, check the runner
+ * is idle (unknown is never idle), journal the intent durably, save, verify
+ * the tree digest, journal the result (a failed final append preserves the
+ * outcome).
  * `execute` takes `unknown` and never throws.
  * Results carry ids, codes, counts and digests only.
  */
@@ -139,12 +140,14 @@ export class SaveLaneEditsUseCase {
     const first = await this.readJournal(journalPrefix, journalKey, saveRef, planDigest, laneId);
     if (first.done) return first.result;
 
+    // The diff check runs before the runner inspect so a secret-shaped or
+    // out-of-prefix finding refuses the save without waking the runner at all.
+    const diff = await this.checkDiff(request);
+    if (diff !== null) return diff;
     // The runner addresses the worktree by directory: a lane without a recorded attempt
     // is addressed by its lane id; a recovered pass checks again.
     const busy = await this.worktreeBusy(request);
     if (busy !== null) return busy;
-    const diff = await this.checkDiff(request);
-    if (diff !== null) return diff;
 
     if (!first.hasIntent) {
       const intent = await this.append({ key: journalKey, kind: 'intent', entryId: '', recordedAtIso: nowIso });

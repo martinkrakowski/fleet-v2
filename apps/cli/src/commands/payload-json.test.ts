@@ -152,12 +152,28 @@ describe('jsonStrArr', () => {
   it('refuses wrong primitives, array-like objects and prototype-polluting keys with CliUsageError', () => {
     // O(1) shape refusals: a number, a boolean, an array-like that is not a
     // real array, and a payload whose own 'constructor' key carries a
-    // non-array value must all be refused rather than trusted.
+    // non-array value must all be refused rather than trusted. Each refusal
+    // must carry both the label and the flag name: an unlabelled error
+    // would not tell the operator which flag was wrong.
     for (const value of [42, true, { length: 1, 0: 'a' }]) {
       expect(() => jsonStrArr({ items: value }, 'items', 'Label')).toThrow(CliUsageError);
+      try {
+        jsonStrArr({ items: value }, 'items', 'Label');
+        expect.unreachable('expected CliUsageError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        expect((error as CliUsageError).message).toContain('Label');
+        expect((error as CliUsageError).message).toContain("'--items'");
+      }
     }
-    expect(() => jsonStrArr({ constructor: 42 }, 'constructor', 'Label')).toThrow(CliUsageError);
-    expect(() => jsonStrArr({ constructor: 42 }, 'constructor', 'Label')).toThrow(/'--constructor'/);
+    try {
+      jsonStrArr({ constructor: 42 }, 'constructor', 'Label');
+      expect.unreachable('expected CliUsageError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(CliUsageError);
+      expect((error as CliUsageError).message).toContain('Label');
+      expect((error as CliUsageError).message).toContain("'--constructor'");
+    }
   });
 
   it('propagates a throwing getter on payload instead of passing', () => {

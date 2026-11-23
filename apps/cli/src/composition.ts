@@ -1560,6 +1560,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  // SW2b2: `cutover switch` lists the merge queue through a read-only handle
+  // over durable state so a corrupt queue file is never quarantined by a
+  // switch read; in memory mode the one writable instance is shared.
+  const mergeQueueRead = durableCutover
+    ? new MergeQueueRepositoryAdapter({ stateDir, readOnly: true })
+    : execution.mergeQueueRepository;
   // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
   // ledger, so the reader stays undefined and the use case refuses. CO30c
   // wires `countUnrecordedLanes` beside it (below); the shadow daemon still
@@ -1705,6 +1711,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     daemonPause: daemon.pause,
     trainPauseRead,
     trainPause: killallTrainPause,
+    // SW2b2: the shadow parks a switch plans, journals and releases. The
+    // shadow-park journal is the separate `shadow-park-journal.json` store
+    // (SW2a2), never the cutover journal.
+    mergeQueueRead,
+    mergeQueue: execution.mergeQueueRepository,
+    mergePolicy: daemon.mergePolicy,
+    shadowParkJournal: execution.shadowParkJournal,
     computeDigest: sha256HexDigest,
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,

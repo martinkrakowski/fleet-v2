@@ -220,6 +220,8 @@ export function buildLiveConductorDriver(
     dispatchAttempt: execution.dispatchAttempt,
     cancelPreparedAttempt,
     worktreeRecovery: execution.workspace,
+    // GD1: the same workspace port reads a fix attempt's worktree clean state.
+    worktreeInspect: execution.workspace,
     installationSchemaVersion: runtime.installation?.schemaVersion,
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,

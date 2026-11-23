@@ -12,7 +12,10 @@ import {
   laneRunConductEntry,
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
+  laneRunGateFailed,
   laneRunGateFact,
+  laneRunGateLatestRound,
+  laneRunFixRoundGateDriven,
   laneRunGateUnknown,
   laneRunIntentEntry,
   laneRunParkedConductCount,
@@ -332,6 +335,217 @@ describe('laneRunGateFact', () => {
       result(retryKey, 'completed', 'gate-congested'),
     ];
     expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('congested');
+  });
+
+  // GD1: the round decides before the retry — the highest round present at the
+  // head wins even when an earlier round carries a higher retry ordinal.
+  it('decides by the highest round first: a round 1 run 0 beats a round 0 retry 1 at the same head', () => {
+    const round0Retry1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+    const round1Run0 = keyOf({ round: 1, step: 'gate', seatIndex: 0, head12: HEAD });
+    const entries = [
+      intent(round0Retry1),
+      result(round0Retry1, 'completed', 'gate-passed'),
+      intent(round1Run0),
+      result(round1Run0, 'completed', 'gate-failed'),
+    ];
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('failed');
+  });
+});
+
+describe('laneRunGateLatestRound', () => {
+  const round0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const round1 = keyOf({ round: 1, step: 'gate', seatIndex: 0, head12: HEAD });
+
+  it('returns the highest round present at the head', () => {
+    const entries = [
+      intent(round0),
+      result(round0, 'completed', 'gate-failed'),
+      intent(round1),
+    ];
+    expect(laneRunGateLatestRound(entries, RUN_ID, HEAD)).toBe(1);
+  });
+
+  it('returns 0 for a lone run 0 gate intent', () => {
+    expect(laneRunGateLatestRound([intent(round0)], RUN_ID, HEAD)).toBe(0);
+  });
+
+  it('returns null with no gate intent at the head', () => {
+    expect(laneRunGateLatestRound([intent(round0)], RUN_ID, OTHER_HEAD)).toBe(null);
+    expect(laneRunGateLatestRound([], RUN_ID, HEAD)).toBe(null);
+  });
+
+  it('returns null for hostile input: null, non-arrays, array-likes, holes, huge lengths, bad ids and bad heads', () => {
+    const entry = intent(round0);
+    const holed: unknown[] = [entry];
+    delete holed[0];
+    const huge: unknown[] = [];
+    huge.length = 100_001;
+    for (const badEntries of [null, undefined, 42, 'entries', { length: 1, 0: entry }, holed, huge]) {
+      expect(laneRunGateLatestRound(badEntries, RUN_ID, HEAD)).toBe(null);
+    }
+    for (const badRunId of [null, undefined, 7, BAD_RUN_ID]) {
+      expect(laneRunGateLatestRound([entry], badRunId, HEAD)).toBe(null);
+    }
+    for (const badHead of [null, undefined, 42, '']) {
+      expect(laneRunGateLatestRound([entry], RUN_ID, badHead)).toBe(null);
+    }
+  });
+
+  it('refuses a getter on an array slot or an entry field without running it, and a prototype-polluting key', () => {
+    const entry = intent(round0);
+    const throwingSlot: unknown[] = [entry];
+    Object.defineProperty(throwingSlot, 0, {
+      enumerable: true,
+      get: () => {
+        throw new Error('slot getter must never run');
+      },
+    });
+    expect(laneRunGateLatestRound(throwingSlot, RUN_ID, HEAD)).toBe(null);
+    const throwingField: Record<string, unknown> = { kind: 'intent', runId: RUN_ID };
+    let reads = 0;
+    Object.defineProperty(throwingField, 'key', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return round0;
+      },
+    });
+    expect(laneRunGateLatestRound([throwingField], RUN_ID, HEAD)).toBe(null);
+    expect(reads).toBe(0);
+    expect(
+      laneRunGateLatestRound([entry, JSON.parse('{"__proto__": {}, "kind": "intent"}') as object], RUN_ID, HEAD),
+    ).toBe(null);
+  });
+});
+
+describe('laneRunGateFailed', () => {
+  const run0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const retry1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+
+  it('returns the failed run 0 as retry 0 with failedCount 1', () => {
+    const entries = [intent(run0), result(run0, 'completed', 'gate-failed')];
+    expect(laneRunGateFailed(entries, RUN_ID, HEAD)).toEqual({ retry: 0, failedCount: 1 });
+  });
+
+  it('returns the failed retry after congestion retries, still failedCount 1', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-congested'),
+      intent(retry1),
+      result(retry1, 'completed', 'gate-failed'),
+    ];
+    expect(laneRunGateFailed(entries, RUN_ID, HEAD)).toEqual({ retry: 1, failedCount: 1 });
+  });
+
+  it('returns null when the highest run did not fail', () => {
+    const entries = [intent(run0), result(run0, 'completed', 'gate-passed')];
+    expect(laneRunGateFailed(entries, RUN_ID, HEAD)).toBe(null);
+  });
+
+  it('returns null when the highest gate intent has no final result', () => {
+    expect(laneRunGateFailed([intent(run0)], RUN_ID, HEAD)).toBe(null);
+  });
+
+  it('counts a second gate-failed intent at the same (round, head12) in failedCount 2', () => {
+    const otherSeat = keyOf({ round: 0, step: 'gate', seatIndex: 1, head12: HEAD });
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-failed'),
+      intent(otherSeat),
+      result(otherSeat, 'completed', 'gate-failed'),
+      intent(retry1),
+      result(retry1, 'completed', 'gate-failed'),
+    ];
+    // The highest (round, retry) is retry1; three distinct failed intents at round 0.
+    expect(laneRunGateFailed(entries, RUN_ID, HEAD)).toEqual({ retry: 1, failedCount: 3 });
+  });
+
+  it('returns null for hostile input and refuses getters and polluted entries', () => {
+    const entry = intent(run0);
+    const holed: unknown[] = [entry];
+    delete holed[0];
+    for (const badEntries of [null, undefined, { length: 1, 0: entry }, holed]) {
+      expect(laneRunGateFailed(badEntries, RUN_ID, HEAD)).toBe(null);
+    }
+    for (const badRunId of [null, 7, BAD_RUN_ID]) {
+      expect(laneRunGateFailed([entry], badRunId, HEAD)).toBe(null);
+    }
+    expect(laneRunGateFailed([entry], RUN_ID, null)).toBe(null);
+    const throwing: Record<string, unknown> = { kind: 'intent' };
+    Object.defineProperty(throwing, 'key', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    expect(laneRunGateFailed([entry, throwing], RUN_ID, HEAD)).toBe(null);
+    expect(
+      laneRunGateFailed([entry, JSON.parse('{"__proto__": {}, "kind": "intent"}') as object], RUN_ID, HEAD),
+    ).toBe(null);
+  });
+});
+
+describe('laneRunFixRoundGateDriven', () => {
+  it('is true when the latest fixing conduct is immediately preceded by gating', () => {
+    const entries = [
+      intent(keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD })),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'gating', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', NOW),
+    ];
+    expect(laneRunFixRoundGateDriven(entries, RUN_ID)).toBe(true);
+  });
+
+  it('is false when the latest fixing conduct follows another state', () => {
+    for (const before of ['collecting', 'seat-failed', 'parked']) {
+      const entries = [
+        laneRunConductEntry(nextEntryId(), RUN_ID, before as 'ready', NOW),
+        laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', NOW),
+      ];
+      expect(laneRunFixRoundGateDriven(entries, RUN_ID)).toBe(false);
+    }
+  });
+
+  it('is false with no fixing conduct or an older fixing not preceded by gating', () => {
+    expect(laneRunFixRoundGateDriven([], RUN_ID)).toBe(false);
+    const entries = [
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'gating', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'collecting', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', NOW),
+    ];
+    expect(laneRunFixRoundGateDriven(entries, RUN_ID)).toBe(false);
+  });
+
+  it('skips parked conducts between gating and fixing', () => {
+    const entries = [
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'gating', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'parked', NOW),
+      laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', NOW),
+    ];
+    expect(laneRunFixRoundGateDriven(entries, RUN_ID)).toBe(true);
+  });
+
+  it('is false for hostile input: bad run ids, holes, non-arrays, throwing getters and polluted entries', () => {
+    const entry = laneRunConductEntry(nextEntryId(), RUN_ID, 'gating', NOW);
+    for (const badRunId of [null, undefined, 7, BAD_RUN_ID]) {
+      expect(laneRunFixRoundGateDriven([entry], badRunId)).toBe(false);
+    }
+    const holed: unknown[] = [entry];
+    delete holed[0];
+    for (const badEntries of [null, undefined, 42, { length: 1, 0: entry }, holed]) {
+      expect(laneRunFixRoundGateDriven(badEntries, RUN_ID)).toBe(false);
+    }
+    const throwing: Record<string, unknown> = { kind: 'conduct', runId: RUN_ID };
+    Object.defineProperty(throwing, 'state', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    expect(laneRunFixRoundGateDriven([entry, throwing], RUN_ID)).toBe(false);
+    expect(
+      laneRunFixRoundGateDriven([entry, JSON.parse('{"__proto__": {}, "kind": "conduct", "runId": "run-01JB0000000000000000000000"}') as object], RUN_ID),
+    ).toBe(false);
   });
 });
 

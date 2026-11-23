@@ -2092,9 +2092,26 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
 
   // ---- AR3b: run-repository reconciliation of redispatch hand-offs ----
 
-  /** A minimal LaneRunRecord-shaped run the reconciliation reads. */
+  /**
+   * A full, well-formed version-1 LaneRunRecord the reconciliation reads.
+   * Fix round 1: the reader validates the whole record, so the fixture
+   * carries every required field.
+   */
   const runRecord = (runId: string, workOrderId: string, attemptIds: string[]): Record<string, unknown> => ({
-    version: 1, runId, workOrderId, attemptIds,
+    version: 1,
+    runId,
+    workOrderId,
+    tier: 2,
+    seatPlanRef: 'b'.repeat(64),
+    cursors: { 'first-pass': null, fix: null, review: null },
+    round: 0,
+    attemptIds,
+    prNumber: null,
+    parked: null,
+    parkCount: 0,
+    lease: null,
+    revision: 1,
+    runPolicyRevision: 'policy-1',
   });
 
   const RUN_A = `run-7${'A'.repeat(25)}`;
@@ -2368,6 +2385,69 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     await refused({ runJournalResult: new Map() }); // the matched run id is missing
     await refused({ runJournalResult: new Map([[RUN_A, [7]]]) }); // a malformed entry
     await refused({ runJournalResult: new Map([[RUN_A, new Array(201).fill(conductEntry(RUN_A, 'running'))]]) }); // over-sized
+  });
+
+  it('AR3b-9 (fix round 1): a run record outside the full LaneRunRecord grammar — a wrong version, a string attemptIds, an extra own key, a polluting own key — refuses stale-plan-state before the grant is spent (cost: one bounded full-record validation per run, O(runs))', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+    ];
+    const refused = async (runs: unknown): Promise<void> => {
+      const deps = makeDeps({ plan, entries, live: { run: null, runs } });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: inputs }))).toEqual({
+        outcome: 'refused', reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    };
+    // The record's version is part of the grammar: a wrong one is malformed.
+    await refused([{ ...runRecord(RUN_A, 'wo-9', ['attempt-1']), version: 2 }]);
+    // A string attemptIds is not the record's array grammar, however it is spelled.
+    await refused([{ ...runRecord(RUN_A, 'wo-9', []), attemptIds: 'attempt-1' }]);
+    // Any extra own key beyond the record's keys is refused.
+    await refused([{ ...runRecord(RUN_A, 'wo-9', ['attempt-1']), extra: true }]);
+    // A polluting own key (`prototype`, `constructor`) is refused the same way.
+    await refused([{ ...runRecord(RUN_A, 'wo-9', ['attempt-1']), prototype: {} }]);
+    await refused([{ ...runRecord(RUN_A, 'wo-9', ['attempt-1']), constructor: {} }]);
+  });
+
+  it('AR3b-10 (fix round 1): a Proxy run record whose getPrototypeOf or getOwnPropertyDescriptor trap throws, and a Proxy journal Map whose has or get trap throws, refuse stale-plan-state before the grant is spent (cost: the throws are caught, never propagated)', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+    ];
+    const refused = async (runs: unknown, runJournalResult?: unknown): Promise<void> => {
+      const deps = makeDeps({
+        plan, entries,
+        live: { run: null, runs, ...(runJournalResult !== undefined ? { runJournalResult } : {}) },
+      });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: inputs }))).toEqual({
+        outcome: 'refused', reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    };
+    const trap = (): never => {
+      throw new Error('trap must never be crossed');
+    };
+    // A Proxy whose getPrototypeOf trap throws on the record itself is caught.
+    await refused([new Proxy(runRecord(RUN_A, 'wo-9', ['attempt-1']), { getPrototypeOf: trap })]);
+    // A Proxy whose getOwnPropertyDescriptor trap throws on a run-record field is caught.
+    await refused([new Proxy(runRecord(RUN_A, 'wo-9', ['attempt-1']), { getOwnPropertyDescriptor: trap })]);
+    // A journal Map whose has trap throws is a malformed answer, not a rejection.
+    await refused(
+      [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+      new Proxy(new Map([[RUN_A, [conductEntry(RUN_A, 'running')]]]), { has: trap }),
+    );
+    // A journal Map whose get trap throws is refused the same way.
+    await refused(
+      [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+      new Proxy(new Map([[RUN_A, [conductEntry(RUN_A, 'running')]]]), { get: trap }),
+    );
   });
 
   it('AR3b-7: a redispatch already refused or ambiguous refuses stale-plan-state, and an inconsistent one refuses step-inconsistent, in both cases without any append', async () => {

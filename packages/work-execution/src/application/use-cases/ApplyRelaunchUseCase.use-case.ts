@@ -19,6 +19,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 import { parseBaseBranch } from '../../domain/base-branch.js';
+import { readLaneRunRecord } from '../../domain/entities/LaneRun.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { parseWorkOrderRisk } from '../../domain/execution-records.js';
 import { SHA256_HEX_PATTERN } from '../../domain/lane-plan-records.js';
@@ -1028,22 +1029,25 @@ interface ReconciledRun {
 }
 
 /**
- * One run record read through its own data descriptors (no getter ever runs);
- * `null` when any required field is missing, an accessor, out of grammar or
- * over-sized. Cost: three descriptor reads plus one bounded array walk.
+ * One run record validated in full by the domain's stored-record reader:
+ * `readLaneRunRecord` refuses a missing or unsupported schema version, an
+ * unknown, extra or polluting own key (`__proto__`, `constructor`,
+ * `prototype`), an accessor field, a string `attemptIds`, and every field
+ * outside the `LaneRunRecord` grammar, reading each value through its own
+ * property descriptor (no getter ever runs) and catching every throwing
+ * Proxy trap as a malformed record. `null` unless the value is a
+ * well-formed version-1 record. Cost: one bounded full-record validation
+ * per element, O(runs) across the whole list, with the reader's own stated
+ * bounds — no unbounded cost is added here.
  */
 function readReconciledRun(value: unknown): ReconciledRun | null {
-  const runId = own(value, 'runId');
-  const workOrderId = own(value, 'workOrderId');
-  const attemptIds = own(value, 'attemptIds');
-  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) return null;
-  if (typeof workOrderId !== 'string' || workOrderId === '') return null;
-  if (typeof attemptIds === 'string' && attemptIds !== '') {
-    return { runId, workOrderId, attemptIds: [attemptIds] };
-  }
-  const dense = readBoundedDenseArray(attemptIds, MAX_RECONCILED_RUNS);
-  if (dense === null || !dense.array.every((id) => typeof id === 'string' && id !== '')) return null;
-  return { runId, workOrderId, attemptIds: dense.array as readonly string[] };
+  const read = readLaneRunRecord(value);
+  if (!read.ok) return null;
+  return {
+    runId: read.record.runId,
+    workOrderId: read.record.workOrderId,
+    attemptIds: read.record.attemptIds,
+  };
 }
 
 /**
@@ -1077,24 +1081,27 @@ async function readReconciledJournals(
   let journalMap: unknown;
   try {
     journalMap = await journalsForRuns(runJournal, runIds);
+    // `instanceof`, `has` and `get` each consult a trap a Proxy may make
+    // throw, so the whole inspection is inside the same refusal guard: any
+    // throw is a malformed answer, never a propagated error.
+    if (!(journalMap instanceof Map)) return null;
+    const out = new Map<string, readonly LaneRunJournalEntryRecord[]>();
+    for (const runId of runIds) {
+      if (!journalMap.has(runId)) return null;
+      const dense = readBoundedDenseArray(journalMap.get(runId), MAX_RECONCILED_ENTRIES);
+      if (dense === null) return null;
+      const entries: LaneRunJournalEntryRecord[] = [];
+      for (const item of dense.array) {
+        const read = readLaneRunJournalEntryRecord(item);
+        if (!read.ok) return null;
+        entries.push(read.record);
+      }
+      out.set(runId, entries);
+    }
+    return out;
   } catch {
     return null;
   }
-  if (!(journalMap instanceof Map)) return null;
-  const out = new Map<string, readonly LaneRunJournalEntryRecord[]>();
-  for (const runId of runIds) {
-    if (!journalMap.has(runId)) return null;
-    const dense = readBoundedDenseArray(journalMap.get(runId), MAX_RECONCILED_ENTRIES);
-    if (dense === null) return null;
-    const entries: LaneRunJournalEntryRecord[] = [];
-    for (const item of dense.array) {
-      const read = readLaneRunJournalEntryRecord(item);
-      if (!read.ok) return null;
-      entries.push(read.record);
-    }
-    out.set(runId, entries);
-  }
-  return out;
 }
 
 /** Per-lane reconciliation outcome the preflight counts and `applyLive` journals. */

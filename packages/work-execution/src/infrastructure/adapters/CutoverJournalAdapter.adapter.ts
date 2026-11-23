@@ -371,10 +371,18 @@ function journalModeOf(shadowParkMode: boolean): {
 export class CutoverJournalAdapter implements CutoverJournalPort {
   private readonly inMemoryEntries: CutoverJournalEntry[] = [];
   private readonly target: string | null;
+  // Pinned at construction (primitives and a mode record copied from the options): the caller's
+  // options object is never read again, so mutating it later cannot change the journal mode.
+  private readonly shadowParkMode: boolean;
+  private readonly readOnly: boolean;
+  private readonly mode: ReturnType<typeof journalModeOf>;
 
-  constructor(private readonly options?: CutoverJournalAdapterOptions) {
+  constructor(options?: CutoverJournalAdapterOptions) {
     const { stateDir, fileName } = options ?? {};
     const shadowParkMode = options?.shadowPark === true;
+    this.shadowParkMode = shadowParkMode;
+    this.readOnly = options?.readOnly === true;
+    this.mode = journalModeOf(shadowParkMode);
     if (shadowParkMode) {
       // SW2a2: a shadow-park instance stores only to the shadow-park journal.
       if (fileName !== undefined && fileName !== SHADOW_PARK_FILE_NAME) {
@@ -397,12 +405,12 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
 
   async append(entry: CutoverJournalEntry): Promise<CutoverJournalAppendResult> {
     try {
-      assertStoreWritable(this.options?.readOnly === true, 'CutoverJournalAdapter');
-      const mode = journalModeOf(this.options?.shadowPark === true);
+      assertStoreWritable(this.readOnly, 'CutoverJournalAdapter');
+      const mode = this.mode;
       const target = this.target;
       if (target === null) {
         // No await between the decision and the push: two racing appends cannot both pass.
-        if (this.options?.shadowPark !== true && this.inMemoryEntries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) {
+        if (!this.shadowParkMode && this.inMemoryEntries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) {
           return { outcome: 'refused', reason: 'store-unreadable' };
         }
         const decision = mode.prepare(this.inMemoryEntries, entry);
@@ -412,7 +420,7 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
       }
       return await withFileLock(`${target}.lock`, async (): Promise<CutoverJournalAppendResult> => {
         const entries = await this.readEntriesFromDisk(target, false, mode.parseRecord);
-        if (this.options?.shadowPark === true && entries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) {
+        if (this.shadowParkMode && entries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) {
           return { outcome: 'refused', reason: 'journal-capacity-exceeded' };
         }
         const decision = mode.prepare(entries, entry);
@@ -432,7 +440,7 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
   async listByKeyPrefix(prefix: string): Promise<CutoverJournalListResult> {
     if (typeof prefix !== 'string' || prefix.length > MAX_PREFIX_LENGTH) return { outcome: 'unreadable' };
     try {
-      const { parseRecord } = journalModeOf(this.options?.shadowPark === true);
+      const { parseRecord } = this.mode;
       const entries = this.target === null ? this.inMemoryEntries : await this.readEntriesFromDisk(this.target, true, parseRecord);
       return { outcome: 'listed', entries: entries.filter((held) => held.key.startsWith(prefix)).map((held) => ({ ...held })) };
     } catch {
@@ -459,7 +467,7 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
     const inspection = inspectVersionedRecordListBytes(buffer, parseRecord);
     if (inspection.status === 'unknown-version') throw new StateFileUnknownVersionError(target, inspection.recordIndex);
     if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, readOnlyRead || this.options?.readOnly === true);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, readOnlyRead || this.readOnly);
     }
     if (inspection.records.length > MAX_CUTOVER_JOURNAL_ENTRIES) throw new Error('cutover journal holds too many entries');
     return [...inspection.records];

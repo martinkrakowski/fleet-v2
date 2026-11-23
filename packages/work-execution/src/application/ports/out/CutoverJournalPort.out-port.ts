@@ -9,6 +9,8 @@
  * hold ids, codes and digests only.
  */
 
+import type { CutoverShadowParkRecord } from '../../../domain/cutover-records.js';
+
 export type CutoverJournalEntryKind = 'intent' | 'result';
 export type CutoverJournalOutcome = 'completed' | 'refused' | 'ambiguous';
 
@@ -32,6 +34,12 @@ export interface CutoverJournalEntry {
   readonly commitId?: string | null;
   /** The save ref (results only). */
   readonly saveRef?: string | null;
+  /**
+   * The ordinary shadow park the entry records (SW2a2). Only entries in the
+   * shadow-park journal carry one; the v2 cutover and shadow-intake journals
+   * refuse any entry holding this key.
+   */
+  readonly shadowPark?: CutoverShadowParkRecord | null;
 }
 
 export type CutoverJournalRefusalCode =
@@ -42,6 +50,7 @@ export type CutoverJournalRefusalCode =
   | 'result-after-final-result'
   | 'intent-after-result'
   | 'store-unreadable'
+  | 'journal-capacity-exceeded'
   | 'store-read-only';
 
 export type CutoverJournalAppendResult =

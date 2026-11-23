@@ -231,19 +231,36 @@ describe("requiredScope and normalizePath hostile-input refusals", () => {
     expect(() => requiredScope(["GET"] as unknown as string, "/v1/questions")).toThrow(TypeError);
   });
 
-  it("refuses objects with throwing getters and hostile Proxies without returning a scope", () => {
-    const throwingGet = {
-      get indexOf(): number {
-        throw new RangeError("getter must never be trusted");
+  it("refuses objects with throwing getters without running them and hostile Proxies without returning a scope", () => {
+    // A throwing getter is never invoked: refusal happens on the first
+    // missing property access (`indexOf` for a path, `toUpperCase` for a
+    // method), so the failure is a TypeError and the getter body below never
+    // executes. If the implementation ever ran the getter, the counter would
+    // move and the RangeError would surface instead of the TypeError.
+    let pathGetterRuns = 0;
+    const hostilePath = {
+      get split(): string[] {
+        pathGetterRuns += 1;
+        throw new RangeError("getter must never be run");
       },
     };
-    // O(1): the trap fires on the first property read and the error propagates.
-    expect(() => normalizePath(throwingGet as unknown as string)).toThrow(
-      "getter must never be trusted",
+    // O(1): the failure happens on the first property access; nothing scans
+    // and no getter is read.
+    expect(() => normalizePath(hostilePath as unknown as string)).toThrow(TypeError);
+    expect(() => requiredScope("GET", hostilePath as unknown as string)).toThrow(TypeError);
+    expect(pathGetterRuns).toBe(0);
+
+    let methodGetterRuns = 0;
+    const hostileMethod = {
+      get length(): number {
+        methodGetterRuns += 1;
+        throw new RangeError("getter must never be run");
+      },
+    };
+    expect(() => requiredScope(hostileMethod as unknown as string, "/v1/questions")).toThrow(
+      TypeError,
     );
-    expect(() => requiredScope("GET", throwingGet as unknown as string)).toThrow(
-      "getter must never be trusted",
-    );
+    expect(methodGetterRuns).toBe(0);
     // A Proxy that lies consistently in every trap: it advertises an indexOf
     // that succeeds but no split, so the lie is still refused by TypeError.
     const lyingProxy = new Proxy(

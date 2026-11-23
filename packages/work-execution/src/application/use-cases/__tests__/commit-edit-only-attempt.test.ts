@@ -29,6 +29,7 @@ import type {
 import type { LaneDiffFinding } from '../../../domain/lane-diff-check.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { CommitEditOnlyAttemptUseCase } from '../CommitEditOnlyAttemptUseCase.use-case.js';
+import { readBoundedDenseArray } from '../../../domain/plain-record-reads.js';
 
 // ---------------------------------------------------------------------------
 // Fakes (copied from seat-plan-dispatch.test.ts)
@@ -491,6 +492,47 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     });
     const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
     expect(result).toMatchObject({ outcome: 'refused', reason: 'no-allowed-prefixes' });
+  });
+
+  it('a manifest whose allowedPathPrefixes contains a hole is refused, not skipped', async () => {
+    // A sparse array's hole is skipped by `.every()`, so the old check passed
+    // a manifest with a missing prefix. JSON has no holes (a hole serializes
+    // to `null`, covered by the null-element assertion below), so the hole
+    // itself is proved directly on the bounded dense reader the use case now
+    // uses: it refuses a genuine sparse array in O(cap), cap 4096, never
+    // invoking a getter.
+    const sparse: string[] = ['packages/example/', 'packages/other/'];
+    delete sparse[1];
+    expect(readBoundedDenseArray(sparse, 4096)).toBeNull();
+    // The JSON shape of that same hole — a `null` element — is refused by the
+    // use case as `no-allowed-prefixes` and the workspace is never called.
+    const withNull = briefFiles({ allowedPathPrefixes: ['packages/example/', null] });
+    const lane = makeLane({
+      attempt: endedAttempt({ briefDigest: withNull.digest }),
+      brief: withNull,
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'no-allowed-prefixes' });
+    expect(lane.commits).toHaveLength(0);
+  });
+
+  it('a manifest whose allowedPathPrefixes exceeds the cap is refused no-allowed-prefixes, not traversed unbounded', async () => {
+    // 4097 dense prefixes is one past PREFIX_CAP (4096): the bounded dense
+    // read refuses the length in O(1) before any element is touched, while an
+    // uncapped `.every()` would have walked all 4097.
+    const manyPrefixes = Array.from(
+      { length: 4097 },
+      (_, index) => 'packages/example-' + index + '/',
+    );
+    const capped = briefFiles({ allowedPathPrefixes: manyPrefixes });
+    const lane = makeLane({
+      attempt: endedAttempt({ briefDigest: capped.digest }),
+      brief: capped,
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'no-allowed-prefixes' });
+    expect(lane.commits).toHaveLength(0);
+    expect(manyPrefixes).toHaveLength(4097);
   });
 
   it('findings are refused diff-findings, the workspace is never called and the journal names only the count', async () => {

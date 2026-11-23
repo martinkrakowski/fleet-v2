@@ -93,6 +93,14 @@ function isNonEmptyString(value: unknown): value is string {
  */
 const INSPECTION_PATH_CAP = 4096;
 
+/**
+ * Fix round 2 item 1: the bound on how many allowed path prefixes one frozen
+ * brief manifest may declare. Cost: `readBoundedDenseArray` refuses a length
+ * above this cap in O(1) before any traversal, then O(cap) for the element
+ * checks.
+ */
+const PREFIX_CAP = 4096;
+
 /** A string data property read through its own descriptor, so no getter runs. */
 function dataStringValue(record: Record<string, unknown>, key: string): string | null {
   let descriptor: PropertyDescriptor | undefined;
@@ -282,11 +290,17 @@ export class CommitEditOnlyAttemptUseCase {
       );
       return { outcome: 'refused', reason: 'brief-changed', findings: [] };
     }
+    // Fix round 2 item 1: the prefixes are a bounded dense array, validated by
+    // `readBoundedDenseArray` — non-array, array hole, accessor element,
+    // foreign own key, or length above `PREFIX_CAP` (an enormous length is
+    // refused in O(1) before any traversal) all read as the
+    // `no-allowed-prefixes` refusal, never a skipped traversal.
     const rawPrefixes: unknown = brief.manifest['allowedPathPrefixes'];
+    const densePrefixes = readBoundedDenseArray(rawPrefixes, PREFIX_CAP);
     if (
-      !Array.isArray(rawPrefixes) ||
-      rawPrefixes.length === 0 ||
-      !rawPrefixes.every((item) => isNonEmptyString(item))
+      densePrefixes === null ||
+      densePrefixes.length === 0 ||
+      !densePrefixes.array.every((item) => isNonEmptyString(item))
     ) {
       await appendEditOnlyJournalEntry(
         deps.journal,
@@ -299,7 +313,7 @@ export class CommitEditOnlyAttemptUseCase {
       );
       return { outcome: 'refused', reason: 'no-allowed-prefixes', findings: [] };
     }
-    const allowedPathPrefixes = rawPrefixes as readonly string[];
+    const allowedPathPrefixes = densePrefixes.array as readonly string[];
 
     // Step 6: the lane diff check on the recorded host, with the same prefixes.
     const diffCheck = deps.laneDiffCheckFor(attempt);

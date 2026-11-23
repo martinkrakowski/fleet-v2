@@ -140,55 +140,105 @@ function isHostileRequestShape(request: unknown): boolean {
 }
 
 /**
- * Whether the injected candidate list may be traversed: a plain (non-Proxy)
- * array within the cap whose length is read once from its own descriptor and
- * whose every entry is a string read from its own data descriptor, without a
- * polluting own key, hole, or accessor element. The list must carry no own
- * accessor property and no own key other than the canonical indices and
- * `length` (this covers an own `Symbol.iterator` override, whose getter or
- * data property would otherwise let iteration yield unvalidated paths). The
- * WHOLE list is validated before any entry is probed. `isProxy` observes no
- * trap and no getter.
+ * The own `length` data value of the candidate array: a number when the
+ * descriptor is a present data property, else null. Cost: one descriptor read.
  */
-function isTraversableCandidateList(candidates: unknown): boolean {
-  if (!Array.isArray(candidates) || types.isProxy(candidates)) {
-    return false;
-  }
+function candidateLengthValue(candidates: unknown[]): number | null {
   const lengthDescriptor = Object.getOwnPropertyDescriptor(candidates, 'length');
   if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
-    return false;
+    return null;
   }
-  const length = lengthDescriptor.value;
-  if (length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
-    return false;
-  }
-  for (const key of Reflect.ownKeys(candidates)) {
-    // Only the canonical indices and `length` may be own keys; any other key
-    // (including a `Symbol.iterator` override) is refused.
-    if (typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key))) {
-      return false;
-    }
-    if (key !== 'length' && Number(key) >= length) {
-      return false;
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(candidates, key);
-    if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
-      return false;
-    }
-    if (key !== 'length' && typeof descriptor.value !== 'string') {
-      return false;
-    }
-  }
+  return lengthDescriptor.value;
+}
+
+/**
+ * Whether the own property at `key` is a present data property: a descriptor
+ * with a value and no accessor pair. A hole (no descriptor), an accessor or a
+ * throwing descriptor read is false. Cost: one descriptor read.
+ */
+function isOwnDataCandidateDescriptor(candidates: unknown[], key: PropertyKey): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(candidates, key);
+  return descriptor !== undefined && 'value' in descriptor && !('get' in descriptor || 'set' in descriptor);
+}
+
+/**
+ * Whether the object carries an own well-known symbol that could alter array
+ * iteration or coercion. `for...in` never yields symbols, so these are
+ * checked by named descriptor reads over a fixed list. Cost: one descriptor
+ * read per listed symbol — constant.
+ */
+function hasForbiddenOwnSymbol(source: object): boolean {
+  return FORBIDDEN_CANDIDATE_SYMBOLS.some((symbol) => Object.getOwnPropertyDescriptor(source, symbol) !== undefined);
+}
+
+/** Well-known symbols an own override of which is refused on the list. */
+const FORBIDDEN_CANDIDATE_SYMBOLS: readonly symbol[] = [
+  Symbol.iterator,
+  Symbol.asyncIterator,
+  Symbol.isConcatSpreadable,
+  Symbol.toPrimitive,
+  Symbol.toStringTag,
+];
+
+/**
+ * Whether every canonical index `0 .. length-1` holds an own data-property
+ * string. Cost: linear in `length`, capped by `SPD_SAY_MAX_CANDIDATES` (16).
+ */
+function candidateElementsAreStrings(candidates: unknown[], length: number): boolean {
   for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
-    if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
+    if (!isOwnDataCandidateDescriptor(candidates, index)) {
       return false;
     }
-    if (typeof descriptor.value !== 'string') {
+    const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
+    if (descriptor === undefined || typeof descriptor.value !== 'string') {
       return false;
     }
   }
   return true;
+}
+
+/**
+ * Whether the injected candidate list may be traversed: a plain (non-Proxy)
+ * array within the cap whose length is read once from its own descriptor and
+ * whose every entry is a string read from its own data descriptor, without a
+ * polluting own key, hole, or accessor element. Own well-known symbols (whose
+ * override could change iteration or coercion) are refused by name — this
+ * covers an own `Symbol.iterator` override, whose getter or
+ * data property would otherwise let iteration yield unvalidated paths). The
+ * WHOLE list is validated before any entry is probed. `isProxy` observes no
+ * trap and no getter.
+ *
+ * Cost: linear in the list length, capped by `SPD_SAY_MAX_CANDIDATES` (16),
+ * plus constant named descriptor reads over the fixed `POLLUTING_KEYS` and
+ * `FORBIDDEN_CANDIDATE_SYMBOLS` lists. The input is NEVER enumerated — no
+ * `for...in`, `Object.keys`, `Object.entries`, `Reflect.ownKeys` or
+ * `Object.getOwnPropertyNames` ever runs on it. Any check that refuses extra
+ * own properties costs at least one step per own key (even `for...in`
+ * materializes the object's own key list before its loop body can reject the
+ * first extra key), and a hostile capped-length array can carry arbitrarily
+ * many extra own properties, so such a check cannot be bounded. Instead the
+ * extra properties — own or inherited — are tolerated and made unreachable:
+ * only `length` and the indices `0 .. length-1` are ever read, each through
+ * its own data descriptor, so an extra key can never be read, run a getter,
+ * or reach a probe.
+ */
+function isTraversableCandidateList(candidates: unknown): boolean {
+  try {
+    if (!Array.isArray(candidates) || types.isProxy(candidates)) {
+      return false;
+    }
+    const length = candidateLengthValue(candidates);
+    if (length === null || length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
+      return false;
+    }
+    if (hasForbiddenOwnSymbol(candidates)) {
+      return false;
+    }
+    return candidateElementsAreStrings(candidates, length);
+  } catch {
+    // A revoked (or otherwise hostile) Proxy may throw on any touch; refuse it.
+    return false;
+  }
 }
 
 /** True when the candidate may be probed: a plain string starting with `/`. */

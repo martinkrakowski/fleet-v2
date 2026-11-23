@@ -81,13 +81,29 @@ const holeyEntries = (): unknown => {
   return entries;
 };
 
-/** An array Proxy whose own-property-descriptor trap counts index reads. */
-const indexDescriptorProxy = (): { proxy: unknown; readonly reads: { count: number } } => {
+/**
+ * An array Proxy that legitimately reports `length` as cap + 1 (a writable,
+ * non-configurable data descriptor is invariant-compatible with an array
+ * target) and enough index keys that, without the cap check, the per-index
+ * descriptor reads would run and be counted.
+ */
+const oversizedArrayProxy = (cap: number): { proxy: unknown; readonly reads: { count: number } } => {
   const reads = { count: 0 };
+  const keys: string[] = ['length'];
+  for (let index = 0; index <= cap; index += 1) keys.push(String(index));
   const proxy = new Proxy([] as unknown[], {
-    getOwnPropertyDescriptor(_target, property) {
-      if (typeof property === 'string' && /^\d+$/.test(property)) reads.count += 1;
-      return undefined;
+    getOwnPropertyDescriptor(target, property) {
+      if (property === 'length') {
+        return { value: cap + 1, writable: true, enumerable: false, configurable: false };
+      }
+      if (typeof property === 'string' && /^\d+$/.test(property)) {
+        reads.count += 1;
+        return undefined;
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    ownKeys() {
+      return keys;
     },
   });
   return { proxy, reads };
@@ -184,19 +200,18 @@ describe('deriveAdoptStepStatus', () => {
       [{}, DIGEST, LANE],
       [{ length: 1, 0: intent(adoptKey('run')) }, DIGEST, LANE], // array-like
       [holeyEntries(), DIGEST, LANE], // hole
-      [intent(adoptKey('run')), 'A'.repeat(64), LANE], // uppercase digest
-      [intent(adoptKey('run')), DIGEST.slice(0, 63), LANE], // short digest
-      [intent(adoptKey('run')), DIGEST, ''],
-      [intent(adoptKey('run')), DIGEST, 'bad lane'],
-      [intent(adoptKey('run')), DIGEST, '__proto__'],
+      [[intent(adoptKey('run'))], 'A'.repeat(64), LANE], // uppercase digest
+      [[intent(adoptKey('run'))], DIGEST.slice(0, 63), LANE], // short digest
+      [[intent(adoptKey('run'))], DIGEST, ''],
+      [[intent(adoptKey('run'))], DIGEST, 'bad lane'],
+      [[intent(adoptKey('run'))], DIGEST, 'a'.repeat(65)], // over-long lane id
       [throwingArrayProxy(), DIGEST, LANE],
     ];
     for (const [entries, planDigest, laneId] of cases) {
       expect(deriveAdoptStepStatus(entries, planDigest, laneId)).toBe('inconsistent');
     }
     // An enormous entries length is refused before index 0 is read.
-    const reads = indexDescriptorProxy();
-    Object.defineProperty(reads.proxy, 'length', { value: MAX_RELAUNCH_APPLY_ENTRIES + 1 });
+    const reads = oversizedArrayProxy(MAX_RELAUNCH_APPLY_ENTRIES);
     expect(deriveAdoptStepStatus(reads.proxy, DIGEST, LANE)).toBe('inconsistent');
     expect(reads.reads.count).toBe(0);
   });
@@ -257,6 +272,52 @@ describe('deriveAdoptStepStatus', () => {
     expect(deriveAdoptStepStatus([intentWithSetter], DIGEST, LANE)).toBe('inconsistent');
   });
 
+  it('R5e: an accessor on an extra own key is refused and never runs', () => {
+    const counter = { reads: 0 };
+    const withGetter = { key: adoptKey('work-order'), kind: 'intent' };
+    Object.defineProperty(withGetter, 'extra', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        counter.reads += 1;
+        return 1;
+      },
+    });
+    expect(deriveAdoptStepStatus([withGetter], DIGEST, LANE)).toBe('inconsistent');
+    expect(counter.reads).toBe(0);
+    const withSetter = { key: adoptKey('work-order'), kind: 'intent' };
+    Object.defineProperty(withSetter, 'extra', { enumerable: true, configurable: true, set() {} });
+    expect(deriveAdoptStepStatus([withSetter], DIGEST, LANE)).toBe('inconsistent');
+  });
+
+  it('R5g: throwing getPrototypeOf and ownKeys traps are refused', () => {
+    const base = () => ({ key: adoptKey('run'), kind: 'intent' });
+    const protoThrows = new Proxy(base(), {
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+    });
+    const keysThrow = new Proxy(base(), {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    expect(deriveAdoptStepStatus([protoThrows], DIGEST, LANE)).toBe('inconsistent');
+    expect(deriveAdoptStepStatus([keysThrow], DIGEST, LANE)).toBe('inconsistent');
+    const arrayProtoThrows = new Proxy([intent(adoptKey('run'))], {
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+    });
+    const arrayKeysThrow = new Proxy([intent(adoptKey('run'))], {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    expect(deriveAdoptStepStatus(arrayProtoThrows, DIGEST, LANE)).toBe('inconsistent');
+    expect(deriveAdoptStepStatus(arrayKeysThrow, DIGEST, LANE)).toBe('inconsistent');
+  });
+
   it('R5d: a getter is never invoked (counter stays 0)', () => {
     const counter = { reads: 0 };
     for (const field of ['key', 'kind', 'outcome']) {
@@ -297,7 +358,8 @@ describe('deriveAdoptStepStatus', () => {
       },
     });
     expect(deriveAdoptStepStatus([proxy], DIGEST, LANE)).toBe('partial');
-    expect(traps).toEqual({ key: 1, kind: 1, outcome: 1 });
+    // Only present own keys are read, each exactly once; an absent `outcome` is never asked for.
+    expect(traps).toEqual({ key: 1, kind: 1, outcome: 0 });
   });
 
   it('R6: the canonical step order and cost bounds hold', () => {
@@ -400,9 +462,8 @@ describe('relaunchApplyLaneProgress', () => {
         { step: 'abort', status: 'partial' },
       ]),
     ).toEqual({ kind: 'stopped', step: 'save', reason: 'out-of-order' });
-    const reads = indexDescriptorProxy();
+    const reads = oversizedArrayProxy(MAX_RELAUNCH_APPLY_STEPS);
     const enormous = reads.proxy;
-    Object.defineProperty(enormous, 'length', { value: MAX_RELAUNCH_APPLY_STEPS + 1 });
     expect(relaunchApplyLaneProgress(enormous)).toEqual({
       kind: 'stopped',
       step: null,
@@ -503,6 +564,14 @@ describe('decideProcessTreeTermination', () => {
       action: 'terminate',
       reason: 'abort-refused',
     });
+    // Contradictory kind/outcome shapes refuse rather than terminate.
+    for (const kind of ['threw', 'missing-method']) {
+      expect(decideProcessTreeTermination({ kind, outcome: 'aborted' })).toEqual({
+        terminate: false,
+        action: 'refuse',
+        reason: 'invalid-abort-outcome',
+      });
+    }
     expect(decideProcessTreeTermination({ kind: 'threw' })).toEqual({
       terminate: true,
       action: 'terminate',
@@ -622,9 +691,8 @@ describe('canonicalSaveInputJson', () => {
       canonicalSaveInputJson(DIGEST, { ...saveInput(), allowedPathPrefixes: { length: 1, 0: 'x' } }),
     ).toBeNull();
     // An enormous prefixes length is refused before any element read.
-    const reads = indexDescriptorProxy();
+    const reads = oversizedArrayProxy(MAX_RELAUNCH_APPLY_ENTRIES);
     const enormous = reads.proxy;
-    Object.defineProperty(enormous, 'length', { value: MAX_RELAUNCH_APPLY_ENTRIES + 1 });
     expect(canonicalSaveInputJson(DIGEST, { ...saveInput(), allowedPathPrefixes: enormous })).toBeNull();
     expect(reads.reads.count).toBe(0);
     // A sparse policyProtectedPaths array is refused too.

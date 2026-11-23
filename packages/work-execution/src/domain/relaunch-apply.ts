@@ -77,22 +77,22 @@ function readLedgerEntrySnapshot(item: unknown): SnapshotEntry | null {
   try {
     const prototype: unknown = Object.getPrototypeOf(item);
     if (prototype !== Object.prototype && prototype !== null) return null;
-    // Each field's descriptor is read exactly once; the refusal decision and
-    // the value both come from that one descriptor.
-    const dataDescriptor = (key: string): PropertyDescriptor | undefined | null => {
-      const descriptor = Object.getOwnPropertyDescriptor(item, key);
-      if (descriptor === undefined) return undefined;
+    // Every own key's descriptor is read exactly once; any accessor (getter or
+    // setter) on ANY own key refuses, and the needed fields reuse that read.
+    const descriptors = new Map<PropertyKey, PropertyDescriptor>();
+    for (const own of Reflect.ownKeys(item)) {
+      const descriptor = Object.getOwnPropertyDescriptor(item, own);
+      if (descriptor === undefined) return null;
       if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) return null;
-      return descriptor;
-    };
-    const keyDescriptor = dataDescriptor('key');
-    if (keyDescriptor === null || keyDescriptor === undefined) return null;
+      descriptors.set(own, descriptor);
+    }
+    const keyDescriptor = descriptors.get('key');
+    if (keyDescriptor === undefined) return null;
     const key: unknown = keyDescriptor.value;
     if (typeof key !== 'string') return null;
-    const kindDescriptor = dataDescriptor('kind');
-    if (kindDescriptor === null || kindDescriptor === undefined) return null;
-    const outcomeDescriptor = dataDescriptor('outcome');
-    if (outcomeDescriptor === null) return null;
+    const kindDescriptor = descriptors.get('kind');
+    if (kindDescriptor === undefined) return null;
+    const outcomeDescriptor = descriptors.get('outcome');
     return { key, kind: kindDescriptor.value, outcome: outcomeDescriptor?.value };
   } catch {
     return null;
@@ -298,6 +298,8 @@ function readAbortOutcomeSnapshot(value: unknown): SnapshotAbortOutcome | null {
   if (fields === null) return null;
   const kind: unknown = fields.kind;
   if (typeof kind !== 'string') return null;
+  // `outcome` belongs to a `'result'` only; any other kind carrying it is contradictory.
+  if (kind !== 'result' && Object.hasOwn(fields, 'outcome')) return null;
   return { kind, outcome: fields.outcome };
 }
 

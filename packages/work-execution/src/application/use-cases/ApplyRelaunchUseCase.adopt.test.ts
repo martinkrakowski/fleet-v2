@@ -56,6 +56,28 @@ const PAST_DEADLINE = '2026-11-23T11:00:00Z';
 const computeDigest = (text: string): string =>
   createHash('sha256').update(text, 'utf8').digest('hex');
 
+/**
+ * The digest `adoptInputIdentity` computes for a resent adopt input: the
+ * journaled `adopt/work-order` completed result must carry exactly this, or
+ * the preflight refuses the lane (AR3c1).
+ */
+const adoptIdentityDigest = (laneId: string, input: Record<string, unknown>): string => {
+  const part = (holder: unknown, field: string): unknown =>
+    holder !== null && typeof holder === 'object' ? (holder as Record<string, unknown>)[field] : undefined;
+  return computeDigest(
+    JSON.stringify([
+      'adopt-lane-ids/1',
+      input['projectId'],
+      part(input['planRef'], 'planId'),
+      laneId,
+      part(input['workOrder'], 'workOrderId'),
+      part(input['brief'], 'briefId'),
+      part(input['attempt'], 'attemptId'),
+      part(input['run'], 'runId'),
+    ]),
+  );
+};
+
 const hex = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
 /** The fixture brief text and its REAL digest: the preflight verifies it before any side effect. */
@@ -471,7 +493,18 @@ const makeDeps = (over: {
               const has = (kind: string): boolean =>
                 store.some((entry) => entry['key'] === subKey && entry['kind'] === kind);
               if (!has('intent')) await append({ key: subKey, kind: 'intent' });
-              if (!has('result')) await append({ key: subKey, kind: 'result', outcome: 'completed' });
+              if (!has('result')) {
+                // AR3c1: the completed work-order result carries the resent
+                // input's identity digest, as the real AdoptLaneUseCase does.
+                await append({
+                  key: subKey,
+                  kind: 'result',
+                  outcome: 'completed',
+                  ...(sub === 'work-order'
+                    ? { digest: adoptIdentityDigest(laneId, request as Record<string, unknown>) }
+                    : {}),
+                });
+              }
             }
           }
           return answer;
@@ -520,9 +553,20 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     result(key(digest, laneId, 'save'), 'completed'),
   ];
 
-  /** All four adopt sub-steps completed for a lane. */
-  const completedAdopt = (digest: string, laneId: string): unknown[] =>
-    ADOPT_SUB_STEPS.flatMap((sub) => [intent(adoptKey(digest, laneId, sub)), result(adoptKey(digest, laneId, sub), 'completed')]);
+  /**
+   * All four adopt sub-steps completed for a lane. AR3c1: when the wave
+   * resents an adopt input, the completed work-order result journals the
+   * matching identity digest, as the real AdoptLaneUseCase does.
+   */
+  const completedAdopt = (digest: string, laneId: string, input?: Record<string, unknown>): unknown[] =>
+    ADOPT_SUB_STEPS.flatMap((sub) => [
+      intent(adoptKey(digest, laneId, sub)),
+      result(
+        adoptKey(digest, laneId, sub),
+        'completed',
+        sub === 'work-order' && input !== undefined ? { digest: adoptIdentityDigest(laneId, input) } : {},
+      ),
+    ]);
 
   it('refuses stale-plan-state before authorization when adoptLane port is missing', async () => {
     const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('no-port plan'))]);
@@ -809,12 +853,12 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       const plan = buildPlan([lane2, lane3, lane4], maxActiveRuns);
       const entries = [
         ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
-        ...completedAdopt(plan.planDigest, 'lane-2'),
+        ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         // lane-3 was adopted in an earlier pass but its redispatch is still
         // absent: only the preflight's adopt counting sees it occupy a run.
         ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
-        ...completedAdopt(plan.planDigest, 'lane-3'),
+        ...completedAdopt(plan.planDigest, 'lane-3', lane3Input),
         ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
       ];
       return { plan, entries };
@@ -1159,7 +1203,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       plan,
       entries: [
         ...completedSave(digest, 'lane-2', saveInput()),
-        ...completedAdopt(digest, 'lane-2'),
+        ...completedAdopt(digest, 'lane-2', adoptInput()),
       ],
       live: { adopt: (request: unknown) => adoptedFor(request) },
     });
@@ -1277,7 +1321,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       ];
       const entries = [
         ...completedSave(plan.planDigest, 'lane-2', saves[0]!),
-        ...completedAdopt(plan.planDigest, 'lane-2'),
+        ...completedAdopt(plan.planDigest, 'lane-2', adoptInput()),
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         ...completedSave(plan.planDigest, 'lane-3', saves[1]!),
         ...lane3Entries(plan.planDigest),

@@ -1264,6 +1264,21 @@ function adoptInputContradictsJournal(
 }
 
 /**
+ * The recorded adopt work-order digest for a lane's `completed` adopt, or
+ * `null` when it is missing, unreadable, or not a usable non-empty string.
+ * Scans the pre-validated snapshot once (bounded by MAX_RELAUNCH_APPLY_ENTRIES
+ * entries) and never invokes object members it does not own, so a getter or
+ * `Proxy`-shaped entry cannot execute here.
+ */
+function adoptWorkOrderResult(args: LiveApplyArgs, snapshot: readonly SnapshotEntry[], laneId: string): string | null {
+  const key = `relaunch/${args.planDigest}/${laneId}/adopt/work-order`;
+  const recorded = snapshot.find((entry) => entry.key === key && entry.kind === 'result' && entry.outcome === 'completed');
+  if (recorded === undefined) return null;
+  if (typeof recorded.digest !== 'string' || recorded.digest === '') return null;
+  return recorded.digest;
+}
+
+/**
  * AR3b (fix round): a participant whose adopt is `partial` or `completed`
  * must have a resolvable work order id that agrees with its journaled adopt
  * result, else its capacity cannot be counted: `stale-plan-state` in
@@ -1284,7 +1299,19 @@ function participantAdoptRefusal(
     if (lane.workOrderId === null && readAdoptWorkOrderId(adoptInput) === null) {
       return refusedLane('stale-plan-state', lane.laneId);
     }
-    if (adoptInput !== undefined && adoptInputContradictsJournal(args, snapshot, lane, adoptInput)) {
+    if (adoptStatus === 'completed') {
+      // AR3c1: a completed adopt must have a journaled work-order result
+      // digest; its absence (or an unreadable/empty digest) fails closed
+      // instead of counting the lane as idle. Lookup is one pass over the
+      // already-validated snapshot, bounded by MAX_RELAUNCH_APPLY_ENTRIES.
+      const recorded = adoptWorkOrderResult(args, snapshot, lane.laneId);
+      if (recorded === null) return refusedLane('stale-plan-state', lane.laneId);
+      if (adoptInput !== undefined && adoptInputIdentity(args.deps, lane.laneId, adoptInput) !== recorded) {
+        return refusedLane('stale-plan-state', lane.laneId);
+      }
+    } else if (adoptInput !== undefined && adoptInputContradictsJournal(args, snapshot, lane, adoptInput)) {
+      // `partial` keeps the softer rule: a not-yet-completed work order may
+      // legitimately lack a journaled digest; only a present one must agree.
       return refusedLane('stale-plan-state', lane.laneId);
     }
   }

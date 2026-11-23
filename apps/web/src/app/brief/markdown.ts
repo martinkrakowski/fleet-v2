@@ -2,17 +2,25 @@
  * A small read-only Markdown reader for the frozen brief, ported from the
  * draft page. Everything is escaped before markup is applied; nothing inside
  * the rendered brief is a control.
+ *
+ * Cost bound: md() splits the input once and advances `i` monotonically
+ * across blocks, so each line is visited at most once per branch; the whole
+ * scan is bounded upfront by MAX_MD_LENGTH, giving O(n) over the input.
  */
+
+const MAX_MD_LENGTH = 2_000_000;
 
 const AMP = String.fromCharCode(38);
 const HASH = String.fromCharCode(35);
-const ENTITIES: Record<string, string> = {
+// Null-prototype map so character escaping never touches Object.prototype
+// (a text literal like "constructor" cannot resolve through the chain).
+const ENTITIES: Record<string, string> = Object.assign(Object.create(null), {
   [AMP]: AMP + "amp;",
   "<": AMP + "lt;",
   ">": AMP + "gt;",
   '"': AMP + "quot;",
   "'": AMP + HASH + "39;"
-};
+});
 
 const esc = (s: string): string =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ENTITIES[c]);
@@ -23,6 +31,7 @@ const inline = (t: string): string =>
     .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
 
 export function md(src: string): string {
+  if (typeof src !== "string" || src.length > MAX_MD_LENGTH) return "";
   const lines = src.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -46,6 +55,7 @@ export function md(src: string): string {
       let rows: string[] = [];
       while (i < lines.length && /^\|/.test(lines[i])) rows.push(lines[i++]);
       rows = rows.filter((r) => !/^\|\s*-+/.test(r));
+      if (rows.length === 0) continue; // separator-only table: render nothing
       const cells = (r: string) => r.split("|").slice(1, -1).map((c) => c.trim());
       out.push(
         `<table><thead><tr>${cells(rows[0]).map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${rows
@@ -71,7 +81,10 @@ export function md(src: string): string {
       i++;
       continue;
     }
-    const p: string[] = [];
+    // Paragraph: always consume the first line (a line like "#tag", "#" or
+    // "#### x" matches no block branch but must advance i or md() would loop
+    // forever), then keep consuming lines that belong to the paragraph.
+    const p: string[] = [lines[i++]];
     while (i < lines.length && lines[i].trim() !== "" && !/^(#|```|\||[-*]\s|\d+\.\s)/.test(lines[i])) p.push(lines[i++]);
     out.push(`<p>${inline(p.join(" "))}</p>`);
   }

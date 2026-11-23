@@ -706,6 +706,12 @@ export function composeExecution(input: ComposeExecutionInput) {
       computeDigest: sha256HexDigest,
       allowedSeats,
       processTreeTermination,
+      // SN2: the lane diff check for a clean strict-descendant head adoption
+      // runs on the dispatching runner's recorded host.
+      laneDiffCheckFor: (recorded) => {
+        const resolved = executorForHost.executorForRecordedHost(recorded);
+        return resolved.ok ? new LaneDiffCheckAdapter(resolved.executor) : null;
+      },
     }),
     commitEditOnlyAttempt: new CommitEditOnlyAttemptUseCase({
       attemptRepo: attemptRepository,

@@ -40,6 +40,8 @@ import type {
   LaneDiffCheckPort,
   LaneDiffCheckRequest,
   LaneDiffCheckResult,
+  LaneDiffCommitRangeRequest,
+  LaneDiffCommitRangeResult,
 } from "../../application/ports/out/LaneDiffCheckPort.out-port.js";
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import { join } from "node:path";
@@ -73,7 +75,7 @@ const MAX_SCAN_BUFFER_BYTES = 64 * 1024 * 1024;
  * GitShelfProvider's hardened prefix. Content is read with `cat` and
  * `git cat-file blob` anyway, neither of which consults these settings.
  */
-const GIT_CONFIG_ARGS = [
+export const GIT_CONFIG_ARGS = [
   "-c",
   "color.ui=never",
   "-c",
@@ -110,6 +112,35 @@ const GIT_CONFIG_ARGS = [
  */
 const GIT_GRAFT_FILE_NEVER =
   "/nonexistent/fleet-v2-lane-diff-check-no-grafts";
+
+/**
+ * The full hardened git argv for one command: the replace-ref and grafts
+ * overrides, `--no-replace-objects`, `-C <worktree>`, then the pinned config.
+ * Shared by the worktree scan and the per-commit range scan, so both run git
+ * with exactly the same flags and environment.
+ */
+function hardenedGitArgv(worktreePath: string, argv: readonly string[]): string[] {
+  return [
+    "env",
+    "GIT_NO_REPLACE_OBJECTS=1",
+    `GIT_GRAFT_FILE=${GIT_GRAFT_FILE_NEVER}`,
+    "git",
+    "--no-replace-objects",
+    "-C",
+    worktreePath,
+    ...GIT_CONFIG_ARGS,
+    ...argv,
+  ];
+}
+
+/** SN2: at most this many commits are scanned in one adoption range. */
+export const MAX_RANGE_COMMITS = 50;
+
+/** SN2: at most this many content bytes are read across one adoption range. */
+export const MAX_RANGE_BYTES = 64 * 1024 * 1024;
+
+/** A commit id: 40 or 64 lowercase hex digits. */
+const RANGE_COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /*
  * No child environment is passed to the executor: it builds its own
@@ -276,17 +307,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       // remote command (every word single-quoted by the remote executor) to
       // reach the remote git at all. Locally the same prefix is harmless.
       const run = await this.commandExecutor.run(
-        [
-          "env",
-          "GIT_NO_REPLACE_OBJECTS=1",
-          `GIT_GRAFT_FILE=${GIT_GRAFT_FILE_NEVER}`,
-          "git",
-          "--no-replace-objects",
-          "-C",
-          request.worktreePath,
-          ...GIT_CONFIG_ARGS,
-          ...argv,
-        ],
+        hardenedGitArgv(request.worktreePath, argv),
         {
           cwd: request.worktreePath,
           ...(input !== undefined ? { input } : {}),
@@ -685,16 +706,148 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     // scans of different text at one line — collapse here. Findings carry
     // path, line and rule only, never a matched value.
     if (verdict.ok) return { outcome: "clean" };
-    const seen = new Set<string>();
-    const findings = verdict.findings.filter((finding) => {
-      const key = `${finding.path}\u0000${finding.rule}\u0000${String(
-        finding.line ?? "",
-      )}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+    return { outcome: "findings", findings: dedupeFindings(verdict.findings) };
+  }
+
+  /**
+   * SN2: scan every commit of `baseCommit..headCommit` on its own diff
+   * against its first parent, with the same pure check, secret registry,
+   * prefixes and protected paths as the worktree scan. A secret that one
+   * commit adds and a later one removes is found here although the final
+   * tree is clean. The range is bounded: more than `MAX_RANGE_COMMITS`
+   * commits, or more than `MAX_RANGE_BYTES` of scanned content, is the typed
+   * `range-too-large` refusal; a merge commit in the range, an unreadable
+   * object or any failed command is an `error`. Cost: one `rev-list`, then
+   * per commit one name-status plus one `cat-file blob` per changed path.
+   */
+  async checkLaneDiffCommitRange(
+    request: LaneDiffCommitRangeRequest,
+  ): Promise<LaneDiffCommitRangeResult> {
+    if (
+      !RANGE_COMMIT_PATTERN.test(request.baseCommit) ||
+      !RANGE_COMMIT_PATTERN.test(request.headCommit)
+    ) {
+      return { outcome: "error", reason: "invalid-range-commit" };
+    }
+    const list = await this.rangeGit(request.worktreePath, [
+      "rev-list",
+      "--reverse",
+      "--parents",
+      `--max-count=${MAX_RANGE_COMMITS + 1}`,
+      `${request.baseCommit}..${request.headCommit}`,
+    ]);
+    if (!list.ok) return { outcome: "error", reason: list.reason };
+    const lines = list.stdout.split("\n").filter((line) => line !== "");
+    if (lines.length > MAX_RANGE_COMMITS) {
+      return { outcome: "range-too-large", limit: "commits" };
+    }
+    const budget = { bytes: 0 };
+    for (const line of lines) {
+      const ids = line.split(" ");
+      if (ids.length !== 2 || !RANGE_COMMIT_PATTERN.test(ids[0]) || !RANGE_COMMIT_PATTERN.test(ids[1])) {
+        return { outcome: "error", reason: "lane diff check: a commit in the range is not a plain single-parent commit" };
+      }
+      const verdict = await this.scanRangeCommit(request, ids[0], ids[1], budget);
+      if (verdict.outcome !== "clean") return verdict;
+    }
+    return { outcome: "clean" };
+  }
+
+  private async rangeGit(
+    worktreePath: string,
+    argv: readonly string[],
+    maxBufferBytes?: number,
+  ): Promise<CommandOutcome> {
+    const run = await this.commandExecutor.run(
+      hardenedGitArgv(worktreePath, argv),
+      {
+        cwd: worktreePath,
+        ...(maxBufferBytes !== undefined ? { maxBufferBytes } : {}),
+      },
+    );
+    if (run.error !== undefined || run.exitCode !== 0) {
+      return {
+        ok: false,
+        stdout: "",
+        reason: "lane diff check: could not read a commit of the range",
+        exitCode: run.exitCode,
+      };
+    }
+    return { ok: true, stdout: run.stdout, reason: "", exitCode: 0 };
+  }
+
+  /** The content lines of every non-deleted path one commit changed. */
+  private async rangeCommitContent(
+    request: LaneDiffCommitRangeRequest,
+    commit: string,
+    changed: Map<string, LaneDiffChangedPath>,
+    budget: { bytes: number },
+  ): Promise<LaneDiffCommitRangeResult | Map<string, { line: number; text: string }[]>> {
+    const lines = new Map<string, { line: number; text: string }[]>();
+    for (const entry of changed.values()) {
+      if (entry.status === "deleted") continue;
+      const blob = await this.rangeGit(
+        request.worktreePath,
+        ["cat-file", "blob", `${commit}:${entry.path}`],
+        MAX_SCAN_BUFFER_BYTES,
+      );
+      if (!blob.ok) return { outcome: "error", reason: blob.reason };
+      budget.bytes += Buffer.byteLength(blob.stdout);
+      if (budget.bytes > MAX_RANGE_BYTES) {
+        return { outcome: "range-too-large", limit: "bytes" };
+      }
+      const merged = new Map<number, Set<string>>();
+      mergeContentLines(merged, blob.stdout);
+      lines.set(entry.path, flattenContentLines(merged));
+    }
+    return lines;
+  }
+
+  /** Scan one commit's own diff against its first parent. */
+  private async scanRangeCommit(
+    request: LaneDiffCommitRangeRequest,
+    commit: string,
+    parent: string,
+    budget: { bytes: number },
+  ): Promise<LaneDiffCommitRangeResult> {
+    const names = await this.rangeGit(request.worktreePath, [
+      "diff",
+      "--no-color",
+      "--no-renames",
+      "--name-status",
+      "-z",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      parent,
+      commit,
+    ]);
+    if (!names.ok) return { outcome: "error", reason: names.reason };
+    const changed = new Map<string, LaneDiffChangedPath>();
+    this.collectNameStatusEntries(names.stdout, changed);
+    for (const path of changed.keys()) {
+      if (hasUnsupportedPathCharacters(path)) {
+        return { outcome: "error", reason: "unsupported-path-characters" };
+      }
+    }
+    const content = await this.rangeCommitContent(request, commit, changed, budget);
+    if (!(content instanceof Map)) return content;
+    const verdict = checkLaneDiff({
+      changedPaths: [...changed.values()].map((entry) => ({
+        ...entry,
+        ...(content.has(entry.path) ? { addedLines: content.get(entry.path) } : {}),
+      })),
+      allowedPathPrefixes: request.allowedPathPrefixes,
+      ...(request.policyProtectedPaths !== undefined
+        ? { policyProtectedPaths: request.policyProtectedPaths }
+        : {}),
+      helperConfigKeys: [],
+      secretPatterns:
+        request.secretPatterns ??
+        this.options?.secretPatterns ??
+        defaultSecretPatterns(),
     });
-    return { outcome: "findings", findings };
+    if (verdict.ok) return { outcome: "clean" };
+    return { outcome: "findings", findings: dedupeFindings(verdict.findings) };
   }
 
   /**
@@ -789,6 +942,24 @@ function hasUnsupportedPathCharacters(path: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Identical (path, line, rule) findings collapse; findings carry path, line
+ * and rule only, never a matched value.
+ */
+function dedupeFindings<T extends { path: string; rule: string; line?: number | null }>(
+  all: readonly T[],
+): T[] {
+  const seen = new Set<string>();
+  return all.filter((finding) => {
+    const key = `${finding.path}\u0000${finding.rule}\u0000${String(
+      finding.line ?? "",
+    )}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** The complete script registry (all 17 patterns) with rule names. */

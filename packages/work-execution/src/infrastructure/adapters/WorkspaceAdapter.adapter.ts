@@ -19,10 +19,13 @@
  * of the transport decision (documented, tested change).
  */
 
+import { GIT_CONFIG_ARGS } from './LaneDiffCheckAdapter.adapter.js';
 import * as path from 'node:path';
 
 import {
   WorktreePathRefusedError,
+  type IsStrictDescendantRequest,
+  type IsStrictDescendantResult,
   type RemoveUntrackedFilesRequest,
   type RemoveUntrackedFilesResult,
   type ResolveBaseTipRequest,
@@ -482,6 +485,130 @@ function snapshotRemoveUntrackedRequest(request: unknown): RemoveUntrackedFilesR
     return null;
   }
   return snap as unknown as RemoveUntrackedFilesRequest;
+}
+
+/**
+ * SN2: a bound, typed git commit SHA: 40 or 64 lowercase hex, never all
+ * zeros. Anything else cannot name a commit object.
+ */
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function isCommitSha(value: unknown): value is string {
+  return typeof value === 'string' && COMMIT_SHA_PATTERN.test(value) && !/^0+$/.test(value);
+}
+
+/** Sentinel: the recorded host block was not a plain, bounded data record. */
+const INVALID_RECORDED_HOST = Symbol('invalid-recorded-host');
+
+const RECORDED_HOST_STRING_KEYS = ['host', 'hostName', 'agent', 'model', 'variant'] as const;
+const RECORDED_HOST_MAX_STRING = 512;
+const RECORDED_HOST_KEYS: ReadonlySet<string> = new Set([
+  'kind',
+  'remotePort',
+  'useFreeSeats',
+  ...RECORDED_HOST_STRING_KEYS,
+]);
+
+/** A bounded string or null (or undefined when `allowAbsent`). */
+function isBoundedStringOrNull(value: unknown, allowAbsent: boolean): boolean {
+  if (value === undefined) {
+    return allowAbsent;
+  }
+  return value === null || (typeof value === 'string' && value.length <= RECORDED_HOST_MAX_STRING);
+}
+
+/** Whether the snapshot's non-string fields (`kind`, `remotePort`, `useFreeSeats`) are well formed. */
+function hasValidRecordedHostScalars(snap: Record<string, unknown>): boolean {
+  const port = snap['remotePort'];
+  const portOk = port === undefined || port === null || (typeof port === 'number' && Number.isSafeInteger(port));
+  const free = snap['useFreeSeats'];
+  const freeOk = free === undefined || typeof free === 'boolean';
+  return portOk && freeOk && (snap['kind'] === 'opencode' || snap['kind'] === 'agy');
+}
+
+/**
+ * SN2: a data-only snapshot of the recorded host block before it reaches the
+ * executor resolver. Absent and null pass through; anything else must be a
+ * plain object whose own keys are enumerable data properties from the known
+ * set (no getter ever runs, `snapshotPlainDataRecord`), with bounded string
+ * fields. Cost: `O(K)` own keys plus `O(1)` field checks.
+ */
+function snapshotRecordedHost(value: unknown): AttemptRunnerRecord | null | undefined | typeof INVALID_RECORDED_HOST {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(value);
+  } catch {
+    return INVALID_RECORDED_HOST;
+  }
+  if (snap === null || Object.keys(snap).some((key) => !RECORDED_HOST_KEYS.has(key))) {
+    return INVALID_RECORDED_HOST;
+  }
+  if (!hasValidRecordedHostScalars(snap)) {
+    return INVALID_RECORDED_HOST;
+  }
+  if (!RECORDED_HOST_STRING_KEYS.every((key) => isBoundedStringOrNull(snap[key], true))) {
+    return INVALID_RECORDED_HOST;
+  }
+  return { ...snap } as unknown as AttemptRunnerRecord;
+}
+
+/**
+ * SN2: the hardened git prefix of the ancestry probe, the same replace-ref
+ * and grafts override the lane diff check uses (`env GIT_NO_REPLACE_OBJECTS=1
+ * GIT_GRAFT_FILE=<never-existing path> git --no-replace-objects`). The
+ * overrides travel in the argv so they reach a remote git over ssh too.
+ */
+const ANCESTRY_GIT_PREFIX = [
+  'env',
+  // Ambient config injected through the environment is cleared, like the
+  // lane diff check's pinned `-c` overrides that follow `-C <worktree>`.
+  '-u',
+  'GIT_CONFIG_COUNT',
+  '-u',
+  'GIT_CONFIG_PARAMETERS',
+  'GIT_NO_REPLACE_OBJECTS=1',
+  'GIT_GRAFT_FILE=/nonexistent/fleet-v2-ancestry-probe-no-grafts',
+  'git',
+  '--no-replace-objects',
+] as const;
+
+/** The full hardened argv of one ancestry-probe git command. */
+function ancestryGitArgv(worktreePath: string, argv: readonly string[]): string[] {
+  return [...ANCESTRY_GIT_PREFIX, '-C', worktreePath, ...GIT_CONFIG_ARGS, ...argv];
+}
+
+/**
+ * SN2: a descriptor-safe snapshot of one `isStrictDescendant` request. A
+ * null, a non-object, a request with a throwing getter, a non-enumerable or
+ * accessor key, or a prototype-polluting key reads as null; the caller
+ * answers `invalid-request` and never throws. Cost: `O(K)` own-key count
+ * plus `O(1)` field checks.
+ */
+function snapshotStrictDescendantRequest(request: unknown): IsStrictDescendantRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  if (!isBoundedAbsolutePath(snap['worktreePath'])) {
+    return null;
+  }
+  if (!isCommitSha(snap['ancestorCommit']) || !isCommitSha(snap['descendantCommit'])) {
+    return null;
+  }
+  const host = snapshotRecordedHost(snap['recordedHost']);
+  if (host === INVALID_RECORDED_HOST) {
+    return null;
+  }
+  snap['recordedHost'] = host;
+  return snap as unknown as IsStrictDescendantRequest;
 }
 
 /**
@@ -1409,6 +1536,104 @@ export class WorkspaceAdapter implements WorkspacePort {
       );
     }
     return result.stdout;
+  }
+
+  /**
+   * SN2: `git cat-file -t` on both commits, then `git merge-base
+   * --is-ancestor`. Every command runs through the recorded host's executor
+   * with the shared git budget. `exit 0` on the merge-base is the only pass;
+   * `exit 1` is a real negative; a command that never answered (`exitCode`
+   * null, an error or a timeout), a thrown executor rejection, a failed
+   * `cat-file`, or an empty type output is `unknown` — never a pass.
+   */
+  async isStrictDescendant(request: IsStrictDescendantRequest): Promise<IsStrictDescendantResult> {
+    const snap = snapshotStrictDescendantRequest(request);
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const { worktreePath } = snap;
+    const ancestorCommit = snap['ancestorCommit'] as string;
+    const descendantCommit = snap['descendantCommit'] as string;
+    if (ancestorCommit === descendantCommit) {
+      return { outcome: 'not-descendant' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(snap['recordedHost'] as AttemptRunnerRecord | null | undefined);
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the probe's executor could not be resolved: ${String(error)}` };
+    }
+    try {
+      for (const commit of [ancestorCommit, descendantCommit]) {
+        const type = await executor.run(ancestryGitArgv(worktreePath, ['cat-file', '-t', commit]), {
+          timeoutMs: GIT_TIMEOUT_MS,
+        });
+        if (type.exitCode === null || type.error !== undefined) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} never answered` };
+        }
+        if (type.exitCode !== 0) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} failed with exit ${String(type.exitCode)}` };
+        }
+        if (type.stdout.trim() === '') {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} answered with no type` };
+        }
+        if (type.stdout.trim() !== 'commit') {
+          return { outcome: 'not-descendant' };
+        }
+      }
+      const ancestor = await executor.run(
+        ancestryGitArgv(worktreePath, ['merge-base', '--is-ancestor', ancestorCommit, descendantCommit]),
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (ancestor.exitCode === null || ancestor.error !== undefined) {
+        return { outcome: 'unknown', reason: 'git merge-base --is-ancestor never answered' };
+      }
+      if (ancestor.exitCode === 0) {
+        return this.refuseForeignParents(executor, worktreePath, ancestorCommit, descendantCommit);
+      }
+      if (ancestor.exitCode === 1) {
+        return { outcome: 'not-descendant' };
+      }
+      return {
+        outcome: 'unknown',
+        reason: `git merge-base --is-ancestor failed with exit ${String(ancestor.exitCode)}`,
+      };
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the strict-descendant probe threw: ${String(error)}` };
+    }
+  }
+
+  /**
+   * SN2: after a passing ancestry answer, any merge commit in
+   * `ancestor..descendant` (a second parent the lane brought in) makes the
+   * range not adoptable. `rev-list --min-parents=2 --max-count=1` prints at
+   * most one line; an unanswered or failed probe is `unknown`, never a pass.
+   */
+  private async refuseForeignParents(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    ancestorCommit: string,
+    descendantCommit: string,
+  ): Promise<IsStrictDescendantResult> {
+    const merges = await executor.run(
+      ancestryGitArgv(worktreePath, [
+        'rev-list',
+        '--min-parents=2',
+        '--max-count=1',
+        `${ancestorCommit}..${descendantCommit}`,
+      ]),
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (merges.exitCode === null || merges.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-list --min-parents=2 never answered' };
+    }
+    if (merges.exitCode !== 0) {
+      return {
+        outcome: 'unknown',
+        reason: `git rev-list --min-parents=2 failed with exit ${String(merges.exitCode)}`,
+      };
+    }
+    return merges.stdout.trim() === '' ? { outcome: 'strict-descendant' } : { outcome: 'not-descendant' };
   }
 
   /** Existence of one absolute path in the worktree's filesystem. */

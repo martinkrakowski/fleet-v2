@@ -370,6 +370,52 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     expect(lane.journal.entries[0]!.status).toBe('completed');
   });
 
+  it('an adopted head is the expected head: output left dirty after adoption is committed through the same scan path (SN2)', async () => {
+    const ADOPTED = '9'.repeat(40);
+    const lane = makeLane({
+      editOnlyMode: 'not-edit-only',
+      attempt: endedAttempt({
+        briefDigest: briefFiles(frozenManifest()).digest,
+        adoptedHeadCommit: ADOPTED,
+      }),
+      inspectWorktree: () => inspection({ checkedOutCommit: ADOPTED, uncommittedPaths: ['packages/example/a.ts'] }),
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toEqual({ outcome: 'committed', headCommit: HEAD, alreadyCommitted: false });
+    expect(lane.inspectionRequests[0]!.baseCommit).toBe(ADOPTED);
+    expect(lane.commits).toHaveLength(1);
+    expect(lane.commits[0]!.expectedHead).toBe(ADOPTED);
+    // The diff check ran before the commit, with the same frozen prefixes.
+    expect(lane.diffRequests.length).toBeGreaterThan(0);
+    expect(lane.diffRequests[0]!.allowedPathPrefixes).toEqual(['packages/example/']);
+  });
+
+  it('an adopted head with a secret-shaped dirty file is refused diff-findings and nothing is committed or removed (SN2)', async () => {
+    const ADOPTED = '9'.repeat(40);
+    const lane = makeLane({
+      editOnlyMode: 'not-edit-only',
+      attempt: endedAttempt({
+        briefDigest: briefFiles(frozenManifest()).digest,
+        adoptedHeadCommit: ADOPTED,
+      }),
+      initialDiffOutcome: { outcome: 'findings', findings: FINDINGS },
+      inspectWorktree: () => inspection({ checkedOutCommit: ADOPTED, untrackedPaths: ['packages/example/secret.txt'] }),
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'diff-findings' });
+    expect(lane.commits).toHaveLength(0);
+    expect(lane.journal.entries.map((entry) => entry.status)).toEqual(['refused']);
+  });
+
+  it('without a recorded adoption a head that is not the dispatch head stays not-applicable (SN2 contrast)', async () => {
+    const lane = makeLane({
+      editOnlyMode: 'not-edit-only',
+      inspectWorktree: () => inspection({ checkedOutCommit: '9'.repeat(40), uncommittedPaths: ['packages/example/a.ts'] }),
+    });
+    expect(await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' })).toEqual({ outcome: 'not-applicable' });
+    expect(lane.commits).toHaveLength(0);
+  });
+
   it('not-edit-only with only untracked files commits too', async () => {
     const lane = makeLane({
       editOnlyMode: 'not-edit-only',

@@ -349,6 +349,14 @@ export interface AttemptRecord {
    */
   readonly dispatchedTimeLimitSeconds?: number;
   /**
+   * SN2: the clean strict-descendant head this dispatch adopted (a commit the
+   * lane made on top of the expected checkout, scanned commit by commit before
+   * adoption). Collection treats it as the expected head, so uncommitted
+   * output left after the adoption is normalised through the SN1 scan path.
+   * Absent when the dispatch adopted nothing; a re-dispatch clears it.
+   */
+  readonly adoptedHeadCommit?: string;
+  /**
    * Owner decision references the product froze into the brief package, read
    * from that frozen package at dispatch and never from a worktree file at
    * acceptance time. An absent field on records written before dispatch

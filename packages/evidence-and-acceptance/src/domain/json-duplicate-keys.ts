@@ -121,6 +121,244 @@ function decodeStringBody(body: string): string | null {
   return out;
 }
 
+type Refusal = { readonly ok: false; readonly reason: JsonDuplicateKeyRefusal };
+
+const INVALID_JSON: Refusal = { ok: false, reason: 'invalid-json' };
+const INVALID_INPUT: Refusal = { ok: false, reason: 'invalid-input' };
+const DUPLICATE_KEY: Refusal = { ok: false, reason: 'duplicate-key' };
+
+/** Mutable scanner position shared by the step helpers. */
+interface ScanContext {
+  readonly text: string;
+  readonly stack: Frame[];
+  state: ScanState;
+  index: number;
+}
+
+/** A step returns a refusal to stop the scan, or `null` to keep scanning. */
+type StepResult = Refusal | null;
+
+const isValueState = (state: ScanState): boolean => state === 'expect-root-value' || state === 'expect-value';
+
+const isKeyState = (state: ScanState): boolean => state === 'expect-key' || state === 'expect-key-or-close';
+
+const topOf = (stack: readonly Frame[]): Frame | undefined => stack[stack.length - 1];
+
+/** Mark the innermost array (if any) as holding a complete element. */
+function markArrayValue(stack: readonly Frame[]): void {
+  const top = topOf(stack);
+  if (top !== undefined && !top.isObject) {
+    top.hadValue = true;
+  }
+}
+
+/** State after a complete value or container close. */
+const stateAfterValue = (stack: readonly Frame[]): ScanState =>
+  stack.length === 0 ? 'after-root-value' : 'expect-comma-or-close';
+
+const isTokenTerminator = (char: string): boolean =>
+  char === '"' || char === '{' || char === '[' ||
+  char === '}' || char === ']' || char === ':' || char === ',' ||
+  isWhitespace(char);
+
+/**
+ * Escape-aware raw string scan, starting just after the opening quote:
+ * `\"` stays inside the string, `\\"` closes it. Returns the raw body, or
+ * `null` when the string never closes. Leaves `ctx.index` after the closing
+ * quote (or at the end of input).
+ */
+function scanStringBody(ctx: ScanContext): string | null {
+  const { text } = ctx;
+  let body = '';
+  while (ctx.index < text.length) {
+    const stringChar = text[ctx.index];
+    if (stringChar === '\\') {
+      body += text.slice(ctx.index, ctx.index + 2);
+      ctx.index += 2;
+      continue;
+    }
+    if (stringChar === '"') {
+      ctx.index += 1;
+      return body;
+    }
+    body += stringChar;
+    ctx.index += 1;
+  }
+  return null;
+}
+
+function acceptKey(ctx: ScanContext, body: string): StepResult {
+  const top = topOf(ctx.stack);
+  if (top === undefined || !top.isObject) {
+    return INVALID_JSON;
+  }
+  const key = decodeStringBody(body);
+  if (key === null) {
+    return INVALID_JSON;
+  }
+  if (top.keys.has(key)) {
+    return DUPLICATE_KEY;
+  }
+  top.keys.add(key);
+  ctx.state = 'expect-colon';
+  return null;
+}
+
+function acceptStringValue(ctx: ScanContext, body: string): StepResult {
+  // String values are decoded too, so an invalid escape or a raw
+  // control character inside a value is refused like JSON.parse would.
+  if (decodeStringBody(body) === null) {
+    return INVALID_JSON;
+  }
+  markArrayValue(ctx.stack);
+  ctx.state = stateAfterValue(ctx.stack);
+  return null;
+}
+
+function stepString(ctx: ScanContext): StepResult {
+  ctx.index += 1;
+  const body = scanStringBody(ctx);
+  if (body === null) {
+    return INVALID_JSON;
+  }
+  if (isKeyState(ctx.state)) {
+    return acceptKey(ctx, body);
+  }
+  if (isValueState(ctx.state)) {
+    return acceptStringValue(ctx, body);
+  }
+  return INVALID_JSON;
+}
+
+function stepOpen(ctx: ScanContext, char: string): StepResult {
+  if (!isValueState(ctx.state)) {
+    return INVALID_JSON;
+  }
+  if (ctx.stack.length >= MAX_JSON_SCAN_DEPTH) {
+    return INVALID_INPUT;
+  }
+  if (char === '{') {
+    ctx.stack.push({ isObject: true, keys: new Set<string>() });
+    ctx.state = 'expect-key-or-close';
+  } else {
+    ctx.stack.push({ isObject: false, hadValue: false });
+    ctx.state = 'expect-value';
+  }
+  ctx.index += 1;
+  return null;
+}
+
+/** True when the close at `char` closes a container with no element or member. */
+function closesEmptyContainer(char: string, state: ScanState, top: Frame): boolean {
+  if (char === '}') {
+    return state === 'expect-key-or-close';
+  }
+  return state === 'expect-value' && !top.isObject && top.hadValue === false;
+}
+
+function stepClose(ctx: ScanContext, char: string): StepResult {
+  const top = topOf(ctx.stack);
+  if (top === undefined) {
+    return INVALID_JSON;
+  }
+  if (top.isObject !== (char === '}')) {
+    return INVALID_JSON;
+  }
+  if (!closesEmptyContainer(char, ctx.state, top) && ctx.state !== 'expect-comma-or-close') {
+    return INVALID_JSON;
+  }
+  ctx.stack.pop();
+  ctx.state = stateAfterValue(ctx.stack);
+  markArrayValue(ctx.stack);
+  ctx.index += 1;
+  return null;
+}
+
+function stepColon(ctx: ScanContext): StepResult {
+  if (ctx.state !== 'expect-colon') {
+    return INVALID_JSON;
+  }
+  ctx.state = 'expect-value';
+  ctx.index += 1;
+  return null;
+}
+
+function stepComma(ctx: ScanContext): StepResult {
+  if (ctx.state !== 'expect-comma-or-close') {
+    return INVALID_JSON;
+  }
+  const top = topOf(ctx.stack);
+  if (top === undefined) {
+    return INVALID_JSON;
+  }
+  ctx.state = top.isObject ? 'expect-key' : 'expect-value';
+  ctx.index += 1;
+  return null;
+}
+
+function stepPrimitive(ctx: ScanContext): StepResult {
+  if (!isValueState(ctx.state)) {
+    return INVALID_JSON;
+  }
+  const { text } = ctx;
+  const tokenStart = ctx.index;
+  while (ctx.index < text.length && !isTokenTerminator(text[ctx.index])) {
+    ctx.index += 1;
+  }
+  if (!isValidPrimitiveToken(text.slice(tokenStart, ctx.index))) {
+    return INVALID_JSON;
+  }
+  markArrayValue(ctx.stack);
+  ctx.state = stateAfterValue(ctx.stack);
+  return null;
+}
+
+/** Dispatch one non-whitespace character to its step. */
+function stepChar(ctx: ScanContext, char: string): StepResult {
+  switch (char) {
+    case '"':
+      return stepString(ctx);
+    case '{':
+    case '[':
+      return stepOpen(ctx, char);
+    case '}':
+    case ']':
+      return stepClose(ctx, char);
+    case ':':
+      return stepColon(ctx);
+    case ',':
+      return stepComma(ctx);
+    default:
+      if (isNumberStart(char) || char === 't' || char === 'f' || char === 'n') {
+        return stepPrimitive(ctx);
+      }
+      return INVALID_JSON;
+  }
+}
+
+function isValidMaxLength(maxLength: unknown): boolean {
+  return typeof maxLength === 'number' && Number.isFinite(maxLength) && maxLength >= 0;
+}
+
+function scanText(text: string): JsonDuplicateKeyCheckResult {
+  const ctx: ScanContext = { text, stack: [], state: 'expect-root-value', index: 0 };
+  while (ctx.index < text.length) {
+    const char = text[ctx.index];
+    if (isWhitespace(char)) {
+      ctx.index += 1;
+      continue;
+    }
+    const refusal = stepChar(ctx, char);
+    if (refusal !== null) {
+      return refusal;
+    }
+  }
+  if (ctx.stack.length !== 0 || ctx.state !== 'after-root-value') {
+    return INVALID_JSON;
+  }
+  return { ok: true };
+}
+
 /**
  * Scan `text` and refuse duplicate object keys at any depth. Returns a typed
  * result and never throws: non-string input, an invalid `maxLength`, or input
@@ -133,180 +371,11 @@ export function checkJsonDuplicateKeys(
   maxLength: number = MAX_REVIEW_REPLY_LENGTH,
 ): JsonDuplicateKeyCheckResult {
   try {
-    if (
-      typeof text !== 'string' ||
-      typeof maxLength !== 'number' ||
-      !Number.isFinite(maxLength) ||
-      maxLength < 0 ||
-      text.length > maxLength
-    ) {
-      return { ok: false, reason: 'invalid-input' };
+    if (typeof text !== 'string' || !isValidMaxLength(maxLength) || text.length > maxLength) {
+      return INVALID_INPUT;
     }
-    const stack: Frame[] = [];
-    let state: ScanState = 'expect-root-value';
-    let index = 0;
-    while (index < text.length) {
-      const char = text[index];
-      if (isWhitespace(char)) {
-        index += 1;
-        continue;
-      }
-      if (char === '"') {
-        // Escape-aware string scan: `\"` stays inside the string, `\\"` closes it.
-        index += 1;
-        let body = '';
-        let closed = false;
-        while (index < text.length) {
-          const stringChar = text[index];
-          if (stringChar === '\\') {
-            body += text.slice(index, index + 2);
-            index += 2;
-            continue;
-          }
-          if (stringChar === '"') {
-            closed = true;
-            index += 1;
-            break;
-          }
-          body += stringChar;
-          index += 1;
-        }
-        if (!closed) {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        if (state === 'expect-key' || state === 'expect-key-or-close') {
-          const top = stack[stack.length - 1];
-          if (top === undefined || !top.isObject) {
-            return { ok: false, reason: 'invalid-json' };
-          }
-          const key = decodeStringBody(body);
-          if (key === null) {
-            return { ok: false, reason: 'invalid-json' };
-          }
-          if (top.keys.has(key)) {
-            return { ok: false, reason: 'duplicate-key' };
-          }
-          top.keys.add(key);
-          state = 'expect-colon';
-          continue;
-        }
-        if (state === 'expect-root-value' || state === 'expect-value') {
-          // String values are decoded too, so an invalid escape or a raw
-          // control character inside a value is refused like JSON.parse would.
-          if (decodeStringBody(body) === null) {
-            return { ok: false, reason: 'invalid-json' };
-          }
-          const top = stack[stack.length - 1];
-          if (top !== undefined && !top.isObject) {
-            top.hadValue = true;
-          }
-          state = stack.length === 0 ? 'after-root-value' : 'expect-comma-or-close';
-          continue;
-        }
-        return { ok: false, reason: 'invalid-json' };
-      }
-      if (char === '{') {
-        if (state !== 'expect-root-value' && state !== 'expect-value') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        if (stack.length >= MAX_JSON_SCAN_DEPTH) {
-          return { ok: false, reason: 'invalid-input' };
-        }
-        stack.push({ isObject: true, keys: new Set<string>() });
-        state = 'expect-key-or-close';
-        index += 1;
-        continue;
-      }
-      if (char === '[') {
-        if (state !== 'expect-root-value' && state !== 'expect-value') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        if (stack.length >= MAX_JSON_SCAN_DEPTH) {
-          return { ok: false, reason: 'invalid-input' };
-        }
-        stack.push({ isObject: false, hadValue: false });
-        state = 'expect-value';
-        index += 1;
-        continue;
-      }
-      if (char === '}' || char === ']') {
-        const top = stack[stack.length - 1];
-        if (top === undefined) {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        const closesOpen = (char === '}' && top.isObject) || (char === ']' && !top.isObject);
-        if (!closesOpen) {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        const empty =
-          (char === '}' && state === 'expect-key-or-close') ||
-          (char === ']' && state === 'expect-value' && !(top.isObject) && top.hadValue === false);
-        if (!empty && state !== 'expect-comma-or-close') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        stack.pop();
-        state = stack.length === 0 ? 'after-root-value' : 'expect-comma-or-close';
-        const parent = stack[stack.length - 1];
-        if (parent !== undefined && !parent.isObject) {
-          parent.hadValue = true;
-        }
-        index += 1;
-        continue;
-      }
-      if (char === ':') {
-        if (state !== 'expect-colon') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        state = 'expect-value';
-        index += 1;
-        continue;
-      }
-      if (char === ',') {
-        if (state !== 'expect-comma-or-close') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        const top = stack[stack.length - 1];
-        if (top === undefined) {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        state = top.isObject ? 'expect-key' : 'expect-value';
-        index += 1;
-        continue;
-      }
-      if (isNumberStart(char) || char === 't' || char === 'f' || char === 'n') {
-        if (state !== 'expect-root-value' && state !== 'expect-value') {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        const tokenStart = index;
-        while (index < text.length) {
-          const tokenChar = text[index];
-          if (
-            tokenChar === '"' || tokenChar === '{' || tokenChar === '[' ||
-            tokenChar === '}' || tokenChar === ']' || tokenChar === ':' || tokenChar === ',' ||
-            isWhitespace(tokenChar)
-          ) {
-            break;
-          }
-          index += 1;
-        }
-        const token = text.slice(tokenStart, index);
-        if (!isValidPrimitiveToken(token)) {
-          return { ok: false, reason: 'invalid-json' };
-        }
-        const tokenTop = stack[stack.length - 1];
-        if (tokenTop !== undefined && !tokenTop.isObject) {
-          tokenTop.hadValue = true;
-        }
-        state = stack.length === 0 ? 'after-root-value' : 'expect-comma-or-close';
-        continue;
-      }
-      return { ok: false, reason: 'invalid-json' };
-    }
-    if (stack.length !== 0 || state !== 'after-root-value') {
-      return { ok: false, reason: 'invalid-json' };
-    }
-    return { ok: true };
+    return scanText(text);
   } catch {
-    return { ok: false, reason: 'invalid-input' };
+    return INVALID_INPUT;
   }
 }

@@ -1,13 +1,15 @@
 // AR2b — ApplyRelaunchUseCase: request validation, trusted-clock budget
 // checks, stored-plan digest verification, journal replay derivation, the
 // dry-run summary and the live apply. An `apply: true` request runs one
-// admission wave of `save`, `abort` and `redispatch` (intent-only; the
-// conductor starts the fix) under
+// admission wave of `save`, `abort`, `adopt` and `redispatch` (intent-only;
+// the conductor starts the fix) under
 // `ActionAuthorizationPort.authorizeRelaunchApply`: preflight liveness, input
 // and port checks run first so a failed preflight never consumes the owner
-// grant, every journaled step is intent-before-action (I3, I7), and adopt
-// still refuses `adopt-not-implemented` (AR2c owns it). `prepareFixAttempt`
-// is never called here.
+// grant, every journaled step is intent-before-action (I3, I7), and the
+// AR2c adopt step adopts the lane's existing worktree through
+// `AdoptLanePort` — idempotent on replay, inside the redispatch capacity
+// rule, and fail-closed on any missing port, missing input, stale plan state
+// or exhausted budget. `prepareFixAttempt` is never called here.
 //
 // `applyRelaunch` takes `unknown` and never throws. Results carry ids, codes,
 // digests and statuses only: never a worktree path, a clone path, an
@@ -36,6 +38,11 @@ import {
 import { relaunchStepStatus } from '../../domain/relaunch-step-ledger.js';
 import { parseValidatedStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
 import type {
+  AdoptLanePort,
+  AdoptLaneSource,
+} from '../ports/in/AdoptLanePort.in-port.js';
+import type {
+  ApplyRelaunchAdoptInput,
   ApplyRelaunchLaneSummary,
   ApplyRelaunchPort,
   ApplyRelaunchResult,
@@ -72,11 +79,22 @@ export interface ApplyRelaunchDependencies {
   readonly runner?: Pick<ExecutionRunnerPort, 'inspectWorktreeRun' | 'abortWorktreeRun'>;
   readonly processTreeTermination?: Pick<ProcessTreeTerminationPort, 'terminateWorktreeProcesses'>;
   readonly runRepo?: Pick<LaneRunRepositoryPort, 'get'>;
+  readonly adoptLane?: Pick<AdoptLanePort, 'adoptLane'>['adoptLane'];
   readonly mintEntryId?: () => string;
 }
 
 /** Every string the request carries is bounded; a longer one is unreadable. */
 const MAX_TEXT_LENGTH = 4096;
+
+/**
+ * The brief-text bound of an adopt input (AR2c): the lane's frozen brief is
+ * never rewritten, so its whole text may travel through the request.
+ */
+const MAX_BRIEF_TEXT_LENGTH = 262_144;
+
+/** The adopt secret-scan bounds: a brief nests deeper and is far longer than a save input. */
+const MAX_ADOPT_SCAN_DEPTH = 8;
+const MAX_ADOPT_SCAN_NODES = 2048;
 
 const PLAN_DIGEST = /^[0-9a-f]{64}$/;
 
@@ -90,6 +108,19 @@ const SAVE_INPUT_REQUIRED_KEYS = [
   'allowedPathPrefixes',
 ] as const;
 const SAVE_INPUT_OPTIONAL_KEYS = ['policyProtectedPaths'] as const;
+
+/** The top-level keys of one adopt input (AR2c); `source` may be derived from the journal. */
+const ADOPT_INPUT_REQUIRED_KEYS = [
+  'laneId',
+  'projectId',
+  'planRef',
+  'baseBranch',
+  'workOrder',
+  'brief',
+  'attempt',
+  'run',
+] as const;
+const ADOPT_INPUT_OPTIONAL_KEYS = ['source'] as const;
 
 const ABSENT = Symbol('absent');
 const BAD = Symbol('bad');
@@ -123,24 +154,32 @@ const MAX_SCAN_NODES = 256;
  * Whether any reachable string value matches a secret shape. Values are read
  * through their own descriptors only; an accessor, a throwing inspection or
  * an over-deep or over-wide graph returns `null` (unreadable), never `false`.
+ * The depth and text-length bounds are parameters so the adopt inputs (AR2c)
+ * may nest one brief deeper and carry the whole frozen brief text.
  */
-function scanForSecret(value: unknown, depth: number, budget: { nodes: number }): boolean | null {
+function scanForSecret(
+  value: unknown,
+  depth: number,
+  budget: { nodes: number },
+  maxDepth: number = MAX_SCAN_DEPTH,
+  maxTextLength: number = MAX_TEXT_LENGTH,
+): boolean | null {
   if (value === null) return false;
   if (typeof value === 'string') {
     // Cost bound: the length cap refuses an enormous string in O(1) before
     // any pattern scan runs.
-    if (value.length > MAX_TEXT_LENGTH) return null;
+    if (value.length > maxTextLength) return null;
     return hasSecretShape(value);
   }
   if (typeof value !== 'object') return false;
-  if (depth >= MAX_SCAN_DEPTH) return null;
+  if (depth >= maxDepth) return null;
   if (Array.isArray(value)) {
     const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_ENTRIES);
     if (dense === null) return null;
     for (const element of dense.array) {
       budget.nodes -= 1;
       if (budget.nodes < 0) return null;
-      const found = scanForSecret(element, depth + 1, budget);
+      const found = scanForSecret(element, depth + 1, budget, maxDepth, maxTextLength);
       if (found !== false) return found;
     }
     return false;
@@ -150,7 +189,7 @@ function scanForSecret(value: unknown, depth: number, budget: { nodes: number })
   for (const key of Object.keys(snapshot)) {
     budget.nodes -= 1;
     if (budget.nodes < 0) return null;
-    const found = scanForSecret(snapshot[key], depth + 1, budget);
+    const found = scanForSecret(snapshot[key], depth + 1, budget, maxDepth, maxTextLength);
     if (found !== false) return found;
   }
   return false;
@@ -220,17 +259,67 @@ function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | '
 }
 
 /**
+ * The request's adopt inputs (AR2c), keyed by `laneId` in a `Map`. Each
+ * element is read exactly once through its own descriptors: any hole,
+ * accessor, extra key, over-deep or over-wide graph, bad lane id, duplicate
+ * lane id, empty or over-long `brief.briefText`, or a failed
+ * `structuredClone` is `null`, and a secret shape anywhere inside is
+ * `'secret-detected'`. The validated element is cloned before it is stored,
+ * so no caller-owned object or `Proxy` is retained across `await`.
+ *
+ * Cost: one O(1) length gate, one O(K) `Reflect.ownKeys` and one O(cap)
+ * descriptor copy per element (`readBoundedDenseArray`), plus a bounded
+ * secret scan of at most `MAX_ADOPT_SCAN_NODES` nodes at most
+ * `MAX_ADOPT_SCAN_DEPTH` deep with strings capped at `MAX_BRIEF_TEXT_LENGTH`.
+ */
+function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> | 'secret-detected' | null {
+  const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
+  if (dense === null) return null;
+  const map = new Map<string, ApplyRelaunchAdoptInput>();
+  for (const element of dense.array) {
+    const fields = readPlainRecordWithOptionalKeys(element, ADOPT_INPUT_REQUIRED_KEYS, ADOPT_INPUT_OPTIONAL_KEYS);
+    if (fields === null) return null;
+    // Secret screening runs over every reachable string before any other
+    // field check, with the adopt bounds: `brief.acceptanceSpec.commands[]
+    // .argv[]` nests to depth 6 and `brief.briefText` may be 262,144 chars.
+    const secret = scanForSecret(element, 0, { nodes: MAX_ADOPT_SCAN_NODES }, MAX_ADOPT_SCAN_DEPTH, MAX_BRIEF_TEXT_LENGTH);
+    if (secret === true) return 'secret-detected';
+    if (secret === null) return null;
+    const laneId: unknown = fields['laneId'];
+    if (typeof laneId !== 'string' || !LANE_ID.test(laneId)) return null;
+    if (map.has(laneId)) return null;
+    const brief: unknown = fields['brief'];
+    const briefText: unknown = own(brief, 'briefText');
+    // The brief text is never empty and never over the frozen-brief bound.
+    if (typeof briefText !== 'string' || briefText === '' || briefText.length > MAX_BRIEF_TEXT_LENGTH) return null;
+    // Clone inside try/catch: a Proxy stand-in the descriptor reads cannot
+    // distinguish from data is refused here rather than trusted.
+    let snapshot: unknown;
+    try {
+      snapshot = structuredClone(element);
+    } catch {
+      return null;
+    }
+    map.set(laneId, snapshot as ApplyRelaunchAdoptInput);
+  }
+  return map;
+}
+
+/**
  * One journal entry read exactly once through its own data descriptors, so no
- * getter ever runs on `key`, `kind`, `outcome` or `digest`. `null` when the
- * entry is not a plain record with an own enumerable string `key` and `kind`,
- * an optional string-or-null `outcome` and `digest`, and no accessor on any
- * own key.
+ * getter ever runs on `key`, `kind`, `outcome`, `digest`, `saveRef` or
+ * `commitId`. `null` when the entry is not a plain record with an own
+ * enumerable string `key` and `kind`, optional string-or-null `outcome`,
+ * `digest`, `saveRef` and `commitId`, and no accessor on any own key.
  */
 interface SnapshotEntry {
   readonly key: string;
   readonly kind: string;
   readonly outcome: undefined | string | null;
   readonly digest: undefined | string | null;
+  /** AR2c: the save result's saved ref and commit id, when the entry carries them. */
+  readonly saveRef: undefined | string | null;
+  readonly commitId: undefined | string | null;
 }
 
 function snapshotJournalEntry(item: unknown): SnapshotEntry | null {
@@ -252,11 +341,17 @@ function snapshotJournalEntry(item: unknown): SnapshotEntry | null {
     if (kindDescriptor === undefined || typeof kindDescriptor.value !== 'string') return null;
     const outcomeDescriptor = descriptors.get('outcome');
     const digestDescriptor = descriptors.get('digest');
+    const saveRefDescriptor = descriptors.get('saveRef');
+    const commitIdDescriptor = descriptors.get('commitId');
     const outcome = outcomeDescriptor === undefined ? undefined : outcomeDescriptor.value;
     const digest = digestDescriptor === undefined ? undefined : digestDescriptor.value;
+    const saveRef = saveRefDescriptor === undefined ? undefined : saveRefDescriptor.value;
+    const commitId = commitIdDescriptor === undefined ? undefined : commitIdDescriptor.value;
     if (outcome !== undefined && outcome !== null && typeof outcome !== 'string') return null;
     if (digest !== undefined && digest !== null && typeof digest !== 'string') return null;
-    return { key: keyDescriptor.value, kind: kindDescriptor.value, outcome, digest };
+    if (saveRef !== undefined && saveRef !== null && typeof saveRef !== 'string') return null;
+    if (commitId !== undefined && commitId !== null && typeof commitId !== 'string') return null;
+    return { key: keyDescriptor.value, kind: kindDescriptor.value, outcome, digest, saveRef, commitId };
   } catch {
     return null;
   }
@@ -328,7 +423,10 @@ interface ParsedRequest {
   readonly apply: boolean;
   readonly grantId: string | null;
   readonly deadlineMs: number | null;
+  /** The raw `deadlineIso` of the request, forwarded to `adoptLane`. */
+  readonly deadlineIso: string | null;
   readonly saveInputs: Map<string, ApplyRelaunchSaveInput>;
+  readonly adoptInputs: Map<string, ApplyRelaunchAdoptInput>;
 }
 
 function readPlanDigest(request: unknown): Step<string> {
@@ -357,15 +455,15 @@ function readGrantId(request: unknown): Step<string | null> {
   return hasSecretShape(grantId) ? fail('secret-detected') : pass(grantId);
 }
 
-function readDeadlineMs(request: unknown): Step<number | null> {
+function readDeadlineMs(request: unknown): Step<{ deadlineMs: number | null; deadlineIso: string | null }> {
   const nowValue = own(request, 'nowIso');
   if (nowValue === ABSENT || nowValue === BAD) return fail('invalid-request');
   if (!isZonedIsoDateTime(nowValue)) return fail('invalid-clock');
   const deadlineValue = own(request, 'deadlineIso');
   if (deadlineValue === BAD) return fail('invalid-request');
-  if (deadlineValue === ABSENT || deadlineValue === null) return pass(null);
+  if (deadlineValue === ABSENT || deadlineValue === null) return pass({ deadlineMs: null, deadlineIso: null });
   if (!isZonedIsoDateTime(deadlineValue)) return fail('invalid-clock');
-  return pass(Date.parse(deadlineValue));
+  return pass({ deadlineMs: Date.parse(deadlineValue), deadlineIso: deadlineValue });
 }
 
 function readSaveInputsField(request: unknown): Step<Map<string, ApplyRelaunchSaveInput>> {
@@ -377,7 +475,24 @@ function readSaveInputsField(request: unknown): Step<Map<string, ApplyRelaunchSa
   return inputs === null ? fail('invalid-request') : pass(inputs);
 }
 
-const KNOWN_REQUEST_KEYS: readonly string[] = ['planDigest', 'apply', 'grantId', 'nowIso', 'deadlineIso', 'saveInputs'];
+function readAdoptInputsField(request: unknown): Step<Map<string, ApplyRelaunchAdoptInput>> {
+  const value = own(request, 'adoptInputs');
+  if (value === BAD) return fail('invalid-request');
+  if (value === ABSENT) return pass(new Map<string, ApplyRelaunchAdoptInput>());
+  const inputs = readAdoptInputs(value);
+  if (inputs === 'secret-detected') return fail('secret-detected');
+  return inputs === null ? fail('invalid-request') : pass(inputs);
+}
+
+const KNOWN_REQUEST_KEYS: readonly string[] = [
+  'planDigest',
+  'apply',
+  'grantId',
+  'nowIso',
+  'deadlineIso',
+  'saveInputs',
+  'adoptInputs',
+];
 
 /** Every other own value of the request gets the same secret scan and length cap. */
 function scanUnknownRequestKeys(request: unknown): ApplyRelaunchResult | null {
@@ -400,18 +515,22 @@ function parseRequestFields(request: unknown): Step<ParsedRequest> {
   if (!apply.ok) return apply;
   const grantId = readGrantId(request);
   if (!grantId.ok) return grantId;
-  const deadlineMs = readDeadlineMs(request);
-  if (!deadlineMs.ok) return deadlineMs;
+  const deadline = readDeadlineMs(request);
+  if (!deadline.ok) return deadline;
   const saveInputs = readSaveInputsField(request);
   if (!saveInputs.ok) return saveInputs;
+  const adoptInputs = readAdoptInputsField(request);
+  if (!adoptInputs.ok) return adoptInputs;
   const unknownKeys = scanUnknownRequestKeys(request);
   if (unknownKeys !== null) return { ok: false, result: unknownKeys };
   return pass({
     planDigest: planDigest.value,
     apply: apply.value,
     grantId: grantId.value,
-    deadlineMs: deadlineMs.value,
+    deadlineMs: deadline.value.deadlineMs,
+    deadlineIso: deadline.value.deadlineIso,
     saveInputs: saveInputs.value,
+    adoptInputs: adoptInputs.value,
   });
 }
 
@@ -612,7 +731,10 @@ interface LiveApplyArgs {
   readonly planDigest: string;
   readonly grantId: string;
   readonly deadlineMs: number | null;
+  /** The raw request `deadlineIso`, forwarded to `adoptLane` (AR2c). */
+  readonly deadlineIso: string | null;
   readonly saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>;
+  readonly adoptInputs: ReadonlyMap<string, ApplyRelaunchAdoptInput>;
   readonly storedPlan: RelaunchPlanRecord;
 }
 
@@ -633,6 +755,7 @@ function hasLivePorts(deps: ApplyRelaunchDependencies): boolean {
     typeof deps.runner?.abortWorktreeRun === 'function' &&
     typeof deps.processTreeTermination?.terminateWorktreeProcesses === 'function' &&
     typeof deps.saveLaneEdits === 'function' &&
+    typeof deps.adoptLane === 'function' &&
     typeof deps.cutoverJournal?.append === 'function' &&
     typeof deps.mintEntryId === 'function'
   );
@@ -677,6 +800,7 @@ async function probeWorktreeLane(
     return refusedLane('stale-plan-state', lane.laneId);
   }
   const redispatchStatus = statusOf(lane.laneId, 'redispatch');
+  const adoptStatus = statusOf(lane.laneId, 'adopt');
   if (
     lane.runnerState === 'idle' &&
     redispatchStatus === 'absent' &&
@@ -688,8 +812,14 @@ async function probeWorktreeLane(
   // A pending hand-off counts toward the cap even while its worktree still
   // reports idle: the conductor has not started the handed-off lane yet, so
   // the idle report is not evidence that the run is over. Counting it keeps a
-  // later wave from appending another intent past maxActiveRuns.
-  if (redispatchStatus === 'intent-only' || (redispatchStatus === 'completed' && stateKind === 'running')) {
+  // later wave from appending another intent past maxActiveRuns. A lane whose
+  // adopt has begun (partial) or completed while its redispatch is still
+  // absent occupies a run too (AR2c): it was adopted into a conducted run.
+  if (
+    redispatchStatus === 'intent-only' ||
+    (redispatchStatus === 'completed' && stateKind === 'running') ||
+    ((adoptStatus === 'partial' || adoptStatus === 'completed') && redispatchStatus === 'absent')
+  ) {
     counts.handedOffNotIdle += 1;
   }
   return null;
@@ -699,11 +829,66 @@ interface LivePreflight {
   readonly derived: DerivedOk;
   readonly statusOf: StatusOf;
   readonly counts: RunCounts;
+  /** Per-lane `save-ref` sources derived from the journaled save results (AR2c). */
+  readonly savedSources: ReadonlyMap<string, AdoptLaneSource>;
+}
+
+/**
+ * The `save-ref` source of a lane whose `save` result is already journaled
+ * (AR2c): `{ kind: 'save-ref', saveRef, commitOid: commitId, treeDigest:
+ * digest }`. `undefined` when the journal holds no completed save result for
+ * the lane carrying a ref, a commit id and a tree digest.
+ */
+function savedSourceForLane(
+  planDigest: string,
+  laneId: string,
+  snapshot: readonly SnapshotEntry[],
+): AdoptLaneSource | undefined {
+  const saveKey = `relaunch/${planDigest}/${laneId}/save`;
+  for (const entry of snapshot) {
+    if (entry.key !== saveKey || entry.kind !== 'result' || entry.outcome !== 'completed') continue;
+    if (typeof entry.saveRef !== 'string' || typeof entry.commitId !== 'string' || typeof entry.digest !== 'string') {
+      continue;
+    }
+    return { kind: 'save-ref', saveRef: entry.saveRef, commitOid: entry.commitId, treeDigest: entry.digest };
+  }
+  return undefined;
+}
+
+/**
+ * The adopt cross-checks of `preflightLive` (AR2c): `true` when the adopt
+ * input disagrees with the plan lane or the save input, so the lane refuses
+ * `stale-plan-state` before the grant is spent. Every field is read through
+ * its own descriptor of the already-cloned plain snapshot, so no getter runs.
+ */
+function adoptInputMismatch(
+  adoptInput: ApplyRelaunchAdoptInput,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): boolean {
+  if (adoptInput.baseBranch !== lane.baseBranch) return true;
+  if (lane.projectId !== null && adoptInput.projectId !== lane.projectId) return true;
+  const workOrderId = own(adoptInput.workOrder, 'workOrderId');
+  if (lane.workOrderId !== null && workOrderId !== lane.workOrderId) return true;
+  const attemptId = own(adoptInput.attempt, 'attemptId');
+  if (attemptId !== saveInput.attemptId) return true;
+  const baseCommit = own(adoptInput.workOrder, 'baseCommit');
+  if (baseCommit !== saveInput.baseCommit) return true;
+  const owned = own(adoptInput.workOrder, 'ownedPaths');
+  if (!Array.isArray(owned)) return true;
+  for (const path of owned) {
+    if (typeof path !== 'string') return true;
+    const covered = saveInput.allowedPathPrefixes.some(
+      (prefix) => path === prefix || path.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`),
+    );
+    if (!covered) return true;
+  }
+  return false;
 }
 
 /** Pre-authorization liveness, input and port checks; spends nothing. */
 async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult | LivePreflight> {
-  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
+  const { deps, planDigest, deadlineMs, saveInputs, adoptInputs, storedPlan } = args;
   if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
   const snapshotStep = await loadJournalSnapshot(deps, planDigest);
   if (!snapshotStep.ok) return snapshotStep.result;
@@ -712,15 +897,34 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
   const statusOf: StatusOf = (laneId, step) =>
     derived.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
   if (!hasLivePorts(deps)) return refusal('stale-plan-state');
+  const savedSources = new Map<string, AdoptLaneSource>();
   const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };
   for (const lane of storedPlan.lanes) {
+    if (lane.population !== 'conducted') {
+      // AR2c: a lane whose adopt is not already completed must carry an adopt
+      // input, and every adopt input must agree with the plan lane and the
+      // save input — all before the grant is spent.
+      const adoptStatus = statusOf(lane.laneId, 'adopt');
+      const adoptInput = adoptInputs.get(lane.laneId);
+      if (adoptStatus !== 'completed' && adoptInput === undefined) {
+        return refusedLane('stale-plan-state', lane.laneId);
+      }
+      if (adoptInput !== undefined) {
+        const saveInput = saveInputs.get(lane.laneId);
+        if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
+          return refusedLane('stale-plan-state', lane.laneId);
+        }
+      }
+      const saved = savedSourceForLane(planDigest, lane.laneId, snapshotStep.value);
+      if (saved !== undefined) savedSources.set(lane.laneId, saved);
+    }
     const refused =
       lane.population === 'conducted'
         ? await probeConductedLane(deps, lane, counts)
         : await probeWorktreeLane(deps, lane, saveInputs.get(lane.laneId), statusOf, counts);
     if (refused !== null) return refused;
   }
-  return { derived: derived.value, statusOf, counts };
+  return { derived: derived.value, statusOf, counts, savedSources };
 }
 
 /** Authorize the grant; the trusted `nowIso` it was authorized at, or a refusal. */
@@ -773,10 +977,15 @@ interface WaveContext {
   readonly deps: ApplyRelaunchDependencies;
   readonly planDigest: string;
   readonly deadlineMs: number | null;
+  /** The raw request `deadlineIso`, forwarded to `adoptLane` (AR2c). */
+  readonly deadlineIso: string | null;
   readonly nowIso: string;
   readonly statusOf: StatusOf;
   readonly maxActiveRuns: number;
   readonly counts: RunCounts;
+  readonly adoptInputs: ReadonlyMap<string, ApplyRelaunchAdoptInput>;
+  /** Per-lane `save-ref` sources: derived from the journal, updated by the wave's saves. */
+  readonly savedSources: Map<string, AdoptLaneSource>;
 }
 
 /** Journal one entry; any non-`appended` result or throw is a write failure. */
@@ -832,7 +1041,17 @@ async function saveOk(
       nowIso: ctx.nowIso,
     });
     const outcome = own(result, 'outcome');
-    if (outcome === 'saved' || outcome === 'already-saved') return { ok: true, busy: false };
+    if (outcome === 'saved' || outcome === 'already-saved') {
+      // AR2c: remember the save's ref, commit id and tree digest so a later
+      // adopt of this lane in the same wave can derive its `save-ref` source.
+      const saveRef = own(result, 'saveRef');
+      const commitId = own(result, 'commitId');
+      const treeDigest = own(result, 'treeDigest');
+      if (typeof saveRef === 'string' && typeof commitId === 'string' && typeof treeDigest === 'string') {
+        ctx.savedSources.set(laneId, { kind: 'save-ref', saveRef, commitOid: commitId, treeDigest });
+      }
+      return { ok: true, busy: false };
+    }
     return { ok: false, busy: own(result, 'reason') === 'worktree-busy' };
   } catch {
     return { ok: false, busy: false };
@@ -1023,19 +1242,78 @@ async function saveAndAbortLane(
   return null;
 }
 
-/** adopt is AR2c's; anything not already completed refuses; then the redispatch intent only. */
-async function adoptAndRedispatchLane(ctx: WaveContext, lane: PlanLane): Promise<ApplyRelaunchResult | null> {
-  if (lane.steps.some((entry) => entry.step === 'adopt')) {
-    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
-    if (ctx.statusOf(lane.laneId, 'adopt') !== 'completed') {
-      return refusedLane('adopt-not-implemented', lane.laneId);
+/**
+ * AR2c: adopt the lane's existing worktree into a conducted run through
+ * `AdoptLanePort` (idempotent on replay — a completed adopt is never
+ * re-called), then append the redispatch intent only. A lane with no adopt
+ * step keeps the old capacity rule: its redispatch checks the cap and counts
+ * its own hand-off. A lane with an adopt step checks the cap for its own
+ * `absent` adopt (a `partial` one was already counted by the preflight), and
+ * its own redispatch neither re-checks nor increments, so the lane's own
+ * hand-off is never counted twice.
+ */
+async function adoptAndRedispatchLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  adoptInput: ApplyRelaunchAdoptInput | undefined,
+): Promise<ApplyRelaunchResult | null> {
+  const hasAdoptStep = lane.steps.some((entry) => entry.step === 'adopt');
+  if (hasAdoptStep) {
+    const adoptStatus = ctx.statusOf(lane.laneId, 'adopt');
+    if (adoptStatus === 'refused') return refusedLane('adopt-failed', lane.laneId);
+    if (adoptStatus === 'absent' || adoptStatus === 'partial') {
+      if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+      if (adoptStatus === 'absent' && ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
+        return refusedLane('active-run-cap-reached', lane.laneId);
+      }
+      // Resolve the source: the caller's, or the one derived from the lane's
+      // completed save (journaled in an earlier pass or saved this wave).
+      const source = adoptInput?.source ?? ctx.savedSources.get(lane.laneId);
+      if (adoptInput === undefined || source === undefined) {
+        return refusedLane('stale-plan-state', lane.laneId);
+      }
+      // The parse proved the clone is a plain snapshot (the descriptor-only
+      // scan refused every accessor before the `structuredClone`), so its
+      // validated fields go to `adoptLane` exactly as they were cloned.
+      let adoptResult: unknown;
+      try {
+        adoptResult = await ctx.deps.adoptLane!({
+          planDigest: ctx.planDigest,
+          laneId: lane.laneId,
+          projectId: adoptInput.projectId,
+          planRef: adoptInput.planRef,
+          baseBranch: adoptInput.baseBranch,
+          workOrder: adoptInput.workOrder,
+          brief: adoptInput.brief,
+          attempt: adoptInput.attempt,
+          run: adoptInput.run,
+          source,
+          nowIso: ctx.nowIso,
+          ...(ctx.deadlineIso === null ? {} : { deadlineIso: ctx.deadlineIso }),
+        });
+      } catch {
+        return refusedLane('adopt-failed', lane.laneId);
+      }
+      const outcome = own(adoptResult, 'outcome');
+      if (outcome === 'budget-exhausted') return refusal('budget-exhausted');
+      if (outcome === 'adopted') {
+        // An `absent` adopt occupies a run from this wave on; a `partial`
+        // resume was already counted by the preflight.
+        if (adoptStatus === 'absent') ctx.counts.handedOffNotIdle += 1;
+      } else {
+        // `'refused'`, `'unknown'`, `null`, a non-object, a getter or any
+        // malformed result fails closed as `adopt-failed`.
+        return refusedLane('adopt-failed', lane.laneId);
+      }
     }
   }
   // redispatch: the intent only; the conductor starts the fix from it.
   if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
   const redispatchStatus = ctx.statusOf(lane.laneId, 'redispatch');
   if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') return null;
-  if (ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
+  // The capacity rule: only a lane without an adopt step re-checks and
+  // counts here — an adopt lane's hand-off was counted by its own adopt.
+  if (!hasAdoptStep && ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
     return refusedLane('active-run-cap-reached', lane.laneId);
   }
   const redispatchStep = lane.steps.find((entry) => entry.step === 'redispatch');
@@ -1043,7 +1321,7 @@ async function adoptAndRedispatchLane(ctx: WaveContext, lane: PlanLane): Promise
   if (!(await appendEntry(ctx, { key: redispatchStep.idempotencyKey, kind: 'intent' }))) {
     return refusedLane('journal-write-failed', lane.laneId);
   }
-  ctx.counts.handedOffNotIdle += 1;
+  if (!hasAdoptStep) ctx.counts.handedOffNotIdle += 1;
   return null;
 }
 
@@ -1059,7 +1337,8 @@ async function executeWave(
     // The preflight proved this exists for every non-conducted lane.
     const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
     const refused =
-      (await saveAndAbortLane(ctx, lane, saveInput)) ?? (await adoptAndRedispatchLane(ctx, lane));
+      (await saveAndAbortLane(ctx, lane, saveInput)) ??
+      (await adoptAndRedispatchLane(ctx, lane, ctx.adoptInputs.get(lane.laneId)));
     if (refused !== null) return refused;
   }
   return null;
@@ -1078,12 +1357,12 @@ function isRefusalResult(value: object): value is ApplyRelaunchResult {
  * starts the fix from the journaled intent.
  */
 async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
-  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
+  const { deps, planDigest, deadlineMs, saveInputs, adoptInputs, storedPlan } = args;
   const preflight = await preflightLive(args);
   if (isRefusalResult(preflight)) return preflight;
   const authorized = await authorizeLive(args);
   if (isRefusalResult(authorized)) return authorized;
-  const { statusOf, counts, derived } = preflight;
+  const { statusOf, counts, derived, savedSources } = preflight;
   const targetWave = selectWave(storedPlan, statusOf);
   if (targetWave === null) {
     return { outcome: 'applied', planDigest, wave: null, lanes: derived.summaries };
@@ -1092,10 +1371,13 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     deps,
     planDigest,
     deadlineMs,
+    deadlineIso: args.deadlineIso,
     nowIso: authorized.nowIso,
     statusOf,
     maxActiveRuns: storedPlan.maxActiveRuns,
     counts,
+    adoptInputs,
+    savedSources: new Map(savedSources),
   };
   const refused = await executeWave(ctx, storedPlan, saveInputs, targetWave);
   if (refused !== null) return refused;
@@ -1122,15 +1404,15 @@ export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
 
     const parsed = parseRequest(request);
     if (!parsed.ok) return parsed.result;
-    const { planDigest, apply, grantId, deadlineMs, saveInputs } = parsed.value;
+    const { planDigest, apply, grantId, deadlineMs, deadlineIso, saveInputs, adoptInputs } = parsed.value;
 
     if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
 
     const planStep = await loadVerifiedPlan(deps, planDigest);
     if (!planStep.ok) return planStep.result;
 
-    // AR2b: the live apply runs one wave under the owner grant; adopt is
-    // still AR2c's and refuses `adopt-not-implemented`.
+    // AR2b: the live apply runs one wave under the owner grant; AR2c: the
+    // adopt step adopts the lane's existing worktree through `adoptLane`.
     if (apply) {
       if (typeof grantId !== 'string' || grantId.trim() === '') return refusal('grant-missing');
       return applyLive({
@@ -1138,7 +1420,9 @@ export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
         planDigest,
         grantId,
         deadlineMs,
+        deadlineIso,
         saveInputs,
+        adoptInputs,
         storedPlan: planStep.value,
       });
     }

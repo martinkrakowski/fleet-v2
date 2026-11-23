@@ -41,6 +41,7 @@ import type {
   SaveLaneEditsRequest,
   SaveLaneEditsResult,
 } from '../../ports/in/SaveLaneEditsPort.in-port.js';
+import type { AdoptLanePort } from '../../ports/in/AdoptLanePort.in-port.js';
 import type {
   TerminateWorktreeProcessesRequest,
   TerminateWorktreeProcessesResult,
@@ -229,6 +230,41 @@ const saveInputDigest = (planDigest: string, input: Record<string, unknown>): st
   return computeDigest(canonical);
 };
 
+/** A valid adopt input for the held lane; every cross-check matches the fixtures. */
+const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  laneId: 'lane-2',
+  projectId: 'proj-1',
+  planRef: { projectId: 'proj-1', planId: 'plan-1', laneId: 'lane-2' },
+  baseBranch: 'chain/relaunch-2',
+  workOrder: {
+    workOrderId: 'wo-9',
+    taskId: 'task-1',
+    repository: 'repo-1',
+    baseCommit: 'b'.repeat(64),
+    ownedPaths: ['src/a.ts'],
+    policyRevision: 'policy-1',
+  },
+  brief: {
+    briefId: 'brief-1',
+    briefText: 'do the thing',
+    expectedBriefDigest: 'a'.repeat(64),
+    prosePath: 'brief/prose.md',
+    manifestPath: 'brief/manifest.json',
+    reviewerModel: 'reviewer-1',
+    acceptanceSpec: { commands: [{ argv: ['yarn', 'test'] }] },
+  },
+  attempt: { attemptId: 'attempt-1', endedAtIso: CLOCK_NOW, sessionId: null },
+  run: {
+    runId: 'run-9',
+    tier: 2,
+    seatPlanRef: 'e'.repeat(64),
+    runPolicyRevision: 'policy-1',
+    branchName: 'fleet/run-9',
+  },
+  source: { kind: 'save-ref', saveRef: 'refs/fleet/saved/lane-2', commitOid: 'c'.repeat(64), treeDigest: 'd'.repeat(64) },
+  ...over,
+});
+
 /** An own accessor on `key` that counts its invocations and never fires. */
 const getterOn = (target: object, key: string, calls: { count: number }): object => {
   const descriptor = Object.getOwnPropertyDescriptor(target, key);
@@ -263,6 +299,7 @@ interface Deps {
     ) => Promise<TerminateWorktreeProcessesResult>;
   };
   saveLaneEdits?: (request: SaveLaneEditsRequest) => Promise<SaveLaneEditsResult>;
+  adoptLane?: Pick<AdoptLanePort, 'adoptLane'>['adoptLane'];
   mintEntryId?: () => string;
   /** The entries appended through the journal spy, in append order. */
   appended?: Record<string, unknown>[];
@@ -276,6 +313,7 @@ interface LiveOver {
   noSave?: boolean;
   noMint?: boolean;
   noAppend?: boolean;
+  noAdoptLane?: boolean;
   noAuthorization?: boolean;
   run?: unknown;
   runThrows?: boolean;
@@ -289,12 +327,26 @@ interface LiveOver {
   terminateThrows?: boolean;
   save?: unknown;
   saveThrows?: boolean;
+  /** The adoptLane result (AR2c); the default refuses, as any malformed port answer does. */
+  adopt?: unknown;
+  adoptThrows?: boolean;
   authorize?: unknown;
   authorizeThrows?: boolean;
   /** Per-append results, consumed in order; the default is `appended`. */
   appendResults?: unknown[];
   appendThrows?: boolean;
 }
+
+/** An `adoptLane` answer whose `outcome` is read through its own descriptor (never a getter). */
+const plainOutcome = (value: unknown): unknown => {
+  if (value === null || typeof value !== 'object') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'outcome');
+    return descriptor !== undefined && descriptor.get === undefined ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /**
  * The default environment: the valid default plan under its own digest, a
@@ -321,6 +373,20 @@ const makeDeps = (over: {
   const store: Record<string, unknown>[] = [...((over.entries ?? []) as Record<string, unknown>[])];
   const appended: Record<string, unknown>[] = [];
   let entryCounter = 0;
+  const append = vi.fn(async (entry: Record<string, unknown>) => {
+    if (live.appendThrows) throw new Error('journal write down');
+    const record = { ...entry, entryId: `entry-${(entryCounter += 1)}` };
+    const result =
+      live.appendResults !== undefined && live.appendResults.length > 0
+        ? live.appendResults.shift()
+        : { outcome: 'appended', entry: record };
+    // A refused append writes nothing (the adapter's own guarantee).
+    if ((result as { outcome?: string } | null)?.outcome === 'appended') {
+      appended.push(record);
+      store.push(record);
+    }
+    return result;
+  });
   const deps: Record<string, unknown> = {
     planRepo: {
       findByDigest: vi.fn(async (_planDigest: string) => {
@@ -337,22 +403,7 @@ const makeDeps = (over: {
           over.journalResult ?? { outcome: 'listed', entries: store }
         ) as unknown as CutoverJournalListResult;
       }),
-      append: live.noAppend
-        ? undefined
-        : vi.fn(async (entry: Record<string, unknown>) => {
-            if (live.appendThrows) throw new Error('journal write down');
-            const record = { ...entry, entryId: `entry-${(entryCounter += 1)}` };
-            const result =
-              live.appendResults !== undefined && live.appendResults.length > 0
-                ? live.appendResults.shift()
-                : { outcome: 'appended', entry: record };
-            // A refused append writes nothing (the adapter's own guarantee).
-            if ((result as { outcome?: string } | null)?.outcome === 'appended') {
-              appended.push(record);
-              store.push(record);
-            }
-            return result;
-          }),
+      append: live.noAppend ? undefined : append,
     },
     computeDigest: over.computeDigest ?? computeDigest,
     authorization: live.noAuthorization
@@ -405,6 +456,31 @@ const makeDeps = (over: {
           if (live.saveThrows) throw new Error('save down');
           return live.save !== undefined ? live.save : { outcome: 'saved' };
         }),
+    // AR2c: the default adoptLane refuses (like any malformed port answer),
+    // so a lane whose adopt runs stops with `adopt-failed`; adopt tests
+    // override `live.adopt` with the outcome they need. An `adopted` outcome
+    // journals the four adopt sub-steps, as the real AdoptLaneUseCase does,
+    // so the wave's re-derivation sees the adopt completed.
+    adoptLane: (live.noAdoptLane
+      ? undefined
+      : vi.fn(async (request: unknown) => {
+          if (live.adoptThrows) throw new Error('adopt down');
+          const answer = live.adopt !== undefined ? live.adopt : { outcome: 'refused', reason: 'invalid-request' };
+          if (
+            plainOutcome(answer) === 'adopted' &&
+            typeof (request as { planDigest?: unknown } | null)?.planDigest === 'string' &&
+            typeof (request as { laneId?: unknown } | null)?.laneId === 'string'
+          ) {
+            const planDigest = (request as { planDigest: string }).planDigest;
+            const laneId = (request as { laneId: string }).laneId;
+            for (const sub of ADOPT_SUB_STEPS) {
+              const subKey = `relaunch/${planDigest}/${laneId}/adopt/${sub}`;
+              await append({ key: subKey, kind: 'intent' });
+              await append({ key: subKey, kind: 'result', outcome: 'completed' });
+            }
+          }
+          return answer;
+        })) as unknown as Deps['adoptLane'],
     mintEntryId: live.noMint ? undefined : vi.fn(() => `minted-${(entryCounter += 1)}`),
   };
   deps['appended'] = appended;
@@ -422,6 +498,8 @@ const applyRequest = (planDigest: string, over: Record<string, unknown> = {}): u
   nowIso: NOW,
   apply: true,
   grantId: 'grant-1',
+  saveInputs: [saveInput()],
+  adoptInputs: [adoptInput()],
   ...over,
 });
 
@@ -901,7 +979,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     }
   });
 
-  it('U15: refuses an over-long grantId as invalid-request before the secret scan, and refuses a live lane whose adopt step is not completed as adopt-not-implemented (AR2c owns adopt)', async () => {
+  it('U15: refuses an over-long grantId as invalid-request before the secret scan, and stops a live lane whose adopt is refused with adopt-failed (AR2c)', async () => {
     // Over-long grantId: 4097 characters, secret-shaped, so the length cap
     // (O(1)) must refuse before `hasSecretShape` (O(length)) ever runs.
     const longGrant = `sk-${'a'.repeat(4097)}`;
@@ -911,7 +989,8 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
         applyRequest(plan.planDigest, { grantId: longGrant }),
       ),
     ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
-    // A live wave stops at adopt: the default idle lane's adopt is absent.
+    // A live wave saves and then stops at adopt: the default adoptLane
+    // refuses, so the lane refuses adopt-failed.
     const liveP = buildPlan([conductedLaneWithRun(), idleLane(hex('adopt-gate plan'))]);
     const digest = liveP.planDigest;
     const deps = makeDeps({ plan: liveP, live: {} });
@@ -919,10 +998,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
         applyRequest(digest, { saveInputs: [saveInput()] }),
       ),
-    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
-    // The grant was consumed by the authorized call, but no save intent was
-    // journaled for the lane before adopt refused? No — save ran first; the
-    // adopt gate is what stopped the wave. Assert exactly what happened.
+    ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     expect(deps.saveLaneEdits).toHaveBeenCalledTimes(1);
     expect(deps.appended!.map((entry) => `${entry.kind}:${entry.key}`)).toEqual([
       `intent:relaunch/${digest}/lane-2/save`,
@@ -1266,7 +1342,9 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     }
     // A missing saveInput for the non-conducted lane names the lane.
     const deps = makeDeps({ plan, live: {} });
-    expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest))).toEqual({
+    const noSave = applyRequest(digest) as Record<string, unknown>;
+    delete noSave['saveInputs'];
+    expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(noSave)).toEqual({
       outcome: 'refused',
       reason: 'stale-plan-state',
       laneId: 'lane-2',
@@ -1404,17 +1482,17 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     }
   });
 
-  it('U26: resuming a save in intent-only with a matching digest re-calls saveLaneEdits without appending a second intent, then stops at adopt', async () => {
+  it('U26: resuming a save in intent-only with a matching digest re-calls saveLaneEdits without appending a second intent, then stops at the refused adopt', async () => {
     const digest = livePlan('resume plan').planDigest;
     const input = saveInput();
     const entries = [intent(key(digest, 'lane-2', 'save'), saveInputDigest(digest, input))];
     const deps = makeDeps({ plan: livePlan('resume plan'), entries, live: {} });
     expect(
       await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: [input] })),
-    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     expect(deps.saveLaneEdits).toHaveBeenCalledTimes(1);
     // No second save intent was journaled (I7): the only appended entry is
-    // the later wave's — here none, because adopt refused first.
+    // the later wave's — here none, because the adopt refused first.
     expect(deps.appended).toEqual([]);
   });
 
@@ -1431,7 +1509,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
         applyRequest(digest, { saveInputs: [saveInput()] }),
       ),
-    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     expect(deps.runner!.abortWorktreeRun).toHaveBeenCalledWith(
       expect.objectContaining({ attemptId: 'attempt-1', gracePeriodSeconds: 30 }),
     );
@@ -1458,7 +1536,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       const deps = makeDeps({ plan, entries: [...entries], live });
       expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
         outcome: 'refused',
-        reason: 'adopt-not-implemented',
+        reason: 'adopt-failed',
         laneId: 'lane-2',
       });
       expect(deps.processTreeTermination!.terminateWorktreeProcesses).toHaveBeenCalledTimes(1);
@@ -1497,7 +1575,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const idle = makeDeps({ plan, entries: [...entries], live: {} });
     expect(await new ApplyRelaunchUseCase(idle).applyRelaunch(request())).toEqual({
       outcome: 'refused',
-      reason: 'adopt-not-implemented',
+      reason: 'adopt-failed',
       laneId: 'lane-2',
     });
     expect(idle.runner!.abortWorktreeRun).not.toHaveBeenCalled();
@@ -1550,14 +1628,21 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
         ...completedAdopt(plan.planDigest, 'lane-3'),
+        // lane-4's adopt is still absent: it must carry an adopt input and
+        // its own adopt re-checks the cap before adoptLane runs (AR2c).
         ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
-        ...completedAdopt(plan.planDigest, 'lane-4'),
       ];
       return { plan, inputs, entries };
     };
-    // Cap 2: lane-3 hands off (0 + 1 < 2), lane-4 then crosses (0 + 2 >= 2).
-    // lane-2's worktree still runs (its redispatch is intent-only), so the
-    // preflight counts one hand-off before the wave starts.
+    const lane4AdoptInput = adoptInput({
+      laneId: 'lane-4',
+      attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-4' },
+      run: { ...(adoptInput()['run'] as object), runId: 'run-11' },
+    });
+    // Cap 2: lane-2's pending hand-off and lane-3's completed adopt are
+    // counted (0 conducted + 2 >= 2), so lane-4's absent adopt refuses before
+    // its intent or adopt could be written; lane-3's own redispatch (a
+    // completed adopt) hands off without a cap re-check.
     const capped = setup(2);
     const deps = makeDeps({
       plan: capped.plan,
@@ -1566,24 +1651,26 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     });
     expect(
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
-        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs }),
+        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs, adoptInputs: [lane4AdoptInput] }),
       ),
     ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-4' });
     expect(
       deps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
     ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
-    // Cap 3: both wave-2 lanes hand off within the same wave.
+    // Cap 3: lane-4's adopt fits and both wave-2 lanes hand off.
     const roomier = setup(3);
-    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: {} });
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { adopt: { outcome: 'adopted', reused: false } } });
     expect(
       await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
-        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs }),
+        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs, adoptInputs: [lane4AdoptInput] }),
       ),
     ).toMatchObject({ outcome: 'applied', wave: 2 });
+    expect(roomierDeps.adoptLane).toHaveBeenCalledTimes(1);
     expect(
       roomierDeps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
     ).toEqual([
       key(roomier.plan.planDigest, 'lane-3', 'redispatch'),
+      ...ADOPT_SUB_STEPS.map((sub) => adoptKey(roomier.plan.planDigest, 'lane-4', sub)),
       key(roomier.plan.planDigest, 'lane-4', 'redispatch'),
     ]);
   });
@@ -1706,13 +1793,13 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
     }
     // The valid host block itself still parses and reaches the live wave,
-    // which saves and then stops at adopt (AR2c).
+    // which saves and then stops at the refused adopt (the default adoptLane).
     const deps = makeDeps({ plan, live: {} });
     expect(
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
         applyRequest(digest, { saveInputs: [saveInput({ recordedHost: validHost })] }),
       ),
-    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     expect(deps.saveLaneEdits).toHaveBeenCalledWith(expect.objectContaining({ recordedHost: validHost }));
     expect(deps.planRepo.findByDigest).toHaveBeenCalled();
   });
@@ -1736,7 +1823,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
         applyRequest(plan.planDigest, { saveInputs: [input] }),
       ),
-    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     // The digest still matched the original snapshot, so the save resumed
     // with the ORIGINAL field values, not the mutated ones.
     expect(deps.saveLaneEdits).toHaveBeenCalledWith(
@@ -1767,7 +1854,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     });
     expect(await new ApplyRelaunchUseCase(running).applyRelaunch(request())).toEqual({
       outcome: 'refused',
-      reason: 'adopt-not-implemented',
+      reason: 'adopt-failed',
       laneId: 'lane-2',
     });
     expect(order).toEqual(['save', 'abort', 'save']);
@@ -1794,7 +1881,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     });
     expect(await new ApplyRelaunchUseCase(idle).applyRelaunch(request())).toEqual({
       outcome: 'refused',
-      reason: 'adopt-not-implemented',
+      reason: 'adopt-failed',
       laneId: 'lane-2',
     });
     expect(idleOrder).toEqual(['save', 'abort']);
@@ -1909,35 +1996,44 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
         intent(key(plan.planDigest, 'lane-2', 'redispatch')),
         ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
         ...completedAdopt(plan.planDigest, 'lane-3'),
+        // lane-4's adopt is still absent: it must carry an adopt input and
+        // its own adopt re-checks the cap before adoptLane runs (AR2c).
         ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
-        ...completedAdopt(plan.planDigest, 'lane-4'),
       ];
       return { plan, inputs, entries };
     };
-    // Cap 2: the pending hand-off on lane-2 counts (its worktree is idle),
-    // so lane-3 fills the cap (1 + 1 = 2) and lane-4 crosses it.
+    const lane4AdoptInput = adoptInput({
+      laneId: 'lane-4',
+      attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-4' },
+      run: { ...(adoptInput()['run'] as object), runId: 'run-11' },
+    });
+    // Cap 2: the pending hand-off on lane-2 (idle worktree) and lane-3's
+    // completed adopt both count (0 + 2 >= 2), so lane-4's absent adopt
+    // refuses before its intent or adopt could be written.
     const capped = setup(2);
     const deps = makeDeps({ plan: capped.plan, entries: capped.entries, live: { inspect: { state: 'idle' } } });
     expect(
       await new ApplyRelaunchUseCase(deps).applyRelaunch(
-        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs }),
+        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs, adoptInputs: [lane4AdoptInput] }),
       ),
     ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-4' });
     expect(
       deps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
     ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
-    // Cap 3: the pending hand-off plus both wave-2 lanes fit.
+    // Cap 3: lane-4's adopt fits and both wave-2 lanes hand off.
     const roomier = setup(3);
-    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { inspect: { state: 'idle' } } });
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { inspect: { state: 'idle' }, adopt: { outcome: 'adopted', reused: false } } });
     expect(
       await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
-        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs }),
+        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs, adoptInputs: [lane4AdoptInput] }),
       ),
     ).toMatchObject({ outcome: 'applied', wave: 2 });
+    expect(roomierDeps.adoptLane).toHaveBeenCalledTimes(1);
     expect(
       roomierDeps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
     ).toEqual([
       key(roomier.plan.planDigest, 'lane-3', 'redispatch'),
+      ...ADOPT_SUB_STEPS.map((sub) => adoptKey(roomier.plan.planDigest, 'lane-4', sub)),
       key(roomier.plan.planDigest, 'lane-4', 'redispatch'),
     ]);
   });

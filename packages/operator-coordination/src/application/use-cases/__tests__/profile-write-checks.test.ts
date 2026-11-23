@@ -4,8 +4,10 @@
  * no filesystem, network or timer use; total cost is O(n log n) over tiny
  * fixture inputs (sorting a handful of keys), well under 100ms.
  *
- * These tests document the helpers' current behaviour as observed; VB17 is a
- * test-only lane and does not modify the production helpers.
+ * These tests document the helpers' behaviour as observed. The fix round for
+ * run-01M8586J1XFBDK1EC2M5WA3R72 additionally required `trimStringArray` to
+ * refuse an array hole with a named error (it previously passed holes
+ * through), so that refusal is asserted here against the current helper.
  */
 
 import { ProjectProfile } from '../../../domain/entities/ProjectProfile.js';
@@ -218,6 +220,86 @@ describe('parseProfileRecord', () => {
     });
     spy.mockRestore();
   });
+
+  it('returns { reason } with a throwing field getter\'s Error message, reading the getter once', () => {
+    let reads = 0;
+    const candidate = {
+      ...baseRecord,
+      get projectId(): string {
+        reads += 1;
+        throw new Error('getter refused the read');
+      },
+    } as unknown as ProjectProfileRecord;
+    expect(parseProfileRecord(candidate, 'fallback')).toEqual({
+      reason: 'getter refused the read',
+    });
+    // The helper never retried the read after the typed refusal.
+    expect(reads).toBe(1);
+  });
+
+  it('returns { reason: fallbackReason } when a field getter throws a non-Error value', () => {
+    const candidate = {
+      ...baseRecord,
+      get projectId(): string {
+        throw 'getter threw a string';
+      },
+    } as unknown as ProjectProfileRecord;
+    expect(parseProfileRecord(candidate, 'fallback')).toEqual({ reason: 'fallback' });
+  });
+
+  it('treats a consistent Proxy over a valid record like the record (documented residual)', () => {
+    // A Proxy that lies consistently in every trap is an accepted residual of
+    // the hostile-input rule; a transparent proxy is parsed like its target.
+    const proxy = new Proxy(baseRecord, {});
+    const result = parseProfileRecord(proxy as unknown as ProjectProfileRecord, 'fallback');
+    expect(result).toEqual({ profile: ProjectProfile.fromRecord(baseRecord).toRecord() });
+  });
+
+  it('returns { reason } with the Proxy get trap\'s Error message when the trap throws', () => {
+    const proxy = new Proxy(baseRecord, {
+      get(target, key, receiver) {
+        if (key === 'projectId') {
+          throw new Error('proxy trap refused the read');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(parseProfileRecord(proxy as unknown as ProjectProfileRecord, 'fallback')).toEqual({
+      reason: 'proxy trap refused the read',
+    });
+  });
+
+  it('parses an enormous-length projectId today (documented residual: no length cap)', () => {
+    // Cost bound: building one 1e6-character string and validating it is
+    // O(n) in that length and stays far under the 100ms budget. The helper
+    // delegates length policy to ProjectProfile.fromRecord, which only
+    // requires a non-empty value; the absence of a cap is documented, not
+    // asserted as intended design.
+    const candidate = {
+      ...baseRecord,
+      projectId: 'x'.repeat(1_000_000),
+    } as ProjectProfileRecord;
+    const result = parseProfileRecord(candidate, 'fallback');
+    expect(result).toHaveProperty('profile');
+    expect((result as { profile: ProjectProfileRecord }).profile.projectId.length).toBe(1_000_000);
+  });
+
+  it('refuses a prototype-polluting clone key without polluting Object.prototype', () => {
+    // An own enumerable '__proto__' data property (as a parsed payload would
+    // carry) reaches the clone-key check and is refused there.
+    const pollutingClones: ProjectProfileRecord['clones'] = {};
+    Object.defineProperty(pollutingClones, '__proto__', {
+      value: { path: '/clones/p', worktreeRoot: '/worktrees/p' },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const candidate = { ...baseRecord, clones: pollutingClones } as ProjectProfileRecord;
+    expect(parseProfileRecord(candidate, 'fallback')).toEqual({
+      reason: 'ProjectProfile clone host name is invalid: __proto__',
+    });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
 });
 
 describe('saveProfileWithConflictCheck', () => {
@@ -272,13 +354,14 @@ describe('trimStringArray', () => {
     expect(trimStringArray(['  a  ', 'b  ', obj as unknown as string])).toEqual(['a', 'b', obj]);
     // Non-string element keeps its identity.
     expect(trimStringArray([obj as unknown as string])[0]).toBe(obj);
-    // Array holes survive the map (sparse arrays are passed through by value):
+    // An array hole is refused with a named error, not accepted or carried
+    // through; the scan over the array's own indices is O(n) over a tiny input.
     // eslint-disable-next-line no-sparse-arrays
     const sparse = ['  a  ', , 'b'];
-    const trimmed = trimStringArray(sparse as unknown as string[]);
-    expect(Array.isArray(trimmed)).toBe(true);
-    expect(trimmed[0]).toBe('a');
-    expect(1 in (trimmed as unknown as string[])).toBe(false);
+    expect(() => trimStringArray(sparse as unknown as string[])).toThrow(TypeError);
+    expect(() => trimStringArray(sparse as unknown as string[])).toThrow(
+      'trimStringArray refuses an array hole at index 1',
+    );
 
     const arr = ['x  ', ' y'];
     expect(trimStringArray(arr)).toEqual(['x', 'y']);

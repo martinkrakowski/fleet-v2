@@ -37,6 +37,7 @@ import type {
   WorktreeRunState,
 } from '../../ports/out/ExecutionRunnerPort.out-port.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type {
   SaveLaneEditsRequest,
   SaveLaneEditsResult,
@@ -309,7 +310,11 @@ interface Deps {
   computeDigest: (text: string) => string;
   authorization?: { authorizeRelaunchApply: (request: unknown) => Promise<AuthorizeRelaunchApplyResult> };
   clock: () => string;
-  runRepo?: { get: (runId: string) => Promise<LaneRunRecord | null> };
+  runRepo?: { get: (runId: string) => Promise<LaneRunRecord | null>; list: () => Promise<readonly LaneRunRecord[]> };
+  runJournal?: {
+    listForRun: (runId: string) => Promise<readonly LaneRunJournalEntryRecord[]>;
+    listForRuns?: (runIds: readonly string[]) => Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>>;
+  };
   runner?: {
     inspectWorktreeRun: (ref: WorktreeRunRef) => Promise<WorktreeRunState>;
     abortWorktreeRun: (request: AbortWorktreeRunRequest) => Promise<AbortWorktreeRunResult>;
@@ -329,6 +334,7 @@ interface Deps {
 /** Overrides for the live apply's ports; each `no*` drops a port entirely. */
 interface LiveOver {
   noRunRepo?: boolean;
+  noRunJournal?: boolean;
   noRunner?: boolean;
   noTerminate?: boolean;
   noSave?: boolean;
@@ -338,6 +344,14 @@ interface LiveOver {
   noAuthorization?: boolean;
   run?: unknown;
   runThrows?: boolean;
+  /** The `runRepo.list()` answer; the default is an empty list. */
+  runs?: unknown;
+  runListThrows?: boolean;
+  /** A per-run journal answer for `listForRun`/`listForRuns`; the default is empty. */
+  runJournalFor?: (runId: string) => unknown;
+  runJournalThrows?: boolean;
+  /** Replaces the whole `listForRuns` answer (for hostile-map cases). */
+  runJournalResult?: unknown;
   inspect?: unknown;
   /** Per-attempt inspect results, taking precedence over `inspect`. */
   inspectByAttempt?: Record<string, unknown>;
@@ -444,6 +458,23 @@ const makeDeps = (over: {
           get: vi.fn(async (_runId: string) => {
             if (live.runThrows) throw new Error('run store down');
             return live.run !== undefined ? live.run : { runId: 'run-1', state: 'running' };
+          }),
+          list: vi.fn(async () => {
+            if (live.runListThrows) throw new Error('run list down');
+            return (live.runs === undefined ? [] : live.runs) as readonly LaneRunRecord[];
+          }),
+        },
+    runJournal: live.noRunJournal
+      ? undefined
+      : {
+          listForRun: vi.fn(async (runId: string) => {
+            if (live.runJournalThrows) throw new Error('run journal down');
+            return live.runJournalFor?.(runId) ?? [];
+          }),
+          listForRuns: vi.fn(async (ids: readonly string[]) => {
+            if (live.runJournalThrows) throw new Error('run journal down');
+            if (live.runJournalResult !== undefined) return live.runJournalResult as ReadonlyMap<string, readonly unknown[]>;
+            return new Map(ids.map((id) => [id, live.runJournalFor?.(id) ?? []]));
           }),
         },
     runner: live.noRunner
@@ -2057,5 +2088,335 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ...ADOPT_SUB_STEPS.map((sub) => adoptKey(roomier.plan.planDigest, 'lane-4', sub)),
       key(roomier.plan.planDigest, 'lane-4', 'redispatch'),
     ]);
+  });
+
+  // ---- AR3b: run-repository reconciliation of redispatch hand-offs ----
+
+  /** A minimal LaneRunRecord-shaped run the reconciliation reads. */
+  const runRecord = (runId: string, workOrderId: string, attemptIds: string[]): Record<string, unknown> => ({
+    version: 1, runId, workOrderId, attemptIds,
+  });
+
+  const RUN_A = `run-7${'A'.repeat(25)}`;
+  const RUN_B = `run-7${'B'.repeat(25)}`;
+
+  /** A valid wave-2 adopt input for lane-3. */
+  const lane3AdoptInput = (): Record<string, unknown> =>
+    adoptInput({
+      laneId: 'lane-3',
+      attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-3' },
+      run: { ...(adoptInput()['run'] as object), runId: `run-7${'C'.repeat(25)}` },
+    });
+
+  /** The full `adopted` answer matching the lane-3 adopt input. */
+  const lane3Adopted = (): Record<string, unknown> => ({
+    outcome: 'adopted', reused: false, workOrderId: 'wo-9', briefDigest: hex('do the thing'),
+    attemptId: 'attempt-3', runId: `run-7${'C'.repeat(25)}`, commitOid: 'c'.repeat(64),
+    enteredState: 'collecting', provenance: 'adopted',
+  });
+
+  /** A valid conduct journal entry carrying the run's state. */
+  const conductEntry = (runId: string, state: string): Record<string, unknown> => ({
+    version: 1,
+    entryId: `7${'A'.repeat(25)}`,
+    kind: 'conduct',
+    key: null,
+    runId,
+    recordedAtIso: BEFORE_DEADLINE,
+    mode: null,
+    expectedRevision: null,
+    mintedId: null,
+    outcome: null,
+    reasonCode: null,
+    detail: null,
+    grantId: null,
+    state,
+  });
+
+  /** A two-wave plan whose wave-1 lane holds a redispatch intent; its plan workOrderId is null. */
+  const handoffPlan = (maxActiveRuns: number): { plan: RelaunchPlanRecord; inputs: Record<string, unknown>[] } => {
+    const seed = 'handoff plan';
+    const digest = hex(seed);
+    const lane2 = { ...idleLane(digest, 'lane-2', ['lane-1']), workOrderId: null };
+    const lane3 = { ...idleLane(digest, 'lane-3', ['lane-2']), hostName: 'host-c', admissionWave: 2, dispatchEndpointKey: 'opencode:host-c:4321' };
+    const plan = buildPlan([conductedLaneWithRun(), lane2, lane3], maxActiveRuns);
+    const inputs = [saveInput(), saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' })];
+    return { plan, inputs };
+  };
+
+  it('AR3b-1: a wave-1 intent-only hand-off whose matched run is terminal appends handed-off, frees capacity and admits wave 2 in the same call, resolving the unrecorded lane work order id from the re-sent adopt input', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const deps = makeDeps({
+      plan,
+      entries,
+      live: {
+        runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+        runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'merged')] : []),
+        adopt: lane3Adopted(),
+      },
+    });
+    const adopt3 = lane3AdoptInput();
+    const result = await new ApplyRelaunchUseCase(deps).applyRelaunch(
+      applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), adopt3] }),
+    );
+    expect(result).toMatchObject({ outcome: 'applied', wave: 2 });
+    // The hand-off result for lane-2 was journaled, then lane-3 was adopted and handed off.
+    expect(deps.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['result', key(digest, 'lane-2', 'redispatch')],
+      ...ADOPT_SUB_STEPS.flatMap((sub) => [['intent', adoptKey(digest, 'lane-3', sub)], ['result', adoptKey(digest, 'lane-3', sub)]]),
+      ['intent', key(digest, 'lane-3', 'redispatch')],
+    ]);
+    // The refreshed summary shows lane-2's redispatch completed.
+    const summary = (result as unknown as { lanes: { laneId: string; stepStatuses: { step: string; status: string }[] }[] }).lanes.find(
+      (entry) => entry.laneId === 'lane-2',
+    );
+    expect(summary?.stepStatuses.find((entry) => entry.step === 'redispatch')).toEqual({
+      step: 'redispatch', status: 'completed',
+    });
+    // The capacity was freed: maxActiveRuns 2 with a terminal matched run still admitted lane-3's adopt.
+    expect(deps.adoptLane).toHaveBeenCalledTimes(1);
+  });
+
+  it('AR3b-2: a wave-1 intent-only hand-off whose matched run is another non-terminal attempt appends handed-off but keeps the slot spent, so wave 2 refuses active-run-cap-reached', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const adopt3 = lane3AdoptInput();
+    const deps = makeDeps({
+      plan,
+      entries,
+      live: {
+        // The worktree reports idle, but the run repository shows a live
+        // other-attempt run: the slot stays spent whatever the worktree says.
+        inspect: { state: 'idle' },
+        runs: [runRecord(RUN_A, 'wo-9', ['attempt-other'])],
+        runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'running')] : []),
+      },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), adopt3] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-3' });
+    // The handed-off result was still journaled for lane-2; lane-3 got nothing.
+    expect(deps.appended!.map((entry) => [(entry as { reasonCode?: string }).reasonCode, entry.key])).toEqual([
+      ['handed-off', key(digest, 'lane-2', 'redispatch')],
+    ]);
+    expect(deps.adoptLane).not.toHaveBeenCalled();
+  });
+
+  it('AR3b-3: a wave-2 completed redispatch with a matched non-terminal run and an idle worktree still counts toward the cap', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      result(key(digest, 'lane-2', 'redispatch'), 'completed'),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const adopt3 = lane3AdoptInput();
+    const deps = makeDeps({
+      plan,
+      entries,
+      live: {
+        inspect: { state: 'idle' },
+        runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+        runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'running')] : []),
+      },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), adopt3] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-3' });
+    // A completed redispatch is never re-journaled as handed-off.
+    expect(deps.appended).toEqual([]);
+  });
+
+  it('AR3b-4: a failed handed-off append whose journal re-read shows the result completed continues; one that does not show completed refuses journal-write-failed', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const baseEntries = (): unknown[] => [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const adopt3 = lane3AdoptInput();
+    const handoffLive = {
+      runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+      runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'merged')] : []),
+      adopt: lane3Adopted(),
+    };
+    // The append "lands elsewhere": the entry reaches the store the re-read
+    // sees, while the append answer itself is a refusal.
+    const racer = makeDeps({ plan, entries: baseEntries(), live: handoffLive });
+    const racerAppend = racer.cutoverJournal.append as unknown as ReturnType<typeof vi.fn>;
+    const racerOriginal = racerAppend.getMockImplementation() as (entry: Record<string, unknown>) => Promise<unknown>;
+    racerAppend.mockImplementation(async (entry: Record<string, unknown>) => {
+      const record = { ...entry, entryId: 'peer-1' };
+      const outcome = await racerOriginal({ ...entry, outcome: entry.outcome ?? 'completed' });
+      if (entry.key === key(digest, 'lane-2', 'redispatch')) {
+        return { outcome: 'refused', reason: 'store-read-only', entry: record };
+      }
+      return outcome;
+    });
+    expect(
+      await new ApplyRelaunchUseCase(racer).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), adopt3] }),
+      ),
+    ).toMatchObject({ outcome: 'applied', wave: 2 });
+    // The append truly failed and the store never saw the result: a refusal.
+    const loser = makeDeps({ plan, entries: baseEntries(), live: { ...handoffLive, appendResults: [{ outcome: 'refused', reason: 'store-read-only' }] } });
+    expect(
+      await new ApplyRelaunchUseCase(loser).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), adopt3] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'journal-write-failed', laneId: 'lane-2' });
+  });
+
+  it('AR3b-5: a hostile runRepo.list answer — throw, null, non-array, array-like, hole, over-sized, getter element, polluting key, two runs on one work order — refuses stale-plan-state before the grant is spent', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+    ];
+    const refused = async (runs: unknown): Promise<void> => {
+      const deps = makeDeps({ plan, entries, live: { run: null, runs } });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: inputs }))).toEqual({
+        outcome: 'refused', reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    };
+    // The runRepo.list() call itself throwing refuses before the grant.
+    const runListThrowsDeps = makeDeps({ plan, entries, live: { run: null, runListThrows: true } });
+    expect(
+      await new ApplyRelaunchUseCase(runListThrowsDeps).applyRelaunch(applyRequest(digest, { saveInputs: inputs })),
+    ).toEqual({ outcome: 'refused', reason: 'stale-plan-state' });
+    expect(runListThrowsDeps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    await refused(null);
+    await refused('not-an-array');
+    // An array-like is not an array.
+    await refused({ length: 1, 0: runRecord(RUN_A, 'wo-9', ['attempt-1']) });
+    // A hole is not a run.
+    const holed: unknown[] = [runRecord(RUN_A, 'wo-9', ['attempt-1'])];
+    delete (holed as { 0?: unknown })[0];
+    await refused(holed);
+    // An over-sized list is refused in the bounded read (cap 512).
+    await refused(new Array(513).fill(runRecord(RUN_A, 'wo-9', ['attempt-1'])));
+    // An element whose field is an accessor is unreadable, so invalid.
+    const getterRun = runRecord(RUN_A, 'wo-9', ['attempt-1']);
+    Object.defineProperty(getterRun, 'workOrderId', {
+      enumerable: true, configurable: true,
+      get(): string {
+        throw new Error('getter must never run');
+      },
+    });
+    await refused([getterRun]);
+    // A Proxy whose ownKeys trap throws is refused without running any get trap.
+    await refused(new Proxy([runRecord(RUN_A, 'wo-9', ['attempt-1'])], {
+      ownKeys(): ArrayLike<string | symbol> {
+        throw new Error('trap must never be crossed');
+      },
+    }));
+    // A polluting own key on the runs array is refused.
+    await refused(withPollutingKey('__proto__', runRecord(RUN_A, 'wo-9', ['attempt-1'])));
+    // More than one run matching the lane's work order id is a stale plan,
+    // named by the lane.
+    const doubled = makeDeps({
+      plan, entries,
+      live: { run: null, runs: [runRecord(RUN_A, 'wo-9', ['attempt-1']), runRecord(RUN_B, 'wo-9', ['attempt-1'])] },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(doubled).applyRelaunch(applyRequest(digest, { saveInputs: inputs })),
+    ).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(doubled.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+  });
+
+  it('AR3b-6: a hostile runJournal answer — throw, non-map, missing run id, malformed entry — refuses stale-plan-state before the grant is spent', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+    ];
+    const refused = async (over: Record<string, unknown>): Promise<void> => {
+      const deps = makeDeps({ plan, entries, live: { run: null, runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])], ...over } });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: inputs }))).toEqual({
+        outcome: 'refused', reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    };
+    await refused({ runJournalThrows: true });
+    await refused({ runJournalResult: 'not-a-map' });
+    await refused({ runJournalResult: new Map() }); // the matched run id is missing
+    await refused({ runJournalResult: new Map([[RUN_A, [7]]]) }); // a malformed entry
+    await refused({ runJournalResult: new Map([[RUN_A, new Array(201).fill(conductEntry(RUN_A, 'running'))]]) }); // over-sized
+  });
+
+  it('AR3b-7: a redispatch already refused or ambiguous refuses stale-plan-state, and an inconsistent one refuses step-inconsistent, in both cases without any append', async () => {
+    const { plan, inputs } = handoffPlan(3);
+    const digest = plan.planDigest;
+    const head = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const fullRequest = (): unknown =>
+      applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), lane3AdoptInput()] });
+    for (const [outcome, reason] of [['refused', 'stale-plan-state'], ['ambiguous', 'stale-plan-state']] as const) {
+      const deps = makeDeps({
+        plan,
+        entries: [...head, intent(key(digest, 'lane-2', 'redispatch')), result(key(digest, 'lane-2', 'redispatch'), outcome)],
+        live: { run: null, runs: [] },
+      });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(fullRequest())).toEqual({
+        outcome: 'refused', reason, laneId: 'lane-2',
+      });
+      expect(deps.appended).toEqual([]);
+    }
+    // A result without its intent is an inconsistent ledger.
+    const inconsistent = makeDeps({
+      plan,
+      entries: [...head, result(key(digest, 'lane-2', 'redispatch'), 'completed')],
+      live: { run: null, runs: [] },
+    });
+    expect(await new ApplyRelaunchUseCase(inconsistent).applyRelaunch(fullRequest())).toEqual({
+      outcome: 'refused', reason: 'step-inconsistent', laneId: 'lane-2',
+    });
+    expect(inconsistent.appended).toEqual([]);
+  });
+
+  it('AR3b-8: a deadline that expires during the save intent append refuses budget-exhausted before saveLaneEdits runs', async () => {
+    const plan = livePlan('intent-deadline plan');
+    const digest = plan.planDigest;
+    let now = CLOCK_NOW;
+    const deps = makeDeps({ plan, clock: () => now, live: {} });
+    (deps.cutoverJournal.append as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (entry: Record<string, unknown>) => {
+      if (entry.key === key(digest, 'lane-2', 'save') && entry.kind === 'intent') now = PAST_DEADLINE;
+      return { outcome: 'appended', entry: { ...entry, entryId: 'entry-x' } };
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { deadlineIso: DEADLINE }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(deps.saveLaneEdits).not.toHaveBeenCalled();
   });
 });

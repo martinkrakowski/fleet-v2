@@ -43,6 +43,13 @@ import {
 import { adoptLaneInputFault, COMMIT as ADOPT_COMMIT, isAdoptLaneId } from './AdoptLaneUseCase.use-case.js';
 import { relaunchStepStatus } from '../../domain/relaunch-step-ledger.js';
 import { parseValidatedStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
+import { journalsForRuns, type RunJournalRunReads } from './run-journal-reads.js';
+import {
+  laneRunJournalState,
+  readLaneRunJournalEntryRecord,
+  type LaneRunJournalEntryRecord,
+} from '../../domain/lane-run-journal.js';
+import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type {
   AdoptLanePort,
   AdoptLaneSource,
@@ -84,7 +91,9 @@ export interface ApplyRelaunchDependencies {
   readonly saveLaneEdits?: Pick<SaveLaneEditsPort, 'saveLaneEdits'>['saveLaneEdits'];
   readonly runner?: Pick<ExecutionRunnerPort, 'inspectWorktreeRun' | 'abortWorktreeRun'>;
   readonly processTreeTermination?: Pick<ProcessTreeTerminationPort, 'terminateWorktreeProcesses'>;
-  readonly runRepo?: Pick<LaneRunRepositoryPort, 'get'>;
+  readonly runRepo?: Pick<LaneRunRepositoryPort, 'get' | 'list'>;
+  /** The run journals of the runs the preflight reconciles; `listForRun` required, `listForRuns` optional. */
+  readonly runJournal?: RunJournalRunReads;
   readonly adoptLane?: Pick<AdoptLanePort, 'adoptLane'>['adoptLane'];
   readonly mintEntryId?: () => string;
 }
@@ -978,6 +987,8 @@ interface RunCounts {
 function hasLivePorts(deps: ApplyRelaunchDependencies): boolean {
   return (
     typeof deps.runRepo?.get === 'function' &&
+    typeof deps.runRepo?.list === 'function' &&
+    typeof deps.runJournal?.listForRun === 'function' &&
     typeof deps.runner?.inspectWorktreeRun === 'function' &&
     typeof deps.runner?.abortWorktreeRun === 'function' &&
     typeof deps.processTreeTermination?.terminateWorktreeProcesses === 'function' &&
@@ -1004,12 +1015,175 @@ async function probeConductedLane(
   return null;
 }
 
+/** Bound on the run records one preflight reconciliation reads (cost: O(runs)). */
+const MAX_RECONCILED_RUNS = MAX_RELAUNCH_APPLY_LANES;
+/** Bound on the journal entries one run's reconciliation reads (cost: O(entries)). */
+const MAX_RECONCILED_ENTRIES = 200;
+
+/** The fields of a `LaneRunRecord` the hand-off reconciliation reads. */
+interface ReconciledRun {
+  readonly runId: string;
+  readonly workOrderId: string;
+  readonly attemptIds: readonly string[];
+}
+
+/**
+ * One run record read through its own data descriptors (no getter ever runs);
+ * `null` when any required field is missing, an accessor, out of grammar or
+ * over-sized. Cost: three descriptor reads plus one bounded array walk.
+ */
+function readReconciledRun(value: unknown): ReconciledRun | null {
+  const runId = own(value, 'runId');
+  const workOrderId = own(value, 'workOrderId');
+  const attemptIds = own(value, 'attemptIds');
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) return null;
+  if (typeof workOrderId !== 'string' || workOrderId === '') return null;
+  if (typeof attemptIds === 'string' && attemptIds !== '') {
+    return { runId, workOrderId, attemptIds: [attemptIds] };
+  }
+  const dense = readBoundedDenseArray(attemptIds, MAX_RECONCILED_RUNS);
+  if (dense === null || !dense.array.every((id) => typeof id === 'string' && id !== '')) return null;
+  return { runId, workOrderId, attemptIds: dense.array as readonly string[] };
+}
+
+/**
+ * The work order id an adopt input carries, read through its own descriptor;
+ * `null` when the input or the field is absent or not a non-empty string.
+ * An unrecorded lane's plan `workOrderId` is `null`, so the adopt input is
+ * the only source the wave-1 reconciliation has.
+ */
+function readAdoptWorkOrderId(adoptInput: ApplyRelaunchAdoptInput | undefined): string | null {
+  const id = own(adoptInput === undefined ? null : own(adoptInput, 'workOrder'), 'workOrderId');
+  return typeof id === 'string' && id !== '' ? id : null;
+}
+
+/** The attempt id an adopt input carries, read the same way; `null` when absent. */
+function readAdoptAttemptId(adoptInput: ApplyRelaunchAdoptInput | undefined): string | null {
+  const id = own(adoptInput === undefined ? null : own(adoptInput, 'attempt'), 'attemptId');
+  return typeof id === 'string' && id !== '' ? id : null;
+}
+
+/**
+ * The run journals of `runIds`, from `journalsForRuns` (one store read when
+ * `listForRuns` exists), validated without running any getter: the answer
+ * must be a genuine `Map` holding a bounded dense array of well-formed
+ * stored entries for every requested id. Cost: O(runs × entries) validated
+ * reads, each bounded. `null` on any throw, missing id or malformed entry.
+ */
+async function readReconciledJournals(
+  runJournal: RunJournalRunReads,
+  runIds: readonly string[],
+): Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]> | null> {
+  let journalMap: unknown;
+  try {
+    journalMap = await journalsForRuns(runJournal, runIds);
+  } catch {
+    return null;
+  }
+  if (!(journalMap instanceof Map)) return null;
+  const out = new Map<string, readonly LaneRunJournalEntryRecord[]>();
+  for (const runId of runIds) {
+    if (!journalMap.has(runId)) return null;
+    const dense = readBoundedDenseArray(journalMap.get(runId), MAX_RECONCILED_ENTRIES);
+    if (dense === null) return null;
+    const entries: LaneRunJournalEntryRecord[] = [];
+    for (const item of dense.array) {
+      const read = readLaneRunJournalEntryRecord(item);
+      if (!read.ok) return null;
+      entries.push(read.record);
+    }
+    out.set(runId, entries);
+  }
+  return out;
+}
+
+/** Per-lane reconciliation outcome the preflight counts and `applyLive` journals. */
+interface LaneHandoff {
+  readonly matchedRun: ReconciledRun | null;
+  readonly terminal: boolean;
+}
+
+interface RunReconciliation {
+  /** The intent-only lanes whose hand-off result `applyLive` journals. */
+  readonly handedOff: ReadonlyMap<string, LaneHandoff>;
+  /** Every participating lane's matched run (or none), for capacity accounting. */
+  readonly matchedByLane: ReadonlyMap<string, LaneHandoff>;
+}
+
+/**
+ * AR3b: reconcile redispatch hand-offs against the run repository before the
+ * grant is spent. A lane whose redispatch is `intent-only` or `completed` may
+ * have a live run the plan's own record no longer names: the run repository
+ * is the authority. `list()` is read once and validated; for each
+ * participating lane the runs matching the lane's work order id are found,
+ * more than one is a stale plan, and one match's journal decides whether the
+ * run is terminal (the hand-off is over and the capacity is free) or still
+ * live (the slot stays spent). Every untrusted read fails closed as
+ * `stale-plan-state` before `authorizeRelaunchApply`.
+ */
+async function reconcileRedispatchRuns(
+  args: LiveApplyArgs,
+  statusOf: StatusOf,
+): Promise<RunReconciliation | ApplyRelaunchResult> {
+  const { deps, storedPlan, saveInputs, adoptInputs } = args;
+  if (deps.runRepo === undefined || deps.runJournal === undefined) return refusal('stale-plan-state');
+  let listed: unknown;
+  try {
+    listed = await deps.runRepo.list();
+  } catch {
+    return refusal('stale-plan-state');
+  }
+  const dense = readBoundedDenseArray(listed, MAX_RECONCILED_RUNS);
+  if (dense === null) return refusal('stale-plan-state');
+  const runs: ReconciledRun[] = [];
+  for (const item of dense.array) {
+    const run = readReconciledRun(item);
+    if (run === null) return refusal('stale-plan-state');
+    runs.push(run);
+  }
+  const participants = storedPlan.lanes.filter((lane) => {
+    if (lane.population === 'conducted') return false;
+    const redispatchStatus = statusOf(lane.laneId, 'redispatch');
+    return redispatchStatus === 'intent-only' || redispatchStatus === 'completed';
+  });
+  const runIds: string[] = [];
+  const matchedByLane = new Map<string, LaneHandoff>();
+  for (const lane of participants) {
+    const workOrderId = lane.workOrderId ?? readAdoptWorkOrderId(adoptInputs.get(lane.laneId));
+    const matched = workOrderId === null ? [] : runs.filter((run) => run.workOrderId === workOrderId);
+    if (matched.length > 1) return refusedLane('stale-plan-state', lane.laneId);
+    const one = matched[0] ?? null;
+    matchedByLane.set(lane.laneId, { matchedRun: one, terminal: false });
+    if (one !== null) runIds.push(one.runId);
+  }
+  const journals = runIds.length === 0 ? new Map<string, readonly LaneRunJournalEntryRecord[]>() : await readReconciledJournals(deps.runJournal, runIds);
+  if (journals === null) return refusal('stale-plan-state');
+  const handedOff = new Map<string, LaneHandoff>();
+  for (const lane of participants) {
+    const matchedRun = matchedByLane.get(lane.laneId)?.matchedRun ?? null;
+    const adoptedAttemptId =
+      saveInputs.get(lane.laneId)?.attemptId ?? readAdoptAttemptId(adoptInputs.get(lane.laneId));
+    if (matchedRun === null) continue;
+    const entries = journals.get(matchedRun.runId) ?? [];
+    const state = laneRunJournalState(entries, matchedRun.runId);
+    const terminal = (LANE_RUN_TERMINAL_STATES as readonly string[]).includes(state);
+    matchedByLane.set(lane.laneId, { matchedRun, terminal });
+    if (statusOf(lane.laneId, 'redispatch') === 'intent-only') {
+      if (matchedRun.attemptIds.some((id) => id !== adoptedAttemptId) || terminal) {
+        handedOff.set(lane.laneId, { matchedRun, terminal });
+      }
+    }
+  }
+  return { handedOff, matchedByLane };
+}
+
 async function probeWorktreeLane(
   deps: ApplyRelaunchDependencies,
   lane: PlanLane,
   saveInput: ApplyRelaunchSaveInput | undefined,
   statusOf: StatusOf,
   counts: RunCounts,
+  handoff: LaneHandoff | undefined,
 ): Promise<ApplyRelaunchResult | null> {
   if (saveInput === undefined) return refusedLane('stale-plan-state', lane.laneId);
   let state: unknown;
@@ -1042,11 +1216,22 @@ async function probeWorktreeLane(
   // later wave from appending another intent past maxActiveRuns. A lane whose
   // adopt has begun (partial) or completed while its redispatch is still
   // absent occupies a run too (AR2c): it was adopted into a conducted run.
-  if (
-    redispatchStatus === 'intent-only' ||
-    (redispatchStatus === 'completed' && stateKind === 'running') ||
-    ((adoptStatus === 'partial' || adoptStatus === 'completed') && redispatchStatus === 'absent')
-  ) {
+  //
+  // AR3b: the run-repository reconciliation decides when a hand-off's run is
+  // actually over. Only a matched TERMINAL run frees the slot; a matched
+  // non-terminal run is still live whatever the worktree reports, so the
+  // slot stays spent.
+  if (redispatchStatus === 'intent-only') {
+    if (!(handoff !== undefined && handoff.matchedRun !== null && handoff.terminal)) {
+      counts.handedOffNotIdle += 1;
+    }
+  } else if (redispatchStatus === 'completed') {
+    if (handoff !== undefined && handoff.matchedRun !== null) {
+      if (!handoff.terminal) counts.handedOffNotIdle += 1;
+    } else if (stateKind === 'running') {
+      counts.handedOffNotIdle += 1;
+    }
+  } else if ((adoptStatus === 'partial' || adoptStatus === 'completed') && redispatchStatus === 'absent') {
     counts.handedOffNotIdle += 1;
   }
   return null;
@@ -1058,6 +1243,8 @@ interface LivePreflight {
   readonly counts: RunCounts;
   /** Per-lane `save-ref` sources derived from the journaled save results (AR2c). */
   readonly savedSources: ReadonlyMap<string, AdoptLaneSource>;
+  /** Per-lane run reconciliation for redispatch hand-offs (AR3b). */
+  readonly handedOff: ReadonlyMap<string, LaneHandoff>;
 }
 
 /**
@@ -1124,6 +1311,8 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
   const statusOf: StatusOf = (laneId, step) =>
     derived.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
   if (!hasLivePorts(deps)) return refusal('stale-plan-state');
+  const reconciliation = await reconcileRedispatchRuns(args, statusOf);
+  if (isRefusalResult(reconciliation)) return reconciliation;
   const savedSources = new Map<string, AdoptLaneSource>();
   const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };
   for (const lane of storedPlan.lanes) {
@@ -1160,10 +1349,10 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
     const refused =
       lane.population === 'conducted'
         ? await probeConductedLane(deps, lane, counts)
-        : await probeWorktreeLane(deps, lane, saveInputs.get(lane.laneId), statusOf, counts);
+        : await probeWorktreeLane(deps, lane, saveInputs.get(lane.laneId), statusOf, counts, reconciliation.matchedByLane.get(lane.laneId));
     if (refused !== null) return refused;
   }
-  return { derived: derived.value, statusOf, counts, savedSources };
+  return { derived: derived.value, statusOf, counts, savedSources, handedOff: reconciliation.handedOff };
 }
 
 /** Authorize the grant; the trusted `nowIso` it was authorized at, or a refusal. */
@@ -1341,6 +1530,9 @@ async function saveStepOfLane(
   if (saveStatus === 'absent') {
     const journalRefusal = await journalSaveIntent(ctx, lane, saveStep.idempotencyKey, saveInput);
     if (journalRefusal !== null) return journalRefusal;
+    // AR3b: the intent append may have consumed the whole budget; the save
+    // never starts on an expired deadline.
+    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
   }
   // 'intent-only': `verifyLaneSaveInput` already proved the digest matches;
   // `saveLaneEdits` recovers an intent-only save.
@@ -1577,6 +1769,13 @@ async function adoptAndRedispatchLane(
   if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
   const redispatchStatus = ctx.statusOf(lane.laneId, 'redispatch');
   if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') return null;
+  // AR3b: a redispatch the journal already refused or left ambiguous is a
+  // stale plan, and an inconsistent one a broken ledger; both refuse before
+  // any capacity check or append.
+  if (redispatchStatus === 'refused' || redispatchStatus === 'ambiguous') {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  if (redispatchStatus === 'inconsistent') return refusedLane('step-inconsistent', lane.laneId);
   // The capacity rule: only a lane without an adopt step re-checks and
   // counts here — an adopt lane's hand-off was counted by its own adopt.
   if (!hasAdoptStep && ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
@@ -1629,11 +1828,7 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
   const authorized = await authorizeLive(args);
   if (isRefusalResult(authorized)) return authorized;
   const { statusOf, counts, derived, savedSources } = preflight;
-  const targetWave = selectWave(storedPlan, statusOf);
-  if (targetWave === null) {
-    return { outcome: 'applied', planDigest, wave: null, lanes: derived.summaries };
-  }
-  const ctx: WaveContext = {
+  let ctx: WaveContext = {
     deps,
     planDigest,
     deadlineMs,
@@ -1645,6 +1840,39 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     adoptInputs,
     savedSources: new Map(savedSources),
   };
+  // AR3b: a reconciled hand-off gets its journaled result before the wave
+  // runs, so `selectWave` and `executeWave` see the redispatch as completed.
+  for (const [laneId] of preflight.handedOff) {
+    if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
+    const lane = storedPlan.lanes.find((entry) => entry.laneId === laneId);
+    const redispatchStep = lane?.steps.find((entry) => entry.step === 'redispatch');
+    if (lane === undefined || redispatchStep === undefined) return refusedLane('step-inconsistent', laneId);
+    if (await appendEntry(ctx, { key: redispatchStep.idempotencyKey, kind: 'result', outcome: 'completed', reasonCode: 'handed-off' })) {
+      continue;
+    }
+    // The append lost a race: re-read the journal and trust only a recorded
+    // completed result for the same key.
+    const fresh = await loadJournalSnapshot(deps, planDigest);
+    if (!fresh.ok) return fresh.result;
+    if (relaunchStepStatus(fresh.value, redispatchStep.idempotencyKey) === 'completed') continue;
+    return refusedLane('journal-write-failed', laneId);
+  }
+  let effectiveStatusOf = statusOf;
+  let laneSummaries = derived.summaries;
+  if (preflight.handedOff.size > 0) {
+    const fresh = await loadJournalSnapshot(deps, planDigest);
+    if (!fresh.ok) return fresh.result;
+    const updated = deriveLaneSummaries(deps, planDigest, storedPlan, fresh.value, saveInputs);
+    if (!updated.ok) return updated.result;
+    effectiveStatusOf = (laneId, step) =>
+      updated.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
+    laneSummaries = updated.value.summaries;
+    ctx = { ...ctx, statusOf: effectiveStatusOf };
+  }
+  const targetWave = selectWave(storedPlan, effectiveStatusOf);
+  if (targetWave === null) {
+    return { outcome: 'applied', planDigest, wave: null, lanes: laneSummaries };
+  }
   const refused = await executeWave(ctx, storedPlan, saveInputs, targetWave);
   if (refused !== null) return refused;
   // Re-derive the summaries from the updated journal state.

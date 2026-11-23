@@ -36,6 +36,7 @@ import type {
   WorktreeRunState,
 } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import type { AdoptLanePort } from '../ports/in/AdoptLanePort.in-port.js';
 import type {
   SaveLaneEditsRequest,
@@ -300,7 +301,11 @@ interface Deps {
   computeDigest: (text: string) => string;
   authorization?: { authorizeRelaunchApply: (request: unknown) => Promise<AuthorizeRelaunchApplyResult> };
   clock: () => string;
-  runRepo?: { get: (runId: string) => Promise<LaneRunRecord | null> };
+  runRepo?: { get: (runId: string) => Promise<LaneRunRecord | null>; list: () => Promise<readonly LaneRunRecord[]> };
+  runJournal?: {
+    listForRun: (runId: string) => Promise<readonly LaneRunJournalEntryRecord[]>;
+    listForRuns?: (runIds: readonly string[]) => Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>>;
+  };
   runner?: {
     inspectWorktreeRun: (ref: WorktreeRunRef) => Promise<WorktreeRunState>;
     abortWorktreeRun: (request: AbortWorktreeRunRequest) => Promise<AbortWorktreeRunResult>;
@@ -319,6 +324,7 @@ interface Deps {
 
 interface LiveOver {
   noRunRepo?: boolean;
+  noRunJournal?: boolean;
   noRunner?: boolean;
   noTerminate?: boolean;
   noSave?: boolean;
@@ -389,7 +395,16 @@ const makeDeps = (over: {
     clock: over.clock ?? (() => CLOCK_NOW),
     runRepo: live.noRunRepo
       ? undefined
-      : { get: vi.fn(async () => (live.run !== undefined ? live.run : null)) },
+      : {
+          get: vi.fn(async () => (live.run !== undefined ? live.run : null)),
+          list: vi.fn(async () => [] as readonly LaneRunRecord[]),
+        },
+    runJournal: live.noRunJournal
+      ? undefined
+      : {
+          listForRun: vi.fn(async () => []),
+          listForRuns: vi.fn(async (ids: readonly string[]) => new Map(ids.map((id) => [id, []]))),
+        },
     runner: live.noRunner
       ? undefined
       : {

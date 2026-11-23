@@ -2027,10 +2027,18 @@ export class WorkspaceAdapter implements WorkspacePort {
     } catch {
       return { outcome: 'error', reason: 'worktree host could not be resolved' };
     }
-    const result = await executor.run(
-      ['git', '-C', snap.worktreePath, ...RECOVERY_GIT_CONFIG, 'clean', '-fd'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    // Fix round 1 item 2: a rejected `executor.run` (an abort or an executor
+    // fault) is an error outcome, never an escape — during collect cleanup an
+    // escape aborts normalization before the untracked files are removed.
+    let result: Awaited<ReturnType<CommandExecutorPort['run']>>;
+    try {
+      result = await executor.run(
+        ['git', '-C', snap.worktreePath, ...RECOVERY_GIT_CONFIG, 'clean', '-fd'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+    } catch {
+      return { outcome: 'error', reason: 'git clean did not complete' };
+    }
     if (result.exitCode === null || result.error !== undefined) {
       return { outcome: 'error', reason: 'git clean did not complete' };
     }

@@ -171,7 +171,10 @@ export class CommitEditOnlyAttemptUseCase {
     attempt: AttemptRecord,
     expectedHead: string,
   ): Promise<CommitEditOnlyAttemptResult | null> {
-    const inspectWorktree = deps.workspace.inspectWorktree;
+    // Fix round 1 item 1: bind the port method to `deps.workspace` so the
+    // real `WorkspaceAdapter.inspectWorktree`, which reads `this`, never runs
+    // detached (a detached call throws and reads as `unknown`).
+    const inspectWorktree = deps.workspace.inspectWorktree?.bind(deps.workspace);
     if (inspectWorktree === undefined) {
       return { outcome: 'unknown', reason: 'the workspace cannot inspect the worktree' };
     }

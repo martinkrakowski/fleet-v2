@@ -144,7 +144,8 @@ export interface AdvanceLaneRunDependencies {
    * outside the worktree and reset the worktree to its head; absent → today's
    * park (the recovery is never attempted).
    */
-  readonly worktreeRecovery?: Pick<WorkspacePort, 'preserveWorktreeEdits' | 'resetWorktreeToHead'>;
+  readonly worktreeRecovery?: Pick<WorkspacePort, 'preserveWorktreeEdits' | 'resetWorktreeToHead'> &
+    Partial<Pick<WorkspacePort, 'removeUntrackedFiles'>>;
   /** Stop a running attempt (K4-6); absent → `not-wired stop`. */
   readonly stopAttempt?: StopAttemptPort;
   /** Collect an ended attempt's artifacts (K4-6); absent → `not-wired collect`. */

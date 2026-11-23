@@ -10,6 +10,8 @@ import { appendRunIntent, appendRunResult, performPark, refusedResult } from './
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
 import { startReviewsInFlight } from './review-fix.js';
+import { conductedRunnerOf } from './conducted-host.js';
+import { worktreeRecoveryPatchInputsValid } from './prepare-dispatch.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -33,7 +35,10 @@ export async function performCollect(ctx: AdvanceStepContext,
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
   const commitEditOnlyAttempt = ctx.deps.commitEditOnlyAttempt;
-  if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt === undefined) {
+  // SN1: the commit step runs for every runner now — a not-edit-only seat
+  // with a dirty worktree at its dispatch head is normalized here too — so a
+  // missing port is a wiring failure for every attempt.
+  if (commitEditOnlyAttempt === undefined) {
     return { outcome: 'not-wired', step: decision.step };
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
@@ -66,8 +71,9 @@ export async function runCollectBody(ctx: AdvanceStepContext,
   if (latest === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
-  // Shared by the act and the reconcile: an agy attempt is never collected without its edit-only commit.
-  if (latest.runner?.kind === 'agy' && ctx.deps.commitEditOnlyAttempt === undefined) {
+  // Shared by the act and the reconcile: no attempt is collected without its
+  // edit-only commit step (SN1: for every runner, not only agy).
+  if (ctx.deps.commitEditOnlyAttempt === undefined) {
     return { outcome: 'not-wired', step: decision.step };
   }
   if (latest.state !== 'ended' || latest.completionReceipt === null) {
@@ -91,17 +97,35 @@ export async function runCollectBody(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
   }
   const commitEditOnlyAttempt = ctx.deps.commitEditOnlyAttempt;
-  if (latest.runner?.kind === 'agy' && commitEditOnlyAttempt !== undefined) {
+  {
     const committed = await commitEditOnlyAttempt.commitEditOnlyAttempt({
       attemptId: latest.id,
       nowIso: request.nowIso,
     });
     if (committed.outcome === 'refused') {
-      const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'edit-only-refused');
+      // SN1: edits outside the owned paths are preserved and the worktree is
+      // normalized before the refusal is journalled, so the next attempt
+      // starts from a clean worktree; other refusals keep `edit-only-refused`.
+      let reasonCode: 'edit-only-refused' | 'edits-outside-owned-paths' = 'edit-only-refused';
+      const normalize =
+        committed.reason === 'diff-findings' ||
+        committed.reason === 'outside-allowed-paths' ||
+        committed.reason === 'staged-content-findings';
+      if (normalize) {
+        reasonCode = 'edits-outside-owned-paths';
+      }
+      // SN1: the refused result is journaled BEFORE anything is reset or
+      // cleaned. If the append fails, the worktree is untouched, so a re-run
+      // reads the same refusal and parks; it can never see a clean tree and
+      // collect over a refusal that was never recorded.
+      const resultRefusal = await appendRunResult(ctx, request, key, 'refused', reasonCode);
       if (resultRefusal !== null) {
         return refusedResult(resultRefusal);
       }
-      return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'edit-only-refused' };
+      if (normalize) {
+        await normalizeRefusedWorktree(ctx, latest);
+      }
+      return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode };
     }
     if (committed.outcome === 'unknown') {
       const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'edit-only-unknown');
@@ -129,6 +153,57 @@ export async function runCollectBody(ctx: AdvanceStepContext,
     return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
+}
+
+/**
+ * SN1: after a `diff-findings` or `outside-allowed-paths` commit refusal the
+ * worktree keeps edits outside the owned paths. They are preserved as a patch
+ * outside the worktree (deterministic path `<worktree>.<attempt>.outside-owned.patch`),
+ * the tracked edits are reset to the head and the untracked files are removed,
+ * so the next attempt starts from a clean worktree. A missing recovery port,
+ * invalid patch inputs, an attempt without a conducted runner, a missing
+ * optional method or a failed step never throws and never blocks the refusal:
+ * the `edits-outside-owned-paths` journal result and the `step-refused` /
+ * `collect` park happen regardless.
+ */
+async function normalizeRefusedWorktree(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+): Promise<void> {
+  const recovery = ctx.deps.worktreeRecovery;
+  if (recovery === undefined) {
+    return;
+  }
+  const runner = conductedRunnerOf(latest);
+  if (runner === null || !worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+    return;
+  }
+  const patchPath = latest.worktreePath + '.' + latest.id + '.outside-owned.patch';
+  try {
+    const preserved = recovery.preserveWorktreeEdits === undefined
+      ? null
+      : await recovery.preserveWorktreeEdits({
+          worktreePath: latest.worktreePath,
+          patchPath,
+          recordedHost: runner,
+        });
+    if (preserved === null || preserved.outcome !== 'preserved') {
+      return;
+    }
+    // The preserved patch holds the tracked edits AND the untracked files; only
+    // now is anything reset or removed. A failed reset skips the clean.
+    if (recovery.resetWorktreeToHead !== undefined) {
+      const reset = await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost: runner });
+      if (reset.outcome !== 'reset') {
+        return;
+      }
+    }
+    if (recovery.removeUntrackedFiles !== undefined) {
+      await recovery.removeUntrackedFiles({ worktreePath: latest.worktreePath, recordedHost: runner });
+    }
+  } catch {
+    // The refusal is already decided; a failed cleanup never throws.
+  }
 }
 
 /** `acceptanceChecks` of a frozen manifest: a non-empty array of non-empty strings, else null. */

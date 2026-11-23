@@ -807,6 +807,67 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(journal.entries.some((entry) => entry.id.includes('/g2'))).toBe(false);
   });
 
+  it('accepts retry 2 after a congested run 0 and a failed run 1, and replays it idempotently', async () => {
+    const journal = new InMemoryJournal();
+    const congested = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const failing = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad diff' },
+        PASS_RESULTS[2],
+      ],
+    });
+    const passing = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const run0 = await new RequestAttemptAcceptanceUseCase(makeDeps({ gate: congested, journal }).deps)
+      .evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+    const run1 = await new RequestAttemptAcceptanceUseCase(makeDeps({ gate: failing, journal }).deps)
+      .evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(run1.verdict).toBe('failed');
+    const useCase2 = new RequestAttemptAcceptanceUseCase(makeDeps({ gate: passing, journal }).deps);
+    const run2 = await useCase2.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(run2.verdict).toBe('passed');
+    expect(passing.requests).toHaveLength(1);
+    const replay = await useCase2.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(replay).toEqual(run2);
+    expect(passing.requests).toHaveLength(1);
+  });
+
+  it('refuses retry 2 after a failed run 0 and a failed run 1 (only one gate-failed retry)', async () => {
+    const journal = new InMemoryJournal();
+    const failing = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad diff' },
+        PASS_RESULTS[2],
+      ],
+    });
+    const useCase = new RequestAttemptAcceptanceUseCase(makeDeps({ gate: failing, journal }).deps);
+    expect((await useCase.evaluateAttemptGate(gateRequest())).verdict).toBe('failed');
+    expect((await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }))).verdict).toBe('failed');
+    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(refused.verdict).toBe('unknown');
+    expect(failing.requests).toHaveLength(2);
+    expect(journal.entries.some((entry) => entry.id.includes('/g2'))).toBe(false);
+  });
+
   it('refuses gate run 2 after a stored CONGESTED run 0 because run 1 is not stored', async () => {
     const gate = new FakeGatePredicatePort({
       outcome: 'evaluated',

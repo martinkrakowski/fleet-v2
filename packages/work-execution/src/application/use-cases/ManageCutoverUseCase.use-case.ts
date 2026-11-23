@@ -25,16 +25,24 @@ import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import {
   CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_SHADOW_CRITERIA,
+  MAX_CUTOVER_JOURNAL_ENTRIES,
+  buildShadowParkJournalPayload,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
   canonicalCutoverSwitchPayload,
+  checkCutoverJournalCapacity,
   cutoverJournalKey,
+  cutoverShadowParkKey,
   isWithinCutoverRollbackWindow,
   readCutoverShadowEvidence,
+  readCutoverShadowParkRecord,
   readRetirementLedger,
   type CutoverRecord,
+  type CutoverShadowParkRecord,
 } from '../../domain/cutover-records.js';
-import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { buildReleasedParkEntry } from '../../domain/merge-pass-transitions.js';
+import { readMergeQueueEntryRecord, type MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
+import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import type {
   ManageCutoverPort,
   ManageCutoverRefusalReason,
@@ -53,6 +61,8 @@ import type {
 import type { DaemonPausePort } from '../ports/out/DaemonPausePort.out-port.js';
 import type { DaemonStatusPort } from '../ports/out/DaemonStatusPort.out-port.js';
 import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
+import type { MergePolicyPort } from '../ports/out/MergePolicyPort.out-port.js';
+import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 
 export interface ManageCutoverDependencies {
   readonly cutoverRepo: CutoverRecordRepositoryPort;
@@ -93,6 +103,22 @@ export interface ManageCutoverDependencies {
     | { readonly status: 'unreadable' }
     | { readonly status: 'unknown-version' }
   >;
+  /**
+   * SW2b2, optional: the read handle the switch lists the merge queue through.
+   * Composition binds a read-only adapter over durable state so a switch never
+   * reaches the writable queue through this seam; a missing reader is a
+   * refusal, never a pass.
+   */
+  readonly mergeQueueRead?: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
+  /** SW2b2, optional: the writable handle that releases a shadow park back to `queued`. */
+  readonly mergeQueue?: Pick<MergeQueueRepositoryPort, 'listMergeEntries' | 'applyMergeTransition'>;
+  /** SW2b2, optional: the merge policy that names which repositories run under shadow. */
+  readonly mergePolicy?: Pick<MergePolicyPort, 'readMergePolicy'>;
+  /**
+   * SW2b2, optional: the separate shadow-park journal (`shadow-park-journal.json`).
+   * Never the cutover journal; a missing journal is a refusal, never a pass.
+   */
+  readonly shadowParkJournal?: CutoverJournalPort;
 }
 
 const MAX_REQUEST_KEYS = 8;
@@ -107,6 +133,39 @@ const SWITCH_KEYS: readonly string[] = [
   'move', 'expectedRevision', 'operationId', 'relaunchPlanDigest', 'nowIso', 'deadlineIso',
 ];
 const RETIRE_KEYS: readonly string[] = ['move', 'expectedRevision', 'operationId', 'nowIso', 'deadlineIso'];
+/**
+ * SW2b2: the deadline every shadow-park queue read and write carries when the
+ * switch request itself names none. A queue call the request deadline cannot
+ * bound still fails closed on this one.
+ */
+const DEFAULT_SWITCH_DEADLINE_MS = 60_000;
+/** The most merge-policy repositories one switch reads before refusing. */
+const MAX_MERGE_POLICY_REPOS = 500;
+/** The most merge-queue entries one switch lists before refusing. */
+const MAX_MERGE_QUEUE_ENTRIES = 10_000;
+/** The most shadow-park journal entries one switch lists before refusing. */
+const MAX_SHADOW_PARK_JOURNAL_ENTRIES = MAX_CUTOVER_JOURNAL_ENTRIES;
+
+/** The release counts a completed switch reports (SW2b2). */
+interface SwitchParkCounts {
+  readonly releasedParks: number;
+  readonly vetoHoldParks: number;
+}
+
+/**
+ * One shadow-repo ordinary `parked` entry the switch plans to journal and
+ * release, built entirely before any write so a planning refusal leaves the
+ * journals and the queue untouched (SW2b2).
+ */
+interface PlannedShadowPark {
+  readonly entry: MergeQueueEntryRecord;
+  readonly parkKey: string;
+  readonly record: CutoverShadowParkRecord;
+  readonly priorDigest: string;
+  readonly releasedRecord: MergeQueueEntryRecord;
+  /** True once this pass found the park's intent already recorded in the shadow-park journal. */
+  recordedIntent: boolean;
+}
 
 type ParsedRequest =
   | {
@@ -270,7 +329,13 @@ function parseRetire(snapshot: Record<string, unknown>): ParsedRequest {
 }
 
 /** A completed switch or retire result, keys in the order the shipped moves print them. */
-function completedResult(kind: MoveKind, key: string, replayed: boolean, record: CutoverRecord): ManageCutoverResult {
+function completedResult(
+  kind: MoveKind,
+  key: string,
+  replayed: boolean,
+  record: CutoverRecord,
+  parkCounts: SwitchParkCounts = { releasedParks: 0, vetoHoldParks: 0 },
+): ManageCutoverResult {
   return {
     outcome: 'completed',
     move: kind.move,
@@ -279,9 +344,36 @@ function completedResult(kind: MoveKind, key: string, replayed: boolean, record:
     state: kind.state,
     revision: record.revision,
     record,
-    // SW2b1 placeholder: SW2b2 replaces these with the actual release counts.
-    ...(kind.move === 'switch' ? { releasedParks: 0, vetoHoldParks: 0 } : {}),
+    ...(kind.move === 'switch' ? { releasedParks: parkCounts.releasedParks, vetoHoldParks: parkCounts.vetoHoldParks } : {}),
   } as ManageCutoverResult;
+}
+
+/**
+ * `snapshotPlainDataRecord` without the throw: a hostile record (a revoked
+ * Proxy, or one whose reflection traps throw) must read as unreadable, not
+ * escape as an exception. Cost is the snapshot's own `O(K)` own-keys walk;
+ * there is no extra pass, so the bound is unchanged.
+ */
+function trySnapshot(value: unknown): Record<string, unknown> | null {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether two validated shadow-park records name the same park, field for field (SW2b2). */
+function sameShadowParkRecord(left: CutoverShadowParkRecord, right: CutoverShadowParkRecord): boolean {
+  return (
+    left.entryId === right.entryId &&
+    left.repository.owner === right.repository.owner &&
+    left.repository.repo === right.repository.repo &&
+    left.pullRequest === right.pullRequest &&
+    left.headOid === right.headOid &&
+    left.reason === right.reason &&
+    left.attempt === right.attempt &&
+    left.notBeforeIso === right.notBeforeIso
+  );
 }
 
 /**
@@ -800,6 +892,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     }
 
     const normalizedNowIso = normalizeIso(nowIso);
+
+    // SW2b2: every shadow-park step between the preflight and the cutover
+    // intent is read-only, so any refusal here leaves `cutover-journal.json`
+    // untouched. Only after that intent is appended do the parks get their own
+    // journal intents and their queue releases, and `applySwitch` runs last.
+    const parks = await this.planShadowParks(deadlineIso);
+    if ('outcome' in parks) {
+      return parks;
+    }
+
     const intentFailure = await this.appendIntentUnlessRecorded(
       journal.intent,
       key,
@@ -811,6 +913,11 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       return intentFailure;
     }
 
+    const released = await this.releaseShadowParks(parks.planned, normalizedNowIso, deadlineIso);
+    if ('outcome' in released) {
+      return released;
+    }
+
     const saved = await this.applySwitch(record, request, plan, normalizedNowIso);
     if ('outcome' in saved) {
       return saved;
@@ -820,7 +927,211 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (resultFailure !== null) {
       return resultFailure;
     }
-    return this.completedMove(SWITCH_KIND, key, saved.record);
+    return this.completedMove(SWITCH_KIND, key, saved.record, {
+      releasedParks: released.releasedParks,
+      vetoHoldParks: parks.vetoHoldParks,
+    });
+  }
+
+  /**
+   * SW2b2: the read-only shadow-park phase of a switch, run after the
+   * preflight (including the daemon-paused gate) and before the cutover
+   * journal intent, so any refusal here leaves `cutover-journal.json`
+   * untouched. It reads the merge policy, lists the queue, plans one park per
+   * shadow-repo ordinary `parked` entry (a `veto-hold` is counted, never
+   * released), matches every plan against the shadow-park journal already on
+   * disk, and checks the journal capacity. Nothing writes.
+   *
+   * Cost bounds: the policy repositories and the queue listing are capped by
+   * `readBoundedDenseArray` (`O(1)` pre-gate, accepted `O(K)` own-keys bound,
+   * `O(cap)` descriptor loop); the per-entry record readers walk fixed-shape
+   * plain data; the journal match is `O(planned * existing)` under the same
+   * caps, so a switch plans at most `MAX_SHADOW_PARKS_PER_SWITCH` parks
+   * against at most `MAX_SHADOW_PARK_JOURNAL_ENTRIES` entries.
+   */
+  private async planShadowParks(
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly planned: readonly PlannedShadowPark[]; readonly vetoHoldParks: number }> {
+    // A request without a deadline still bounds every queue call: the default
+    // is computed fresh on every pass, never cached.
+    const effectiveDeadlineIso = new Date(Date.now() + DEFAULT_SWITCH_DEADLINE_MS).toISOString();
+
+    if (this.deps.mergeQueue === undefined && this.deps.mergeQueueRead === undefined) {
+      return refuse('merge-queue-absent');
+    }
+    if (this.deps.mergeQueue === undefined) {
+      return refuse('merge-queue-absent');
+    }
+    if (this.deps.mergePolicy === undefined) {
+      return refuse('merge-policy-absent');
+    }
+    if (this.deps.shadowParkJournal === undefined) {
+      return refuse('park-journal-append-failed');
+    }
+    const mergeQueueReader = this.deps.mergeQueueRead ?? this.deps.mergeQueue;
+
+    const policy = await this.guarded(deadlineIso, () => this.deps.mergePolicy!.readMergePolicy());
+    if (policy.kind === 'deadline') return unknown('deadline-exceeded');
+    // A null/undefined answer, or a hostile record whose reflection throws or
+    // hides a getter, is unreadable — never dereferenced directly.
+    const policySnapshot =
+      policy.kind === 'value' ? trySnapshot(policy.value) : null;
+    if (policySnapshot === null || policySnapshot.outcome !== 'known') return unknown('merge-policy-unreadable');
+    const repositoryList = readBoundedDenseArray(policySnapshot.repositories, MAX_MERGE_POLICY_REPOS);
+    if (repositoryList === null) return unknown('merge-policy-unreadable');
+    const shadowRepos = new Set<string>();
+    for (const repo of repositoryList.array) {
+      const snapshot = trySnapshot(repo);
+      if (
+        snapshot === null ||
+        typeof snapshot.repositoryKey !== 'string' ||
+        typeof snapshot.shadow !== 'boolean'
+      ) {
+        return unknown('merge-policy-unreadable');
+      }
+      if (snapshot.shadow) {
+        shadowRepos.add(snapshot.repositoryKey);
+      }
+    }
+
+    const listed = await this.guarded(deadlineIso, () => mergeQueueReader.listMergeEntries({ deadlineIso: effectiveDeadlineIso }));
+    if (listed.kind === 'deadline') return unknown('deadline-exceeded');
+    if (listed.kind === 'threw') return unknown('merge-queue-unreadable');
+    const queueEntries = readBoundedDenseArray(listed.value, MAX_MERGE_QUEUE_ENTRIES);
+    if (queueEntries === null) return unknown('merge-queue-unreadable');
+    const parked: MergeQueueEntryRecord[] = [];
+    for (const element of queueEntries.array) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok) return unknown('merge-queue-unreadable');
+      if (shadowRepos.has(`${read.record.repository.owner}/${read.record.repository.repo}`) && read.record.state === 'parked') {
+        parked.push(read.record);
+      }
+    }
+
+    // A `veto-hold` on a shadow repository is never released by the switch; it is only counted.
+    const vetoHoldParks = parked.filter((entry) => entry.reason === 'veto-hold').length;
+    const planned: PlannedShadowPark[] = [];
+    for (const entry of parked) {
+      if (entry.reason === 'veto-hold') {
+        continue;
+      }
+      const entryIdDigest = this.deps.computeDigest(entry.entryId).slice(0, 32);
+      const keyRes = cutoverShadowParkKey(entryIdDigest, entry.revision);
+      const payloadRes = buildShadowParkJournalPayload(entry);
+      const releasedRes = buildReleasedParkEntry(entry);
+      if (!keyRes.ok || !payloadRes.ok || !releasedRes.ok) {
+        return refuse('invalid-park-record');
+      }
+      planned.push({
+        entry,
+        parkKey: keyRes.key,
+        record: payloadRes.record,
+        priorDigest: this.deps.computeDigest(payloadRes.canonicalPayload),
+        releasedRecord: releasedRes.record,
+        recordedIntent: false,
+      });
+    }
+
+    const journalList = await this.guarded(deadlineIso, () => this.deps.shadowParkJournal!.listByKeyPrefix(''));
+    if (journalList.kind === 'deadline') return unknown('deadline-exceeded');
+    if (journalList.kind === 'threw') return unknown('journal-unreadable');
+    // A null/undefined response, or a hostile one whose own keys throw, is an
+    // unreadable journal — never dereferenced directly.
+    const journalSnapshot = trySnapshot(journalList.value);
+    if (journalSnapshot === null || journalSnapshot.outcome !== 'listed') return unknown('journal-unreadable');
+    const existing = readBoundedDenseArray(journalSnapshot.entries, MAX_SHADOW_PARK_JOURNAL_ENTRIES);
+    if (existing === null) return unknown('journal-unreadable');
+    // Every listed entry is snapshotted before its fields are read, so a null
+    // element or a throwing `key`/`kind` getter cannot escape the match loop.
+    const entrySnapshots: Array<Record<string, unknown> | null> = existing.array.map((element) => trySnapshot(element));
+    if (entrySnapshots.some((entrySnapshot) => entrySnapshot === null)) return unknown('journal-unreadable');
+    const listedEntries = entrySnapshots.filter((entrySnapshot): entrySnapshot is Record<string, unknown> => entrySnapshot !== null);
+    const findRecorded = (parkKey: string): Record<string, unknown> | null => {
+      for (const entrySnapshot of listedEntries) {
+        if (entrySnapshot.kind !== 'intent') continue;
+        if (entrySnapshot.key === parkKey) return entrySnapshot;
+      }
+      return null;
+    };
+
+    let newParksCount = 0;
+    for (const park of planned) {
+      const entrySnapshot = findRecorded(park.parkKey);
+      if (entrySnapshot === null) {
+        newParksCount += 1;
+        continue;
+      }
+      park.recordedIntent = true;
+      const parkRead = readCutoverShadowParkRecord(entrySnapshot.shadowPark);
+      if (!parkRead.ok || entrySnapshot.digest !== park.priorDigest || !sameShadowParkRecord(parkRead.record, park.record)) {
+        return refuse('park-digest-mismatch');
+      }
+    }
+
+    const capacity = checkCutoverJournalCapacity(existing.length, newParksCount);
+    if (!capacity.ok) {
+      // Both counts are proven non-negative safe integers, so the invalid-input
+      // reason is unreachable here; every remaining reason is a typed refusal.
+      if (capacity.reason === 'too-many-shadow-parks') return refuse('too-many-shadow-parks');
+      if (capacity.reason === 'journal-capacity-exceeded') return refuse('journal-capacity-exceeded');
+      return unknown('journal-unreadable');
+    }
+    return { planned, vetoHoldParks };
+  }
+
+  /**
+   * SW2b2: the write phase of the shadow parks, run only after the cutover
+   * journal intent is appended and before `applySwitch`. Each park still
+   * missing its journal intent gets one in `shadow-park-journal.json`, then
+   * every planned park is released back to `queued` by compare-and-set on its
+   * revision — never dropped. An already-released entry (a crash between the
+   * release and the record save) is no longer `parked`, so a replay skips it
+   * and the resumed count stays exact.
+   */
+  private async releaseShadowParks(
+    planned: readonly PlannedShadowPark[],
+    normalizedNowIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly releasedParks: number }> {
+    const effectiveDeadlineIso = new Date(Date.now() + DEFAULT_SWITCH_DEADLINE_MS).toISOString();
+    let releasedParks = 0;
+    for (const park of planned) {
+      if (!park.recordedIntent) {
+        const appended = await this.guarded(deadlineIso, () =>
+          this.deps.shadowParkJournal!.append({
+            key: park.parkKey,
+            kind: 'intent',
+            entryId: this.deps.mintEntryId(),
+            recordedAtIso: normalizedNowIso,
+            digest: park.priorDigest,
+            shadowPark: park.record,
+          }),
+        );
+        if (appended.kind === 'deadline') return unknown('deadline-exceeded');
+        if (appended.kind === 'threw' || appended.value.outcome === 'refused') {
+          return refuse('park-journal-append-failed');
+        }
+      }
+      const transition = await this.guarded(deadlineIso, () =>
+        this.deps.mergeQueue!.applyMergeTransition({
+          entryId: park.entry.entryId,
+          expectedRevision: park.entry.revision,
+          next: park.releasedRecord,
+          successor: null,
+          deadlineIso: effectiveDeadlineIso,
+        }),
+      );
+      if (transition.kind === 'deadline') return unknown('deadline-exceeded');
+      if (transition.kind === 'threw') return unknown('merge-queue-write-failed');
+      if (transition.value.outcome === 'refused') {
+        if (transition.value.reason === 'revision-conflict') {
+          return refuse('park-release-conflict');
+        }
+        return unknown('merge-queue-write-failed');
+      }
+      releasedParks += 1;
+    }
+    return { releasedParks };
   }
 
   /** The digest a switch intent carries for one value of `trainPausedBefore` (none: the four-key payload). */
@@ -1101,8 +1412,8 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   }
 
   /** The completed result of a move this pass performed. */
-  private completedMove(kind: MoveKind, key: string, record: CutoverRecord): ManageCutoverResult {
-    return completedResult(kind, key, false, record);
+  private completedMove(kind: MoveKind, key: string, record: CutoverRecord, parkCounts?: SwitchParkCounts): ManageCutoverResult {
+    return completedResult(kind, key, false, record, parkCounts);
   }
 
   /** A completed switch returns its recorded outcome with no write; a refused one stays refused. */

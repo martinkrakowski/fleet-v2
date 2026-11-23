@@ -57,14 +57,13 @@ describe("loadSdk", () => {
 
   it("rejects with the install-hint error preserving the original cause when the mcp.js specifier fails to load", async () => {
     const originalError = new Error("missing mcp");
-    // A throwing getter instead of a throwing factory: vitest wraps factory
-    // errors into its own error, while the getter throws exactly when `sdk.ts`
-    // reads the binding, so the original error object reaches `.catch` intact.
-    vi.doMock(MCP_SPECIFIER, () => ({
-      get McpServer(): unknown {
-        throw originalError;
-      },
-    }));
+    // The factory throws, so the mcp.js dynamic import itself rejects: vitest
+    // wraps factory errors into its own Error whose `cause` is the thrown
+    // error, so the original error object is preserved one hop inside the
+    // cause chain that reaches `sdk.ts`'s `.catch`.
+    vi.doMock(MCP_SPECIFIER, () => {
+      throw originalError;
+    });
     vi.doMock(STDIO_SPECIFIER, () => ({
       StdioServerTransport: FakeStdioServerTransport,
     }));
@@ -75,7 +74,10 @@ describe("loadSdk", () => {
       const failure = error as Error & { cause?: unknown };
       expect(failure.message.startsWith("Failed to load @modelcontextprotocol/sdk")).toBe(true);
       expect(failure.message.includes("npm install @modelcontextprotocol/sdk zod")).toBe(true);
-      expect(failure.cause).toBe(originalError);
+      // The direct cause is vitest's factory-error wrapper; the original
+      // thrown error is preserved as the wrapper's own cause.
+      expect(failure.cause).toBeInstanceOf(Error);
+      expect((failure.cause as { cause?: unknown }).cause).toBe(originalError);
       return true;
     });
   });
@@ -83,13 +85,11 @@ describe("loadSdk", () => {
   it("rejects with the install-hint error preserving the original cause when the stdio.js specifier fails to load", async () => {
     const originalError = new Error("missing stdio");
     vi.doMock(MCP_SPECIFIER, () => ({ McpServer: FakeMcpServer }));
-    // A throwing getter instead of a throwing factory, for the same reason as
-    // in the mcp.js failure test.
-    vi.doMock(STDIO_SPECIFIER, () => ({
-      get StdioServerTransport(): unknown {
-        throw originalError;
-      },
-    }));
+    // The factory throws, so the stdio.js dynamic import itself rejects, for
+    // the same reason as in the mcp.js failure test above.
+    vi.doMock(STDIO_SPECIFIER, () => {
+      throw originalError;
+    });
     const { loadSdk } = await import("./sdk.js");
 
     await expect(loadSdk()).rejects.toSatisfy((error: unknown) => {
@@ -97,7 +97,10 @@ describe("loadSdk", () => {
       const failure = error as Error & { cause?: unknown };
       expect(failure.message.startsWith("Failed to load @modelcontextprotocol/sdk")).toBe(true);
       expect(failure.message.includes("npm install @modelcontextprotocol/sdk zod")).toBe(true);
-      expect(failure.cause).toBe(originalError);
+      // The direct cause is vitest's factory-error wrapper; the original
+      // thrown error is preserved as the wrapper's own cause.
+      expect(failure.cause).toBeInstanceOf(Error);
+      expect((failure.cause as { cause?: unknown }).cause).toBe(originalError);
       return true;
     });
   });

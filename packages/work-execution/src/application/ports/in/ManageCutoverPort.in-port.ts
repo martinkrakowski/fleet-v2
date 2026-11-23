@@ -78,6 +78,10 @@ export interface ManageCutoverSwitchCompleted {
   readonly state: 'switched';
   readonly revision: number;
   readonly record: CutoverRecord;
+  /** Shadow parks released by this switch (SW2b2 replaces the placeholder `0`). */
+  readonly releasedParks: number;
+  /** Shadow parks held back by a veto at switch time (SW2b2 replaces the placeholder `0`). */
+  readonly vetoHoldParks: number;
 }
 
 export interface ManageCutoverRetireCompleted {
@@ -106,7 +110,16 @@ export type ManageCutoverRefusalReason =
   | 'conductor-driver-live'
   | 'inside-rollback-window'
   | 'retirement-ledger-absent'
-  | 'retirement-ledger-failed';
+  | 'retirement-ledger-failed'
+  | 'daemon-not-paused'
+  | 'merge-queue-absent'
+  | 'merge-policy-absent'
+  | 'invalid-park-record'
+  | 'too-many-shadow-parks'
+  | 'journal-capacity-exceeded'
+  | 'park-digest-mismatch'
+  | 'park-journal-append-failed'
+  | 'park-release-conflict';
 
 export type ManageCutoverUnknownReason =
   | 'deadline-exceeded'
@@ -124,7 +137,10 @@ export type ManageCutoverUnknownReason =
   | 'shadow-evidence-unknown-version'
   | 'unrecorded-lanes-unknown'
   | 'retirement-ledger-unreadable'
-  | 'retirement-ledger-unknown-version';
+  | 'retirement-ledger-unknown-version'
+  | 'merge-policy-unreadable'
+  | 'merge-queue-unreadable'
+  | 'merge-queue-write-failed';
 
 export type ManageCutoverResult =
   | ManageCutoverStatusResult

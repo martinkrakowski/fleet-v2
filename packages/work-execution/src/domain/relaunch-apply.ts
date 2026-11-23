@@ -13,6 +13,7 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
+import type { AttemptRunnerRecord } from './execution-records.js';
 import { isPlainRecordObject } from './record-schema-version.js';
 import {
   readBoundedDenseArray,
@@ -494,13 +495,18 @@ function preflightJsonValue(value: unknown): boolean {
   return true;
 }
 
-/** One validated and snapshotted save input: every field a plain value. */
-interface SnapshotSaveInput {
+/**
+ * One validated and snapshotted save input: every field a plain value, and
+ * `recordedHost` validated field-by-field against `AttemptRunnerRecord`. The
+ * object is detached from its caller, so a later mutation of the input can
+ * never change what an apply reads.
+ */
+export interface ValidatedRelaunchSaveInput {
   readonly laneId: string;
   readonly attemptId: string;
   readonly worktreePath: string;
   readonly clonePath: string;
-  readonly recordedHost: Record<string, unknown> | null;
+  readonly recordedHost: AttemptRunnerRecord | null;
   readonly baseCommit: string;
   readonly allowedPathPrefixes: readonly string[];
   readonly policyProtectedPaths: readonly string[];
@@ -512,7 +518,7 @@ interface SnapshotSaveInput {
  * accessors and unknown keys refused, and every validated value copied into a
  * plain record. `null` on any failure.
  */
-function snapshotSaveInput(input: unknown): SnapshotSaveInput | null {
+export function snapshotSaveInput(input: unknown): ValidatedRelaunchSaveInput | null {
   const fields = readStrictPlainRecord(
     input,
     ['laneId', 'attemptId', 'worktreePath', 'clonePath', 'recordedHost', 'baseCommit', 'allowedPathPrefixes'],
@@ -542,12 +548,15 @@ function snapshotSaveInput(input: unknown): SnapshotSaveInput | null {
   }
   const host = snapshotRecordedHost(fields.recordedHost);
   if (host === undefined) return null;
+  // `snapshotRecordedHost` has already validated every field of the host
+  // block against the `AttemptRunnerRecord` contract; the assertion only
+  // names that proved shape for the type system.
   return {
     laneId,
     attemptId,
     worktreePath,
     clonePath,
-    recordedHost: host,
+    recordedHost: host as unknown as AttemptRunnerRecord | null,
     baseCommit,
     allowedPathPrefixes: allowed.array as readonly string[],
     policyProtectedPaths: policyProtected,

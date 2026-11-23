@@ -13,7 +13,7 @@ import {
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
 import { checkJsonDuplicateKeys } from '../../domain/json-duplicate-keys.js';
-import { parseReviewStreamGrammar } from '../../domain/review-stream-grammar.js';
+import { parseReviewStreamGrammar, MAX_REVIEW_STREAM_LENGTH } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
@@ -1677,6 +1677,7 @@ export function createOcmReviewTransport(
     const spawnStdout = safeRead(() => spawnResult.stdout);
     const streamText = typeof spawnStdout === 'string' ? spawnStdout : '';
     let readOnlyVoided = false;
+    let hasInvalidJsonStreamLine = false;
     let hasStepStart = false;
     let hasStepFinish = false;
     let lastStepOpen = false;
@@ -1684,6 +1685,17 @@ export function createOcmReviewTransport(
     for (const rawLine of streamText.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (line === '') continue;
+      // RV2b: every non-blank stream line is scanned for duplicate keys and
+      // invalid JSON (bad escapes, raw control characters) at the stream
+      // length cap before `JSON.parse` sees it; a refused line is a
+      // `stream-grammar` refusal, not an `unparseable-verdict`. Cost bound:
+      // one linear scan per line, O(1) length refusal.
+      const lineCheck = checkJsonDuplicateKeys(line, MAX_REVIEW_STREAM_LENGTH);
+      if (!lineCheck.ok) {
+        readOnlyVoided = true;
+        hasInvalidJsonStreamLine = true;
+        continue;
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
@@ -1749,6 +1761,12 @@ export function createOcmReviewTransport(
     // 9. Parse verdict, findings, and rawOutput
     if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
       return refusedStreamResult('stream-incomplete', readOnlyVerified);
+    }
+    // RV2b: a stream line the duplicate-key scan refused (duplicate key,
+    // invalid escape, raw control character, or a line over the stream cap)
+    // is a stream-grammar refusal, never an `unparseable-verdict`.
+    if (hasInvalidJsonStreamLine) {
+      return refusedStreamResult(STREAM_GRAMMAR_REASON, readOnlyVerified);
     }
     // RVG2: the verdict text is read only from a stream the strict grammar accepts.
     const grammar = parseReviewStreamGrammar(streamText);

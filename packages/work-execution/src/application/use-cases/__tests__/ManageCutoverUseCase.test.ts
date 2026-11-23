@@ -1381,6 +1381,8 @@ describe('ManageCutoverUseCase switch shadow parks', () => {
       ['undefined entries', { outcome: 'listed', entries: undefined }],
       ['array-like entries', { outcome: 'listed', entries: { length: 1, 0: { key: 'k', kind: 'intent' } } }],
       ['getter entry', { outcome: 'listed', entries: [getterEntry] }],
+      ['null element', { outcome: 'listed', entries: [null] }],
+      ['array hole', { outcome: 'listed', entries: new Array(1) }],
     ];
     for (const [label, behaviour] of cases) {
       const h = await harness({ seed: null, daemonPaused: true });

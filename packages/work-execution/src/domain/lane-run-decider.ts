@@ -1283,7 +1283,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           const requested = mergingPreMergeRequest();
           return requested !== null && requested.kind !== 'wait';
         })();
-      if (!premergeNeedsReview) {
+      // FS: a force stop wins over an unread `premerge` intent (a `wait` hold
+      // the operator never read): it falls through to G3d/G4a instead of
+      // reconciling, so the run ends without waiting on the review. A graceful
+      // stop keeps reconciling the premerge hold.
+      const forceStopOverPremerge =
+        facts.pendingIntent.step === 'premerge' && facts.stopMode === 'force';
+      if (!premergeNeedsReview && !forceStopOverPremerge) {
         return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
       }
     }

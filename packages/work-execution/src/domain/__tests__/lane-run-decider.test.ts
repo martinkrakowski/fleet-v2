@@ -223,6 +223,67 @@ describe('global rules', () => {
     assertDecision(ended, rec, decide(rec, ended), { kind: 'enter', to: 'stopped' });
   });
 
+  it('G3a / G4a: a force stop over an unread premerge intent in merging enters stopped', () => {
+    const rec = record({});
+    const intent = { key: `${RUN_ID}/r0/premerge/0@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
+    const facts = baseFacts({
+      state: 'merging',
+      stopMode: 'force',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      attempt: attemptFact({ phase: 'collected' }),
+      pendingIntent: intent,
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('G3a: a graceful stop over an unread premerge intent in merging still reconciles premerge', () => {
+    const rec = record({});
+    const intent = { key: `${RUN_ID}/r0/premerge/0@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
+    const facts = baseFacts({
+      state: 'merging',
+      stopMode: 'graceful',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      attempt: attemptFact({ phase: 'collected' }),
+      pendingIntent: intent,
+      preMergeReviewWired: false,
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'premerge', key: intent.key });
+  });
+
+  it('G3a / G3d: a force stop over an unread premerge intent with a merged PR carrying the head enters merged', () => {
+    const rec = record({});
+    const intent = { key: `${RUN_ID}/r0/premerge/0@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
+    const facts = baseFacts({
+      state: 'merging',
+      stopMode: 'force',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+      attempt: attemptFact({ phase: 'collected' }),
+      pendingIntent: intent,
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3a: a halted run with a force stop and an unread premerge intent still parks halted', () => {
+    const rec = record({});
+    const intent = { key: `${RUN_ID}/r0/premerge/0@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
+    const facts = baseFacts({
+      state: 'merging',
+      halted: true,
+      stopMode: 'force',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      attempt: attemptFact({ phase: 'collected' }),
+      pendingIntent: intent,
+    });
+    assertDecision(facts, rec, decide(rec, facts), {
+      kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'merging',
+    });
+  });
+
   it('G4h: a halted park with a stop pending lifts by itself', () => {
     const rec = record({ parked: PARKED_HALTED, parkCount: 1 });
     const facts = baseFacts({

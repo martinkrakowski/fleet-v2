@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { MAX_JSON_SCAN_DEPTH, checkJsonDuplicateKeys } from '../json-duplicate-keys.js';
 import { MAX_REVIEW_REPLY_LENGTH } from '../review-answer-schema.js';
@@ -116,12 +116,18 @@ describe('checkJsonDuplicateKeys', () => {
     }
   });
 
-  it('returns a typed invalid-input result on hostile non-string inputs without throwing', () => {
-    const throwingGetter = Object.create(null, { length: { get: () => { throw new Error('getter ran'); } } });
+  it('returns a typed invalid-input result on hostile non-string inputs without throwing and never runs getters or Proxy traps', () => {
+    const getterSpy = vi.fn(() => {
+      throw new Error('getter ran');
+    });
+    const throwingGetter = Object.create(null, { length: { get: getterSpy } });
+    const trapSpy = vi.fn(() => {
+      throw new Error('trap ran');
+    });
     const lyingProxy = new Proxy({}, {
-      get: () => { throw new Error('trap ran'); },
-      has: () => { throw new Error('trap ran'); },
-      ownKeys: () => { throw new Error('trap ran'); },
+      get: trapSpy,
+      has: trapSpy,
+      ownKeys: trapSpy,
     });
     const holed: unknown[] = new Array(2);
     holed[1] = '{';
@@ -140,6 +146,10 @@ describe('checkJsonDuplicateKeys', () => {
       expect(() => checkJsonDuplicateKeys(value)).not.toThrow();
       expect(checkJsonDuplicateKeys(value)).toEqual({ ok: false, reason: 'invalid-input' });
     }
+    // The invalid-input guard runs before any property access, so the
+    // throwing getter and every Proxy trap are provably never invoked.
+    expect(getterSpy).not.toHaveBeenCalled();
+    expect(trapSpy).not.toHaveBeenCalled();
     // Prototype-polluting keys are data: unique ones are accepted (the
     // scanner never touches Object.prototype) and a repeated one is refused.
     expect(checkJsonDuplicateKeys('{"__proto__":1,"constructor":2,"prototype":3}')).toEqual({

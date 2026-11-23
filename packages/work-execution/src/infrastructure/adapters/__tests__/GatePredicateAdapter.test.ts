@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { GatePredicateAdapter } from '../GatePredicateAdapter.adapter.js';
+import { GatePredicateAdapter, boundedRedactedOutputTail } from '../GatePredicateAdapter.adapter.js';
 import type { GatePredicateAdapterOptions } from '../GatePredicateAdapter.adapter.js';
 import type {
   EvaluateGatePredicatesRequest,
@@ -861,5 +861,108 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     const prefixed = executor.argvRecords.find((argv) => argv.includes(GATE_SLOT_PATH));
     expect(prefixed).toBeDefined();
     expect(prefixed).toContain('FLEET_V2_GATE_WAIT_MAX_SECONDS=1');
+  });
+});
+
+describe('GatePredicateAdapter failed output tail (GD2)', () => {
+  const HOST_SPEC: RunnerForAttemptHostSpec = {
+    transport: 'local',
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 4096 },
+  };
+
+  function commandResults(script: (argv: readonly string[]) => Partial<CommandRunResult>) {
+    const adapter = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? script(argv) : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    return adapter.adapter.evaluateGatePredicates(REQUEST).then(evaluatedResults);
+  }
+
+  it('attaches a bounded outputTail to a failing command with output', async () => {
+    const results = await commandResults(() => ({ exitCode: 1, stdout: 'error: build failed\n' }));
+    expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 1, outputTail: 'error: build failed' });
+  });
+
+  it('omits outputTail when both streams are empty or whitespace', async () => {
+    for (const streams of [{}, { stdout: '', stderr: '' }, { stdout: '   \n\t', stderr: '' }]) {
+      const results = await commandResults(() => ({ exitCode: 1, ...streams }));
+      expect(results[2]).not.toHaveProperty('outputTail');
+    }
+  });
+
+  it('omits outputTail on pass, skipped, timeout and congestion verdicts', async () => {
+    const passing = await commandResults(() => ({ exitCode: 0, stdout: 'all good\n' }));
+    expect(passing[2]).not.toHaveProperty('outputTail');
+    const killed = await commandResults(() => ({ exitCode: 137, signal: 'KILL', stdout: 'out of memory\n' }));
+    expect(killed[2]).toMatchObject({ verdict: 'unknown', cause: 'resource-exhausted' });
+    expect(killed[2]).not.toHaveProperty('outputTail');
+    const timedOut = await commandResults(() => ({ exitCode: 1, error: 'timed out', stdout: 'partial\n' }));
+    expect(timedOut[2].verdict === 'unknown').toBe(true);
+    expect(timedOut[2]).not.toHaveProperty('outputTail');
+  });
+
+  it('omits outputTail for the declared gate-slot wait-limit verdict (exit 75 unknown)', async () => {
+    const slotSpec: RunnerForAttemptHostSpec = {
+      transport: 'local',
+      roles: ['lane-runner'],
+      runner: { kind: 'opencode', port: 4096, gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 } },
+    };
+    const adapter = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? { exitCode: 75, stderr: 'gate-slot: no slot within the wait limit\n' }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      slotSpec,
+    );
+    const results = evaluatedResults(await adapter.adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'unknown', cause: 'gate-slot-wait-limit' });
+    expect(results[2]).not.toHaveProperty('outputTail');
+  });
+
+  it('keeps the tail at most 200 lines and 32 KiB of combined output', async () => {
+    const long = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+    const results = await commandResults(() => ({ exitCode: 1, stdout: long }));
+    const tail = results[2].kind === 'command' && typeof results[2].outputTail === 'string' ? results[2].outputTail : '';
+    expect(tail.length).toBeLessThanOrEqual(32 * 1024);
+    expect(tail.startsWith('line ')).toBe(true);
+    expect(tail).not.toContain('line 0\n');
+    expect(tail.endsWith('line 399')).toBe(true);
+  });
+
+  it('redacts secret-shaped lines line by line', async () => {
+    const results = await commandResults(() => ({
+      exitCode: 1,
+      stdout: 'starting build\ntoken: ghp_abc123def456ghi789jkl012mno345pqr678\nbuild failed\n',
+    }));
+    const tail = results[2].kind === 'command' && typeof results[2].outputTail === 'string' ? results[2].outputTail : '';
+    expect(tail).toContain('starting build');
+    expect(tail).toContain('[redacted: secret-shaped line]');
+    expect(tail).not.toContain('ghp_');
+  });
+
+  it('never throws for non-string streams (boundedRedactedOutputTail is total)', () => {
+    for (const [a, b] of [
+      [undefined, undefined],
+      [null as unknown, null as unknown],
+      [{ length: 3 } as unknown, 42 as unknown],
+    ]) {
+      expect(() => boundedRedactedOutputTail(a, b)).not.toThrow();
+      expect(boundedRedactedOutputTail(a, b)).toBeUndefined();
+    }
+    expect(boundedRedactedOutputTail('out\n', undefined)).toBe('out');
+    expect(boundedRedactedOutputTail(undefined, 'err\n')).toBe('err');
+  });
+
+  it('strips ANSI escape sequences before bounding and redacting', async () => {
+    const results = await commandResults(() => ({
+      exitCode: 1,
+      stdout: '[31merror: failed[0m\n',
+    }));
+    expect(results[2].kind === 'command' && results[2].outputTail).toBe('error: failed');
   });
 });

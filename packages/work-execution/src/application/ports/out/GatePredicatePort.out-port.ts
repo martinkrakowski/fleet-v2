@@ -55,6 +55,21 @@ export interface GatePredicateResult {
    * none could be determined. Absent on every other result. Never command output.
    */
   readonly failingFile?: string | null;
+  /**
+   * GD2: on a failing command predicate only, the bounded, secret-redacted
+   * tail of the command's combined stdout and stderr. Absent on every other
+   * verdict (pass, skipped, unknown — including congestion) and never part of
+   * the journal detail: the tail is archived through the evidence archive and
+   * only its `evidence://` reference is journalled.
+   */
+  readonly outputTail?: string;
+  /**
+   * GD2: reference to the archived failed output tail (`evidence://…`), set
+   * by the acceptance use case on a journalled failing predicate when
+   * archiving succeeded. Absent when no archive is wired, the archive fails
+   * or the predicate is not a failing command.
+   */
+  readonly outputEvidenceRef?: string;
 }
 
 export interface EvaluateGatePredicatesRequest {

@@ -257,6 +257,69 @@ function withBoundedDetail(result: GatePredicateResult): GatePredicateResult {
   return { ...result, detail, ...(coverage === undefined ? {} : { coverage }) };
 }
 
+/**
+ * GD2: cost bounds for the failed output tail — the tail scans at most the
+ * last 32 KiB / 200 lines of the combined streams (after stripping ANSI
+ * sequences), so a command that floods its output costs the same as one that
+ * printed a screenful.
+ */
+const MAX_OUTPUT_TAIL_BYTES = 32 * 1024;
+const MAX_OUTPUT_TAIL_LINES = 200;
+const OUTPUT_TAIL_WITHHELD = '[output withheld: secret-shaped text]';
+const OUTPUT_TAIL_REDACTED_LINE = '[redacted: secret-shaped line]';
+/** CSI and OSC ANSI escape sequences. */
+// eslint-disable-next-line no-control-regex -- the tail must strip escape sequences, never match text containing them
+const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+function isSecretShapedLine(line: string): boolean {
+  return containsSecretShape(line) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(line));
+}
+
+/**
+ * GD2: the bounded, secret-redacted tail of a failed command's combined
+ * stdout and stderr, or undefined when both streams are empty,
+ * whitespace-only or not strings. Pure and never throwing: the combined
+ * streams are stripped of ANSI sequences, cut to the last 200 lines and
+ * 32 KiB, then each line matching a secret shape is replaced with a
+ * `[redacted: …]` marker; if the redacted tail still matches a secret shape
+ * the whole tail is withheld with one fixed marker.
+ */
+export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
+  const parts: string[] = [];
+  if (typeof stdout === 'string') {
+    parts.push(stdout);
+  }
+  if (typeof stderr === 'string') {
+    parts.push(stderr);
+  }
+  if (parts.length === 0) {
+    return undefined;
+  }
+  const stripped = parts.join('\n').replace(ANSI_PATTERN, '');
+  if (stripped.trim() === '') {
+    return undefined;
+  }
+  let lines = stripped.split(/\r?\n/);
+  if (lines.length > MAX_OUTPUT_TAIL_LINES) {
+    lines = lines.slice(-MAX_OUTPUT_TAIL_LINES);
+  }
+  let tail = lines.join('\n');
+  if (tail.length > MAX_OUTPUT_TAIL_BYTES) {
+    tail = tail.slice(tail.length - MAX_OUTPUT_TAIL_BYTES);
+  }
+  // A trailing newline is not command output: drop the empty last lines.
+  tail = tail.replace(/(?:\n[\t ]*)+$/, '');
+  const redacted = tail
+    .split(/\r?\n/)
+    .map((line) => (isSecretShapedLine(line) ? OUTPUT_TAIL_REDACTED_LINE : line))
+    .join('\n');
+  if (isSecretShapedLine(redacted)) {
+    return OUTPUT_TAIL_WITHHELD;
+  }
+  return redacted;
+}
+
+
 /** A predicate that could not run: unknown, never a pass. */
 function unknownResult(
   name: string,
@@ -881,21 +944,24 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
 
     const raw = rawVerdict(run, this.isRemote(executor));
+    const verdict = mapVerdict(raw);
     // PT1a: a failing command's output may name the file that failed; only the
     // screened, repo-relative path is carried, never the output.
-    const failing =
-      mapVerdict(raw) === 'fail'
-        ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
-        : {};
+    const failing = verdict === 'fail'
+      ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
+      : {};
+    // GD2: only a failing command carries the bounded, redacted output tail.
+    const tail = verdict === 'fail' ? boundedRedactedOutputTail(run.stdout, run.stderr) : undefined;
     if (command.coverage === undefined) {
       return {
         name,
         kind: 'command',
-        verdict: mapVerdict(raw),
+        verdict,
         exitCode: run.exitCode,
         durationMs: this.nowMs() - started,
         detail: detailForCommand(run, command, undefined),
         ...failing,
+        ...(tail === undefined ? {} : { outputTail: tail }),
       };
     }
 
@@ -904,21 +970,24 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const coverage: CheckCoverage = isCheckCoverage(read)
       ? read
       : { ran: false, reason: 'coverage reader returned a malformed value' };
-    const verdict = applyCoverage(raw, coverage, {
+    const verdictWithCoverage = applyCoverage(raw, coverage, {
       unitKind: command.coverage.unitKind,
       minUnits: command.coverage.minUnits,
     });
+    const coverageVerdict = mapVerdict(verdictWithCoverage);
+    const coverageTail = coverageVerdict === 'fail' ? boundedRedactedOutputTail(run.stdout, run.stderr) : undefined;
     return {
       name,
       kind: 'command',
-      verdict: mapVerdict(verdict),
+      verdict: coverageVerdict,
       exitCode: run.exitCode,
       durationMs: this.nowMs() - started,
       detail: detailForCommand(run, command, coverage),
       coverage,
-      ...(mapVerdict(verdict) === 'fail'
+      ...(coverageVerdict === 'fail'
         ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
         : {}),
+      ...(coverageTail === undefined ? {} : { outputTail: coverageTail }),
     };
   }
 }

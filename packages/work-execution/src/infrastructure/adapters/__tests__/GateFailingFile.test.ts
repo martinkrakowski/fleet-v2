@@ -125,7 +125,14 @@ describe('GatePredicateAdapter failingFile (PT1a)', () => {
     expect(command?.failingFile).toBe(
       'packages/work-execution/src/application/use-cases/__tests__/advance-lane-run-fix-round.test.ts',
     );
-    expect(JSON.stringify(command)).not.toContain('AssertionError');
+    // GD2: a failing command also carries a bounded, secret-redacted
+    // `outputTail`, which is the fixture's own text — so the no-output
+    // assertion applies to the screened `detail` and `failingFile`, which
+    // never echo output; the tail is the archived exception.
+    expect(JSON.stringify({ detail: command?.detail, failingFile: command?.failingFile })).not.toContain(
+      'AssertionError',
+    );
+    expect(typeof command?.outputTail === 'string' && command.outputTail.includes('AssertionError')).toBe(true);
   });
 
   it('a failing command with no file in its output records null', async () => {

@@ -513,7 +513,10 @@ describe('work-execution state file descriptors match the store readers', () => 
     expect(workOrderInspect(Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'chain/example' }]))).status).toBe('ok');
     expect(workOrderInspect(Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1 }]))).status).toBe('ok');
     const badWorkOrder = workOrderInspect(
-      Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'release' }])),
+      // RP1: the work-order store parser accepts any safe branch name
+      // (e.g. a profile defaultBranch like `staging`), so the unparsable
+      // value here is one that fails `isSafeWorkOrderBranchName`.
+      Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'bad..branch' }])),
     );
     expect(badWorkOrder.status).toBe('unreadable');
     expect(badWorkOrder.status === 'unreadable' ? badWorkOrder.detail : '').toBe('record 0 failed validation');

@@ -739,7 +739,12 @@ function joinLanes(
     const cloneHost = (matched ?? hostClones.find((clone) => clone.recordedHost !== null))?.recordedHost ?? null;
     let baseBranch: BaseBranchValue = 'main';
     if (run !== null) baseBranch = resolveLaneRunBaseBranch(run);
-    else if (workOrder !== null) baseBranch = resolveWorkOrderBaseBranch(workOrder);
+    else if (workOrder !== null) {
+      // RP1: a work order may now carry a profile base (e.g. `staging`); the
+      // lane-run record still only takes declared branches until RP1b, so an
+      // undeclared value reads as `main` here, as it always has.
+      baseBranch = parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? 'main';
+    }
     if (parseBaseBranch(baseBranch) === undefined) return null;
     lanes.push({
       row,

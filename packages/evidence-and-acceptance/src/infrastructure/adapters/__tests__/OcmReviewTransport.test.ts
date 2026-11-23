@@ -4087,3 +4087,53 @@ describe('RVG2: the reviewer stream must match the grammar', () => {
     expect((await verify([START, READ, PASS_TEXT, FINISH].join('\n'))).result).toBe('pass');
   });
 });
+
+describe('OcmReviewTransport: duplicate JSON keys in the fenced answer (RV2)', () => {
+  // `JSON.parse` keeps the last value of a duplicate key, so every duplicate
+  // must be refused before the parse. `parseReviewReply` must return
+  // `unknown` with `unknownReason: 'unparseable-verdict'` for all of them.
+  const refusals: readonly { readonly label: string; readonly reply: string }[] = [
+    {
+      label: 'top-level duplicate verdict, FAIL-then-PASS',
+      reply: '```json\n{"verdict":"FAIL","findings":[],"verdict":"PASS"}\n```',
+    },
+    {
+      label: 'top-level duplicate verdict, PASS-then-FAIL',
+      reply: '```json\n{"verdict":"PASS","findings":[],"verdict":"FAIL"}\n```',
+    },
+    {
+      label: 'nested duplicate severity key inside one finding',
+      reply:
+        '```json\n{"verdict":"PASS","findings":[{"severity":"blocker","file":"a.ts","line":1,"summary":"s","severity":"nit"}]}\n```',
+    },
+    {
+      label: 'deeply nested duplicate key inside an array of objects',
+      reply: '```json\n{"verdict":"PASS","findings":[[{"a":1},{"a":2,"a":3}]]}\n```',
+    },
+  ];
+
+  it.each(refusals)('refuses $label as unparseable-verdict', ({ reply }) => {
+    const parsed = parseReviewReply(reply);
+    expect(parsed.result).toBe('unknown');
+    expect(parsed.findings).toEqual([]);
+    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+  });
+
+  it('still accepts a unique-key PASS reply with no findings', () => {
+    expect(parseReviewReply(jsonReply('PASS'))).toEqual({ result: 'pass', findings: [] });
+  });
+
+  it('still accepts a unique-key FAIL reply with findings', () => {
+    const parsed = parseReviewReply(jsonReply('FAIL', [finding('blocker', 'src/a.ts', 1, 'broken')]));
+    expect(parsed.result).toBe('fail');
+    expect(parsed.findings).toHaveLength(1);
+  });
+
+  it('ignores duplicate-key-shaped text inside a finding summary string', () => {
+    const reply =
+      '```json\n{"verdict":"PASS","findings":[{"severity":"nit","file":"a.ts","line":1,"summary":"\\"verdict\\":\\"FAIL\\""}]}\n```';
+    const parsed = parseReviewReply(reply);
+    expect(parsed.result).toBe('pass');
+    expect(parsed.findings).toHaveLength(1);
+  });
+});

@@ -271,3 +271,169 @@ describe('ActionAuthorizationAdapter.authorizeShadowImport (GR1a2)', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
   });
 });
+
+// #4g: the local grant map must prefer a resumable release grant (already
+// consumed by exactly the resolve's action id) over an unrelated unconsumed
+// grant, so a retry after a crash between the consumption and the release's
+// write never spends a second approved grant.
+import type {
+  ResolveActionAuthorizationRequest,
+  ResolveActionAuthorizationResult,
+} from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
+import type { ActionAuthorizationGrantEntry } from './ActionAuthorizationAdapter.adapter.js';
+
+describe('ActionAuthorizationAdapter local grant map (#4g)', () => {
+  const HEAD_SHA = 'a'.repeat(40);
+  const ROOT = '/srv/fleet/releases';
+
+  function releaseEntry(overrides: Record<string, unknown> = {}): ActionAuthorizationGrantEntry {
+    return {
+      attemptId: 'att-1',
+      expectedHeadSha: HEAD_SHA,
+      kind: 'release-swap',
+      releaseRoot: ROOT,
+      consumedByActionId: null,
+      ...overrides,
+    } as ActionAuthorizationGrantEntry;
+  }
+
+  function resolveRequest(overrides: Partial<ResolveActionAuthorizationRequest> = {}): ResolveActionAuthorizationRequest {
+    return {
+      actionId: 'action-1',
+      projectId: 'project-1',
+      workOrderId: 'wo-1',
+      attemptId: 'att-1',
+      actionKind: 'release-swap',
+      expectedHeadSha: HEAD_SHA,
+      policyRevision: 'policy-7',
+      releaseRoot: ROOT,
+      ...overrides,
+    };
+  }
+
+  function resolve(
+    entries: Array<[string, ActionAuthorizationGrantEntry]>,
+    request: ResolveActionAuthorizationRequest = resolveRequest(),
+  ): Promise<ResolveActionAuthorizationResult> {
+    return new ActionAuthorizationAdapter({ grants: new Map(entries) }).resolveActionAuthorization(request);
+  }
+
+  it('prefers matching resumable release grant over a second approved grant on retry', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry({ consumedByActionId: 'action-1' })],
+      ['grant-2', releaseEntry()],
+    ];
+    const result = await resolve(grants);
+    expect(result).toMatchObject({ outcome: 'granted', authorizationGrantId: 'grant-1' });
+  });
+
+  it('still resolves through the unconsumed grant when no grant is consumed by the resuming action', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry({ consumedByActionId: 'other-action' })],
+      ['grant-2', releaseEntry()],
+    ];
+    const result = await resolve(grants);
+    expect(result).toMatchObject({ outcome: 'granted', authorizationGrantId: 'grant-2' });
+  });
+
+  it('blocks a retry when the only structural match is consumed by another action', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry({ consumedByActionId: 'other-action' })],
+    ];
+    const result = await resolve(grants);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'no-matching-grant' });
+  });
+
+  it('blocks an invalid grant record in the map as invalid-grant-record', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry()],
+      ['bad/id/path', releaseEntry({ expectedHeadSha: HEAD_SHA })],
+    ];
+    const result = await resolve(grants);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-grant-record' });
+  });
+
+  it('blocks an unknown-schema grant record as unknown-grant-schema-version', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry()],
+      ['grant-2', { ...releaseEntry(), schemaVersion: 9 } as unknown as ActionAuthorizationGrantEntry],
+    ];
+    const result = await resolve(grants);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'unknown-grant-schema-version' });
+  });
+
+  it('refuses a null resolve request as invalid-request without throwing', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const result = await adapter.resolveActionAuthorization(null as unknown as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an undefined resolve request as invalid-request without throwing', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const result = await adapter.resolveActionAuthorization(undefined as unknown as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses a wrong-primitive resolve request (a number where a record is due) as invalid-request', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const result = await adapter.resolveActionAuthorization(7 as unknown as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an array resolve request (non-record where a record is due) as invalid-request', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const result = await adapter.resolveActionAuthorization([] as unknown as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('refuses an enormous sparse array resolve request before any traversal', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const sparse: unknown[] = [];
+    Object.defineProperty(sparse, 'length', { value: 2 ** 32 - 1 });
+    const result = await adapter.resolveActionAuthorization(sparse as unknown as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('never runs a hostile getter on a resolve request field (own data descriptors only)', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    let getterCalls = 0;
+    const request = {
+      ...resolveRequest(),
+      get projectId(): string {
+        getterCalls += 1;
+        return 'project-1';
+      },
+    };
+    const result = await adapter.resolveActionAuthorization(request as ResolveActionAuthorizationRequest);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('never mutates the prototype on a resolve request with an own __proto__ key', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: new Map([['grant-1', releaseEntry()]]) });
+    const raw: Record<string, unknown> = { ...resolveRequest() };
+    Object.defineProperty(raw, '__proto__', { value: { polluted: true }, enumerable: true });
+    const result = await adapter.resolveActionAuthorization(raw as unknown as ResolveActionAuthorizationRequest);
+    // A hostile own `__proto__` key is inert data: the resolve yields exactly
+    // the plain-data result and never writes through to Object.prototype.
+    const clean = await adapter.resolveActionAuthorization(resolveRequest());
+    expect(result).toEqual(clean);
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('a constant-verdict implementation would fail: an unrelated blocked map still resolves the resumable grant', async () => {
+    const grants: Array<[string, ActionAuthorizationGrantEntry]> = [
+      ['grant-1', releaseEntry({ consumedByActionId: 'action-1' })],
+    ];
+    const result = await resolve(grants);
+    expect(result).toMatchObject({ outcome: 'granted', authorizationGrantId: 'grant-1' });
+  });
+
+  it('an identity echo of the input would fail: the granted result names the stored grant, not the request', async () => {
+    const result = await resolve([['grant-1', releaseEntry({ consumedByActionId: 'action-1' })]]);
+    expect('authorizationGrantId' in result).toBe(true);
+    expect((result as { authorizationGrantId?: string }).authorizationGrantId).toBe('grant-1');
+    expect(result).not.toEqual(resolveRequest());
+  });
+});

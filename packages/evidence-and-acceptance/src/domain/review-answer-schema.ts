@@ -355,7 +355,60 @@ function scanFences(lines: readonly string[]): {
       };
     }
   }
+  if (open !== null) {
+    const glued = tryCloseGluedTrailingJsonFence(open);
+    if (glued !== null) {
+      fences.push(glued);
+      return { fences, unclosed: false };
+    }
+  }
   return { fences, unclosed: open !== null };
+}
+
+/**
+ * Close a trailing backtick `INFO_JSON` fence whose closing ```` ``` ````
+ * markers are glued to the end of the last non-blank body line (for example
+ * `{"verdict":"FAIL",...}````). Succeeds only when the fence is a backtick
+ * fence named `json`-ish, the last non-blank body line ends with a backtick
+ * run at least as long as the opening fence, and that run is not the entire
+ * (trimmed) line — a standalone indented fence-close line is not glued
+ * content. Returns `null` when any condition fails, so the fence stays
+ * unclosed and the caller refuses.
+ */
+function tryCloseGluedTrailingJsonFence(open: OpenFenceState): ScannedFence | null {
+  if (!open.fence.startsWith('`') || !INFO_JSON.test(open.info.trim())) {
+    return null;
+  }
+  let lastNonBlankIndex = -1;
+  for (let index = open.body.length - 1; index >= 0; index -= 1) {
+    if ((open.body[index] ?? '').trim() !== '') {
+      lastNonBlankIndex = index;
+      break;
+    }
+  }
+  if (lastNonBlankIndex < 0) {
+    return null;
+  }
+  const trimmedEnd = (open.body[lastNonBlankIndex] ?? '').replace(/[ \t]+$/, '');
+  let closeLen = 0;
+  for (let index = trimmedEnd.length - 1; index >= 0 && trimmedEnd[index] === '`'; index -= 1) {
+    closeLen += 1;
+  }
+  if (closeLen < open.fence.length) {
+    return null;
+  }
+  const before = trimmedEnd.slice(0, trimmedEnd.length - closeLen);
+  if (before.trim() === '') {
+    return null;
+  }
+  const body = [...open.body.slice(0, lastNonBlankIndex), before].join('\n');
+  return {
+    fence: open.fence,
+    info: open.info,
+    openLine: open.openLine,
+    endLine: open.openLine + lastNonBlankIndex + 1,
+    body,
+  };
 }
 
 function hasTrailingNonBlankLines(lines: readonly string[], startLine: number): boolean {
@@ -393,6 +446,9 @@ function checkTrailingRegion(
 export function extractSingleTrailingJsonFence(
   strippedText: string,
 ): { kind: 'none' } | { kind: 'invalid' } | { kind: 'single'; jsonText: string } {
+  if (typeof strippedText !== 'string' || strippedText.length > MAX_REVIEW_REPLY_LENGTH) {
+    return { kind: 'invalid' };
+  }
   const lines = strippedText.split(/\r?\n/);
   const { fences, unclosed } = scanFences(lines);
   if (unclosed) {

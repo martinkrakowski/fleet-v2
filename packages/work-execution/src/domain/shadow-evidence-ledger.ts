@@ -10,7 +10,11 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { CUTOVER_SHADOW_CONSECUTIVE_DAYS, CUTOVER_SHADOW_CRITERIA, LEGACY_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import {
+  readBoundedDenseArray,
+  readExactPlainRecord,
+  readPlainRecordWithOptionalKeys,
+} from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,
@@ -18,6 +22,7 @@ import {
 } from './record-schema-version.js';
 
 export const SHADOW_LEDGER_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+
 export const SHADOW_LEDGER_MAX_DAYS = 31;
 export const SHADOW_REASON_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const SHADOW_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
@@ -90,11 +95,14 @@ export type ShadowLedgerRead =
  * name). A Proxy stand-in either is refused by the shape checks below or
  * yields exactly the result the plain data would, since every read here goes
  * through `Object.getOwnPropertyDescriptor`/`Reflect.ownKeys`, never a `get`
- * trap. Cost: linear in the capped input — at most `SHADOW_LEDGER_MAX_DAYS`
+ * trap. Cost: an `O(1)` length/prototype pre-gate, then the accepted `O(K)`
+ * engine bound of `Reflect.ownKeys` (where `K` is the target's own-property
+ * count), then `O(cap)` element traversal — at most `SHADOW_LEDGER_MAX_DAYS`
  * days times `CUTOVER_SHADOW_CRITERIA.length` verdicts, each with a constant
- * number of descriptor reads; an oversized or non-dense `days` array is
- * refused from its own keys before any element is traversed. Never throws,
- * never echoes the input.
+ * number of descriptor reads; an oversized, sparse, accessor-carrying,
+ * non-enumerable-index, symbol-keyed, foreign-keyed or subclassed `days`
+ * array is refused from its own keys and prototype before any element is
+ * traversed. Never throws, never echoes the input.
  */
 export function readShadowLedger(raw: unknown): ShadowLedgerRead {
   try {
@@ -117,15 +125,14 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
     ) {
       return INVALID_LEDGER;
     }
-    const dayArray = Array.isArray(days) ? (days as readonly unknown[]) : null;
-    const dayCount = dayArray === null ? null : boundedArrayLength(dayArray);
-    if (dayCount === null || dayArray === null) {
+    const dayList = days === null ? null : readBoundedDayList(days);
+    if (dayList === null) {
       return INVALID_LEDGER;
     }
     const readDays: ShadowDayRecord[] = [];
     let previousSerial: number | null = null;
-    for (let index = 0; index < dayCount; index += 1) {
-      const day = readDayRecord(ownElement(dayArray, index));
+    for (let index = 0; index < dayList.length; index += 1) {
+      const day = readDayRecord(dayList[index]);
       if (day === null) {
         return INVALID_LEDGER;
       }
@@ -165,40 +172,20 @@ export function isVersionAboveCurrent(raw: unknown): boolean {
 }
 
 /**
- * The capped element count of a real, dense array, or null for any stand-in,
- * oversized, sparse, or extra-keyed array. `Object.keys` lists own enumerable
- * string keys without reading any value, so it runs no getter; comparing its
- * count to `length` catches both a hole (fewer keys than `length`) and an
- * extra own enumerable property such as a getter planted beside the indices
- * (more keys than `length`) — either way, the array is refused before a
- * single element or any extra property is read, so a getter hiding on it
- * never runs, here or when the ledger is rebuilt afterward.
+ * The capped element list of a real, dense array of `Array.prototype`, or
+ * null for any stand-in. Cost: an `O(1)` length/prototype pre-gate, then the
+ * accepted `O(K)` engine bound of `Reflect.ownKeys` (where `K` is the
+ * target's own-property count), then `O(cap)` element traversal with cap
+ * `SHADOW_LEDGER_MAX_DAYS`. `Reflect.ownKeys` lists own keys — string,
+ * symbol, enumerable or not — without reading any value, so it runs no
+ * getter; a hole, a non-enumerable index, a symbol key, an extra own
+ * property (such as a getter planted beside the indices), a subclassed
+ * array or an over-cap length is refused before a single element is read,
+ * so a getter hiding on it never runs, here or when the ledger is rebuilt
+ * afterward. No getter and no Proxy `get` trap ever runs.
  */
-function boundedArrayLength(value: unknown): number | null {
-  // `Array.isArray` follows a Proxy without running a trap; the length is
-  // read from its own descriptor, so no `get` trap ever runs.
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    lengthDescriptor === undefined ||
-    lengthDescriptor.get !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    lengthDescriptor.value > SHADOW_LEDGER_MAX_DAYS
-  ) {
-    return null;
-  }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
-    return null;
-  }
-  return lengthDescriptor.value;
-}
-
-/** The own data-property element at `index`, or undefined for a hole or an accessor. */
-function ownElement(array: readonly unknown[], index: number): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+function readBoundedDayList(value: unknown): readonly unknown[] | null {
+  return readBoundedDenseArray(value, SHADOW_LEDGER_MAX_DAYS)?.array ?? null;
 }
 
 /** One day record, or null when any field is out of shape. */

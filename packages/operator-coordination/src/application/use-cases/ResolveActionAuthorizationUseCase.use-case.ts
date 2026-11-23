@@ -91,6 +91,59 @@ function snapshotRepository(value: unknown): unknown {
   }
 }
 
+/**
+ * BL02g fix round: snapshots the request with EXACTLY ONE own-descriptor read
+ * per snapshotted field, so both the accessor refusal and the snapshotted
+ * value derive from the same single descriptor and a Proxy cannot report an
+ * accessor descriptor on the snapshot read and a data descriptor on a second
+ * inspection (TOCTOU). An own accessor (a getter OR a setter) on ANY snapshotted
+ * field — required or optional (`resumeActionId`, `releaseRoot`,
+ * `repository`, `pullRequestNumber`, `attemptId`, every field) — is refused,
+ * because a set-only accessor snapshots to `undefined` exactly like an
+ * omitted field and would otherwise silently read as absent (a release retry
+ * could skip its resumable grant and fall through to an unrelated approved
+ * grant). Absence (no own property at all) stays absent and still resolves as
+ * before. Inspecting a descriptor never runs a getter, a setter or a `get`
+ * trap. The snapshot shape is `readPlainObjectLoose`'s (unknown keys copied,
+ * null-prototype, symbol keys and a non-plain prototype refused as null);
+ * a trap that throws propagates and the caller turns it into the same typed
+ * refusal. Returns the snapshot plus the first accessor-carrying field name,
+ * or null when every snapshotted field is plain data.
+ */
+function readRequestSnapshot(
+  input: object,
+): { snapshot: Record<string, unknown> | null; accessorField: string | null } {
+  if (Array.isArray(input)) {
+    return { snapshot: null, accessorField: null };
+  }
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { snapshot: null, accessorField: null };
+  }
+  // The snapshot is built on a null prototype: an own `__proto__` key on the
+  // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
+  // as an ordinary data property instead of mutating the snapshot's
+  // prototype, so the snapshot reads exactly like main reads any other body.
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  let accessorField: string | null = null;
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== 'string') {
+      return { snapshot: null, accessorField: null };
+    }
+    // EXACTLY ONE descriptor read per snapshotted field: both the accessor
+    // refusal and the copied value derive from this single descriptor.
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (descriptor === undefined || !descriptor.enumerable) {
+      return { snapshot: null, accessorField: null };
+    }
+    if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+      accessorField = key;
+    }
+    out[key] = descriptor.value;
+  }
+  return { snapshot: out, accessorField };
+}
+
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
   constructor(private readonly deps?: ResolveActionAuthorizationDependencies) {}
 
@@ -106,9 +159,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
     }
     // A configured runtime still refuses a missing request object instead of
-    // inventing one; the HTTP boundary always supplies an object body.
+    // inventing one: a malformed non-object input (null, undefined, or any
+    // primitive where a request object is due) is a typed refusal, never an
+    // exception. The exported boundary never throws on hostile input; only
+    // the missing required fields of a well-formed object keep main's throw.
     if (typeof input !== 'object' || input === null) {
-      throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
+      return blocked('invalid-request');
     }
     // Standing shadow import grant (owner decision 2026-11-18): the resolve
     // is head-free — the grant is bound by its digest-bound request id, its
@@ -124,19 +180,22 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // request) can run before the request is frozen. A throwing trap during
     // the snapshot is a hostile proxy: a typed refusal, never an exception.
     let snapshot: Record<string, unknown> | null = null;
+    let accessorField: string | null = null;
     try {
-      snapshot = readPlainObjectLoose(input);
+      ({ snapshot, accessorField } = readRequestSnapshot(input));
     } catch {
       return blocked('invalid-request');
     }
-    // An accessor field snapshots to `undefined` (its value is never read), but
-    // its presence is still visible through its own property descriptor, and
-    // inspecting a descriptor never runs a getter. A getter-carrying
-    // `actionScope` therefore cannot be resolved head-free at all: it is a
-    // typed refusal with a getter-call count of 0. A plain-data `actionScope`
-    // — every ordinary request — reads exactly as before from the snapshot.
-    const actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
-    if (actionScopeDescriptor !== undefined && actionScopeDescriptor.get !== undefined) {
+    // BL02g fix round: a set-only accessor is an accessor too — its snapshot
+    // value is `undefined` exactly like an omitted field, so it must be
+    // refused the same way. Every snapshotted field — required or optional —
+    // went through the single descriptor read above, so no field can be
+    // missed and no field is read twice: ANY own accessor on ANY field the
+    // snapshot copied is a typed `invalid-request` refusal, checked before
+    // any field — including the routing `actionScope` — is read. A
+    // plain-data request — every ordinary request — reads exactly as before
+    // from the snapshot.
+    if (snapshot !== null && accessorField !== null) {
       return blocked('invalid-request');
     }
     const scope =
@@ -157,8 +216,19 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       };
       return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
     }
-    const request = input as ResolveActionAuthorizationRequest;
-    if (Object.keys(request).length === 0) {
+    // Fix round 3 (BL02g): the non-shadow validation reads no field off the
+    // original request. The emptiness check and the required-field values come
+    // from the descriptor-safe snapshot taken above — a null-prototype object
+    // this code built itself, so it is known plain data — and the only reads
+    // on `input` are `Object.getOwnPropertyDescriptor` calls, which inspect a
+    // descriptor without ever running a getter or a Proxy `get` trap. An own
+    // accessor on a required field (a getter or a setter — a set-only accessor
+    // snapshots to `undefined` exactly like an omitted field, so it is refused
+    // for the same reason) is visible through its descriptor and is
+    // refused as invalid-request; a trap throwing during that inspection is a
+    // hostile proxy, also a typed refusal. A plain-data request keeps main's
+    // exact throw on genuinely missing required fields.
+    if (snapshot === null || Object.keys(snapshot).length === 0) {
       // The HTTP boundary's empty body object: the resolve is blocked with
       // its missing coordinates named, never reported as an unimplemented
       // station.
@@ -167,10 +237,27 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       );
     }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
-      if (!isFilled(request[field])) {
+      // BL02g fix round: the accessor check for this field already ran through
+      // the single descriptor read in `readRequestSnapshot` above, alongside
+      // every other snapshotted field. Only the required-field presence check stays.
+      if (!isFilled(snapshot[field])) {
         throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
       }
     }
+    // Past the validation every request field this use-case reads has been
+    // proved a filled string on the snapshot. `request` is built from the
+    // descriptor-safe `snapshot` (with `snapshotRepository` re-snapshotting
+    // the nested `repository`), so no later read — `findRecordedRequest`
+    // included — ever touches `input` or invokes a `get` trap on it.
+    const request = {
+      ...snapshot,
+      repository: snapshotRepository(snapshot['repository']),
+    } as unknown as ResolveActionAuthorizationRequest;
+    // BL02g fix round: an own accessor on the optional `releaseRoot` (and on
+    // every other optional snapshotted field — `resumeActionId` included) is
+    // already refused by the single descriptor read in `readRequestSnapshot`
+    // above, so the separate releaseRoot-only inspection is gone. No accessor
+    // can survive to the recorded-request lookup.
     const recorded = await this.findRecordedRequest(request);
     if (recorded === null) {
       return blocked(
@@ -491,23 +578,25 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         !isPolicyGrantRecord(candidate) &&
         this.matchesMergeGrantCoordinates(candidate, request),
     );
-    const approved = matching.filter((candidate) => candidate.state === 'approved');
-    if (approved.length > 0) {
-      return approved[approved.length - 1];
-    }
-    if (resumeActionId !== undefined) {
-      // CO14 follow-up: a release grant consumed by exactly the resuming
-      // action id is still the grant that authorizes this resolve, so the
-      // retry after a crash between consumption and write finds it again.
+    // CO14 follow-up (#4g): when the resolve is a release retry naming the
+    // resuming action id, the matching resumable grant is preferred BEFORE
+    // any unrelated approved/unconsumed grant, so a crash between the
+    // consumption and the release's write can never spend a second grant.
+    if (resumeActionId !== undefined && isReleaseActionScope(request.actionScope.trim())) {
       const resumable = matching.filter(
         (candidate) =>
           candidate.state === 'completed' &&
+          isReleaseActionScope(candidate.actionScope) &&
           candidate.consumptions.length === 1 &&
           candidate.consumptions[0].actionId === resumeActionId,
       );
       if (resumable.length > 0) {
         return resumable[resumable.length - 1];
       }
+    }
+    const approved = matching.filter((candidate) => candidate.state === 'approved');
+    if (approved.length > 0) {
+      return approved[approved.length - 1];
     }
     const awaiting = matching.filter((candidate) => candidate.state === 'awaiting-decision');
     return awaiting.length > 0 ? awaiting[awaiting.length - 1] : null;

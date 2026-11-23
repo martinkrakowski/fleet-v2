@@ -14,7 +14,7 @@
  * stands for and is not claimed to be detected.
  */
 
-import { containsSecretShape } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 import type { AttemptRunnerRecord, RunnerKind } from './execution-records.js';
 import { parseSeatTool } from './execution-records.js';
@@ -123,6 +123,21 @@ export type RecordedHostValidation =
   | { readonly ok: true; readonly value: AttemptRunnerRecord | null }
   | { readonly ok: false; readonly reason: 'invalid-recorded-host' };
 
+/**
+ * True when any secret shape — legacy or canonical — matches anywhere in
+ * `text`. `containsSecretShape` scans only the legacy six shapes; the
+ * canonical seventeen of `LANE_DIFF_SECRET_PATTERNS` are screened here too,
+ * so a canonical-only shape (a fine-grained GitHub token, an OpenRouter key,
+ * a basic-auth URL, …) is refused wherever a string field is screened.
+ */
+function containsAnySecretShape(text: string): boolean {
+  if (containsSecretShape(text)) return true;
+  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+    if (pattern.regex.test(text)) return true;
+  }
+  return false;
+}
+
 /** A non-blank string without control characters and with no secret shape. */
 function isCleanString(value: unknown): value is string {
   return (
@@ -130,8 +145,13 @@ function isCleanString(value: unknown): value is string {
     value.length > 0 &&
     value.trim().length > 0 &&
     !CONTROL_CHARACTERS.test(value) &&
-    !containsSecretShape(value)
+    !containsAnySecretShape(value)
   );
+}
+
+/** A well-formed string of any content with no secret shape. */
+function isSecretFreeString(value: unknown): value is string {
+  return typeof value === 'string' && !containsAnySecretShape(value);
 }
 
 /** `null` or a clean string. */
@@ -294,6 +314,7 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   if (record === null) return null;
   const laneId = record['laneId'];
   if (typeof laneId !== 'string' || !LANE_ID_PATTERN.test(laneId)) return null;
+  if (!isSecretFreeString(laneId)) return null;
   if (!isCleanString(record['hostName'])) return null;
   if (!isNullableCleanString(record['projectId'])) return null;
   if (!isNullableCleanString(record['runId'])) return null;
@@ -310,13 +331,13 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   const runnerState = record['runnerState'];
   if (runnerState !== 'idle' && runnerState !== 'running') return null;
   const baseBranch = record['baseBranch'];
-  if (typeof baseBranch !== 'string' || parseBaseBranch(baseBranch) === undefined) return null;
+  if (!isSecretFreeString(baseBranch) || parseBaseBranch(baseBranch) === undefined) return null;
   if (typeof record['chainHead'] !== 'boolean') return null;
   const dependencies = readBoundedDenseArray(record['dependsOnLaneIds'], MAX_RELAUNCH_APPLY_LANES);
   if (dependencies === null) return null;
   const dependsOnLaneIds: string[] = [];
   for (const dependency of dependencies.array) {
-    if (typeof dependency !== 'string' || !LANE_ID_PATTERN.test(dependency)) return null;
+    if (!isSecretFreeString(dependency) || !LANE_ID_PATTERN.test(dependency)) return null;
     if (dependency === laneId || dependsOnLaneIds.includes(dependency)) return null;
     dependsOnLaneIds.push(dependency);
   }

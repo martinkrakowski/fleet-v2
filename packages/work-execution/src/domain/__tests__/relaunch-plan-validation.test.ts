@@ -6,6 +6,8 @@
  * subject) and asserts the exact typed result — never an uncaught error.
  */
 
+import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -107,6 +109,51 @@ const getterOn = (target: object, key: string, calls: { count: number }): object
   });
   return target;
 };
+
+/**
+ * The true canonical digest of a plan literal: the relaunch plan port's
+ * `canonicalRelaunchPlanBodyJson` shape (fixed key order, `stepCodes` from
+ * the steps, no digest, creation time or step keys) hashed with
+ * `node:crypto` sha256. Used to give a mutated plan the digest its own body
+ * hashes to, so a refusal can only come from field validation — never from a
+ * digest mismatch.
+ */
+const canonicalDigestOf = (plan: Record<string, unknown>): string =>
+  createHash('sha256')
+    .update(
+      JSON.stringify({
+        schemaVersion: plan['schemaVersion'],
+        hostFilter: plan['hostFilter'],
+        maxActiveRuns: plan['maxActiveRuns'],
+        dispatchStaggerMs: plan['dispatchStaggerMs'],
+        conductor: plan['conductor'],
+        lanes: (plan['lanes'] as Record<string, unknown>[]).map((lane) => ({
+          laneId: lane['laneId'],
+          hostName: lane['hostName'],
+          projectId: lane['projectId'],
+          population: lane['population'],
+          runnerState: lane['runnerState'],
+          runId: lane['runId'],
+          attemptId: lane['attemptId'],
+          workOrderId: lane['workOrderId'],
+          baseBranch: lane['baseBranch'],
+          chainHead: lane['chainHead'],
+          dependsOnLaneIds: lane['dependsOnLaneIds'],
+          admissionWave: lane['admissionWave'],
+          dispatchEndpointKey: lane['dispatchEndpointKey'],
+          staggerOffsetMs: lane['staggerOffsetMs'],
+          stepCodes: (lane['steps'] as Record<string, unknown>[]).map((s) => s['step']),
+        })),
+      }),
+    )
+    .digest('hex');
+
+/**
+ * A canonical-registry-only secret shape: it matches
+ * `LANE_DIFF_SECRET_PATTERNS` (`google-api-key`) but none of the legacy six
+ * shapes `containsSecretShape` scans, so only the canonical screen refuses it.
+ */
+const CANONICAL_ONLY_SECRET = `AIza${'a'.repeat(30)}`;
 
 describe('validateStoredRelaunchPlan (V1: a valid stored plan passes)', () => {
   it('V1 accepts the pinned valid plan with its true canonical digest', () => {
@@ -338,6 +385,37 @@ describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => 
     const plan = { ...validPlan(), lanes: 7 };
     expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
   });
+
+  it('V5 refuses a canonical-only secret shape in a lane hostName even when the digest matches', () => {
+    // The mutated body is given its own true canonical digest, so the only
+    // rule that can refuse this plan is the string-field secret screen — a
+    // digest mismatch would hide the fix.
+    const plan = validPlan();
+    (plan['lanes'] as Record<string, unknown>[])[1]['hostName'] = CANONICAL_ONLY_SECRET;
+    const digest = canonicalDigestOf(plan);
+    plan['planDigest'] = digest;
+    (plan['lanes'] as Record<string, unknown>[])[1]['steps'] = [
+      step(digest, 'lane-2', 'save'),
+      step(digest, 'lane-2', 'adopt'),
+      step(digest, 'lane-2', 'redispatch'),
+    ];
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V5 refuses a canonical-only secret shape in a laneId and in a dependency on it', () => {
+    const plan = validPlan();
+    const secretLaneId = CANONICAL_ONLY_SECRET;
+    (plan['lanes'] as Record<string, unknown>[])[0]['laneId'] = secretLaneId;
+    (plan['lanes'] as Record<string, unknown>[])[1]['dependsOnLaneIds'] = [secretLaneId];
+    const digest = canonicalDigestOf(plan);
+    plan['planDigest'] = digest;
+    (plan['lanes'] as Record<string, unknown>[])[1]['steps'] = [
+      step(digest, 'lane-2', 'save'),
+      step(digest, 'lane-2', 'adopt'),
+      step(digest, 'lane-2', 'redispatch'),
+    ];
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
 });
 
 describe('validateStoredRelaunchPlan (V6/V7: malformed steps refuse)', () => {
@@ -532,6 +610,13 @@ describe('validateRecordedHost (V10: recorded-host validation)', () => {
       reason: 'invalid-recorded-host',
     });
     expect(validateRecordedHost({ ...validRecordedHost(), variant: SECRET_SHAPED })).toEqual({
+      ok: false,
+      reason: 'invalid-recorded-host',
+    });
+  });
+
+  it('V10 refuses a canonical-only secret shape that the legacy scan alone would pass', () => {
+    expect(validateRecordedHost({ ...validRecordedHost(), host: CANONICAL_ONLY_SECRET })).toEqual({
       ok: false,
       reason: 'invalid-recorded-host',
     });

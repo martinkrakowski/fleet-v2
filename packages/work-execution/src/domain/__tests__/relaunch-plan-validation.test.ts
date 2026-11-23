@@ -25,7 +25,7 @@ import {
  * and pinned here: it proves the validator's domain-local canonical body
  * builder agrees with the application writer the digests must match.
  */
-const PINNED_PLAN_DIGEST = '5d3c45d22787173bbf2faca0c7a3470c38fac4f4671eccf7a3cf1a2a91ffca46';
+const PINNED_PLAN_DIGEST = '39e12ca7e3e7325d919b54218471eb40e05f9a8f50f5f42594c8efb73ba54c64';
 
 const step = (digest: string, laneId: string, code: string) => ({
   step: code,
@@ -73,7 +73,7 @@ const validPlan = (digest: string = PINNED_PLAN_DIGEST): Record<string, unknown>
       chainHead: false,
       dependsOnLaneIds: ['lane-1'],
       admissionWave: 1,
-      dispatchEndpointKey: 'ep-key-1',
+      dispatchEndpointKey: 'opencode:host-b:4321',
       staggerOffsetMs: 0,
       steps: [
         step(digest, 'lane-2', 'save'),
@@ -195,7 +195,7 @@ describe('validateStoredRelaunchPlan (V1: a valid stored plan passes)', () => {
   it('V1 accepts a valid plan with an optional hostFilter string', () => {
     // The pinned digest is the canonical body of this plan with the
     // hostFilter set, so the field set and the digest must both agree.
-    const plan = { ...validPlan('c1895aef81d2603e5c0a6aa488ff3d2b0f8363d007e730ac75c74f2d1bea4579'), hostFilter: 'lane-runner-host.example' };
+    const plan = { ...validPlan('bd0bac5df5b3d97f33a0f292b1ea2223001b8eb8ccf7f4487fd39daf58c52117'), hostFilter: 'lane-runner-host.example' };
     expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: true });
   });
 });
@@ -460,6 +460,65 @@ describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => 
       ];
       expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
     }
+  });
+
+  const lane2Of = (plan: Record<string, unknown>): Record<string, unknown> =>
+    (plan['lanes'] as Record<string, unknown>[])[1];
+  const refused = { ok: false, reason: 'invalid-plan' };
+
+  it('V5 caps hostName at the repository adapter\'s 128 characters, not DNS\'s 253', () => {
+    expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['hostName'] = 'h'.repeat(128); }))).toEqual({ ok: true });
+    expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['hostName'] = 'h'.repeat(129); }))).toEqual(refused);
+    expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['hostName'] = 'h'.repeat(253); }))).toEqual(refused);
+  });
+
+  it('V4 holds hostFilter to the identifier grammar and the 128 cap, refusing paths, free text and long strings', () => {
+    for (const value of ['/tmp/private-runner', 'two words', 'a'.repeat(129), 'a'.repeat(4096)]) {
+      expect(validateStoredRelaunchPlan(redigested((p) => { p['hostFilter'] = value; }))).toEqual(refused);
+    }
+    expect(validateStoredRelaunchPlan(redigested((p) => { p['hostFilter'] = 'a'.repeat(128); }))).toEqual({ ok: true });
+  });
+
+  it('V5 accepts the planner\'s kind:host:port endpoint keys and refuses anything else', () => {
+    for (const value of ['opencode:lane-host:4321', 'agy:host-b:0', 'unknown:local:0']) {
+      expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['dispatchEndpointKey'] = value; }))).toEqual({ ok: true });
+    }
+    for (const value of [
+      'opencode:lane-host',
+      'ep-key-1',
+      'other:host:1',
+      'opencode:host:99999',
+      'opencode:host:12a',
+      'opencode:a:b:1',
+      'opencode::1',
+      'opencode:/tmp/x:1',
+      `opencode:${'h'.repeat(129)}:1`,
+    ]) {
+      expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['dispatchEndpointKey'] = value; }))).toEqual(refused);
+    }
+  });
+
+  it('V4 refuses more redispatch lanes in one wave than maxActiveRuns allows, counting the conducted lanes in wave 1', () => {
+    const withExtra = (extra: number, maxActiveRuns: number, wave: number) =>
+      redigested((p) => {
+        p['maxActiveRuns'] = maxActiveRuns;
+        const lanes = p['lanes'] as Record<string, unknown>[];
+        lane2Of(p)['admissionWave'] = wave;
+        lane2Of(p)['dependsOnLaneIds'] = [];
+        for (let i = 0; i < extra; i += 1) {
+          lanes.push({ ...lane2Of(p), laneId: `extra-${i}`, hostName: `host-x${i}`, steps: [] });
+        }
+      });
+    // maxActiveRuns 3 with one conducted lane leaves two slots in wave 1.
+    expect(validateStoredRelaunchPlan(withExtra(1, 3, 1))).toEqual({ ok: true });
+    expect(validateStoredRelaunchPlan(withExtra(2, 3, 1))).toEqual(refused);
+    expect(validateStoredRelaunchPlan(withExtra(97, 3, 1))).toEqual(refused);
+    // A later wave has the whole of maxActiveRuns.
+    expect(validateStoredRelaunchPlan(withExtra(2, 3, 2))).toEqual({ ok: true });
+    expect(validateStoredRelaunchPlan(withExtra(3, 3, 2))).toEqual(refused);
+    // A conducted lane that fills maxActiveRuns leaves wave 1 empty.
+    expect(validateStoredRelaunchPlan(withExtra(0, 1, 1))).toEqual(refused);
+    expect(validateStoredRelaunchPlan(withExtra(0, 1, 2))).toEqual({ ok: true });
   });
 
   it('V5 refuses a dependency cycle that cannot be topologically scheduled', () => {

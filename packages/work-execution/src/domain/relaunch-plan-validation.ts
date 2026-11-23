@@ -115,15 +115,23 @@ const HEX_64 = /^[0-9a-f]{64}$/;
 const LANE_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 /**
  * The identifier grammar of every plan record's name-like string (a host
- * name, a project, run, attempt or work-order id, a dispatch endpoint key):
- * a leading alphanumeric and then alphanumerics, dots, underscores or
- * hyphens, at most 128 characters. It is deliberately narrower than
- * "any clean string": no `/` (so no path can enter a record whose contract
- * forbids paths), no whitespace, no separator characters, no free text.
+ * name, a host filter, a project, run, attempt or work-order id): the same
+ * grammar and the same 128-character cap as the repository adapter's `ID`
+ * pattern (`RelaunchPlanRepositoryAdapter.adapter.ts`, `ID` and
+ * `MAX_ID_LENGTH`), so this validator accepts exactly what the store will
+ * accept. No `/` (so no path can enter a record whose contract forbids
+ * paths), no whitespace, no separator characters, no free text.
  */
-const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-/** The same grammar with a host name's longer bound (253, as in DNS). */
-const HOST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/;
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+/**
+ * The grammar of a dispatch endpoint key, exactly as the planner builds it
+ * (`dispatchEndpointKey` in `dispatch-stagger.ts`): `kind:host:port`, with the
+ * kind a runner kind or `unknown`, a host part in the identifier grammar (a
+ * host name is capped at 128 by the adapter) and a decimal port. The colons
+ * are the key's own separators, not free text.
+ */
+const ENDPOINT_KEY_PATTERN = /^(opencode|agy|unknown):[A-Za-z0-9._-]{1,128}:([0-9]{1,5})$/;
+const MAX_ENDPOINT_PORT = 65535;
 /** The scheduling caps of the plan contract: at most 64 concurrent runs. */
 const MAX_PLAN_MAX_ACTIVE_RUNS = 64;
 /** The scheduling caps of the plan contract: at most 10 minutes of stagger. */
@@ -179,9 +187,11 @@ function isCleanIdentifier(value: unknown): value is string {
   return isCleanString(value) && IDENTIFIER_PATTERN.test(value);
 }
 
-/** A clean host name: the identifier grammar at the host-name bound. */
-function isCleanHostName(value: unknown): value is string {
-  return isCleanString(value) && HOST_NAME_PATTERN.test(value);
+/** A clean dispatch endpoint key in the planner's `kind:host:port` grammar. */
+function isCleanEndpointKey(value: unknown): value is string {
+  if (!isCleanString(value)) return false;
+  const match = ENDPOINT_KEY_PATTERN.exec(value);
+  return match !== null && Number(match[2]) <= MAX_ENDPOINT_PORT;
 }
 
 /** `null` or a clean identifier. */
@@ -345,7 +355,7 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   const laneId = record['laneId'];
   if (typeof laneId !== 'string' || !LANE_ID_PATTERN.test(laneId)) return null;
   if (!isSecretFreeString(laneId)) return null;
-  if (!isCleanHostName(record['hostName'])) return null;
+  if (!isCleanIdentifier(record['hostName'])) return null;
   if (!isNullableCleanIdentifier(record['projectId'])) return null;
   if (!isNullableCleanIdentifier(record['runId'])) return null;
   if (!isNullableCleanIdentifier(record['attemptId'])) return null;
@@ -374,7 +384,7 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   const admissionWave = record['admissionWave'] as number;
   if (!isSafeIntegerWithin(admissionWave, 0, Number.MAX_SAFE_INTEGER)) return null;
   const dispatchEndpointKey = record['dispatchEndpointKey'];
-  if (!isNullableCleanIdentifier(dispatchEndpointKey)) return null;
+  if (dispatchEndpointKey !== null && !isCleanEndpointKey(dispatchEndpointKey)) return null;
   const staggerOffsetMs = record['staggerOffsetMs'];
   if (!isNullableSafeIntegerWithin(staggerOffsetMs)) return null;
   const steps = readBoundedDenseArray(record['steps'], MAX_RELAUNCH_APPLY_STEPS);
@@ -450,7 +460,7 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
     if (!isZonedIsoDateTime(record['createdAtIso'])) return INVALID_PLAN;
     const hostFilter = record['hostFilter'];
     if (hostFilter !== null) {
-      if (!isCleanString(hostFilter) || (hostFilter as string).length > 4096) return INVALID_PLAN;
+      if (!isCleanIdentifier(hostFilter)) return INVALID_PLAN;
     }
     if (!isSafeIntegerWithin(record['maxActiveRuns'], 1, MAX_PLAN_MAX_ACTIVE_RUNS)) return INVALID_PLAN;
     if (!isSafeIntegerWithin(record['dispatchStaggerMs'], 0, MAX_PLAN_DISPATCH_STAGGER_MS)) return INVALID_PLAN;
@@ -479,6 +489,20 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
       if (laneIds.has(lane.laneId)) return INVALID_PLAN;
       laneIds.add(lane.laneId);
       snapshotLanes.push(lane);
+    }
+    // Per-wave capacity, as the planner assigns it: a wave admits at most
+    // maxActiveRuns lanes, and wave 1 shares that capacity with the conducted
+    // lanes that keep running (none at all when they already fill it).
+    const maxActiveRuns = record['maxActiveRuns'] as number;
+    const conductedCount = snapshotLanes.filter((lane) => lane.population === 'conducted').length;
+    const waveCounts = new Map<number, number>();
+    for (const lane of snapshotLanes) {
+      if (lane.population === 'conducted') continue;
+      waveCounts.set(lane.admissionWave, (waveCounts.get(lane.admissionWave) ?? 0) + 1);
+    }
+    for (const [wave, count] of waveCounts) {
+      const capacity = wave === 1 ? maxActiveRuns - conductedCount : maxActiveRuns;
+      if (count > capacity) return INVALID_PLAN;
     }
     // Dependency graph: membership, wave ordering (a lane admits strictly
     // after every lane it depends on) and acyclicity (Kahn's algorithm), so

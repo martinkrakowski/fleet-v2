@@ -249,15 +249,16 @@ export function readShadowParkJournalEntry(input: unknown, stored = false): Shad
     if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(input).length > 0) return invalid;
     const names = Object.keys(input);
     if (names.length > SHADOW_PARK_ENTRY_FIELDS.length + (stored ? 1 : 0)) return invalid;
-    // Descriptor first: an accessor property is refused before it is ever read,
-    // so a throwing or stateful getter is never executed.
+    // One descriptor read per property: an accessor property is refused
+    // before it is ever read, so a throwing or stateful getter is never
+    // executed, and the snapshot uses the descriptor's own value rather than
+    // a second `get` a Proxy could answer differently.
+    const snap: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const name of names) {
       const descriptor = Object.getOwnPropertyDescriptor(input, name);
       if (descriptor === undefined || !('value' in descriptor) || descriptor.get !== undefined) return invalid;
+      snap[name] = descriptor.value;
     }
-    // One read per property: a stateful getter cannot answer twice.
-    const snap: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    for (const name of names) snap[name] = (input as Record<string, unknown>)[name];
     if (!isCutoverJournalKey(snap.key)) return { ok: false, reason: 'invalid-key' };
     const allowed = stored ? [...SHADOW_PARK_ENTRY_FIELDS, 'schemaVersion'] : SHADOW_PARK_ENTRY_FIELDS;
     if (names.some((name) => !allowed.includes(name))) return invalid;

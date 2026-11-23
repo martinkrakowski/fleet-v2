@@ -29,6 +29,7 @@ import {
   decideProcessTreeTermination,
   deriveAdoptStepStatus,
   relaunchApplyLaneProgress,
+  snapshotSaveInput,
   verifySaveIntentDigest,
   type RelaunchApplyStepStatus,
 } from '../../domain/relaunch-apply.js';
@@ -176,14 +177,6 @@ function isBoundedTextArray(value: unknown): boolean {
   return true;
 }
 
-/** `null` or a plain data record (a recorded runner host or the absence of one). */
-function isPlainRecordOrNull(value: unknown): boolean {
-  if (value === null) return true;
-  if (typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
 function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | 'secret-detected' | null {
   const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
   if (dense === null) return null;
@@ -212,9 +205,18 @@ function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | '
     if (!isBoundedTextArray(fields['allowedPathPrefixes'])) return null;
     const protectedPaths: unknown = fields['policyProtectedPaths'];
     if (protectedPaths !== undefined && !isBoundedTextArray(protectedPaths)) return null;
-    if (!isPlainRecordOrNull(fields['recordedHost'])) return null;
-    if (map.has(laneId)) return null;
-    map.set(laneId, element as ApplyRelaunchSaveInput);
+    // Deep validation plus snapshot in one step (fix-round items 1 and 2):
+    // the domain reader validates `recordedHost` field-by-field against the
+    // runner-record contract (a bare `{}` or any malformed host refuses here,
+    // during request parsing, rather than after authorization) and returns a
+    // detached plain snapshot, so the map never retains a caller-owned object
+    // that a concurrent mutation could change between this parse and the
+    // awaited plan/journal reads. Cost: one bounded descriptor read per
+    // element, on top of the checks above.
+    const snapshot = snapshotSaveInput(element);
+    if (snapshot === null) return null;
+    if (map.has(snapshot.laneId)) return null;
+    map.set(snapshot.laneId, snapshot);
   }
   return map;
 }
@@ -653,6 +655,15 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
   const runner = deps.runner;
   let liveConductedRuns = 0;
   let handedOffNotIdle = 0;
+  /**
+   * Lanes whose worktree the preflight observed as `running`. For these,
+   * `saveLaneEdits` runs after the abort (the save would refuse
+   * `worktree-busy` while a runner session is live in the tree, which would
+   * stop the lane at save-failed and never reach abort). Aborting the runner
+   * session never touches worktree contents, so the post-abort save still
+   * captures the edits before the lane is redispatched.
+   */
+  const runningLanes = new Set<string>();
   for (const lane of storedPlan.lanes) {
     if (lane.population === 'conducted') {
       if (lane.runId === null) return refusedLane('stale-plan-state', lane.laneId);
@@ -681,6 +692,7 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     if (stateKind === null || stateKind === 'unknown') {
       return refusedLane('stale-plan-state', lane.laneId);
     }
+    if (stateKind === 'running') runningLanes.add(lane.laneId);
     const redispatchStatus = statusOf(lane.laneId, 'redispatch');
     if (
       lane.runnerState === 'idle' &&
@@ -789,11 +801,19 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     // The preflight proved this exists for every non-conducted lane.
     const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
 
-    // save (I2: save before abort).
-    if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-    const saveStep = lane.steps.find((entry) => entry.step === 'save');
-    const saveStatus = statusOf(lane.laneId, 'save');
-    if (saveStep !== undefined && saveStatus !== 'completed') {
+    // save (I2: save before abort) and abort (I3: intent before action,
+    // termination only without a confirmed result). A lane the preflight saw
+    // running runs the abort first and the save after it: `saveLaneEdits`
+    // refuses a busy worktree, so a save-first order would stop every running
+    // lane at save-failed before its abort. Aborting the runner session never
+    // touches worktree contents, so the post-abort save still captures the
+    // edits before the lane is redispatched; a content-refused save still
+    // stops the lane before redispatch.
+    const saveWave = async (): Promise<ApplyRelaunchResult | null> => {
+      if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
+      const saveStep = lane.steps.find((entry) => entry.step === 'save');
+      const saveStatus = statusOf(lane.laneId, 'save');
+      if (saveStep === undefined || saveStatus === 'completed') return null;
       if (saveStatus === 'inconsistent') return refusedLane('step-inconsistent', lane.laneId);
       if (saveStatus === 'refused' || saveStatus === 'ambiguous') {
         return refusedLane('save-failed', lane.laneId);
@@ -816,11 +836,12 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
         // matches; `saveLaneEdits` recovers an intent-only save.
         if (!(await saveOk(lane.laneId, saveInput))) return refusedLane('save-failed', lane.laneId);
       }
-    }
+      return null;
+    };
 
-    // abort (I3: intent before action, termination only without a confirmed result).
-    const abortStep = lane.steps.find((entry) => entry.step === 'abort');
-    if (abortStep !== undefined) {
+    const abortWave = async (): Promise<ApplyRelaunchResult | null> => {
+      const abortStep = lane.steps.find((entry) => entry.step === 'abort');
+      if (abortStep === undefined) return null;
       if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
       const abortStatus = statusOf(lane.laneId, 'abort');
       if (abortStatus === 'refused' || abortStatus === 'inconsistent') {
@@ -908,6 +929,15 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
           if (!terminated) return refusedLane('abort-failed', lane.laneId);
         }
       }
+      return null;
+    };
+
+    // A running lane aborts before its save; an idle lane saves before its
+    // abort (I2 for an idle tree, where `saveLaneEdits` can actually run).
+    const laneOrder = runningLanes.has(lane.laneId) ? [abortWave, saveWave] : [saveWave, abortWave];
+    for (const wave of laneOrder) {
+      const refused = await wave();
+      if (refused !== null) return refused;
     }
 
     // adopt: AR2c owns it; anything not already completed refuses here.

@@ -1660,4 +1660,147 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     // consumes it, and a replay re-authorizes cleanly).
     expect(deps.authorization!.authorizeRelaunchApply).toHaveBeenCalledTimes(3);
   });
+
+  // ---- Fix round 1: the three review items ----
+
+  it('U33: a malformed recordedHost — an empty object, a partial runner record, a non-record or a host field accessor — refuses invalid-request during parsing, before any store read (cost: one bounded descriptor read per element)', async () => {
+    const plan = livePlan('host plan');
+    const digest = plan.planDigest;
+    // The valid host block the malformed variants are compared against.
+    const validHost = {
+      kind: 'opencode',
+      remotePort: 4321,
+      host: 'host-b',
+      agent: 'agent-1',
+      model: 'model-1',
+      variant: null,
+    };
+    // `recordedHost` itself is an accessor: the scan cannot read it.
+    const accessorHost = { ...validHost };
+    Object.defineProperty(accessorHost, 'host', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error('getter must never run');
+      },
+    });
+    const cases: unknown[] = [
+      {}, // empty object: nothing like a runner record
+      { kind: 'opencode' }, // a partial runner record
+      { ...validHost, extra: 'x' }, // an unknown key
+      { ...validHost, remotePort: 0 }, // an out-of-range port
+      { ...validHost, kind: 'mystery' }, // an unknown runner kind
+      [], // an array is not a host record
+      'host-b', // a primitive is not a host record
+      accessorHost, // an accessor field is unreadable, so invalid
+    ];
+    for (const recordedHost of cases) {
+      const deps = makeDeps({ plan, live: {} });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(
+          dryRunRequest(digest, { saveInputs: [saveInput({ recordedHost })] }),
+        ),
+      ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      // Parsing refused: no plan was read and no grant could be consumed.
+      expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    }
+    // The valid host block itself still parses and reaches the live wave,
+    // which saves and then stops at adopt (AR2c).
+    const deps = makeDeps({ plan, live: {} });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput({ recordedHost: validHost })] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    expect(deps.saveLaneEdits).toHaveBeenCalledWith(expect.objectContaining({ recordedHost: validHost }));
+    expect(deps.planRepo.findByDigest).toHaveBeenCalled();
+  });
+
+  it('U34: the save-input map holds a detached snapshot — a caller-owned input mutated between parsing and the awaited plan read cannot change the digest verified or the request saved (cost: one bounded copy per element)', async () => {
+    const seed = 'snapshot plan';
+    const plan = buildPlan([conductedLaneWithRun(), idleLane(hex(seed))]);
+    const input = saveInput();
+    const entries = [intent(key(plan.planDigest, 'lane-2', 'save'), saveInputDigest(plan.planDigest, input))];
+    const deps = makeDeps({ plan, entries, live: {} });
+    // Mutate the caller-owned object the moment the plan store answers: an
+    // implementation that retained the original object would re-read the
+    // mutated fields after this await.
+    const findByDigest = deps.planRepo.findByDigest as unknown as ReturnType<typeof vi.fn>;
+    findByDigest.mockImplementation(async () => {
+      (input as { worktreePath: string }).worktreePath = '/wt/mutated';
+      (input as { baseCommit: string }).baseCommit = 'c'.repeat(64);
+      return { outcome: 'found', plan } as unknown as FindRelaunchPlanResult;
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [input] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    // The digest still matched the original snapshot, so the save resumed
+    // with the ORIGINAL field values, not the mutated ones.
+    expect(deps.saveLaneEdits).toHaveBeenCalledWith(
+      expect.objectContaining({ worktreePath: '/wt/lane-2', baseCommit: 'b'.repeat(64) }),
+    );
+  });
+
+  it('U35: a running lane aborts before its save (the real saveLaneEdits refuses a busy worktree) while an idle lane saves before its abort — both waves reach abort and adopt still refuses', async () => {
+    const seed = 'ordering plan';
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
+    const digest = plan.planDigest;
+    const request = (): unknown =>
+      applyRequest(plan.planDigest, { saveInputs: [saveInput()] });
+    // Running worktree: the preflight observed `running`, so the abort intent,
+    // the abort and its result all happen before the save is attempted.
+    const running = makeDeps({ plan, live: { inspect: { state: 'running', sessionId: 's-1' } } });
+    const order: string[] = [];
+    const runningAbort = running.runner!.abortWorktreeRun as unknown as ReturnType<typeof vi.fn>;
+    runningAbort.mockImplementation(async () => {
+      order.push('abort');
+      return { outcome: 'aborted', endedAtIso: CLOCK_NOW };
+    });
+    const runningSave = running.saveLaneEdits as unknown as ReturnType<typeof vi.fn>;
+    runningSave.mockImplementation(async () => {
+      order.push('save');
+      return { outcome: 'saved' };
+    });
+    expect(await new ApplyRelaunchUseCase(running).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'adopt-not-implemented',
+      laneId: 'lane-2',
+    });
+    // The abort ran first and the lane reached it — an implementation that
+    // saved first would stop at save-failed and never call abortWorktreeRun.
+    expect(order).toEqual(['abort', 'save']);
+    expect(running.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['intent', key(digest, 'lane-2', 'abort')],
+      ['result', key(digest, 'lane-2', 'abort')],
+      ['intent', key(digest, 'lane-2', 'save')],
+    ]);
+    expect(running.processTreeTermination!.terminateWorktreeProcesses).not.toHaveBeenCalled();
+    // Idle worktree (same plan): save-before-abort is preserved (I2).
+    const idle = makeDeps({ plan, live: { inspect: { state: 'idle' } } });
+    const idleOrder: string[] = [];
+    const idleAbort = idle.runner!.abortWorktreeRun as unknown as ReturnType<typeof vi.fn>;
+    idleAbort.mockImplementation(async () => {
+      idleOrder.push('abort');
+      return { outcome: 'aborted', endedAtIso: CLOCK_NOW };
+    });
+    const idleSave = idle.saveLaneEdits as unknown as ReturnType<typeof vi.fn>;
+    idleSave.mockImplementation(async () => {
+      idleOrder.push('save');
+      return { outcome: 'saved' };
+    });
+    expect(await new ApplyRelaunchUseCase(idle).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'adopt-not-implemented',
+      laneId: 'lane-2',
+    });
+    expect(idleOrder).toEqual(['save', 'abort']);
+    expect(idle.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['intent', key(digest, 'lane-2', 'save')],
+      ['intent', key(digest, 'lane-2', 'abort')],
+      ['result', key(digest, 'lane-2', 'abort')],
+    ]);
+  });
 });

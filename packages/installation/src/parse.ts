@@ -2867,14 +2867,17 @@ function readMergePremergePosterLogin(
     errors.push(`${path}.premergePosterLogin: must be a string`);
     return undefined;
   }
-  if (containsSecretShape(value)) {
-    errors.push(`${path}.premergePosterLogin: must not contain secret-shaped text`);
-    return undefined;
-  }
+  // Cost bound: the length check inside `isValidGithubLogin` is O(1) and runs
+  // before the O(n) secret scan, so an enormous string never reaches
+  // `containsSecretShape`.
   if (!isValidGithubLogin(value)) {
     errors.push(
       `${path}.premergePosterLogin: must be a valid GitHub login (1-39 characters of A-Z, a-z, 0-9, or -, with no leading or trailing hyphen)`,
     );
+    return undefined;
+  }
+  if (containsSecretShape(value)) {
+    errors.push(`${path}.premergePosterLogin: must not contain secret-shaped text`);
     return undefined;
   }
   return value;

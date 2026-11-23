@@ -1,6 +1,6 @@
 /** The `attempt` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { AttemptRevisionConflictError, historyEntryOf, laneRunJournalState, LANE_RUN_TERMINAL_STATES, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat, unhealthySeatIdsFromCatalog, type LaneRunStateValue } from '@fleet/work-execution';
+import { AttemptRevisionConflictError, findLiveRunForAttempt, historyEntryOf, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat, unhealthySeatIdsFromCatalog } from '@fleet/work-execution';
 import { isSameModelFamily, underlyingModelFamily as evidenceFamily } from '@fleet/evidence-and-acceptance';
 import { join } from 'node:path';
 import type { AttemptRecord, AttemptSeatOverrideRecord, CommandCompletionReceipt } from '@fleet/work-execution';
@@ -246,21 +246,18 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
           'attempt cancel-prepared needs --yes: it marks a prepared, never-dispatched attempt cancelled and releases any slot it holds; it contacts no runner and changes no run, branch or pull request.',
         );
       }
-      for (const run of await rt.conductor.laneRunRepository.list()) {
-        if (run.attemptIds.includes(attemptId)) {
-          const state = laneRunJournalState(
-            await rt.conductor.laneRunJournal.listForRun(run.runId),
-            run.runId,
-          );
-          if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
-            return {
-              outcome: 'refused',
-              reason: 'run-active',
-              runId: run.runId,
-              message: 'a live conducted run owns this attempt; use conductor stop <runId>',
-            };
-          }
-        }
+      const liveRun = await findLiveRunForAttempt(
+        rt.conductor.laneRunRepository,
+        rt.conductor.laneRunJournal,
+        attemptId,
+      );
+      if (liveRun !== null) {
+        return {
+          outcome: 'refused',
+          reason: 'run-active',
+          runId: liveRun.runId,
+          message: 'a live conducted run owns this attempt; use conductor stop <runId>',
+        };
       }
       return rt.execution.cancelPreparedAttempt.cancelPreparedAttempt({
         attemptId,

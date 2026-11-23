@@ -257,6 +257,205 @@ function withBoundedDetail(result: GatePredicateResult): GatePredicateResult {
   return { ...result, detail, ...(coverage === undefined ? {} : { coverage }) };
 }
 
+/**
+ * GD2: cost bounds for the failed output tail — the tail scans at most the
+ * last 32 KiB / 200 lines of the combined streams (after stripping ANSI
+ * sequences), so a command that floods its output costs the same as one that
+ * printed a screenful.
+ */
+const MAX_OUTPUT_TAIL_BYTES = 32 * 1024;
+const MAX_OUTPUT_TAIL_LINES = 200;
+const OUTPUT_TAIL_WITHHELD = '[output withheld: secret-shaped text]';
+const OUTPUT_TAIL_REDACTED_LINE = '[redacted: secret-shaped line]';
+/** CSI and OSC ANSI escape sequences. */
+const ESC = String.fromCharCode(27);
+const BEL = String.fromCharCode(7);
+const ANSI_PATTERN = new RegExp(
+  `${ESC}\\[[0-?]*[ -/]*[@-~]|${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`,
+  'g',
+);
+
+function isSecretShapedLine(line: string): boolean {
+  return containsSecretShape(line) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(line));
+}
+
+/**
+ * GD2: the bounded, secret-redacted tail of a failed command's combined
+ * stdout and stderr, or undefined when both streams are empty,
+ * whitespace-only or not strings. Pure and never throwing: the combined
+ * streams are stripped of ANSI sequences, cut to the last 200 lines and
+ * 32 KiB, then each line matching a secret shape is replaced with a
+ * `[redacted: …]` marker; if the redacted tail still matches a secret shape
+ * the whole tail is withheld with one fixed marker.
+ *
+ * Fix round 2: the scan bound is on the COMBINED text. Each stream is first
+ * cut to its last `MAX_OUTPUT_TAIL_BYTES + 1` characters only so the exact
+ * last-32-KiB window of the raw combined text can be located without reading
+ * more; the combined window itself is then cut to at most 32 KiB (+ the one
+ * join newline of slack) BEFORE any strip, scan or split, and the 200-line
+ * limit is applied by scanning newline positions inside that window rather
+ * than splitting it whole. Every step therefore costs O(32 KiB) total
+ * regardless of how much a failing command printed — never O(64 KiB) or an
+ * unbounded line split.
+ */
+/** The last `max` UTF-8 bytes of `text`, cut on a code-point boundary. */
+function lastUtf8Bytes(text: string, max: number): string {
+  if (text.length * 3 <= max || Buffer.byteLength(text, 'utf8') <= max) {
+    return text;
+  }
+  let bytes = 0;
+  let start = text.length;
+  while (start > 0) {
+    const low = text.charCodeAt(start - 1);
+    const pair = low >= 0xdc00 && low <= 0xdfff && start >= 2;
+    const width = pair ? 2 : 1;
+    const unit = text.slice(start - width, start);
+    const size = Buffer.byteLength(unit, 'utf8');
+    if (bytes + size > max) {
+      break;
+    }
+    bytes += size;
+    start -= width;
+  }
+  return text.slice(start);
+}
+
+export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
+  // Retain at most the last 32 KiB + 1 of each stream: more than the largest
+  // window any later step can need is never retained. O(1) slice per stream.
+  const bounded = (stream: unknown): string | undefined => {
+    if (typeof stream !== 'string') {
+      return undefined;
+    }
+    return stream.length > MAX_OUTPUT_TAIL_BYTES + 1
+      ? stream.slice(stream.length - (MAX_OUTPUT_TAIL_BYTES + 1))
+      : stream;
+  };
+  const boundedStdout = bounded(stdout);
+  const boundedStderr = bounded(stderr);
+  if (boundedStdout === undefined && boundedStderr === undefined) {
+    return undefined;
+  }
+  const a = boundedStdout ?? '';
+  const b = boundedStderr ?? '';
+  const joinNewline = boundedStdout !== undefined && boundedStderr !== undefined ? '\n' : '';
+  const rawCombinedLength = a.length + joinNewline.length + b.length;
+  // Cut the raw combined text to its last MAX_OUTPUT_TAIL_BYTES characters
+  // (the join newline counts towards the bound) without ever materialising
+  // the whole join: ANSI stripping only removes characters, so the processed
+  // tail can never exceed this window's 32 KiB.
+  let rawWindow: string;
+  if (rawCombinedLength <= MAX_OUTPUT_TAIL_BYTES) {
+    rawWindow = a + joinNewline + b;
+  } else if (b.length >= MAX_OUTPUT_TAIL_BYTES) {
+    rawWindow = b.slice(b.length - MAX_OUTPUT_TAIL_BYTES);
+  } else {
+    const headKeep = MAX_OUTPUT_TAIL_BYTES - joinNewline.length - b.length;
+    rawWindow = a.slice(a.length - headKeep) + joinNewline + b;
+  }
+  // Any cut of the raw window may have split a line (and so a token): that
+  // first line is partial, its prefix lost, so it is dropped rather than
+  // scanned (a token whose prefix was cut would otherwise slip past the scan).
+  const windowCut = rawCombinedLength > MAX_OUTPUT_TAIL_BYTES;
+  const ansiFree = rawWindow.replace(ANSI_PATTERN, '');
+  let stripped = lastUtf8Bytes(ansiFree, MAX_OUTPUT_TAIL_BYTES);
+  const partialFirstLine = windowCut || stripped.length !== ansiFree.length;
+  if (partialFirstLine) {
+    stripped = dropFirstLine(stripped);
+  }
+  if (stripped.trim() === '') {
+    return undefined;
+  }
+  // Line bound: element `k` of the full split starts after the k-th newline,
+  // so keeping the last MAX_OUTPUT_TAIL_LINES elements means cutting after
+  // the MAX_OUTPUT_TAIL_LINES-th newline from the end. The backward scan is
+  // O(window) with no allocation, and only that ≤ MAX_OUTPUT_TAIL_LINES + 1
+  // element tail is ever split.
+  let lineCut = -1;
+  let remainingNewlines = MAX_OUTPUT_TAIL_LINES;
+  let searchEnd = stripped.length;
+  while (remainingNewlines > 0) {
+    const at = stripped.lastIndexOf('\n', searchEnd - 1);
+    if (at === -1) {
+      break;
+    }
+    remainingNewlines -= 1;
+    searchEnd = at;
+    if (remainingNewlines === 0) {
+      lineCut = at;
+    }
+  }
+  const lineWindow = lineCut === -1 ? stripped : stripped.slice(lineCut + 1);
+  let tail = lineWindow
+    .split(/\r?\n/)
+    .slice(-MAX_OUTPUT_TAIL_LINES)
+    .join('\n');
+  // A trailing newline is not command output: drop the empty last lines.
+  tail = tail.replace(/(?:\n[\t ]*)+$/, '');
+  let redacted = redactTailLines(tail.split(/\r?\n/)).join('\n');
+  if (isSecretShapedLine(redacted)) {
+    return OUTPUT_TAIL_WITHHELD;
+  }
+  // The byte bound holds AFTER redaction: a marker can be longer than the
+  // line it replaces. Re-cut the redacted text (already safe to cut) and drop
+  // the first, possibly partial, line of the cut.
+  if (Buffer.byteLength(redacted, 'utf8') > MAX_OUTPUT_TAIL_BYTES) {
+    redacted = dropFirstLine(lastUtf8Bytes(redacted, MAX_OUTPUT_TAIL_BYTES));
+  }
+  return redacted;
+}
+
+/** The text after its first newline; empty when it has none. */
+function dropFirstLine(text: string): string {
+  const at = text.indexOf('\n');
+  return at === -1 ? '' : text.slice(at + 1);
+}
+
+const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]*-----/;
+const PEM_END = /-----END [A-Z0-9 ]*-----/;
+const BASE64_RUN = /[A-Za-z0-9+/=]{40,}/g;
+
+/**
+ * A defensive rule for key material: a long base64-alphabet run with a digit,
+ * an upper-case and a lower-case letter, and not directly followed by `.` (a file name or extension). A
+ * path (`src/a/b.ts`) ends at its extension dot or lacks a digit or a case
+ * mix, so error locations stay readable; plain hex never qualifies.
+ */
+function hasBase64Blob(line: string): boolean {
+  for (const match of line.matchAll(BASE64_RUN)) {
+    const run = match[0];
+    if (line[match.index + run.length] === '.') {
+      continue;
+    }
+    if (/[0-9]/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Redacts secret-shaped lines and whole PEM blocks (BEGIN through END, or to the end when END is missing). */
+function redactTailLines(lines: readonly string[]): string[] {
+  const out: string[] = [];
+  let inPem = false;
+  for (const line of lines) {
+    if (inPem) {
+      out.push(OUTPUT_TAIL_REDACTED_LINE);
+      if (PEM_END.test(line)) {
+        inPem = false;
+      }
+      continue;
+    }
+    if (PEM_BEGIN.test(line)) {
+      out.push(OUTPUT_TAIL_REDACTED_LINE);
+      inPem = !PEM_END.test(line);
+      continue;
+    }
+    out.push(isSecretShapedLine(line) || hasBase64Blob(line) ? OUTPUT_TAIL_REDACTED_LINE : line);
+  }
+  return out;
+}
+
 /** A predicate that could not run: unknown, never a pass. */
 function unknownResult(
   name: string,
@@ -881,21 +1080,24 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
 
     const raw = rawVerdict(run, this.isRemote(executor));
+    const verdict = mapVerdict(raw);
     // PT1a: a failing command's output may name the file that failed; only the
     // screened, repo-relative path is carried, never the output.
-    const failing =
-      mapVerdict(raw) === 'fail'
-        ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
-        : {};
+    const failing = verdict === 'fail'
+      ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
+      : {};
+    // GD2: only a failing command carries the bounded, redacted output tail.
+    const tail = verdict === 'fail' ? boundedRedactedOutputTail(run.stdout, run.stderr) : undefined;
     if (command.coverage === undefined) {
       return {
         name,
         kind: 'command',
-        verdict: mapVerdict(raw),
+        verdict,
         exitCode: run.exitCode,
         durationMs: this.nowMs() - started,
         detail: detailForCommand(run, command, undefined),
         ...failing,
+        ...(tail === undefined ? {} : { outputTail: tail }),
       };
     }
 
@@ -904,21 +1106,24 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const coverage: CheckCoverage = isCheckCoverage(read)
       ? read
       : { ran: false, reason: 'coverage reader returned a malformed value' };
-    const verdict = applyCoverage(raw, coverage, {
+    const verdictWithCoverage = applyCoverage(raw, coverage, {
       unitKind: command.coverage.unitKind,
       minUnits: command.coverage.minUnits,
     });
+    const coverageVerdict = mapVerdict(verdictWithCoverage);
+    const coverageTail = coverageVerdict === 'fail' ? boundedRedactedOutputTail(run.stdout, run.stderr) : undefined;
     return {
       name,
       kind: 'command',
-      verdict: mapVerdict(verdict),
+      verdict: coverageVerdict,
       exitCode: run.exitCode,
       durationMs: this.nowMs() - started,
       detail: detailForCommand(run, command, coverage),
       coverage,
-      ...(mapVerdict(verdict) === 'fail'
+      ...(coverageVerdict === 'fail'
         ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
         : {}),
+      ...(coverageTail === undefined ? {} : { outputTail: coverageTail }),
     };
   }
 }

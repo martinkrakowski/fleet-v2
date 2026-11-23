@@ -1204,6 +1204,12 @@ interface FixGatePredicate {
   readonly name: string;
   readonly verdict: 'fail' | 'unknown';
   readonly exitCode: number | null;
+  /**
+   * GD2: the archived failed output tail, read back through the evidence
+   * archive. Absent when no archive is wired, the reference is missing or the
+   * read fails — the predicate still hands over with name and exit code.
+   */
+  readonly outputTail?: string;
 }
 
 /** Step 1: the prepare ports must all be wired before anything runs. */
@@ -1491,6 +1497,13 @@ async function fixVerifyManifestStep(
  * Step 13: the prior's failed gate checks, in their recorded order, verdict
  * and exit code only — never their `detail`. A `gate-failed` with no usable
  * failed check refuses rather than handing the lane a bare reason code.
+ *
+ * GD2: when the failure is the gate and the evidence archive is wired, each
+ * predicate that journalled an `outputEvidenceRef` has its archived tail read
+ * back (cost bound: one read per predicate) inside a try/catch; a non-empty
+ * string is handed to the handover render as `outputTail`. An absent archive,
+ * a `null`/non-string read or a throw omit the tail — the predicate name and
+ * exit code still hand over.
  */
 async function fixPrepareGatePredicatesStep(
   shared: FixPrepareWired,
@@ -1506,13 +1519,31 @@ async function fixPrepareGatePredicatesStep(
   } catch {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-gate-journal-unreadable') };
   }
+  const archive = shared.ctx.deps.evidenceArchive;
   const gatePredicates = nonPassingGatePredicatesOf(journalEntries, prior.id, prior.artifacts.headCommit).map(
-    ({ name, verdict, exitCode }) => ({ name, verdict, exitCode }) satisfies FixGatePredicate,
+    async ({ name, verdict, exitCode, outputEvidenceRef }) => {
+      if (archive === undefined || typeof outputEvidenceRef !== 'string') {
+        return { name, verdict, exitCode } satisfies FixGatePredicate;
+      }
+      try {
+        const tail = await archive.readArchivedEvidence(outputEvidenceRef);
+        if (typeof tail === 'string' && tail.length > 0) {
+          return { name, verdict, exitCode, outputTail: tail } satisfies FixGatePredicate;
+        }
+      } catch {
+        // An unreadable archive omits the tail; the handover still prepares.
+      }
+      return { name, verdict, exitCode } satisfies FixGatePredicate;
+    },
   );
-  if (failure.reasonCode === 'gate-failed' && gatePredicates.length === 0) {
+  const resolved: FixGatePredicate[] = [];
+  for (const predicate of gatePredicates) {
+    resolved.push(await predicate);
+  }
+  if (failure.reasonCode === 'gate-failed' && resolved.length === 0) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-no-gate-checks') };
   }
-  return { status: 'ok', value: gatePredicates };
+  return { status: 'ok', value: resolved };
 }
 
 /**

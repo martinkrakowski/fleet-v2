@@ -1076,3 +1076,141 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(result.verdict).toBe('failed');
   });
 });
+
+describe('evaluateAttemptGate output-tail archiving (GD2)', () => {
+  const FAIL_WITH_TAIL: readonly GatePredicateResult[] = [
+    ...PASS_RESULTS.slice(0, 2),
+    {
+      name: 'command 1: corepack yarn build',
+      kind: 'command',
+      verdict: 'fail',
+      exitCode: 1,
+      durationMs: 1,
+      detail: 'exit 1',
+      outputTail: 'error: build failed',
+    },
+  ];
+
+  class FakeArchive {
+    readonly archived: { artifactId: string; content: string; candidateHeadSha: string }[] = [];
+    constructor(
+      private readonly behaviour: 'ok' | 'throw' | 'malformed' = 'ok',
+      private readonly store: Map<string, string> = new Map(),
+    ) {}
+
+    async archiveEvidence(request: { artifactId: string; candidateHeadSha: string; content: string }) {
+      this.archived.push({ ...request });
+      if (this.behaviour === 'throw') {
+        throw new Error('archive unavailable');
+      }
+      if (this.behaviour === 'malformed') {
+        return { evidenceRef: 'not-an-evidence-ref', digest: '0'.repeat(64) };
+      }
+      const ref = `evidence://${request.artifactId}@${'a'.repeat(64)}`;
+      this.store.set(ref, request.content);
+      return { evidenceRef: ref, digest: 'a'.repeat(64) };
+    }
+
+    async readArchivedEvidence(evidenceRef: string): Promise<string | null> {
+      return this.store.get(evidenceRef) ?? null;
+    }
+  }
+
+  function failingGate(): FakeGatePredicatePort {
+    return new FakeGatePredicatePort({ outcome: 'evaluated', results: FAIL_WITH_TAIL });
+  }
+
+  it('archives a failing command tail and journals only the evidence reference', async () => {
+    const archive = new FakeArchive();
+    const { deps, journal } = makeDeps({ gate: failingGate() });
+    (deps as { evidenceArchive?: unknown }).evidenceArchive = archive;
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.evaluateAttemptGate(gateRequest());
+    expect(result.verdict).toBe('failed');
+    expect(archive.archived).toHaveLength(1);
+    expect(archive.archived[0]).toMatchObject({
+      artifactId: `attempt-1:accept:${HEAD_SHA}:3:output-tail`,
+      candidateHeadSha: HEAD_SHA,
+      content: 'error: build failed',
+    });
+    const details = journal.entries.map((entry) => entry.detail);
+    const withRef = details.filter((detail) => typeof detail === 'string' && detail.includes('outputEvidenceRef'));
+    expect(withRef).toHaveLength(1);
+    expect(withRef[0]).toContain('evidence://');
+    expect(withRef[0]).not.toContain('build failed');
+    const stored = parseStoredPredicateResult(journal.entries[3]);
+    expect(stored?.outputEvidenceRef).toMatch(/^evidence:\/\//);
+  });
+
+  it('journals without a reference when no archive is wired', async () => {
+    const { journal } = makeDeps({ gate: failingGate() });
+    const useCase = new RequestAttemptAcceptanceUseCase(makeDeps({ gate: failingGate() }).deps);
+    const result = await useCase.evaluateAttemptGate(gateRequest());
+    expect(result.verdict).toBe('failed');
+    for (const entry of journal.entries) {
+      expect(typeof entry.detail !== 'string' || !entry.detail.includes('outputEvidenceRef')).toBe(true);
+    }
+  });
+
+  it('still journals the failure when the archive throws or returns malformed data', async () => {
+    for (const behaviour of ['throw', 'malformed'] as const) {
+      const archive = new FakeArchive(behaviour);
+      const { deps, journal } = makeDeps({ gate: failingGate() });
+      (deps as { evidenceArchive?: unknown }).evidenceArchive = archive;
+      const result = await new RequestAttemptAcceptanceUseCase(deps).evaluateAttemptGate(gateRequest());
+      expect(result.verdict).toBe('failed');
+      for (const entry of journal.entries) {
+        expect(typeof entry.detail !== 'string' || !entry.detail.includes('outputEvidenceRef')).toBe(true);
+      }
+    }
+  });
+
+  it('keeps existing journalled entries identical when they carry no outputEvidenceRef', () => {
+    const entryWith = (outputEvidenceRef?: string) =>
+      ({
+        id: 'x',
+        attemptId: 'attempt-1',
+        workOrderId: 'wo-1',
+        action: 'accept',
+        baseCommit: BASE_COMMIT,
+        recordedAtIso: FIXED_NOW,
+        sessionId: null,
+        status: 'refused',
+        detail: JSON.stringify({
+          predicate: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'fail',
+          exitCode: 1,
+          durationMs: 1,
+          detail: 'exit 1',
+          ...(outputEvidenceRef === undefined ? {} : { outputEvidenceRef }),
+        }),
+      }) as Parameters<typeof parseStoredPredicateResult>[0];
+    const withoutRef = parseStoredPredicateResult(entryWith());
+    expect(withoutRef).not.toHaveProperty('outputEvidenceRef');
+    expect(parseStoredPredicateResult(entryWith('garbage'))).not.toHaveProperty('outputEvidenceRef');
+    expect(parseStoredPredicateResult(entryWith(`evidence://${'x'.repeat(600)}`))).not.toHaveProperty(
+      'outputEvidenceRef',
+    );
+    expect(parseStoredPredicateResult(entryWith('evidence://dir/file@' + 'a'.repeat(64)))).toEqual(
+      expect.objectContaining({ outputEvidenceRef: 'evidence://dir/file@' + 'a'.repeat(64) }),
+    );
+  });
+
+  it('returns null for a null, undefined, non-object or throwing-detail record instead of throwing', () => {
+    // A stored journal row is untrusted input: a missing record and a record
+    // whose `detail` accessor throws are both ignored as null (O(1) guards;
+    // the JSON parse stays bounded by the stored detail's length).
+    expect(parseStoredPredicateResult(null as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult(undefined as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult(42 as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult([1, 2, 3] as unknown as ActionJournalEntryRecord)).toBeNull();
+    const throwingDetail = {
+      get detail(): string {
+        throw new Error('hostile detail getter must be ignored, never thrown');
+      },
+    };
+    expect(parseStoredPredicateResult(throwingDetail as unknown as ActionJournalEntryRecord)).toBeNull();
+  });
+});

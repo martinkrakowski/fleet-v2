@@ -578,21 +578,6 @@ function gateIntentPartsOf(
   return { key: snapshot.key, round: parsed.round, retry: parsed.retry ?? 0 };
 }
 
-/** The snapshot's final (non-ambiguous) result for the key in the run, or null. O(N) per call over the snapshots. */
-function gateReaderFinalResultOf(
-  snapshots: readonly (GateRetryEntrySnapshot | null)[], runId: string, key: string,
-): GateRetryEntrySnapshot | null {
-  for (const snapshot of snapshots) {
-    if (
-      snapshot !== null && snapshot.kind === 'result' && snapshot.runId === runId &&
-      snapshot.key === key && snapshot.outcome !== 'ambiguous'
-    ) {
-      return snapshot;
-    }
-  }
-  return null;
-}
-
 /**
  * GD1: the round of the gate intent at `head12` with the highest round, then
  * highest retry (no retry = run 0); `null` when there is no such intent or the
@@ -638,9 +623,10 @@ export function laneRunGateLatestRound(entries: unknown, runId: unknown, head12:
  * `failedCount` — the count of distinct gate intents in the same
  * `(round, head12)` whose final result is `gate-failed`; otherwise `null`
  * (including a pending, passed, congested or unknown latest run, and any
- * hostile input). Cost: a single O(N) pass over `entries` plus O(F · N) for
- * the final-result lookups of the failed intents of one round (F is small:
- * the journal keeps at most one intent per key).
+ * hostile input). Cost: a single O(N) pass over `entries` that collects the
+ * gate intents and indexes each key's final result, then one pass over the
+ * collected intents of the highest round — O(N) overall, never a per-intent
+ * rescan of the snapshots.
  */
 export function laneRunGateFailed(
   entries: unknown, runId: unknown, head12: unknown,
@@ -656,16 +642,30 @@ export function laneRunGateFailed(
     if (snapshots === null) {
       return null;
     }
-    // The highest (round, retry) gate intent at head12 decides.
-    let highest: { readonly key: string; readonly round: number; readonly retry: number } | null = null;
+    // One pass: collect the gate intents at (runId, head12) and index each
+    // key's final (non-ambiguous) result — the first such result wins, as the
+    // per-key final-result reader it replaces returned.
+    const intents: { readonly key: string; readonly round: number; readonly retry: number }[] = [];
+    const finals = new Map<string, GateRetryEntrySnapshot>();
     for (const snapshot of snapshots) {
       if (snapshot === null) {
         continue;
       }
       const parts = gateIntentPartsOf(snapshot, runId, head12);
-      if (parts === null) {
-        continue;
+      if (parts !== null) {
+        intents.push(parts);
       }
+      if (
+        snapshot.kind === 'result' && snapshot.runId === runId &&
+        typeof snapshot.key === 'string' && snapshot.outcome !== 'ambiguous' &&
+        !finals.has(snapshot.key)
+      ) {
+        finals.set(snapshot.key, snapshot);
+      }
+    }
+    // The highest (round, retry) gate intent at head12 decides.
+    let highest: { readonly key: string; readonly round: number; readonly retry: number } | null = null;
+    for (const parts of intents) {
       if (
         highest === null || parts.round > highest.round ||
         (parts.round === highest.round && parts.retry > highest.retry)
@@ -676,26 +676,24 @@ export function laneRunGateFailed(
     if (highest === null) {
       return null;
     }
-    const final = gateReaderFinalResultOf(snapshots, runId, highest.key);
-    if (final === null || final.reasonCode !== 'gate-failed') {
+    const final = finals.get(highest.key);
+    if (final === undefined || final.reasonCode !== 'gate-failed') {
       return null;
     }
     // The distinct gate intents of the same (round, head12) that failed.
-    const failedIntents = new Set<string>();
-    for (const snapshot of snapshots) {
-      if (snapshot === null) {
+    let failedCount = 0;
+    const counted = new Set<string>();
+    for (const parts of intents) {
+      if (parts.round !== highest.round || counted.has(parts.key)) {
         continue;
       }
-      const parts = gateIntentPartsOf(snapshot, runId, head12);
-      if (parts === null || parts.round !== highest.round || failedIntents.has(parts.key)) {
-        continue;
-      }
-      const intentFinal = gateReaderFinalResultOf(snapshots, runId, parts.key);
-      if (intentFinal !== null && intentFinal.reasonCode === 'gate-failed') {
-        failedIntents.add(parts.key);
+      counted.add(parts.key);
+      const intentFinal = finals.get(parts.key);
+      if (intentFinal !== undefined && intentFinal.reasonCode === 'gate-failed') {
+        failedCount += 1;
       }
     }
-    return { retry: highest.retry, failedCount: failedIntents.size };
+    return { retry: highest.retry, failedCount };
   } catch {
     return null;
   }

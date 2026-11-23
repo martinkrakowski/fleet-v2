@@ -316,6 +316,19 @@ export type ReleaseGrantCheck =
 const RELEASE_GRANT_KEYS = ['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot', 'nonce'] as const;
 const RELEASE_GRANT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
 
+/** The refusal codes a hostile-object grant reader reports, one set per grant kind. */
+interface GrantObjectCodes<C extends string> {
+  readonly notObject: C;
+  readonly invalidInput: C;
+  readonly unexpectedKey: C;
+  readonly forbiddenKey: C;
+  readonly accessorForbidden: C;
+}
+
+type GrantObjectSnapshot<C extends string> =
+  | { readonly ok: true; readonly keys: string[]; readonly values: Record<string, unknown> }
+  | { readonly ok: false; readonly code: C };
+
 /**
  * True only for a plain object (no array, no function, prototype
  * `Object.prototype` or null). Prototype and type checks never read the
@@ -324,93 +337,119 @@ const RELEASE_GRANT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] a
  * `Object.getPrototypeOf` throw; every such throw is a typed refusal, never
  * an exception.
  */
-function isPlainReleaseGrantObject(
+function checkPlainGrantObject<C extends string>(
   value: unknown,
-): { readonly ok: true } | { readonly ok: false; readonly code: ReleaseGrantErrorCode } {
+  codes: GrantObjectCodes<C>,
+): { readonly ok: true } | { readonly ok: false; readonly code: C } {
   if (typeof value !== 'object' || value === null) {
-    return { ok: false, code: 'release-grant-not-object' };
+    return { ok: false, code: codes.notObject };
   }
   let isArray: boolean;
   try {
     isArray = Array.isArray(value);
   } catch {
-    return { ok: false, code: 'release-grant-invalid-input' };
+    return { ok: false, code: codes.invalidInput };
   }
   if (isArray) {
-    return { ok: false, code: 'release-grant-not-object' };
+    return { ok: false, code: codes.notObject };
   }
   let proto: unknown;
   try {
     proto = Object.getPrototypeOf(value);
   } catch {
-    return { ok: false, code: 'release-grant-invalid-input' };
+    return { ok: false, code: codes.invalidInput };
   }
   if (proto === Object.prototype || proto === null) {
     return { ok: true };
   }
-  return { ok: false, code: 'release-grant-not-object' };
+  return { ok: false, code: codes.notObject };
 }
 
-type ReleaseGrantSnapshot =
-  | { readonly ok: true; readonly keys: string[]; readonly values: Record<string, unknown> }
-  | { readonly ok: false; readonly code: ReleaseGrantErrorCode };
+/** One own key's data value read through its descriptor only, or the refusal code. */
+function readGrantDescriptorValue<C extends string>(
+  raw: object,
+  key: string,
+  codes: GrantObjectCodes<C>,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly code: C } {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(raw, key);
+  } catch {
+    return { ok: false, code: codes.accessorForbidden };
+  }
+  if (descriptor === undefined) {
+    return { ok: false, code: codes.unexpectedKey };
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    return { ok: false, code: codes.accessorForbidden };
+  }
+  if (descriptor.enumerable !== true) {
+    return { ok: false, code: codes.unexpectedKey };
+  }
+  return { ok: true, value: descriptor.value };
+}
 
 /**
  * Snapshot a plain object's own enumerable data properties through their
- * descriptors only. Cost is linear in `MAX_RELEASE_GRANT_KEYS` plus the
- * bounded values copied; accessors are never invoked, symbol keys and
- * non-enumerable data keys are refused, and a prototype-polluting key
- * (`__proto__`, `constructor`, `prototype`) is refused before any key-set
- * comparison so a polluting key can never masquerade as a field.
+ * descriptors only, inspecting a bounded prefix of `maxKeys + 1` keys so the
+ * cost never grows past the cap. A prototype-polluting key seen inside that
+ * prefix is reported before any key-set comparison can mask it. Accessors
+ * are never invoked, and symbol keys and non-enumerable data keys are
+ * refused.
  */
-function readReleaseGrantSnapshot(raw: object): ReleaseGrantSnapshot {
+function readGrantObjectSnapshot<C extends string>(
+  raw: object,
+  maxKeys: number,
+  forbiddenKeys: readonly string[],
+  codes: GrantObjectCodes<C>,
+): GrantObjectSnapshot<C> {
   let ownKeys: PropertyKey[];
   try {
     ownKeys = Reflect.ownKeys(raw);
   } catch {
-    return { ok: false, code: 'release-grant-not-object' };
+    return { ok: false, code: codes.notObject };
   }
   const keys: string[] = [];
   const values: Record<string, unknown> = {};
-  let forbiddenCode: ReleaseGrantErrorCode | undefined;
-  // A bounded prefix of `MAX_RELEASE_GRANT_KEYS + 1` keys is inspected, so the
-  // cost never grows past the cap; a prototype-polluting key seen inside that
-  // prefix is reported before any key-set comparison can mask it.
+  let forbiddenCode: C | undefined;
   for (let index = 0; index < ownKeys.length; index += 1) {
-    if (index > MAX_RELEASE_GRANT_KEYS) {
-      return { ok: false, code: forbiddenCode ?? 'release-grant-unexpected-key' };
+    if (index > maxKeys) {
+      return { ok: false, code: forbiddenCode ?? codes.unexpectedKey };
     }
     const key = ownKeys[index];
     if (typeof key !== 'string' || key.length === 0) {
-      return { ok: false, code: 'release-grant-unexpected-key' };
+      return { ok: false, code: codes.unexpectedKey };
     }
-    if ((RELEASE_GRANT_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
-      forbiddenCode = 'release-grant-forbidden-key';
+    if (forbiddenKeys.includes(key)) {
+      forbiddenCode = codes.forbiddenKey;
       continue;
     }
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(raw, key);
-    } catch {
-      return { ok: false, code: 'release-grant-accessor-forbidden' };
-    }
-    if (descriptor === undefined) {
-      return { ok: false, code: 'release-grant-unexpected-key' };
-    }
-    if (descriptor.get !== undefined || descriptor.set !== undefined) {
-      return { ok: false, code: 'release-grant-accessor-forbidden' };
-    }
-    if (descriptor.enumerable !== true) {
-      return { ok: false, code: 'release-grant-unexpected-key' };
+    const read = readGrantDescriptorValue(raw, key, codes);
+    if (!read.ok) {
+      return read;
     }
     keys.push(key);
-    values[key] = descriptor.value;
+    values[key] = read.value;
   }
   if (forbiddenCode !== undefined) {
     return { ok: false, code: forbiddenCode };
   }
   return { ok: true, keys, values };
 }
+
+const RELEASE_GRANT_OBJECT_CODES: GrantObjectCodes<ReleaseGrantErrorCode> = {
+  notObject: 'release-grant-not-object',
+  invalidInput: 'release-grant-invalid-input',
+  unexpectedKey: 'release-grant-unexpected-key',
+  forbiddenKey: 'release-grant-forbidden-key',
+  accessorForbidden: 'release-grant-accessor-forbidden',
+};
+
+const isPlainReleaseGrantObject = (value: unknown): ReturnType<typeof checkPlainGrantObject<ReleaseGrantErrorCode>> =>
+  checkPlainGrantObject(value, RELEASE_GRANT_OBJECT_CODES);
+
+const readReleaseGrantSnapshot = (raw: object): GrantObjectSnapshot<ReleaseGrantErrorCode> =>
+  readGrantObjectSnapshot(raw, MAX_RELEASE_GRANT_KEYS, RELEASE_GRANT_FORBIDDEN_KEYS, RELEASE_GRANT_OBJECT_CODES);
 
 /** A bounded non-empty string of at most 256 characters with no control character. */
 function isBoundedTextField(value: unknown): value is string {
@@ -634,40 +673,16 @@ const SHADOW_IMPORT_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const SHADOW_IMPORT_EXPIRES_AT_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/;
 
-/**
- * True only for a plain object (no array, no function, prototype
- * `Object.prototype` or null). Prototype and type checks never read the
- * object's own properties, so no accessor or trap can run here. A revoked
- * Proxy (whose target is gone) can make even `Array.isArray` or
- * `Object.getPrototypeOf` throw; every such throw is a typed refusal, never
- * an exception.
- */
-function isPlainShadowImportObject(
-  value: unknown,
-): { readonly ok: true } | { readonly ok: false; readonly code: ShadowImportGrantErrorCode } {
-  if (typeof value !== 'object' || value === null) {
-    return { ok: false, code: 'shadow-import-grant-not-object' };
-  }
-  let isArray: boolean;
-  try {
-    isArray = Array.isArray(value);
-  } catch {
-    return { ok: false, code: 'shadow-import-grant-invalid-input' };
-  }
-  if (isArray) {
-    return { ok: false, code: 'shadow-import-grant-not-object' };
-  }
-  let proto: unknown;
-  try {
-    proto = Object.getPrototypeOf(value);
-  } catch {
-    return { ok: false, code: 'shadow-import-grant-invalid-input' };
-  }
-  if (proto === Object.prototype || proto === null) {
-    return { ok: true };
-  }
-  return { ok: false, code: 'shadow-import-grant-not-object' };
-}
+const SHADOW_IMPORT_OBJECT_CODES: GrantObjectCodes<ShadowImportGrantErrorCode> = {
+  notObject: 'shadow-import-grant-not-object',
+  invalidInput: 'shadow-import-grant-invalid-input',
+  unexpectedKey: 'shadow-import-grant-unexpected-key',
+  forbiddenKey: 'shadow-import-grant-forbidden-key',
+  accessorForbidden: 'shadow-import-grant-accessor-forbidden',
+};
+
+const isPlainShadowImportObject = (value: unknown): ReturnType<typeof checkPlainGrantObject<ShadowImportGrantErrorCode>> =>
+  checkPlainGrantObject(value, SHADOW_IMPORT_OBJECT_CODES);
 
 /** Every calendar month's day count; February is leap-corrected at call time. */
 const CALENDAR_MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
@@ -680,74 +695,15 @@ function daysInCalendarMonth(year: number, month: number): number {
   return CALENDAR_MONTH_DAYS[month - 1] ?? 0;
 }
 
-type ShadowImportSnapshot =
-  | { readonly ok: true; readonly keys: string[]; readonly values: Record<string, unknown> }
-  | { readonly ok: false; readonly code: ShadowImportGrantErrorCode };
-
 /**
- * Snapshot a plain object's own enumerable data properties through their
- * descriptors only. Cost policy (decided, BL06a): enumerating
- * `Reflect.ownKeys(raw)` carries an accepted engine-level `O(K)` bound in
- * the target's own-property count `K` (ECMAScript `[[OwnPropertyKeys]]` has
- * no count-only primitive), and the loop itself is bounded by the
- * `MAX_SHADOW_IMPORT_KEYS` prefix cap, so the traversal is
- * `O(MAX_SHADOW_IMPORT_KEYS)` after the enumeration. Accessors are never
- * invoked, symbol keys and non-enumerable data keys are refused, and a
- * prototype-polluting key (`__proto__`, `constructor`, `prototype`) is
- * refused before any key-set comparison so a polluting key can never
- * masquerade as a field.
+ * Snapshot a shadow import grant's own data properties. Cost policy (decided,
+ * BL06a): `Reflect.ownKeys(raw)` carries an accepted engine-level `O(K)`
+ * bound in the target's own-property count `K` (ECMAScript
+ * `[[OwnPropertyKeys]]` has no count-only primitive); the traversal after the
+ * enumeration is `O(MAX_SHADOW_IMPORT_KEYS)`.
  */
-function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
-  let ownKeys: PropertyKey[];
-  try {
-    ownKeys = Reflect.ownKeys(raw);
-  } catch {
-    return { ok: false, code: 'shadow-import-grant-not-object' };
-  }
-  const keys: string[] = [];
-  const values: Record<string, unknown> = {};
-  let forbiddenCode: ShadowImportGrantErrorCode | undefined;
-  // A bounded prefix of `MAX_SHADOW_IMPORT_KEYS + 1` keys is inspected, so the
-  // cost never grows past the cap; a prototype-polluting key seen inside that
-  // prefix is reported before any key-set comparison can mask it. The
-  // `Reflect.ownKeys` enumeration above carries an accepted engine-level
-  // `O(K)` bound in the target's own-property count `K` (no count-only
-  // primitive exists in ECMAScript).
-  for (let index = 0; index < ownKeys.length; index += 1) {
-    if (index > MAX_SHADOW_IMPORT_KEYS) {
-      return { ok: false, code: forbiddenCode ?? 'shadow-import-grant-unexpected-key' };
-    }
-    const key = ownKeys[index];
-    if (typeof key !== 'string' || key.length === 0) {
-      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
-    }
-    if ((SHADOW_IMPORT_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
-      forbiddenCode = 'shadow-import-grant-forbidden-key';
-      continue;
-    }
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(raw, key);
-    } catch {
-      return { ok: false, code: 'shadow-import-grant-accessor-forbidden' };
-    }
-    if (descriptor === undefined) {
-      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
-    }
-    if (descriptor.get !== undefined || descriptor.set !== undefined) {
-      return { ok: false, code: 'shadow-import-grant-accessor-forbidden' };
-    }
-    if (descriptor.enumerable !== true) {
-      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
-    }
-    keys.push(key);
-    values[key] = descriptor.value;
-  }
-  if (forbiddenCode !== undefined) {
-    return { ok: false, code: forbiddenCode };
-  }
-  return { ok: true, keys, values };
-}
+const readShadowImportSnapshot = (raw: object): GrantObjectSnapshot<ShadowImportGrantErrorCode> =>
+  readGrantObjectSnapshot(raw, MAX_SHADOW_IMPORT_KEYS, SHADOW_IMPORT_FORBIDDEN_KEYS, SHADOW_IMPORT_OBJECT_CODES);
 
 /**
  * Read a shadow import grant from hostile runtime data and never throw. Only

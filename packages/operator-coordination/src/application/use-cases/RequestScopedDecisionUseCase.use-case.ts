@@ -91,6 +91,10 @@ type DecisionStep<T> =
   | { readonly result: RequestScopedDecisionResult }
   | { readonly value: T };
 
+function rejectedStep(reason: string): { readonly result: RequestScopedDecisionResult } {
+  return { result: { outcome: 'rejected', reason } };
+}
+
 /** The release-root read the domain helper returns. */
 type ReleaseRootRead = ReturnType<typeof readReleaseRoot>;
 
@@ -403,48 +407,63 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (scope.isShadowScope) {
       const grantEvaluation = evaluateShadowImportGrant(scope.request, nowIso, deps.computeDigest);
       if (!grantEvaluation.ok) {
-        return { result: { outcome: 'rejected', reason: grantEvaluation.reason } };
+        return rejectedStep(grantEvaluation.reason);
       }
       shadowImportGrant = grantEvaluation.grant;
     }
-    if (scope.isRelaunchScope) {
-      if (deps.computeDigest === undefined) {
-        return { result: { outcome: 'rejected', reason: 'relaunch-apply-digest-unavailable' } };
-      }
-      const expectedRelaunchId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${deps.computeDigest(
-        relaunchApplyDigestPayload({
-          projectId: scope.request.projectId.trim(),
-          proposalDigest: scope.request.proposalDigest.trim(),
-          createdAtIso: nowIso,
-        }),
-      )}`;
-      if (scope.request.requestId.trim() !== expectedRelaunchId) {
-        return { result: { outcome: 'rejected', reason: 'relaunch-apply-request-digest-mismatch' } };
-      }
-    }
-    if (scope.isReleaseScope) {
-      if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
-        return { result: { outcome: 'rejected', reason: 'release-expected-head-required' } };
-      }
-      if (deps.computeDigest === undefined) {
-        return { result: { outcome: 'rejected', reason: 'release-grant-digest-unavailable' } };
-      }
-      const payloadResult = releaseGrantDigestPayload({
-        actionScope: scope.request.actionScope.trim(),
-        projectId: scope.request.projectId.trim(),
-        expectedHeadSha: scope.request.expectedHeadSha.trim(),
-        releaseRoot: scope.releaseRootValue,
-        nonce: readReleaseNonce(scope.request),
-      });
-      if (!payloadResult.ok) {
-        return { result: { outcome: 'rejected', reason: payloadResult.code } };
-      }
-      const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${deps.computeDigest(payloadResult.value)}`;
-      if (scope.request.requestId.trim() !== expectedRequestId) {
-        return { result: { outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' } };
-      }
+    const bindingReason =
+      (scope.isRelaunchScope ? this.relaunchBindingRejection(deps, scope, nowIso) : null) ??
+      (scope.isReleaseScope ? this.releaseBindingRejection(deps, scope) : null);
+    if (bindingReason !== null) {
+      return rejectedStep(bindingReason);
     }
     return { value: shadowImportGrant };
+  }
+
+  /** The relaunch-apply request id must be the digest of its exact coordinates; a rejection reason or null. */
+  private relaunchBindingRejection(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+    nowIso: string,
+  ): string | null {
+    if (deps.computeDigest === undefined) {
+      return 'relaunch-apply-digest-unavailable';
+    }
+    const expectedRelaunchId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${deps.computeDigest(
+      relaunchApplyDigestPayload({
+        projectId: scope.request.projectId.trim(),
+        proposalDigest: scope.request.proposalDigest.trim(),
+        createdAtIso: nowIso,
+      }),
+    )}`;
+    return scope.request.requestId.trim() === expectedRelaunchId
+      ? null
+      : 'relaunch-apply-request-digest-mismatch';
+  }
+
+  /** A release grant needs its head and a request id bound to its exact coordinates; a reason or null. */
+  private releaseBindingRejection(
+    deps: RequestScopedDecisionDependencies,
+    scope: ValidatedDecisionRequest,
+  ): string | null {
+    if (scope.request.expectedHeadSha === null || !isFilled(scope.request.expectedHeadSha)) {
+      return 'release-expected-head-required';
+    }
+    if (deps.computeDigest === undefined) {
+      return 'release-grant-digest-unavailable';
+    }
+    const payloadResult = releaseGrantDigestPayload({
+      actionScope: scope.request.actionScope.trim(),
+      projectId: scope.request.projectId.trim(),
+      expectedHeadSha: scope.request.expectedHeadSha.trim(),
+      releaseRoot: scope.releaseRootValue,
+      nonce: readReleaseNonce(scope.request),
+    });
+    if (!payloadResult.ok) {
+      return payloadResult.code;
+    }
+    const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${deps.computeDigest(payloadResult.value)}`;
+    return scope.request.requestId.trim() === expectedRequestId ? null : 'release-grant-request-digest-mismatch';
   }
 
   /**

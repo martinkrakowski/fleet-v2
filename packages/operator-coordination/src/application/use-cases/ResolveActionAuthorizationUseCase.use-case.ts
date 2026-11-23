@@ -169,29 +169,73 @@ function snapshotRepository(value: unknown): unknown {
 function readRequestSnapshot(
   input: object,
   preRead?: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined },
-): {
-  snapshot: Record<string, unknown> | null;
-  accessorField: string | null;
-  keyBoundExceeded: boolean;
-  pollutingKey: string | null;
-} {
+): RequestSnapshotRead {
   if (Array.isArray(input)) {
-    return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
+    return refusedSnapshot();
   }
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) {
-    return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
+    return refusedSnapshot();
   }
   // Prototype-polluting own keys are refused outright: a request body that
   // carries `__proto__` (or `constructor`/`prototype`) as an own property is
   // hostile bulk, and the hostile-input rules require it to be refused with a
   // typed result — copying it onto a null-prototype snapshot would leave the
   // key readable on the snapshot and one spread away from pollution.
-  for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
-    if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: polluting };
+  const polluting = firstOwnKeyAmong(input, PROTOTYPE_POLLUTING_KEYS);
+  if (polluting !== null) {
+    return refusedSnapshot({ pollutingKey: polluting });
+  }
+  return copyRequestSnapshotFields(input, preRead);
+}
+
+type RequestSnapshotRead = {
+  snapshot: Record<string, unknown> | null;
+  accessorField: string | null;
+  keyBoundExceeded: boolean;
+  pollutingKey: string | null;
+};
+
+function refusedSnapshot(
+  overrides: { readonly keyBoundExceeded?: boolean; readonly pollutingKey?: string } = {},
+): RequestSnapshotRead {
+  return {
+    snapshot: null,
+    accessorField: null,
+    keyBoundExceeded: overrides.keyBoundExceeded ?? false,
+    pollutingKey: overrides.pollutingKey ?? null,
+  };
+}
+
+/** The first of `keys` that `input` carries as an own property, or null; one descriptor read per key. */
+function firstOwnKeyAmong(input: object, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    if (Object.getOwnPropertyDescriptor(input, key) !== undefined) {
+      return key;
     }
   }
+  return null;
+}
+
+/**
+ * EXACTLY ONE descriptor read per snapshotted field: a field whose descriptor
+ * was already read once by the O(1) routing read is reused, never consulted a
+ * second time.
+ */
+function readSnapshotDescriptor(
+  input: object,
+  key: string,
+  preRead: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined } | undefined,
+): PropertyDescriptor | undefined {
+  return preRead !== undefined && key === preRead.key
+    ? preRead.descriptor
+    : Object.getOwnPropertyDescriptor(input, key);
+}
+
+function copyRequestSnapshotFields(
+  input: object,
+  preRead: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined } | undefined,
+): RequestSnapshotRead {
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let accessorField: string | null = null;
   // Enormous-input bound: a legitimate request carries a fixed handful of own
@@ -202,22 +246,15 @@ function readRequestSnapshot(
   let ownKeyCount = 0;
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string') {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
+      return refusedSnapshot();
     }
     if (ownKeyCount >= MAX_SNAPSHOT_OWN_KEYS) {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: true, pollutingKey: null };
+      return refusedSnapshot({ keyBoundExceeded: true });
     }
     ownKeyCount += 1;
-    // EXACTLY ONE descriptor read per snapshotted field: both the accessor
-    // refusal and the copied value derive from this single descriptor. A
-    // field whose descriptor was already read once by the O(1) routing read
-    // above is reused here, never consulted a second time.
-    const descriptor =
-      preRead !== undefined && key === preRead.key
-        ? preRead.descriptor
-        : Object.getOwnPropertyDescriptor(input, key);
+    const descriptor = readSnapshotDescriptor(input, key, preRead);
     if (descriptor === undefined || !descriptor.enumerable) {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
+      return refusedSnapshot();
     }
     if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
       accessorField = key;
@@ -254,15 +291,11 @@ function readRelaunchRequestFields(
   authorizationGrantId: unknown;
   proposalDigest: unknown;
 } | null {
-  for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
-    if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
-      return null;
-    }
+  if (firstOwnKeyAmong(input, PROTOTYPE_POLLUTING_KEYS) !== null) {
+    return null;
   }
-  for (const arrayLike of ARRAY_LIKE_KEYS) {
-    if (Object.getOwnPropertyDescriptor(input, arrayLike) !== undefined) {
-      return null;
-    }
+  if (firstOwnKeyAmong(input, ARRAY_LIKE_KEYS) !== null) {
+    return null;
   }
   const fields: Record<string, unknown> = {};
   for (const field of RELAUNCH_REQUEST_FIELDS) {
@@ -282,6 +315,83 @@ function readRelaunchRequestFields(
     authorizationGrantId: unknown;
     proposalDigest: unknown;
   };
+}
+
+/**
+ * Cost bound: O(1) — a fixed count of field reads and one bounded 64-hex
+ * pattern test; nothing scales with input size. Every string field is
+ * length-checked against its enormous-input bound BEFORE it is trimmed or
+ * pattern-tested, so hostile bulk is refused by a constant-time length test,
+ * never by work proportional to its size. The grant id and the plan digest
+ * are non-secret handles, but neither is ever echoed into a refusal reason.
+ */
+function checkRelaunchRequestFields(
+  request: ResolveActionAuthorizationRequest,
+):
+  | { readonly ok: true; readonly grantId: string }
+  | { readonly ok: false; readonly block: ResolveActionAuthorizationResult } {
+  if (
+    typeof request.projectId !== 'string' ||
+    request.projectId.length > MAX_RELAUNCH_PROJECT_ID_LENGTH ||
+    !isFilled(request.projectId) ||
+    request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID
+  ) {
+    return { ok: false, block: blocked('grant-wrong-project') };
+  }
+  if (
+    typeof request.authorizationGrantId !== 'string' ||
+    request.authorizationGrantId.length > MAX_RELAUNCH_GRANT_ID_LENGTH ||
+    !isFilled(request.authorizationGrantId)
+  ) {
+    return { ok: false, block: blocked('grant-missing') };
+  }
+  if (
+    typeof request.proposalDigest !== 'string' ||
+    request.proposalDigest.length !== 64 ||
+    !/^[0-9a-f]{64}$/.test(request.proposalDigest)
+  ) {
+    return { ok: false, block: blocked('invalid-request') };
+  }
+  return { ok: true, grantId: request.authorizationGrantId.trim() };
+}
+
+/** The stored relaunch-apply record must hold the relaunch scope, project and the requested plan digest. */
+function checkRelaunchGrantRecord(
+  candidate: CoordinationRequest,
+  refreshed: CoordinationRequestRecord,
+  request: ResolveActionAuthorizationRequest,
+): ResolveActionAuthorizationResult | null {
+  if (candidate.getActionScope() !== RELAUNCH_APPLY_ACTION_SCOPE || refreshed.expectedHeadSha !== null) {
+    return blocked('grant-wrong-scope');
+  }
+  if (refreshed.projectId !== RELAUNCH_APPLY_PROJECT_ID) {
+    return blocked('grant-wrong-project');
+  }
+  if (refreshed.proposalDigest !== request.proposalDigest) {
+    return blocked('grant-digest-mismatch');
+  }
+  return null;
+}
+
+/**
+ * The expiry is measured with the trusted clock alone: a request-supplied
+ * `nowIso` can never revive an expired grant. The boundary is exclusive —
+ * exactly `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days after creation is already
+ * expired.
+ */
+function checkRelaunchExpiry(createdAtIso: string, nowIso: string): ResolveActionAuthorizationResult | null {
+  const createdAtMs = Date.parse(createdAtIso);
+  const nowMs = Date.parse(nowIso);
+  if (!isStrictIsoInstant(createdAtIso)) {
+    return blocked('grant-expired');
+  }
+  if (createdAtMs > nowMs) {
+    return blocked('grant-created-in-future');
+  }
+  if (!Number.isFinite(createdAtMs) || nowMs >= createdAtMs + RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000) {
+    return blocked('grant-expired');
+  }
+  return null;
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -682,38 +792,20 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (requestedRepository === null) {
       return blocked('grant-wrong-repository');
     }
-    if (this.deps?.shadowImportClock === undefined) {
-      return blocked('clock-unavailable');
+    const trustedNow = this.readTrustedNow();
+    if (!trustedNow.ok) {
+      return trustedNow.block;
     }
-    const nowIso = this.deps.shadowImportClock.nowIso();
-    if (!isStrictIsoInstant(nowIso)) {
-      return blocked('invalid-now-iso');
-    }
-    if (this.deps.computeDigest === undefined) {
+    const { nowIso } = trustedNow;
+    const computeDigest = this.deps?.computeDigest;
+    if (computeDigest === undefined) {
       return blocked('digest-unavailable');
     }
-    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
-    if (recorded === null) {
-      return blocked('grant-missing');
+    const loaded = await this.loadApprovedHeadFreeGrant(grantId);
+    if (!loaded.ok) {
+      return loaded.block;
     }
-    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
-    if (refreshedResult.refusalReason !== undefined) {
-      // A pinned owner-key refusal blocks before any grant state is checked.
-      return blocked(refreshedResult.refusalReason);
-    }
-    const refreshed = refreshedResult.record;
-    if (refreshed.state === 'cancelled') {
-      return blocked('grant-revoked');
-    }
-    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
-      return blocked('grant-not-approved');
-    }
-    let candidate: CoordinationRequest;
-    try {
-      candidate = CoordinationRequest.fromRecord(refreshed);
-    } catch {
-      return blocked('grant-wrong-scope');
-    }
+    const { refreshed, candidate } = loaded;
     if (
       candidate.getActionScope() !== SHADOW_IMPORT_ACTION_SCOPE ||
       !candidate.canAuthorizeShadowImport(SHADOW_IMPORT_ACTION_SCOPE)
@@ -726,7 +818,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     const payloadResult = shadowImportDigestPayload(shadowGrant);
     const expectedRequestId = payloadResult.ok
-      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`
+      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${computeDigest(payloadResult.value)}`
       : null;
     if (!payloadResult.ok || candidate.getId() !== expectedRequestId) {
       return blocked('grant-digest-mismatch');
@@ -774,106 +866,31 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
   private async resolveRelaunchApply(
     request: ResolveActionAuthorizationRequest,
   ): Promise<ResolveActionAuthorizationResult> {
-    // Cost bound: O(1) — a fixed count of field reads, one bounded 64-hex
-    // pattern test and two bounded ISO parses; nothing scales with input
-    // size. Every string field is length-checked against its enormous-input
-    // bound BEFORE it is trimmed or pattern-tested, so hostile bulk is
-    // refused by a constant-time length test, never by work proportional to
-    // its size.
-    if (
-      typeof request.projectId !== 'string' ||
-      request.projectId.length > MAX_RELAUNCH_PROJECT_ID_LENGTH ||
-      !isFilled(request.projectId) ||
-      request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID
-    ) {
-      return blocked('grant-wrong-project');
+    const fieldCheck = checkRelaunchRequestFields(request);
+    if (!fieldCheck.ok) {
+      return fieldCheck.block;
     }
-    if (
-      typeof request.authorizationGrantId !== 'string' ||
-      request.authorizationGrantId.length > MAX_RELAUNCH_GRANT_ID_LENGTH ||
-      !isFilled(request.authorizationGrantId)
-    ) {
-      return blocked('grant-missing');
+    const { grantId } = fieldCheck;
+    const trustedNow = this.readTrustedNow();
+    if (!trustedNow.ok) {
+      return trustedNow.block;
     }
-    const grantId = request.authorizationGrantId.trim();
-    if (
-      typeof request.proposalDigest !== 'string' ||
-      request.proposalDigest.length !== 64 ||
-      !/^[0-9a-f]{64}$/.test(request.proposalDigest)
-    ) {
-      return blocked('invalid-request');
+    const loaded = await this.loadApprovedHeadFreeGrant(grantId);
+    if (!loaded.ok) {
+      return loaded.block;
     }
-    if (this.deps?.shadowImportClock === undefined) {
-      return blocked('clock-unavailable');
+    const { refreshed, candidate } = loaded;
+    const recordBlock = checkRelaunchGrantRecord(candidate, refreshed, request);
+    if (recordBlock !== null) {
+      return recordBlock;
     }
-    const nowIso = this.deps.shadowImportClock.nowIso();
-    if (!isStrictIsoInstant(nowIso)) {
-      return blocked('invalid-now-iso');
+    const requestIdBlock = this.checkRelaunchRequestId(refreshed);
+    if (requestIdBlock !== null) {
+      return requestIdBlock;
     }
-    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
-    if (recorded === null) {
-      return blocked('grant-missing');
-    }
-    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
-    if (refreshedResult.refusalReason !== undefined) {
-      // A pinned owner-key refusal blocks before any grant state is checked.
-      return blocked(refreshedResult.refusalReason);
-    }
-    const refreshed = refreshedResult.record;
-    if (refreshed.state === 'cancelled') {
-      return blocked('grant-revoked');
-    }
-    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
-      return blocked('grant-not-approved');
-    }
-    let candidate: CoordinationRequest;
-    try {
-      candidate = CoordinationRequest.fromRecord(refreshed);
-    } catch {
-      return blocked('grant-wrong-scope');
-    }
-    if (candidate.getActionScope() !== RELAUNCH_APPLY_ACTION_SCOPE || refreshed.expectedHeadSha !== null) {
-      return blocked('grant-wrong-scope');
-    }
-    if (refreshed.projectId !== RELAUNCH_APPLY_PROJECT_ID) {
-      return blocked('grant-wrong-project');
-    }
-    if (refreshed.proposalDigest !== request.proposalDigest) {
-      return blocked('grant-digest-mismatch');
-    }
-    // The owner's signature covers the request id, not the plan digest or the
-    // creation instant: both are bound by the id's digest, recomputed here
-    // from the stored fields, so a store edit of either is refused.
-    if (this.deps.computeDigest === undefined) {
-      return blocked('digest-unavailable');
-    }
-    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${this.deps.computeDigest(
-      relaunchApplyDigestPayload({
-        projectId: refreshed.projectId,
-        proposalDigest: refreshed.proposalDigest,
-        createdAtIso: refreshed.createdAtIso,
-      }),
-    )}`;
-    if (refreshed.id !== expectedRequestId) {
-      return blocked('grant-request-digest-mismatch');
-    }
-    // The expiry is measured with the trusted clock alone: a request-supplied
-    // `nowIso` can never revive an expired grant. The boundary is exclusive —
-    // exactly `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days after creation is
-    // already expired.
-    const createdAtMs = Date.parse(refreshed.createdAtIso);
-    const nowMs = Date.parse(nowIso);
-    if (!isStrictIsoInstant(refreshed.createdAtIso)) {
-      return blocked('grant-expired');
-    }
-    if (createdAtMs > nowMs) {
-      return blocked('grant-created-in-future');
-    }
-    if (
-      !Number.isFinite(createdAtMs) ||
-      nowMs >= createdAtMs + RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000
-    ) {
-      return blocked('grant-expired');
+    const expiryBlock = checkRelaunchExpiry(refreshed.createdAtIso, trustedNow.nowIso);
+    if (expiryBlock !== null) {
+      return expiryBlock;
     }
     // A signed owner decision is re-verified before anything is authorized:
     // the stored approved state alone is never authority.
@@ -888,6 +905,75 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       expectedHeadSha: '',
       policyRevision: candidate.getPolicyRevision(),
     };
+  }
+
+  /** The injected clock's strict instant, or the typed refusal; a request field is never the clock. */
+  private readTrustedNow():
+    | { readonly ok: true; readonly nowIso: string }
+    | { readonly ok: false; readonly block: ResolveActionAuthorizationResult } {
+    const clock = this.deps?.shadowImportClock;
+    if (clock === undefined) {
+      return { ok: false, block: blocked('clock-unavailable') };
+    }
+    const nowIso = clock.nowIso();
+    if (!isStrictIsoInstant(nowIso)) {
+      return { ok: false, block: blocked('invalid-now-iso') };
+    }
+    return { ok: true, nowIso };
+  }
+
+  /**
+   * The shared head-free load: the recorded request for the grant id, refreshed
+   * from a verified answer, that is approved and parses as a coordination
+   * request; otherwise the typed refusal.
+   */
+  private async loadApprovedHeadFreeGrant(
+    grantId: string,
+  ): Promise<
+    | { readonly ok: true; readonly refreshed: CoordinationRequestRecord; readonly candidate: CoordinationRequest }
+    | { readonly ok: false; readonly block: ResolveActionAuthorizationResult }
+  > {
+    const recorded = (await this.deps?.requestRepo.findRequestByGrantId(grantId)) ?? null;
+    if (recorded === null) {
+      return { ok: false, block: blocked('grant-missing') };
+    }
+    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshedResult.refusalReason !== undefined) {
+      // A pinned owner-key refusal blocks before any grant state is checked.
+      return { ok: false, block: blocked(refreshedResult.refusalReason) };
+    }
+    const refreshed = refreshedResult.record;
+    if (refreshed.state === 'cancelled') {
+      return { ok: false, block: blocked('grant-revoked') };
+    }
+    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
+      return { ok: false, block: blocked('grant-not-approved') };
+    }
+    try {
+      return { ok: true, refreshed, candidate: CoordinationRequest.fromRecord(refreshed) };
+    } catch {
+      return { ok: false, block: blocked('grant-wrong-scope') };
+    }
+  }
+
+  /**
+   * The owner's signature covers the request id, not the plan digest or the
+   * creation instant: both are bound by the id's digest, recomputed here from
+   * the stored fields, so a store edit of either is refused.
+   */
+  private checkRelaunchRequestId(refreshed: CoordinationRequestRecord): ResolveActionAuthorizationResult | null {
+    const computeDigest = this.deps?.computeDigest;
+    if (computeDigest === undefined) {
+      return blocked('digest-unavailable');
+    }
+    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${computeDigest(
+      relaunchApplyDigestPayload({
+        projectId: refreshed.projectId,
+        proposalDigest: refreshed.proposalDigest,
+        createdAtIso: refreshed.createdAtIso,
+      }),
+    )}`;
+    return refreshed.id === expectedRequestId ? null : blocked('grant-request-digest-mismatch');
   }
 
   /**

@@ -737,6 +737,23 @@ function readRelaunchApplyAnswer(
   answer: unknown,
   requestedGrantId: string,
 ): AuthorizeRelaunchApplyResult {
+  return readDelegateAuthorizeAnswer(answer, requestedGrantId, (reason, outcome) =>
+    cleanRelaunchApplyReason(reason, requestedGrantId, outcome),
+  );
+}
+
+/**
+ * The shared reader of a delegate's authorize answer: an authorized answer
+ * must carry a bounded, safe grant handle equal to the requested id; a
+ * blocked or unknown answer carries a reason cleaned by the caller's scrubber.
+ */
+function readDelegateAuthorizeAnswer(
+  answer: unknown,
+  requestedGrantId: string,
+  cleanBlockedReason: (reason: string, outcome: 'blocked' | 'unknown') => string,
+):
+  | { readonly outcome: 'authorized'; readonly grantId: string }
+  | { readonly outcome: 'blocked' | 'unknown'; readonly reason: string } {
   const head = readPlainRecord(answer, {
     outcome: { kind: 'literal', values: ['authorized', 'blocked', 'unknown'] },
   });
@@ -761,14 +778,8 @@ function readRelaunchApplyAnswer(
   if (!withReason.ok) {
     return { outcome: 'unknown', reason: 'authorization-unavailable' };
   }
-  return {
-    outcome: head.value.outcome as 'blocked' | 'unknown',
-    reason: cleanRelaunchApplyReason(
-      withReason.value.reason as string,
-      requestedGrantId,
-      head.value.outcome as 'blocked' | 'unknown',
-    ),
-  };
+  const outcome = head.value.outcome as 'blocked' | 'unknown';
+  return { outcome, reason: cleanBlockedReason(withReason.value.reason as string, outcome) };
 }
 
 /**
@@ -782,34 +793,9 @@ function readShadowImportAnswer(
   answer: unknown,
   requestedGrantId: string,
 ): AuthorizeShadowImportResult {
-  const head = readPlainRecord(answer, {
-    outcome: { kind: 'literal', values: ['authorized', 'blocked', 'unknown'] },
-  });
-  if (!head.ok) {
-    return { outcome: 'unknown', reason: 'authorization-unavailable' };
-  }
-  if (head.value.outcome === 'authorized') {
-    const granted = readPlainRecord(answer, {
-      grantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
-    });
-    if (!granted.ok || !isSafeId(granted.value.grantId, MAX_GRANT_ID_LENGTH, true)) {
-      return { outcome: 'unknown', reason: 'authorization-unreadable' };
-    }
-    if (granted.value.grantId !== requestedGrantId) {
-      return { outcome: 'blocked', reason: 'grant-id-mismatch' };
-    }
-    return { outcome: 'authorized', grantId: granted.value.grantId as string };
-  }
-  const withReason = readPlainRecord(answer, {
-    reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },
-  });
-  if (!withReason.ok) {
-    return { outcome: 'unknown', reason: 'authorization-unavailable' };
-  }
-  return {
-    outcome: head.value.outcome as 'blocked' | 'unknown',
-    reason: cleanReason(withReason.value.reason as string, 'delegate-blocked'),
-  };
+  return readDelegateAuthorizeAnswer(answer, requestedGrantId, (reason) =>
+    cleanReason(reason, 'delegate-blocked'),
+  );
 }
 
 function readDelegateResolveResult(

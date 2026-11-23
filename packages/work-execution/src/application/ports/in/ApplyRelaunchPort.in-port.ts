@@ -87,6 +87,11 @@ export type ApplyRelaunchRefusalReason =
   | 'authorization-unavailable'
   | 'unexpected-running-lane'
   | 'stale-plan-state'
+  | 'journal-write-failed'
+  | 'save-failed'
+  | 'abort-failed'
+  | 'active-run-cap-reached'
+  | 'adopt-not-implemented'
   | 'live-apply-not-implemented';
 
 /** One lane's apply summary: ids, step codes and statuses only. */
@@ -104,6 +109,13 @@ export type ApplyRelaunchResult =
   | {
       readonly outcome: 'dry-run';
       readonly planDigest: string;
+      readonly lanes: readonly ApplyRelaunchLaneSummary[];
+    }
+  | {
+      /** AR2b: one live wave applied (`wave: null` when nothing was left to do). */
+      readonly outcome: 'applied';
+      readonly planDigest: string;
+      readonly wave: number | null;
       readonly lanes: readonly ApplyRelaunchLaneSummary[];
     }
   | {

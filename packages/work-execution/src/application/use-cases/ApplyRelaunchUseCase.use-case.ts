@@ -40,7 +40,7 @@ import {
   verifySaveIntentDigest,
   type RelaunchApplyStepStatus,
 } from '../../domain/relaunch-apply.js';
-import { COMMIT as ADOPT_COMMIT } from './AdoptLaneUseCase.use-case.js';
+import { adoptLaneInputFault, COMMIT as ADOPT_COMMIT, isAdoptLaneId } from './AdoptLaneUseCase.use-case.js';
 import { relaunchStepStatus } from '../../domain/relaunch-step-ledger.js';
 import { parseValidatedStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
 import type {
@@ -101,6 +101,8 @@ const MAX_BRIEF_TEXT_LENGTH = 262_144;
 /** The adopt secret-scan bounds: a brief nests deeper and is far longer than a save input. */
 const MAX_ADOPT_SCAN_DEPTH = 8;
 const MAX_ADOPT_SCAN_NODES = 2048;
+/** Aggregate string length across one adopt input: the brief plus slack, not nodes times the per-string cap. */
+const MAX_ADOPT_SCAN_CHARS = 3 * MAX_BRIEF_TEXT_LENGTH;
 
 const PLAN_DIGEST = /^[0-9a-f]{64}$/;
 
@@ -166,7 +168,7 @@ const MAX_SCAN_NODES = 256;
 function scanForSecret(
   value: unknown,
   depth: number,
-  budget: { nodes: number },
+  budget: { nodes: number; chars?: number },
   maxDepth: number = MAX_SCAN_DEPTH,
   maxTextLength: number = MAX_TEXT_LENGTH,
 ): boolean | null {
@@ -175,6 +177,10 @@ function scanForSecret(
     // Cost bound: the length cap refuses an enormous string in O(1) before
     // any pattern scan runs.
     if (value.length > maxTextLength) return null;
+    if (budget.chars !== undefined) {
+      budget.chars -= value.length;
+      if (budget.chars < 0) return null;
+    }
     return hasSecretShape(value);
   }
   if (typeof value !== 'object') return false;
@@ -493,7 +499,7 @@ function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> |
     // Secret screening runs over every reachable string before any other
     // field check, with the adopt bounds: `brief.acceptanceSpec.commands[]
     // .argv[]` nests to depth 6 and `brief.briefText` may be 262,144 chars.
-    const secret = scanForSecret(element, 0, { nodes: MAX_ADOPT_SCAN_NODES }, MAX_ADOPT_SCAN_DEPTH, MAX_BRIEF_TEXT_LENGTH);
+    const secret = scanForSecret(element, 0, { nodes: MAX_ADOPT_SCAN_NODES, chars: MAX_ADOPT_SCAN_CHARS }, MAX_ADOPT_SCAN_DEPTH, MAX_BRIEF_TEXT_LENGTH);
     if (secret === true) return 'secret-detected';
     if (secret === null) return null;
     // Fix-round item 1: a nested own `constructor` or `prototype` key would
@@ -501,7 +507,8 @@ function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> |
     const polluting = containsPollutingKey(element, 0, { nodes: MAX_ADOPT_SCAN_NODES }, MAX_ADOPT_SCAN_DEPTH);
     if (polluting !== false) return null;
     const laneId: unknown = fields['laneId'];
-    if (typeof laneId !== 'string' || !LANE_ID.test(laneId)) return null;
+    // AdoptLaneUseCase's own lane-id grammar (a leading `.`, `_` or `-` is refused there), never a looser copy.
+    if (typeof laneId !== 'string' || !isAdoptLaneId(laneId)) return null;
     if (map.has(laneId)) return null;
     const brief: unknown = fields['brief'];
     const briefText: unknown = own(brief, 'briefText');
@@ -1136,6 +1143,14 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
           const saveInput = saveInputs.get(lane.laneId);
           if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
             return refusedLane('stale-plan-state', lane.laneId);
+          }
+          // The SAME pure input validation `adoptLane` runs (brief digest, path
+          // rules, clean-commit facts), before the grant is spent or anything is
+          // saved or aborted. The one refusal class left after the first side
+          // effect is a `save-ref` source's check against the journal
+          // (save-missing / save-unverified), which needs the save's own result.
+          if (adoptStatus !== 'completed' && adoptLaneInputFault(adoptInput, deps.computeDigest) !== null) {
+            return refusedLane('adopt-failed', lane.laneId);
           }
         }
       }

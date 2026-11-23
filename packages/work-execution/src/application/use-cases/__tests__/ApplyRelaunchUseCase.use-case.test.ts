@@ -247,7 +247,8 @@ const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown>
     brief: {
       briefId: 'brief-1',
       briefText: 'do the thing',
-      expectedBriefDigest: 'a'.repeat(64),
+      // The real digest of `briefText`: the preflight verifies it before any side effect.
+      expectedBriefDigest: hex('do the thing'),
       prosePath: 'brief/prose.md',
       manifestPath: 'brief/manifest.json',
       reviewerModel: 'reviewer-1',
@@ -291,7 +292,7 @@ const lane4Adopted = (): Record<string, unknown> => ({
   outcome: 'adopted',
   reused: false,
   workOrderId: 'wo-9',
-  briefDigest: 'a'.repeat(64),
+  briefDigest: hex('do the thing'),
   attemptId: 'attempt-4',
   runId: `run-7${'C'.repeat(25)}`,
   commitOid: 'c'.repeat(64),

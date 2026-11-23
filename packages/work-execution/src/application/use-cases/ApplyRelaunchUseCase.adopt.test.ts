@@ -57,6 +57,10 @@ const computeDigest = (text: string): string =>
 
 const hex = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
+/** The fixture brief text and its REAL digest: the preflight verifies it before any side effect. */
+const BRIEF_TEXT = 'do the thing';
+const BRIEF_DIGEST = hex(BRIEF_TEXT);
+
 type PlannedStep = { step: string; idempotencyKey: string };
 
 interface FixtureLane {
@@ -227,8 +231,8 @@ const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown>
     },
     brief: {
       briefId: 'brief-1',
-      briefText: 'do the thing',
-      expectedBriefDigest: 'a'.repeat(64),
+      briefText: BRIEF_TEXT,
+      expectedBriefDigest: BRIEF_DIGEST,
       prosePath: 'brief/prose.md',
       manifestPath: 'brief/manifest.json',
       reviewerModel: 'reviewer-1',
@@ -257,7 +261,7 @@ const adopted = (): Record<string, unknown> => ({
   outcome: 'adopted',
   reused: false,
   workOrderId: 'wo-9',
-  briefDigest: 'a'.repeat(64),
+  briefDigest: BRIEF_DIGEST,
   attemptId: 'attempt-1',
   runId: RUN_9,
   commitOid: COMMIT,
@@ -278,7 +282,7 @@ const adoptedFor = (request: unknown): Record<string, unknown> => {
     outcome: 'adopted',
     reused: false,
     workOrderId: req.workOrder?.workOrderId ?? 'wo-9',
-    briefDigest: req.brief?.expectedBriefDigest ?? 'a'.repeat(64),
+    briefDigest: req.brief?.expectedBriefDigest ?? BRIEF_DIGEST,
     attemptId: req.attempt?.attemptId ?? 'attempt-1',
     runId: req.run?.runId ?? RUN_9,
     commitOid: req.source?.commitOid ?? COMMIT,
@@ -446,8 +450,13 @@ const makeDeps = (over: {
             const laneId = (request as { laneId: string }).laneId;
             for (const sub of ADOPT_SUB_STEPS) {
               const subKey = `relaunch/${planDigest}/${laneId}/adopt/${sub}`;
-              await append({ key: subKey, kind: 'intent' });
-              await append({ key: subKey, kind: 'result', outcome: 'completed' });
+              // A resumed adopt re-uses what the journal already holds: a real
+              // AdoptLaneUseCase never journals a second intent or result for
+              // a sub-step that has one.
+              const has = (kind: string): boolean =>
+                store.some((entry) => entry['key'] === subKey && entry['kind'] === kind);
+              if (!has('intent')) await append({ key: subKey, kind: 'intent' });
+              if (!has('result')) await append({ key: subKey, kind: 'result', outcome: 'completed' });
             }
           }
           return answer;
@@ -526,7 +535,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     expect(deps.appended).toEqual([]);
   });
 
-  it('applies a lane whose plan has no adopt step without requiring an adoptInput', async () => {
+  it('refuses invalid-plan for a held lane whose plan has no adopt step (the grammar pins it before preflight)', async () => {
     // Fix-round item 2 (documented residual): the adopt-input requirement and
     // its cross-checks are gated on the lane having an `adopt` step, matching
     // the AR2c brief exactly. The stored-plan grammar (`validateLaneStepOrder`)
@@ -634,27 +643,49 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     // Fix-round item 1: a NESTED own `constructor` or `prototype` key
     // survives both the snapshot helper and `structuredClone`, so the parse
     // must refuse it explicitly (the top-level reader alone does not see it).
+    // Every input below is otherwise VALID (the nested readers ignore an
+    // extra key), so only `containsPollutingKey` can refuse it: removing the
+    // guard turns each case into a request that reaches the plan read.
+    const validWorkOrder = valid['workOrder'] as object;
+    const validBrief = valid['brief'] as object;
     for (const nested of ['constructor', 'prototype']) {
-      await refused([
-        adoptInput({ workOrder: withPollutingKey(nested, 'hostile') }),
-      ]);
-      await refused([
-        adoptInput({
-          brief: {
-            ...(valid['brief'] as object),
-            acceptanceSpec: { commands: [withPollutingKey(nested, ['yarn', 'test'])] },
-          },
-        }),
-      ]);
+      await refused([adoptInput({ workOrder: { ...validWorkOrder, [nested]: 'hostile' } })]);
+      await refused([adoptInput({ brief: { ...validBrief, [nested]: ['hostile'] } })]);
       expect((pristine as Record<string, unknown>)['untouched']).toBe(true);
     }
-    // Over-deep: a container nested past MAX_ADOPT_SCAN_DEPTH = 8 is unreadable.
-    let deep: unknown = ['x'];
-    for (let index = 0; index < 12; index += 1) deep = [deep];
-    await refused([adoptInput({ brief: { ...(valid['brief'] as object), acceptanceSpec: deep } })]);
-    // Over-wide: more nodes than MAX_ADOPT_SCAN_NODES = 2048 is unreadable.
-    const wide = new Array(2049).fill('x');
-    await refused([adoptInput({ brief: { ...(valid['brief'] as object), acceptanceSpec: wide } })]);
+    // Positive control: the same extra key under an innocuous name passes the parse.
+    const passes = async (adoptInputs: unknown): Promise<void> => {
+      const deps = makeDeps({ plan });
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs }),
+      );
+      expect(deps.planRepo.findByDigest).toHaveBeenCalled();
+    };
+    await passes([adoptInput({ workOrder: { ...validWorkOrder, note: 'fine' } })]);
+    // Over-deep: a container nested past MAX_ADOPT_SCAN_DEPTH = 8 is unreadable;
+    // 4 levels of the same shape pass (so only the depth bound refuses).
+    const nest = (levels: number): unknown => {
+      let node: unknown = ['x'];
+      for (let index = 0; index < levels; index += 1) node = [node];
+      return node;
+    };
+    await passes([adoptInput({ workOrder: { ...validWorkOrder, junk: nest(3) } })]);
+    await refused([adoptInput({ workOrder: { ...validWorkOrder, junk: nest(12) } })]);
+    // Over-wide: more nodes than MAX_ADOPT_SCAN_NODES = 2048 is unreadable;
+    // 100 nodes of the same shape pass.
+    await passes([adoptInput({ workOrder: { ...validWorkOrder, junk: new Array(100).fill('x') } })]);
+    await refused([adoptInput({ workOrder: { ...validWorkOrder, junk: new Array(2049).fill('x') } })]);
+    // Aggregate text: one brief-sized string is fine, but four of them
+    // (briefText plus three extras) exceed MAX_ADOPT_SCAN_CHARS although each
+    // is within the per-string bound.
+    const bulk = 'y'.repeat(262_144);
+    await passes([adoptInput({ workOrder: { ...validWorkOrder, a: bulk }, brief: { ...validBrief, briefText: bulk, expectedBriefDigest: hex(bulk) } })]);
+    await refused([
+      adoptInput({
+        workOrder: { ...validWorkOrder, a: bulk, b: bulk, c: bulk },
+        brief: { ...validBrief, briefText: bulk, expectedBriefDigest: hex(bulk) },
+      }),
+    ]);
     // An element missing a required key, and one with an extra key, refuse.
     const missing = { ...valid };
     delete (missing as Record<string, unknown>)['run'];
@@ -940,7 +971,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     // otherwise the wave must not journal the redispatch intent.
     const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('adopted-shape plan'))]);
     for (const answer of [
-      { outcome: 'adopted', reused: false, workOrderId: 'wo-9', briefDigest: 'a'.repeat(64), attemptId: 'attempt-1', commitOid: COMMIT, enteredState: 'collecting', provenance: 'adopted' }, // no runId
+      { outcome: 'adopted', reused: false, workOrderId: 'wo-9', briefDigest: BRIEF_DIGEST, attemptId: 'attempt-1', commitOid: COMMIT, enteredState: 'collecting', provenance: 'adopted' }, // no runId
       { ...adopted(), attemptId: 'attempt-2' }, // a mismatched attempt id
       { ...adopted(), commitOid: 'a'.repeat(64) }, // a commit the source does not carry
       { ...adopted(), enteredState: 'running' },
@@ -1053,6 +1084,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     const brief = {
       ...(adoptInput()['brief'] as object),
       briefText: 'x'.repeat(262_144),
+      expectedBriefDigest: hex('x'.repeat(262_144)),
       acceptanceSpec: {
         commitRequired: true,
         diffCheck: true,
@@ -1069,7 +1101,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
         intent(key(digest, 'lane-2', 'save'), saveInputDigest(digest, saveInput())),
         savedResult(key(digest, 'lane-2', 'save')),
       ],
-      live: { adopt: adopted() },
+      live: { adopt: (request: unknown) => adoptedFor(request) },
     });
     const request = (): unknown =>
       applyRequest(digest, {
@@ -1114,7 +1146,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
         ...completedSave(digest, 'lane-2', saveInput()),
         ...completedAdopt(digest, 'lane-2'),
       ],
-      live: { adopt: adopted() },
+      live: { adopt: (request: unknown) => adoptedFor(request) },
     });
     expect(
       await new ApplyRelaunchUseCase(replayDeps).applyRelaunch(
@@ -1130,7 +1162,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     const waveDeps = makeDeps({
       plan,
       live: {
-        adopt: adopted(),
+        adopt: (request: unknown) => adoptedFor(request),
         save: { outcome: 'saved', saveRef: SAVE_REF, commitId: COMMIT, treeDigest: TREE },
       },
     });
@@ -1148,5 +1180,154 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
         source: { kind: 'save-ref', saveRef: SAVE_REF, commitOid: COMMIT, treeDigest: TREE },
       }),
     );
+  });
+
+  it('refuses pure adopt-input faults in preflight with zero side effects, before the grant', async () => {
+    // AdoptLaneUseCase refuses these after the grant, the save and the abort;
+    // the relaunch preflight runs the SAME pure validation first.
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('pure-fault plan'))]);
+    const brief = adoptInput()['brief'] as object;
+    const branch = `fleet/${RUN_9}`;
+    const clean = (over: Record<string, unknown>): Record<string, unknown> =>
+      adoptInput({
+        source: { kind: 'clean-commit', commitOid: COMMIT, branchName: branch, commitOnBranch: true, dirtyCount: 0, ...over },
+      });
+    const cases: Record<string, Record<string, unknown>> = {
+      'digest mismatch': adoptInput({ brief: { ...brief, expectedBriefDigest: 'a'.repeat(64) } }),
+      'NUL in a path': adoptInput({ brief: { ...brief, prosePath: 'brief/pro\u0000se.md' } }),
+      'commitOid equals baseCommit': clean({ commitOid: 'b'.repeat(64) }),
+      'commit on another branch': clean({ branchName: 'fleet/other' }),
+      'dirty worktree': clean({ dirtyCount: 3 }),
+      'unknown dirty state': clean({ dirtyCount: 'unknown' }),
+    };
+    for (const [name, bad] of Object.entries(cases)) {
+      const deps = makeDeps({ plan, live: { adopt: (request: unknown) => adoptedFor(request) } });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(
+          applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [bad] }),
+        ),
+        name,
+      ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+      expect(deps.authorization!.authorizeRelaunchApply, name).not.toHaveBeenCalled();
+      expect(deps.saveLaneEdits, name).not.toHaveBeenCalled();
+      expect(deps.runner!.abortWorktreeRun, name).not.toHaveBeenCalled();
+      expect(deps.processTreeTermination!.terminateWorktreeProcesses, name).not.toHaveBeenCalled();
+      expect(deps.adoptLane, name).not.toHaveBeenCalled();
+      expect(deps.appended, name).toEqual([]);
+    }
+    // Control: a clean commit that is on the lane branch and is not the base adopts.
+    const deps = makeDeps({ plan, live: { adopt: (request: unknown) => adoptedFor(request) } });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [clean({})] }),
+      ),
+    ).toMatchObject({ outcome: 'applied' });
+  });
+
+  it('refuses a lane id AdoptLane would refuse (a leading dot) at parse, with no side effect', async () => {
+    // `.lane` passes the save-input grammar but not AdoptLane's id pattern.
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('dot-lane plan'), '.lane')]);
+    const deps = makeDeps({ plan, live: { adopt: (request: unknown) => adoptedFor(request) } });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, {
+          saveInputs: [saveInput({ laneId: '.lane' })],
+          adoptInputs: [adoptInput({ laneId: '.lane' })],
+        }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+    expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    expect(deps.saveLaneEdits).not.toHaveBeenCalled();
+    expect(deps.appended).toEqual([]);
+  });
+
+  describe('a partially begun adopt', () => {
+    // Wave 1: lane-2 is fully adopted and handed off (redispatch intent-only),
+    // so it occupies one run. Wave 2: lane-3 has its work-order adopt step
+    // completed and the brief step begun (status `partial`, redispatch
+    // absent), and lane-4 has a save and nothing else (adopt `absent`).
+    const adoptKey = (digest: string, laneId: string, sub: string): string =>
+      `relaunch/${digest}/${laneId}/adopt/${sub}`;
+    const setup = (maxActiveRuns: number, lane3Entries: (digest: string) => unknown[]) => {
+      const seed = hex('partial plan');
+      const lane2 = { ...heldLane(seed, 'lane-2'), dependsOnLaneIds: [] };
+      const lane3 = { ...heldLane(seed, 'lane-3'), hostName: 'host-c', dependsOnLaneIds: ['lane-2'], admissionWave: 2 };
+      const lane4 = { ...heldLane(seed, 'lane-4'), hostName: 'host-d', dependsOnLaneIds: ['lane-2'], admissionWave: 2 };
+      const plan = buildPlan([lane2, lane3, lane4], maxActiveRuns);
+      const saves = [
+        saveInput(),
+        saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' }),
+        saveInput({ laneId: 'lane-4', attemptId: 'attempt-4' }),
+      ];
+      const entries = [
+        ...completedSave(plan.planDigest, 'lane-2', saves[0]!),
+        ...completedAdopt(plan.planDigest, 'lane-2'),
+        intent(key(plan.planDigest, 'lane-2', 'redispatch')),
+        ...completedSave(plan.planDigest, 'lane-3', saves[1]!),
+        ...lane3Entries(plan.planDigest),
+        ...completedSave(plan.planDigest, 'lane-4', saves[2]!),
+      ];
+      const laneInput = (laneId: string, attemptId: string, runId: string): Record<string, unknown> =>
+        adoptInput({
+          laneId,
+          attempt: { ...(adoptInput()['attempt'] as object), attemptId },
+          run: { ...(adoptInput()['run'] as object), runId },
+        });
+      const deps = makeDeps({ plan, entries, live: { adopt: (request: unknown) => adoptedFor(request) } });
+      const apply = (): Promise<unknown> =>
+        new ApplyRelaunchUseCase(deps).applyRelaunch(
+          applyRequest(plan.planDigest, {
+            saveInputs: saves,
+            adoptInputs: [laneInput('lane-3', 'attempt-3', RUN_10), laneInput('lane-4', 'attempt-4', RUN_11)],
+          }),
+        );
+      const adoptedLanes = (): unknown[] =>
+        (deps.adoptLane as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+          (call) => (call[0] as { laneId: string }).laneId,
+        );
+      return { plan, deps, apply, adoptedLanes };
+    };
+    const partial = (digest: string): unknown[] => [
+      intent(adoptKey(digest, 'lane-3', 'work-order')),
+      result(adoptKey(digest, 'lane-3', 'work-order'), 'completed'),
+      intent(adoptKey(digest, 'lane-3', 'brief')),
+    ];
+
+    it('counts a partial adopt against the cap, resumes it without a cap check, and refuses the next absent adopt', async () => {
+      // maxActiveRuns 2: lane-2's hand-off and lane-3's partial adopt fill the
+      // cap in the preflight. lane-3 still resumes (a partial adopt is never
+      // re-checked against the cap) and lane-4's absent adopt is refused.
+      // Deleting `adoptStatus === 'partial'` from the preflight count lets
+      // lane-4 adopt; checking the cap for a partial adopt refuses lane-3.
+      const { deps, apply, adoptedLanes, plan } = setup(2, partial);
+      expect(await apply()).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-4' });
+      expect(adoptedLanes()).toEqual(['lane-3']);
+      expect(
+        deps.appended!.some((entry) => entry.key === `relaunch/${plan.planDigest}/lane-3/redispatch`),
+      ).toBe(true);
+      expect(deps.appended!.some((entry) => String(entry.key).includes('/lane-4/'))).toBe(false);
+    });
+
+    it('does not count a resumed partial adopt a second time', async () => {
+      // maxActiveRuns 3: lane-2 and lane-3 are counted once each (by the
+      // preflight), so lane-4 still fits. Counting lane-3's resume again
+      // would fill the cap and refuse lane-4.
+      const { apply, adoptedLanes } = setup(3, partial);
+      expect(await apply()).toMatchObject({ outcome: 'applied', wave: 2 });
+      expect(adoptedLanes()).toEqual(['lane-3', 'lane-4']);
+    });
+
+    it('resumes a crash-window adopt (intent journaled, no result) once, counts it once, and a re-run never adopts again', async () => {
+      const { deps, apply, adoptedLanes } = setup(3, (digest) => [intent(adoptKey(digest, 'lane-3', 'work-order'))]);
+      expect(await apply()).toMatchObject({ outcome: 'applied', wave: 2 });
+      // lane-3 was adopted once and counted once (lane-4 fit under the cap of 3).
+      expect(adoptedLanes()).toEqual(['lane-3', 'lane-4']);
+      // The process runs again over the same journal: both adopts completed,
+      // so neither is adopted twice.
+      await apply();
+      expect(adoptedLanes()).toEqual(['lane-3', 'lane-4']);
+      expect(deps.adoptLane).toHaveBeenCalledTimes(2);
+    });
   });
 });

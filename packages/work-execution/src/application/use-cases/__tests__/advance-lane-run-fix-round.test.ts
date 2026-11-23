@@ -1380,6 +1380,18 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     const key = gateKey();
     await appendIntent(harness, key, null, NOW);
     await appendResult(harness, key, 'completed', 'gate-failed', NOW);
+    // GD1: the round's single gate-failed run retries once; the retry's own
+    // failure is the second gate-failed at (round, head), so the run parks
+    // `blocker-after-round-2` and the PT1a classification below still applies.
+    const built = buildLaneRunStepKey({
+      runId: RUN_ID, round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12_A, retry: 1,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    await appendIntent(harness, built.key, null, NOW);
+    await appendResult(harness, built.key, 'completed', 'gate-failed', NOW);
     await conduct(harness, 'gating', NOW);
     return harness;
   }

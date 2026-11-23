@@ -211,6 +211,12 @@ export interface AdvanceLaneRunDependencies {
   readonly gateReceipts?: GateReceiptPort;
   /** PT1a: read the file the failing gate check named, to class a gate park; absent → a gate park classes `other`. */
   readonly gateFailingFile?: GateFailingFilePort;
+  /**
+   * GD1: read a fix attempt's worktree clean/dirty state (read-only) so a
+   * clean gate-driven fix round may be re-gated once; absent → the fix round
+   * is never clean and keeps today's `fix-no-progress` park.
+   */
+  readonly worktreeInspect?: Pick<WorkspacePort, 'inspectWorktree'>;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

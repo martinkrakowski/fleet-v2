@@ -715,12 +715,12 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     const { deps, journal } = makeDeps({ gate });
     const useCase = new RequestAttemptAcceptanceUseCase(deps);
 
-    // No run stored at all: run 1 needs a congested run 0.
+    // No run stored at all: run 1 needs a congested or failed run 0.
     const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
     expect(refused).toEqual({
       verdict: 'unknown',
       reason:
-        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
+        'Unknown: gate run 1 requires a stored congested or failed gate run 0 for head ' + HEAD_SHA,
     });
 
     // A passed run 0 is stored: run 2 is refused because run 1 is not stored,
@@ -747,13 +747,16 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(refused).toEqual({
       verdict: 'unknown',
       reason:
-        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
+        'Unknown: gate run 1 requires a stored congested or failed gate run 0 for head ' + HEAD_SHA,
     });
     expect(gate.requests).toHaveLength(1);
     expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
   });
 
-  it('refuses gate run 1 after a stored FAILED run 0 and runs nothing', async () => {
+  // GD1: a stored FAILED run 0 grants its one retry run — the gate runs once
+  // under /g1, and a second call with the same run reads the stored /g1
+  // verdict instead of re-running the predicates.
+  it('runs gate run 1 once after a stored FAILED run 0 and replays its stored verdict', async () => {
     const gate = new FakeGatePredicatePort({
       outcome: 'evaluated',
       results: [
@@ -782,14 +785,14 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     const run0 = await useCase.evaluateAttemptGate(gateRequest());
     expect(run0.verdict).toBe('failed');
 
-    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
-    expect(refused).toEqual({
-      verdict: 'unknown',
-      reason:
-        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
-    });
-    expect(gate.requests).toHaveLength(1);
-    expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
+    const retry = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(retry.verdict).toBe('failed');
+    expect(gate.requests).toHaveLength(2);
+    expect(journal.entries.some((entry) => entry.id.includes('/g1'))).toBe(true);
+
+    const replay = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(replay).toEqual(retry);
+    expect(gate.requests).toHaveLength(2);
   });
 
   it('refuses gate run 2 after a stored CONGESTED run 0 because run 1 is not stored', async () => {
@@ -819,7 +822,7 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(refused).toEqual({
       verdict: 'unknown',
       reason:
-        'Unknown: gate run 2 requires a stored congested gate run 1 for head ' + HEAD_SHA,
+        'Unknown: gate run 2 requires a stored congested or failed gate run 1 for head ' + HEAD_SHA,
     });
     expect(gate.requests).toHaveLength(1);
     expect(journal.entries.every((entry) => !entry.id.includes('/g2'))).toBe(true);

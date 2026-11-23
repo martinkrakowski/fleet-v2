@@ -950,14 +950,18 @@ export class RequestAttemptAcceptanceUseCase
           expected,
           requestedRun - 1,
         );
-        const priorCongested =
+        // GD1: a retry run is granted over a congested prior run (KF-30c2) or
+        // over a failed prior run (the decider's single gate-failed retry).
+        // Any other prior outcome (a pass, a non-congestion unknown, nothing
+        // stored) refuses without running anything.
+        const priorEligible =
           priorRun.kind === 'completed' &&
-          priorRun.verdict.verdict === 'unknown' &&
-          priorRun.verdict.congested === true;
-        if (!priorCongested) {
+          ((priorRun.verdict.verdict === 'unknown' && priorRun.verdict.congested === true) ||
+            priorRun.verdict.verdict === 'failed');
+        if (!priorEligible) {
           return gateUnknown(
             'Unknown: gate run ' + String(requestedRun) +
-              ' requires a stored congested gate run ' + String(requestedRun - 1) +
+              ' requires a stored congested or failed gate run ' + String(requestedRun - 1) +
               ' for head ' + candidateHeadSha,
           );
         }

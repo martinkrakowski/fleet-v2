@@ -1,9 +1,13 @@
-// AR2a2 — ApplyRelaunchUseCase: request validation, trusted-clock budget
-// checks, stored-plan digest verification, journal replay derivation and the
-// dry-run summary. The live apply (authorization, save, abort, adopt,
-// redispatch) belongs to AR2b: an `apply: true` request is refused with
-// `grant-missing` or `live-apply-not-implemented`, and
-// `ActionAuthorizationPort.authorizeRelaunchApply` is never called here.
+// AR2b — ApplyRelaunchUseCase: request validation, trusted-clock budget
+// checks, stored-plan digest verification, journal replay derivation, the
+// dry-run summary and the live apply. An `apply: true` request runs one
+// admission wave of `save`, `abort` and `redispatch` (intent-only; the
+// conductor starts the fix) under
+// `ActionAuthorizationPort.authorizeRelaunchApply`: preflight liveness, input
+// and port checks run first so a failed preflight never consumes the owner
+// grant, every journaled step is intent-before-action (I3, I7), and adopt
+// still refuses `adopt-not-implemented` (AR2c owns it). `prepareFixAttempt`
+// is never called here.
 //
 // `applyRelaunch` takes `unknown` and never throws. Results carry ids, codes,
 // digests and statuses only: never a worktree path, a clone path, an
@@ -22,21 +26,27 @@ import {
   MAX_RELAUNCH_APPLY_ENTRIES,
   MAX_RELAUNCH_APPLY_LANES,
   canonicalSaveInputJson,
+  decideProcessTreeTermination,
   deriveAdoptStepStatus,
   relaunchApplyLaneProgress,
+  snapshotSaveInput,
   verifySaveIntentDigest,
   type RelaunchApplyStepStatus,
 } from '../../domain/relaunch-apply.js';
 import { relaunchStepStatus } from '../../domain/relaunch-step-ledger.js';
-import { validateStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
+import { parseValidatedStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
 import type {
   ApplyRelaunchLaneSummary,
   ApplyRelaunchPort,
   ApplyRelaunchResult,
   ApplyRelaunchSaveInput,
 } from '../ports/in/ApplyRelaunchPort.in-port.js';
+import type { SaveLaneEditsPort } from '../ports/in/SaveLaneEditsPort.in-port.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
+import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
+import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import {
   canonicalRelaunchPlanBodyJson,
   type RelaunchPlanRecord,
@@ -46,12 +56,23 @@ import {
 
 export interface ApplyRelaunchDependencies {
   readonly planRepo: Pick<RelaunchPlanRepositoryPort, 'findByDigest'>;
-  readonly cutoverJournal: Pick<CutoverJournalPort, 'listByKeyPrefix'>;
+  /**
+   * `append` is optional only for dry-run callers: an `apply: true` request
+   * without it refuses `stale-plan-state` rather than writing nothing.
+   */
+  readonly cutoverJournal: Pick<CutoverJournalPort, 'listByKeyPrefix'> &
+    Partial<Pick<CutoverJournalPort, 'append'>>;
   readonly computeDigest: (text: string) => string;
-  /** Kept for AR2b's live apply; AR2a2 never calls it. */
+  /** The live apply's owner grant; required for `apply: true`. */
   readonly authorization?: Pick<ActionAuthorizationPort, 'authorizeRelaunchApply'>;
   /** The trusted clock for the deadline check; never `request.nowIso`. */
   readonly clock?: () => string;
+  /** Live-apply ports; each missing one refuses `stale-plan-state`. */
+  readonly saveLaneEdits?: Pick<SaveLaneEditsPort, 'saveLaneEdits'>['saveLaneEdits'];
+  readonly runner?: Pick<ExecutionRunnerPort, 'inspectWorktreeRun' | 'abortWorktreeRun'>;
+  readonly processTreeTermination?: Pick<ProcessTreeTerminationPort, 'terminateWorktreeProcesses'>;
+  readonly runRepo?: Pick<LaneRunRepositoryPort, 'get'>;
+  readonly mintEntryId?: () => string;
 }
 
 /** Every string the request carries is bounded; a longer one is unreadable. */
@@ -72,6 +93,9 @@ const SAVE_INPUT_OPTIONAL_KEYS = ['policyProtectedPaths'] as const;
 
 const ABSENT = Symbol('absent');
 const BAD = Symbol('bad');
+
+/** The lane-id grammar of a save input, as the plan validator enforces it. */
+const LANE_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
 /** An own data property of a plain object: ABSENT when missing, BAD for a getter, a setter or a non-plain object. */
 function own(value: unknown, key: string): unknown {
@@ -138,6 +162,19 @@ function scanForSecret(value: unknown, depth: number, budget: { nodes: number })
  * collide). Each element is read exactly once through its own descriptors;
  * any hole, accessor, extra key, bad field or duplicate lane id is `null`.
  */
+/** A non-empty, length-capped string field. */
+function isBoundedText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_TEXT_LENGTH;
+}
+
+/** A dense, in-bound array of bounded strings, read through own descriptors. */
+function isBoundedTextArray(value: unknown): boolean {
+  // Descriptor-only read (no get trap, no Proxy): the domain reader refuses
+  // anything but a genuine dense data array.
+  const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
+  return dense !== null && dense.array.every(isBoundedText);
+}
+
 function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | 'secret-detected' | null {
   const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
   if (dense === null) return null;
@@ -153,12 +190,31 @@ function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | '
     if (secret === null) return null;
     const laneId: unknown = fields['laneId'];
     const attemptId: unknown = fields['attemptId'];
-    if (typeof laneId !== 'string' || laneId === '') return null;
+    if (typeof laneId !== 'string' || !LANE_ID.test(laneId)) return null;
     // `attemptId` is never `null` and never empty: a lane without an attempt
     // is planned with no save input at all.
     if (typeof attemptId !== 'string' || attemptId === '') return null;
-    if (map.has(laneId)) return null;
-    map.set(laneId, element as ApplyRelaunchSaveInput);
+    // Every field's type is validated up front (AR2a2 carry-over): a bad
+    // field refuses here even when no `save` intent ever consumes it, so a
+    // hostile input can never ride along to a later wave.
+    if (!isBoundedText(fields['worktreePath'])) return null;
+    if (!isBoundedText(fields['clonePath'])) return null;
+    if (!isBoundedText(fields['baseCommit'])) return null;
+    if (!isBoundedTextArray(fields['allowedPathPrefixes'])) return null;
+    const protectedPaths: unknown = fields['policyProtectedPaths'];
+    if (protectedPaths !== undefined && !isBoundedTextArray(protectedPaths)) return null;
+    // Deep validation plus snapshot in one step (fix-round items 1 and 2):
+    // the domain reader validates `recordedHost` field-by-field against the
+    // runner-record contract (a bare `{}` or any malformed host refuses here,
+    // during request parsing, rather than after authorization) and returns a
+    // detached plain snapshot, so the map never retains a caller-owned object
+    // that a concurrent mutation could change between this parse and the
+    // awaited plan/journal reads. Cost: one bounded descriptor read per
+    // element, on top of the checks above.
+    const snapshot = snapshotSaveInput(element);
+    if (snapshot === null) return null;
+    if (map.has(snapshot.laneId)) return null;
+    map.set(snapshot.laneId, snapshot);
   }
   return map;
 }
@@ -219,7 +275,7 @@ function deriveLane(
     readonly laneId: string;
     readonly steps: readonly { readonly step: RelaunchStepCode; readonly idempotencyKey: string }[];
   },
-): LaneDerivation | null {
+): LaneDerivation {
   const stepStatuses: { step: RelaunchStepCode; status: RelaunchApplyStepStatus }[] = [];
   for (const step of lane.steps) {
     const status =
@@ -295,6 +351,9 @@ function readGrantId(request: unknown): Step<string | null> {
   const grantId = value === ABSENT || value === null ? null : value;
   if (grantId === null) return pass(null);
   if (typeof grantId !== 'string') return fail('invalid-request');
+  // The length cap runs before the regex: an enormous string never reaches
+  // `hasSecretShape`, so the cost is O(1) before any scan (AR2a2 carry-over).
+  if (grantId.length > MAX_TEXT_LENGTH) return fail('invalid-request');
   return hasSecretShape(grantId) ? fail('secret-detected') : pass(grantId);
 }
 
@@ -365,16 +424,26 @@ function parseRequest(request: unknown): Step<ParsedRequest> {
   }
 }
 
-/** The trusted clock: a throwing or malformed reading, or a passed deadline, is an exhausted budget. */
-function withinBudget(deps: ApplyRelaunchDependencies, deadlineMs: number | null): boolean {
+/**
+ * The trusted clock reading: a throwing or malformed reading returns `null`,
+ * never `request.nowIso`.
+ */
+function trustedNowIso(deps: ApplyRelaunchDependencies): string | null {
   try {
     const nowText: unknown = deps.clock !== undefined ? deps.clock() : new Date().toISOString();
-    if (typeof nowText !== 'string') return false;
-    if (!isZonedIsoDateTime(nowText) || Number.isNaN(Date.parse(nowText))) return false;
-    return deadlineMs === null || Date.parse(nowText) < deadlineMs;
+    if (typeof nowText !== 'string') return null;
+    if (!isZonedIsoDateTime(nowText) || Number.isNaN(Date.parse(nowText))) return null;
+    return nowText;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** The trusted clock: a throwing or malformed reading, or a passed deadline, is an exhausted budget. */
+function withinBudget(deps: ApplyRelaunchDependencies, deadlineMs: number | null): boolean {
+  const nowText = trustedNowIso(deps);
+  if (nowText === null) return false;
+  return deadlineMs === null || Date.parse(nowText) < deadlineMs;
 }
 
 function planFromEnvelope(found: unknown): Step<unknown> {
@@ -401,8 +470,13 @@ async function loadVerifiedPlan(
   }
   const planStep = planFromEnvelope(found);
   if (!planStep.ok) return planStep;
-  if (!validateStoredRelaunchPlan(planStep.value).ok) return fail('invalid-plan');
-  const storedPlan = planStep.value as RelaunchPlanRecord;
+  // Only the validated `structuredClone` snapshot is used from here on
+  // (AR2a2 carry-over): the original store object is never read again after
+  // this `await`, so a later mutation of it cannot change what this apply
+  // executes.
+  const parsed = parseValidatedStoredRelaunchPlan(planStep.value);
+  if (!parsed.ok) return fail('invalid-plan');
+  const storedPlan = parsed.plan as unknown as RelaunchPlanRecord;
   let computedDigest: unknown;
   try {
     computedDigest = deps.computeDigest(canonicalRelaunchPlanBodyJson(storedPlan));
@@ -477,21 +551,28 @@ function stoppedRefusal(nextAction: LaneDerivation['nextAction'], laneId: string
   return null;
 }
 
+interface DerivedLanes {
+  readonly summaries: ApplyRelaunchLaneSummary[];
+  /** Per-lane derivations keyed by lane id, for the live wave executor. */
+  readonly derivations: Map<string, LaneDerivation>;
+}
+
 function deriveLaneSummaries(
   deps: ApplyRelaunchDependencies,
   planDigest: string,
   storedPlan: RelaunchPlanRecord,
   snapshot: readonly SnapshotEntry[],
   saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>,
-): Step<ApplyRelaunchLaneSummary[]> {
+): Step<DerivedLanes> {
   const lanes: ApplyRelaunchLaneSummary[] = [];
+  const derivations = new Map<string, LaneDerivation>();
   for (const lane of storedPlan.lanes) {
     const saveRefusal = verifyLaneSaveInput(deps, planDigest, lane, snapshot, saveInputs);
     if (saveRefusal !== null) return { ok: false, result: saveRefusal };
     const derivation = deriveLane(snapshot, planDigest, lane);
-    if (derivation === null) return { ok: false, result: { outcome: 'refused', reason: 'step-inconsistent', laneId: lane.laneId } };
     const stopped = stoppedRefusal(derivation.nextAction, lane.laneId);
     if (stopped !== null) return { ok: false, result: stopped };
+    derivations.set(lane.laneId, derivation);
     lanes.push({
       laneId: lane.laneId,
       population: lane.population,
@@ -499,7 +580,531 @@ function deriveLaneSummaries(
       nextAction: derivation.nextAction,
     });
   }
-  return pass(lanes);
+  return pass({ summaries: lanes, derivations });
+}
+
+/** The grant refusal codes a `blocked` authorization result may report. */
+const KNOWN_GRANT_REASONS: ReadonlySet<string> = new Set([
+  'grant-missing',
+  'grant-expired',
+  'grant-revoked',
+  'grant-wrong-scope',
+  'grant-wrong-project',
+  'grant-digest-mismatch',
+  'grant-not-approved',
+  'grant-id-mismatch',
+]);
+
+const refusedLane = (
+  reason: Extract<ApplyRelaunchResult, { outcome: 'refused' }>['reason'],
+  laneId: string,
+): ApplyRelaunchResult => ({ outcome: 'refused', reason, laneId });
+
+/** The `state` kind of a `WorktreeRunState`, read through its own descriptor. */
+function readWorktreeStateKind(state: unknown): 'idle' | 'running' | 'unknown' | null {
+  const kind = own(state, 'state');
+  if (kind === BAD || kind === ABSENT) return null;
+  return kind === 'idle' || kind === 'running' || kind === 'unknown' ? kind : null;
+}
+
+interface LiveApplyArgs {
+  readonly deps: ApplyRelaunchDependencies;
+  readonly planDigest: string;
+  readonly grantId: string;
+  readonly deadlineMs: number | null;
+  readonly saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>;
+  readonly storedPlan: RelaunchPlanRecord;
+}
+
+type StatusOf = (laneId: string, step: RelaunchStepCode) => RelaunchApplyStepStatus;
+type DerivedOk = Extract<Step<DerivedLanes>, { ok: true }>['value'];
+
+/** Counters the preflight establishes and the redispatch step keeps current. */
+interface RunCounts {
+  liveConductedRuns: number;
+  handedOffNotIdle: number;
+}
+
+/** Every live port the wave may need must exist before the grant is spent. */
+function hasLivePorts(deps: ApplyRelaunchDependencies): boolean {
+  return (
+    typeof deps.runRepo?.get === 'function' &&
+    typeof deps.runner?.inspectWorktreeRun === 'function' &&
+    typeof deps.runner?.abortWorktreeRun === 'function' &&
+    typeof deps.processTreeTermination?.terminateWorktreeProcesses === 'function' &&
+    typeof deps.saveLaneEdits === 'function' &&
+    typeof deps.cutoverJournal?.append === 'function' &&
+    typeof deps.mintEntryId === 'function'
+  );
+}
+
+async function probeConductedLane(
+  deps: ApplyRelaunchDependencies,
+  lane: PlanLane,
+  counts: RunCounts,
+): Promise<ApplyRelaunchResult | null> {
+  if (lane.runId === null) return refusedLane('stale-plan-state', lane.laneId);
+  let run: unknown;
+  try {
+    run = await deps.runRepo!.get(lane.runId);
+  } catch {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  if (run !== null) counts.liveConductedRuns += 1;
+  return null;
+}
+
+async function probeWorktreeLane(
+  deps: ApplyRelaunchDependencies,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput | undefined,
+  statusOf: StatusOf,
+  counts: RunCounts,
+): Promise<ApplyRelaunchResult | null> {
+  if (saveInput === undefined) return refusedLane('stale-plan-state', lane.laneId);
+  let state: unknown;
+  try {
+    state = await deps.runner!.inspectWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+    });
+  } catch {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  const stateKind = readWorktreeStateKind(state);
+  if (stateKind === null || stateKind === 'unknown') {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  const redispatchStatus = statusOf(lane.laneId, 'redispatch');
+  if (
+    lane.runnerState === 'idle' &&
+    redispatchStatus === 'absent' &&
+    statusOf(lane.laneId, 'save') !== 'completed' &&
+    stateKind === 'running'
+  ) {
+    return refusedLane('unexpected-running-lane', lane.laneId);
+  }
+  // A pending hand-off counts toward the cap even while its worktree still
+  // reports idle: the conductor has not started the handed-off lane yet, so
+  // the idle report is not evidence that the run is over. Counting it keeps a
+  // later wave from appending another intent past maxActiveRuns.
+  if (redispatchStatus === 'intent-only' || (redispatchStatus === 'completed' && stateKind === 'running')) {
+    counts.handedOffNotIdle += 1;
+  }
+  return null;
+}
+
+interface LivePreflight {
+  readonly derived: DerivedOk;
+  readonly statusOf: StatusOf;
+  readonly counts: RunCounts;
+}
+
+/** Pre-authorization liveness, input and port checks; spends nothing. */
+async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult | LivePreflight> {
+  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
+  if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
+  const snapshotStep = await loadJournalSnapshot(deps, planDigest);
+  if (!snapshotStep.ok) return snapshotStep.result;
+  const derived = deriveLaneSummaries(deps, planDigest, storedPlan, snapshotStep.value, saveInputs);
+  if (!derived.ok) return derived.result;
+  const statusOf: StatusOf = (laneId, step) =>
+    derived.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
+  if (!hasLivePorts(deps)) return refusal('stale-plan-state');
+  const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };
+  for (const lane of storedPlan.lanes) {
+    const refused =
+      lane.population === 'conducted'
+        ? await probeConductedLane(deps, lane, counts)
+        : await probeWorktreeLane(deps, lane, saveInputs.get(lane.laneId), statusOf, counts);
+    if (refused !== null) return refused;
+  }
+  return { derived: derived.value, statusOf, counts };
+}
+
+/** Authorize the grant; the trusted `nowIso` it was authorized at, or a refusal. */
+async function authorizeLive(
+  args: LiveApplyArgs,
+): Promise<{ readonly nowIso: string } | ApplyRelaunchResult> {
+  const { deps, planDigest, grantId, deadlineMs } = args;
+  if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
+  if (typeof deps.authorization?.authorizeRelaunchApply !== 'function') {
+    return refusal('authorization-unavailable');
+  }
+  const nowIso = trustedNowIso(deps);
+  if (nowIso === null) return refusal('authorization-unavailable');
+  let grant: unknown;
+  try {
+    grant = await deps.authorization.authorizeRelaunchApply({ planDigest, grantId, nowIso });
+  } catch {
+    return refusal('authorization-unavailable');
+  }
+  const grantOutcome = own(grant, 'outcome');
+  if (typeof grantOutcome !== 'string' || grantOutcome === 'unknown') {
+    return refusal('authorization-unavailable');
+  }
+  if (grantOutcome === 'blocked') {
+    const reason = own(grant, 'reason');
+    if (typeof reason === 'string' && KNOWN_GRANT_REASONS.has(reason)) {
+      // Every code in `KNOWN_GRANT_REASONS` is a member of the refusal union.
+      return refusal(reason as Parameters<typeof refusal>[0]);
+    }
+    return refusal('authorization-unavailable');
+  }
+  if (grantOutcome !== 'authorized') return refusal('authorization-unavailable');
+  if (own(grant, 'grantId') !== grantId) return refusal('grant-id-mismatch');
+  return { nowIso };
+}
+
+/** The lowest admission wave with a lane not yet handed off; `null` when none. */
+function selectWave(storedPlan: RelaunchPlanRecord, statusOf: StatusOf): number | null {
+  let targetWave: number | null = null;
+  for (const lane of storedPlan.lanes) {
+    if (lane.population === 'conducted') continue;
+    const redispatchStatus = statusOf(lane.laneId, 'redispatch');
+    if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') continue;
+    if (targetWave === null || lane.admissionWave < targetWave) targetWave = lane.admissionWave;
+  }
+  return targetWave;
+}
+
+interface WaveContext {
+  readonly deps: ApplyRelaunchDependencies;
+  readonly planDigest: string;
+  readonly deadlineMs: number | null;
+  readonly nowIso: string;
+  readonly statusOf: StatusOf;
+  readonly maxActiveRuns: number;
+  readonly counts: RunCounts;
+}
+
+/** Journal one entry; any non-`appended` result or throw is a write failure. */
+async function appendEntry(
+  ctx: WaveContext,
+  request: {
+    readonly key: string;
+    readonly kind: 'intent' | 'result';
+    readonly digest?: string;
+    readonly outcome?: 'completed' | 'refused';
+    readonly reasonCode?: string;
+  },
+): Promise<boolean> {
+  const { deps } = ctx;
+  try {
+    const appended = await deps.cutoverJournal.append!({
+      key: request.key,
+      kind: request.kind,
+      entryId: deps.mintEntryId!(),
+      recordedAtIso: ctx.nowIso,
+      ...(request.digest !== undefined ? { digest: request.digest } : {}),
+      ...(request.outcome !== undefined ? { outcome: request.outcome, reasonCode: request.reasonCode ?? null } : {}),
+    });
+    return own(appended, 'outcome') === 'appended';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `saveLaneEdits`; only `saved` or `already-saved` counts as success. The
+ * `busy` flag separates the one refusal an abort may clear — a runner
+ * session still live in the worktree — from every content or state refusal,
+ * which must stop the lane before any abort (I2: a refused save never
+ * causes an abort).
+ */
+async function saveOk(
+  ctx: WaveContext,
+  laneId: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<{ readonly ok: boolean; readonly busy: boolean }> {
+  try {
+    const result = await ctx.deps.saveLaneEdits!({
+      planDigest: ctx.planDigest,
+      laneId,
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      clonePath: saveInput.clonePath,
+      recordedHost: saveInput.recordedHost,
+      baseCommit: saveInput.baseCommit,
+      allowedPathPrefixes: saveInput.allowedPathPrefixes,
+      ...(saveInput.policyProtectedPaths === undefined ? {} : { policyProtectedPaths: saveInput.policyProtectedPaths }),
+      nowIso: ctx.nowIso,
+    });
+    const outcome = own(result, 'outcome');
+    if (outcome === 'saved' || outcome === 'already-saved') return { ok: true, busy: false };
+    return { ok: false, busy: own(result, 'reason') === 'worktree-busy' };
+  } catch {
+    return { ok: false, busy: false };
+  }
+}
+
+/** Journal the save intent (digest of the canonical save input) before the first save attempt. */
+async function journalSaveIntent(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const canonicalJson = canonicalSaveInputJson(ctx.planDigest, saveInput);
+  if (canonicalJson === null) return refusal('invalid-request');
+  let saveInputDigest: string;
+  try {
+    saveInputDigest = ctx.deps.computeDigest(canonicalJson);
+  } catch {
+    return refusal('invalid-request');
+  }
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'intent', digest: saveInputDigest }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+/**
+ * Save (I2: save before abort — a save refusal other than `worktree-busy`
+ * stops the lane before any abort, so a diff finding never costs a live
+ * process). `saveLaneEdits` refuses a busy worktree while a runner session is
+ * live there; that one refusal is cleared by the abort, after which the save
+ * is retried against the intent already journaled.
+ */
+async function saveStepOfLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | 'save-busy' | null> {
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const saveStep = lane.steps.find((entry) => entry.step === 'save');
+  const saveStatus = ctx.statusOf(lane.laneId, 'save');
+  if (saveStep === undefined || saveStatus === 'completed') return null;
+  if (saveStatus === 'inconsistent') return refusedLane('step-inconsistent', lane.laneId);
+  if (saveStatus === 'refused' || saveStatus === 'ambiguous') {
+    return refusedLane('save-failed', lane.laneId);
+  }
+  if (saveStatus === 'absent') {
+    const journalRefusal = await journalSaveIntent(ctx, lane, saveStep.idempotencyKey, saveInput);
+    if (journalRefusal !== null) return journalRefusal;
+  }
+  // 'intent-only': `verifyLaneSaveInput` already proved the digest matches;
+  // `saveLaneEdits` recovers an intent-only save.
+  const saveOutcome = await saveOk(ctx, lane.laneId, saveInput);
+  if (saveOutcome.ok) return null;
+  return saveOutcome.busy ? 'save-busy' : refusedLane('save-failed', lane.laneId);
+}
+
+/** Reconcile an abort whose intent is journaled: read-only, never re-calls `abortWorktreeRun` (I7). */
+async function reconcileAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  let state: unknown;
+  try {
+    state = await ctx.deps.runner!.inspectWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+    });
+  } catch {
+    return refusedLane('abort-failed', lane.laneId);
+  }
+  if (readWorktreeStateKind(state) !== 'idle') return refusedLane('abort-failed', lane.laneId);
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'result', outcome: 'completed', reasonCode: 'reconciled-idle' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+/** Terminate the worktree's process tree after an abort that asked for it. */
+async function terminateAfterAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  let termination: unknown;
+  try {
+    termination = await ctx.deps.processTreeTermination!.terminateWorktreeProcesses({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+      gracePeriodSeconds: 30,
+    });
+  } catch {
+    termination = null;
+  }
+  const terminated = own(termination, 'outcome') === 'terminated';
+  if (
+    !(await appendEntry(ctx, {
+      key: idempotencyKey,
+      kind: 'result',
+      outcome: terminated ? 'completed' : 'refused',
+      reasonCode: terminated ? 'terminated' : 'terminate-failed',
+    }))
+  ) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return terminated ? null : refusedLane('abort-failed', lane.laneId);
+}
+
+/** I3: intent before action; termination only without a confirmed result. */
+async function performAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'intent' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  let threw = false;
+  let abortOutcome: unknown;
+  try {
+    abortOutcome = await ctx.deps.runner!.abortWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+      gracePeriodSeconds: 30,
+    });
+  } catch {
+    threw = true;
+  }
+  const decision = decideProcessTreeTermination(
+    threw ? { kind: 'threw' } : { kind: 'result', outcome: own(abortOutcome, 'outcome') },
+  );
+  if (decision.action === 'refuse') return refusedLane('abort-failed', lane.laneId);
+  if (decision.action !== 'none') return terminateAfterAbort(ctx, lane, idempotencyKey, saveInput);
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'result', outcome: 'completed', reasonCode: 'aborted' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+async function abortStepOfLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const abortStep = lane.steps.find((entry) => entry.step === 'abort');
+  if (abortStep === undefined) return null;
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const abortStatus = ctx.statusOf(lane.laneId, 'abort');
+  if (abortStatus === 'refused' || abortStatus === 'inconsistent') {
+    return refusedLane('abort-failed', lane.laneId);
+  }
+  if (abortStatus === 'intent-only' || abortStatus === 'ambiguous') {
+    return reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  }
+  if (abortStatus === 'absent') return performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  return null;
+}
+
+/**
+ * Save first, always: the save attempt itself decides whether an abort is
+ * allowed. A busy worktree is the only save refusal an abort clears — the
+ * intent is already journaled, so the retry calls `saveLaneEdits` directly,
+ * after re-checking the deadline (the abort may have run past it). Every
+ * other save refusal returns before `abortWorktreeRun`, honouring I2.
+ */
+async function saveAndAbortLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const firstSave = await saveStepOfLane(ctx, lane, saveInput);
+  if (firstSave !== null && firstSave !== 'save-busy') return firstSave;
+  const abortRefusal = await abortStepOfLane(ctx, lane, saveInput);
+  if (abortRefusal !== null) return abortRefusal;
+  if (firstSave === 'save-busy') {
+    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+    if (!(await saveOk(ctx, lane.laneId, saveInput)).ok) return refusedLane('save-failed', lane.laneId);
+  }
+  return null;
+}
+
+/** adopt is AR2c's; anything not already completed refuses; then the redispatch intent only. */
+async function adoptAndRedispatchLane(ctx: WaveContext, lane: PlanLane): Promise<ApplyRelaunchResult | null> {
+  if (lane.steps.some((entry) => entry.step === 'adopt')) {
+    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+    if (ctx.statusOf(lane.laneId, 'adopt') !== 'completed') {
+      return refusedLane('adopt-not-implemented', lane.laneId);
+    }
+  }
+  // redispatch: the intent only; the conductor starts the fix from it.
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const redispatchStatus = ctx.statusOf(lane.laneId, 'redispatch');
+  if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') return null;
+  if (ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
+    return refusedLane('active-run-cap-reached', lane.laneId);
+  }
+  const redispatchStep = lane.steps.find((entry) => entry.step === 'redispatch');
+  if (redispatchStep === undefined) return refusedLane('step-inconsistent', lane.laneId);
+  if (!(await appendEntry(ctx, { key: redispatchStep.idempotencyKey, kind: 'intent' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  ctx.counts.handedOffNotIdle += 1;
+  return null;
+}
+
+/** Execute the wave, lane by lane, step by step. */
+async function executeWave(
+  ctx: WaveContext,
+  storedPlan: RelaunchPlanRecord,
+  saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>,
+  targetWave: number,
+): Promise<ApplyRelaunchResult | null> {
+  for (const lane of storedPlan.lanes) {
+    if (lane.population === 'conducted' || lane.admissionWave !== targetWave) continue;
+    // The preflight proved this exists for every non-conducted lane.
+    const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
+    const refused =
+      (await saveAndAbortLane(ctx, lane, saveInput)) ?? (await adoptAndRedispatchLane(ctx, lane));
+    if (refused !== null) return refused;
+  }
+  return null;
+}
+
+function isRefusalResult(value: object): value is ApplyRelaunchResult {
+  return 'outcome' in value;
+}
+
+/**
+ * AR2b: the live apply. One wave per invocation, `save`, `abort` and
+ * `redispatch` (intent-only), under the owner grant. All liveness, input and
+ * port checks run before `authorizeRelaunchApply`, so a failed preflight
+ * never consumes the grant and a replay with the same `grantId`
+ * re-authorizes cleanly. Never calls `prepareFixAttempt`: the conductor
+ * starts the fix from the journaled intent.
+ */
+async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
+  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
+  const preflight = await preflightLive(args);
+  if (isRefusalResult(preflight)) return preflight;
+  const authorized = await authorizeLive(args);
+  if (isRefusalResult(authorized)) return authorized;
+  const { statusOf, counts, derived } = preflight;
+  const targetWave = selectWave(storedPlan, statusOf);
+  if (targetWave === null) {
+    return { outcome: 'applied', planDigest, wave: null, lanes: derived.summaries };
+  }
+  const ctx: WaveContext = {
+    deps,
+    planDigest,
+    deadlineMs,
+    nowIso: authorized.nowIso,
+    statusOf,
+    maxActiveRuns: storedPlan.maxActiveRuns,
+    counts,
+  };
+  const refused = await executeWave(ctx, storedPlan, saveInputs, targetWave);
+  if (refused !== null) return refused;
+  // Re-derive the summaries from the updated journal state.
+  const fresh = await loadJournalSnapshot(deps, planDigest);
+  if (!fresh.ok) return fresh.result;
+  const updated = deriveLaneSummaries(deps, planDigest, storedPlan, fresh.value, saveInputs);
+  if (!updated.ok) return updated.result;
+  return { outcome: 'applied', planDigest, wave: targetWave, lanes: updated.value.summaries };
 }
 
 export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
@@ -524,9 +1129,18 @@ export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
     const planStep = await loadVerifiedPlan(deps, planDigest);
     if (!planStep.ok) return planStep.result;
 
-    // Authorization is never called here: AR2b owns the live apply.
+    // AR2b: the live apply runs one wave under the owner grant; adopt is
+    // still AR2c's and refuses `adopt-not-implemented`.
     if (apply) {
-      return refusal(typeof grantId !== 'string' || grantId.trim() === '' ? 'grant-missing' : 'live-apply-not-implemented');
+      if (typeof grantId !== 'string' || grantId.trim() === '') return refusal('grant-missing');
+      return applyLive({
+        deps,
+        planDigest,
+        grantId,
+        deadlineMs,
+        saveInputs,
+        storedPlan: planStep.value,
+      });
     }
 
     if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
@@ -535,6 +1149,6 @@ export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
 
     const lanes = deriveLaneSummaries(deps, planDigest, planStep.value, snapshotStep.value, saveInputs);
     if (!lanes.ok) return lanes.result;
-    return { outcome: 'dry-run', planDigest, lanes: lanes.value };
+    return { outcome: 'dry-run', planDigest, lanes: lanes.value.summaries };
   }
 }

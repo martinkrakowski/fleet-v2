@@ -15,6 +15,7 @@ import {
   MAX_RELAUNCH_APPLY_STEPS,
 } from '../relaunch-apply.js';
 import {
+  parseValidatedStoredRelaunchPlan,
   validateRecordedHost,
   validateStoredRelaunchPlan,
 } from '../relaunch-plan-validation.js';
@@ -197,6 +198,40 @@ describe('validateStoredRelaunchPlan (V1: a valid stored plan passes)', () => {
     // hostFilter set, so the field set and the digest must both agree.
     const plan = { ...validPlan('bd0bac5df5b3d97f33a0f292b1ea2223001b8eb8ccf7f4487fd39daf58c52117'), hostFilter: 'lane-runner-host.example' };
     expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: true });
+  });
+});
+
+describe('parseValidatedStoredRelaunchPlan (AR2b: the validated clone is detached)', () => {
+  // Cost bound: one preflight walk plus one `structuredClone`, as
+  // `validateStoredRelaunchPlan` already pays; no extra pass is added.
+  it('returns a detached deep clone: mutating the input after validation never mutates the returned plan', () => {
+    const plan = validPlan();
+    const parsed = parseValidatedStoredRelaunchPlan(plan);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    // Mutate every container of the original graph after validation.
+    plan['maxActiveRuns'] = 99;
+    plan['conductor'] = { halted: false, driverLease: 'live', runCount: 0 };
+    const lanes = plan['lanes'] as Record<string, unknown>[];
+    (lanes[1]!['steps'] as Record<string, unknown>[]).push({ step: 'abort', idempotencyKey: 'x' });
+    (lanes[1]!['dependsOnLaneIds'] as string[]).push('lane-9');
+    // The validated snapshot is untouched by all of it.
+    expect(parsed.plan.maxActiveRuns).toBe(3);
+    expect(parsed.plan.conductor).toEqual({ halted: true, driverLease: 'lapsed', runCount: 2 });
+    expect(parsed.plan.lanes.map((lane) => lane.laneId)).toEqual(['lane-1', 'lane-2']);
+    expect(parsed.plan.lanes[1]!.steps.map((step) => step.step)).toEqual(['save', 'adopt', 'redispatch']);
+    expect(parsed.plan.lanes[1]!.dependsOnLaneIds).toEqual(['lane-1']);
+    // And the plan still validates on its own: the snapshot is a complete,
+    // standalone record.
+    expect(validateStoredRelaunchPlan(structuredClone(parsed.plan))).toEqual({ ok: true });
+  });
+
+  it('refuses like the validator: a malformed plan is invalid-plan, never a throw', () => {
+    expect(parseValidatedStoredRelaunchPlan(null)).toEqual({ ok: false, reason: 'invalid-plan' });
+    expect(parseValidatedStoredRelaunchPlan({ ...validPlan(), extra: 1 })).toEqual({
+      ok: false,
+      reason: 'invalid-plan',
+    });
   });
 });
 

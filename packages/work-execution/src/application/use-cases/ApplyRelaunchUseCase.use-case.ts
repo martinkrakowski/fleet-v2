@@ -169,12 +169,10 @@ function isBoundedText(value: unknown): value is string {
 
 /** A dense, in-bound array of bounded strings, read through own descriptors. */
 function isBoundedTextArray(value: unknown): boolean {
-  if (!Array.isArray(value) || value.length > MAX_RELAUNCH_APPLY_LANES) return false;
-  for (let index = 0; index < value.length; index += 1) {
-    if (!(index in value)) return false;
-    if (!isBoundedText(value[index])) return false;
-  }
-  return true;
+  // Descriptor-only read (no get trap, no Proxy): the domain reader refuses
+  // anything but a genuine dense data array.
+  const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
+  return dense !== null && dense.array.every(isBoundedText);
 }
 
 function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | 'secret-detected' | null {
@@ -618,93 +616,118 @@ interface LiveApplyArgs {
   readonly storedPlan: RelaunchPlanRecord;
 }
 
-/**
- * AR2b: the live apply. One wave per invocation, `save`, `abort` and
- * `redispatch` (intent-only), under the owner grant. All liveness, input and
- * port checks run before `authorizeRelaunchApply`, so a failed preflight
- * never consumes the grant and a replay with the same `grantId`
- * re-authorizes cleanly. Never calls `prepareFixAttempt`: the conductor
- * starts the fix from the journaled intent.
- */
-async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
-  const { deps, planDigest, grantId, deadlineMs, saveInputs, storedPlan } = args;
+type StatusOf = (laneId: string, step: RelaunchStepCode) => RelaunchApplyStepStatus;
+type DerivedOk = Extract<Step<DerivedLanes>, { ok: true }>['value'];
 
-  // ---- Pre-authorization liveness, input and port checks ----
+/** Counters the preflight establishes and the redispatch step keeps current. */
+interface RunCounts {
+  liveConductedRuns: number;
+  handedOffNotIdle: number;
+}
+
+/** Every live port the wave may need must exist before the grant is spent. */
+function hasLivePorts(deps: ApplyRelaunchDependencies): boolean {
+  return (
+    typeof deps.runRepo?.get === 'function' &&
+    typeof deps.runner?.inspectWorktreeRun === 'function' &&
+    typeof deps.runner?.abortWorktreeRun === 'function' &&
+    typeof deps.processTreeTermination?.terminateWorktreeProcesses === 'function' &&
+    typeof deps.saveLaneEdits === 'function' &&
+    typeof deps.cutoverJournal?.append === 'function' &&
+    typeof deps.mintEntryId === 'function'
+  );
+}
+
+async function probeConductedLane(
+  deps: ApplyRelaunchDependencies,
+  lane: PlanLane,
+  counts: RunCounts,
+): Promise<ApplyRelaunchResult | null> {
+  if (lane.runId === null) return refusedLane('stale-plan-state', lane.laneId);
+  let run: unknown;
+  try {
+    run = await deps.runRepo!.get(lane.runId);
+  } catch {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  if (run !== null) counts.liveConductedRuns += 1;
+  return null;
+}
+
+async function probeWorktreeLane(
+  deps: ApplyRelaunchDependencies,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput | undefined,
+  statusOf: StatusOf,
+  counts: RunCounts,
+): Promise<ApplyRelaunchResult | null> {
+  if (saveInput === undefined) return refusedLane('stale-plan-state', lane.laneId);
+  let state: unknown;
+  try {
+    state = await deps.runner!.inspectWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+    });
+  } catch {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  const stateKind = readWorktreeStateKind(state);
+  if (stateKind === null || stateKind === 'unknown') {
+    return refusedLane('stale-plan-state', lane.laneId);
+  }
+  const redispatchStatus = statusOf(lane.laneId, 'redispatch');
+  if (
+    lane.runnerState === 'idle' &&
+    redispatchStatus === 'absent' &&
+    statusOf(lane.laneId, 'save') !== 'completed' &&
+    stateKind === 'running'
+  ) {
+    return refusedLane('unexpected-running-lane', lane.laneId);
+  }
+  // A pending hand-off counts toward the cap even while its worktree still
+  // reports idle: the conductor has not started the handed-off lane yet, so
+  // the idle report is not evidence that the run is over. Counting it keeps a
+  // later wave from appending another intent past maxActiveRuns.
+  if (redispatchStatus === 'intent-only' || (redispatchStatus === 'completed' && stateKind === 'running')) {
+    counts.handedOffNotIdle += 1;
+  }
+  return null;
+}
+
+interface LivePreflight {
+  readonly derived: DerivedOk;
+  readonly statusOf: StatusOf;
+  readonly counts: RunCounts;
+}
+
+/** Pre-authorization liveness, input and port checks; spends nothing. */
+async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult | LivePreflight> {
+  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
   if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
   const snapshotStep = await loadJournalSnapshot(deps, planDigest);
   if (!snapshotStep.ok) return snapshotStep.result;
   const derived = deriveLaneSummaries(deps, planDigest, storedPlan, snapshotStep.value, saveInputs);
   if (!derived.ok) return derived.result;
-
-  const statusOf = (laneId: string, step: RelaunchStepCode): RelaunchApplyStepStatus =>
+  const statusOf: StatusOf = (laneId, step) =>
     derived.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
-
-  // Every live port the wave may need must exist before the grant is spent.
-  if (
-    typeof deps.runRepo?.get !== 'function' ||
-    typeof deps.runner?.inspectWorktreeRun !== 'function' ||
-    typeof deps.runner?.abortWorktreeRun !== 'function' ||
-    typeof deps.processTreeTermination?.terminateWorktreeProcesses !== 'function' ||
-    typeof deps.saveLaneEdits !== 'function' ||
-    typeof deps.cutoverJournal?.append !== 'function' ||
-    typeof deps.mintEntryId !== 'function'
-  ) {
-    return refusal('stale-plan-state');
-  }
-
-  const runner = deps.runner;
-  let liveConductedRuns = 0;
-  let handedOffNotIdle = 0;
-
+  if (!hasLivePorts(deps)) return refusal('stale-plan-state');
+  const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };
   for (const lane of storedPlan.lanes) {
-    if (lane.population === 'conducted') {
-      if (lane.runId === null) return refusedLane('stale-plan-state', lane.laneId);
-      let run: unknown;
-      try {
-        run = await deps.runRepo.get(lane.runId);
-      } catch {
-        return refusedLane('stale-plan-state', lane.laneId);
-      }
-      if (run !== null) liveConductedRuns += 1;
-      continue;
-    }
-    const saveInput = saveInputs.get(lane.laneId);
-    if (saveInput === undefined) return refusedLane('stale-plan-state', lane.laneId);
-    let state: unknown;
-    try {
-      state = await runner.inspectWorktreeRun!({
-        attemptId: saveInput.attemptId,
-        worktreePath: saveInput.worktreePath,
-        runner: saveInput.recordedHost,
-      });
-    } catch {
-      return refusedLane('stale-plan-state', lane.laneId);
-    }
-    const stateKind = readWorktreeStateKind(state);
-    if (stateKind === null || stateKind === 'unknown') {
-      return refusedLane('stale-plan-state', lane.laneId);
-    }
-    const redispatchStatus = statusOf(lane.laneId, 'redispatch');
-    if (
-      lane.runnerState === 'idle' &&
-      redispatchStatus === 'absent' &&
-      statusOf(lane.laneId, 'save') !== 'completed' &&
-      stateKind === 'running'
-    ) {
-      return refusedLane('unexpected-running-lane', lane.laneId);
-    }
-    if (redispatchStatus === 'intent-only') {
-      // A pending hand-off counts toward the cap even while its worktree still
-      // reports idle: the conductor has not started the handed-off lane yet,
-      // so the idle report is not evidence that the run is over. Counting it
-      // keeps a later wave from appending another intent past maxActiveRuns.
-      handedOffNotIdle += 1;
-    } else if (redispatchStatus === 'completed' && stateKind === 'running') {
-      handedOffNotIdle += 1;
-    }
+    const refused =
+      lane.population === 'conducted'
+        ? await probeConductedLane(deps, lane, counts)
+        : await probeWorktreeLane(deps, lane, saveInputs.get(lane.laneId), statusOf, counts);
+    if (refused !== null) return refused;
   }
+  return { derived: derived.value, statusOf, counts };
+}
 
-  // ---- Authorize ----
+/** Authorize the grant; the trusted `nowIso` it was authorized at, or a refusal. */
+async function authorizeLive(
+  args: LiveApplyArgs,
+): Promise<{ readonly nowIso: string } | ApplyRelaunchResult> {
+  const { deps, planDigest, grantId, deadlineMs } = args;
   if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
   if (typeof deps.authorization?.authorizeRelaunchApply !== 'function') {
     return refusal('authorization-unavailable');
@@ -718,8 +741,9 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     return refusal('authorization-unavailable');
   }
   const grantOutcome = own(grant, 'outcome');
-  if (typeof grantOutcome !== 'string') return refusal('authorization-unavailable');
-  if (grantOutcome === 'unknown') return refusal('authorization-unavailable');
+  if (typeof grantOutcome !== 'string' || grantOutcome === 'unknown') {
+    return refusal('authorization-unavailable');
+  }
   if (grantOutcome === 'blocked') {
     const reason = own(grant, 'reason');
     if (typeof reason === 'string' && KNOWN_GRANT_REASONS.has(reason)) {
@@ -730,8 +754,11 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
   }
   if (grantOutcome !== 'authorized') return refusal('authorization-unavailable');
   if (own(grant, 'grantId') !== grantId) return refusal('grant-id-mismatch');
+  return { nowIso };
+}
 
-  // ---- Select one wave ----
+/** The lowest admission wave with a lane not yet handed off; `null` when none. */
+function selectWave(storedPlan: RelaunchPlanRecord, statusOf: StatusOf): number | null {
   let targetWave: number | null = null;
   for (const lane of storedPlan.lanes) {
     if (lane.population === 'conducted') continue;
@@ -739,251 +766,339 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') continue;
     if (targetWave === null || lane.admissionWave < targetWave) targetWave = lane.admissionWave;
   }
-  if (targetWave === null) {
-    return { outcome: 'applied', planDigest, wave: null, lanes: derived.value.summaries };
-  }
+  return targetWave;
+}
 
-  /** Journal one entry; any non-`appended` result or throw is a write failure. */
-  const appendEntry = async (request: {
+interface WaveContext {
+  readonly deps: ApplyRelaunchDependencies;
+  readonly planDigest: string;
+  readonly deadlineMs: number | null;
+  readonly nowIso: string;
+  readonly statusOf: StatusOf;
+  readonly maxActiveRuns: number;
+  readonly counts: RunCounts;
+}
+
+/** Journal one entry; any non-`appended` result or throw is a write failure. */
+async function appendEntry(
+  ctx: WaveContext,
+  request: {
     readonly key: string;
     readonly kind: 'intent' | 'result';
     readonly digest?: string;
     readonly outcome?: 'completed' | 'refused';
     readonly reasonCode?: string;
-  }): Promise<boolean> => {
-    try {
-      const appended = await deps.cutoverJournal.append!({
-        key: request.key,
-        kind: request.kind,
-        entryId: deps.mintEntryId!(),
-        recordedAtIso: nowIso,
-        ...(request.digest !== undefined ? { digest: request.digest } : {}),
-        ...(request.outcome !== undefined
-          ? { outcome: request.outcome, reasonCode: request.reasonCode ?? null }
-          : {}),
-      });
-      return own(appended, 'outcome') === 'appended';
-    } catch {
-      return false;
-    }
-  };
+  },
+): Promise<boolean> {
+  const { deps } = ctx;
+  try {
+    const appended = await deps.cutoverJournal.append!({
+      key: request.key,
+      kind: request.kind,
+      entryId: deps.mintEntryId!(),
+      recordedAtIso: ctx.nowIso,
+      ...(request.digest !== undefined ? { digest: request.digest } : {}),
+      ...(request.outcome !== undefined ? { outcome: request.outcome, reasonCode: request.reasonCode ?? null } : {}),
+    });
+    return own(appended, 'outcome') === 'appended';
+  } catch {
+    return false;
+  }
+}
 
-  /**
-   * `saveLaneEdits`; only `saved` or `already-saved` counts as success. The
-   * `busy` flag separates the one refusal an abort may clear — a runner
-   * session still live in the worktree — from every content or state refusal,
-   * which must stop the lane before any abort (I2: a refused save never
-   * causes an abort).
-   */
-  const saveOk = async (
-    laneId: string,
-    saveInput: ApplyRelaunchSaveInput,
-  ): Promise<{ readonly ok: boolean; readonly busy: boolean }> => {
-    try {
-      const result = await deps.saveLaneEdits!({
-        planDigest,
-        laneId,
-        attemptId: saveInput.attemptId,
-        worktreePath: saveInput.worktreePath,
-        clonePath: saveInput.clonePath,
-        recordedHost: saveInput.recordedHost,
-        baseCommit: saveInput.baseCommit,
-        allowedPathPrefixes: saveInput.allowedPathPrefixes,
-        ...(saveInput.policyProtectedPaths === undefined
-          ? {}
-          : { policyProtectedPaths: saveInput.policyProtectedPaths }),
-        nowIso,
-      });
-      const outcome = own(result, 'outcome');
-      if (outcome === 'saved' || outcome === 'already-saved') return { ok: true, busy: false };
-      return { ok: false, busy: own(result, 'reason') === 'worktree-busy' };
-    } catch {
-      return { ok: false, busy: false };
-    }
-  };
+/**
+ * `saveLaneEdits`; only `saved` or `already-saved` counts as success. The
+ * `busy` flag separates the one refusal an abort may clear — a runner
+ * session still live in the worktree — from every content or state refusal,
+ * which must stop the lane before any abort (I2: a refused save never
+ * causes an abort).
+ */
+async function saveOk(
+  ctx: WaveContext,
+  laneId: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<{ readonly ok: boolean; readonly busy: boolean }> {
+  try {
+    const result = await ctx.deps.saveLaneEdits!({
+      planDigest: ctx.planDigest,
+      laneId,
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      clonePath: saveInput.clonePath,
+      recordedHost: saveInput.recordedHost,
+      baseCommit: saveInput.baseCommit,
+      allowedPathPrefixes: saveInput.allowedPathPrefixes,
+      ...(saveInput.policyProtectedPaths === undefined ? {} : { policyProtectedPaths: saveInput.policyProtectedPaths }),
+      nowIso: ctx.nowIso,
+    });
+    const outcome = own(result, 'outcome');
+    if (outcome === 'saved' || outcome === 'already-saved') return { ok: true, busy: false };
+    return { ok: false, busy: own(result, 'reason') === 'worktree-busy' };
+  } catch {
+    return { ok: false, busy: false };
+  }
+}
 
-  // ---- Execute the wave, lane by lane, step by step ----
+/** Journal the save intent (digest of the canonical save input) before the first save attempt. */
+async function journalSaveIntent(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const canonicalJson = canonicalSaveInputJson(ctx.planDigest, saveInput);
+  if (canonicalJson === null) return refusal('invalid-request');
+  let saveInputDigest: string;
+  try {
+    saveInputDigest = ctx.deps.computeDigest(canonicalJson);
+  } catch {
+    return refusal('invalid-request');
+  }
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'intent', digest: saveInputDigest }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+/**
+ * Save (I2: save before abort — a save refusal other than `worktree-busy`
+ * stops the lane before any abort, so a diff finding never costs a live
+ * process). `saveLaneEdits` refuses a busy worktree while a runner session is
+ * live there; that one refusal is cleared by the abort, after which the save
+ * is retried against the intent already journaled.
+ */
+async function saveStepOfLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | 'save-busy' | null> {
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const saveStep = lane.steps.find((entry) => entry.step === 'save');
+  const saveStatus = ctx.statusOf(lane.laneId, 'save');
+  if (saveStep === undefined || saveStatus === 'completed') return null;
+  if (saveStatus === 'inconsistent') return refusedLane('step-inconsistent', lane.laneId);
+  if (saveStatus === 'refused' || saveStatus === 'ambiguous') {
+    return refusedLane('save-failed', lane.laneId);
+  }
+  if (saveStatus === 'absent') {
+    const journalRefusal = await journalSaveIntent(ctx, lane, saveStep.idempotencyKey, saveInput);
+    if (journalRefusal !== null) return journalRefusal;
+  }
+  // 'intent-only': `verifyLaneSaveInput` already proved the digest matches;
+  // `saveLaneEdits` recovers an intent-only save.
+  const saveOutcome = await saveOk(ctx, lane.laneId, saveInput);
+  if (saveOutcome.ok) return null;
+  return saveOutcome.busy ? 'save-busy' : refusedLane('save-failed', lane.laneId);
+}
+
+/** Reconcile an abort whose intent is journaled: read-only, never re-calls `abortWorktreeRun` (I7). */
+async function reconcileAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  let state: unknown;
+  try {
+    state = await ctx.deps.runner!.inspectWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+    });
+  } catch {
+    return refusedLane('abort-failed', lane.laneId);
+  }
+  if (readWorktreeStateKind(state) !== 'idle') return refusedLane('abort-failed', lane.laneId);
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'result', outcome: 'completed', reasonCode: 'reconciled-idle' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+/** Terminate the worktree's process tree after an abort that asked for it. */
+async function terminateAfterAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  let termination: unknown;
+  try {
+    termination = await ctx.deps.processTreeTermination!.terminateWorktreeProcesses({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+      gracePeriodSeconds: 30,
+    });
+  } catch {
+    termination = null;
+  }
+  const terminated = own(termination, 'outcome') === 'terminated';
+  if (
+    !(await appendEntry(ctx, {
+      key: idempotencyKey,
+      kind: 'result',
+      outcome: terminated ? 'completed' : 'refused',
+      reasonCode: terminated ? 'terminated' : 'terminate-failed',
+    }))
+  ) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return terminated ? null : refusedLane('abort-failed', lane.laneId);
+}
+
+/** I3: intent before action; termination only without a confirmed result. */
+async function performAbort(
+  ctx: WaveContext,
+  lane: PlanLane,
+  idempotencyKey: string,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'intent' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  let threw = false;
+  let abortOutcome: unknown;
+  try {
+    abortOutcome = await ctx.deps.runner!.abortWorktreeRun!({
+      attemptId: saveInput.attemptId,
+      worktreePath: saveInput.worktreePath,
+      runner: saveInput.recordedHost,
+      gracePeriodSeconds: 30,
+    });
+  } catch {
+    threw = true;
+  }
+  const decision = decideProcessTreeTermination(
+    threw ? { kind: 'threw' } : { kind: 'result', outcome: own(abortOutcome, 'outcome') },
+  );
+  if (decision.action === 'refuse') return refusedLane('abort-failed', lane.laneId);
+  if (decision.action !== 'none') return terminateAfterAbort(ctx, lane, idempotencyKey, saveInput);
+  if (!(await appendEntry(ctx, { key: idempotencyKey, kind: 'result', outcome: 'completed', reasonCode: 'aborted' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  return null;
+}
+
+async function abortStepOfLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const abortStep = lane.steps.find((entry) => entry.step === 'abort');
+  if (abortStep === undefined) return null;
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const abortStatus = ctx.statusOf(lane.laneId, 'abort');
+  if (abortStatus === 'refused' || abortStatus === 'inconsistent') {
+    return refusedLane('abort-failed', lane.laneId);
+  }
+  if (abortStatus === 'intent-only' || abortStatus === 'ambiguous') {
+    return reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  }
+  if (abortStatus === 'absent') return performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  return null;
+}
+
+/**
+ * Save first, always: the save attempt itself decides whether an abort is
+ * allowed. A busy worktree is the only save refusal an abort clears — the
+ * intent is already journaled, so the retry calls `saveLaneEdits` directly,
+ * after re-checking the deadline (the abort may have run past it). Every
+ * other save refusal returns before `abortWorktreeRun`, honouring I2.
+ */
+async function saveAndAbortLane(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+): Promise<ApplyRelaunchResult | null> {
+  const firstSave = await saveStepOfLane(ctx, lane, saveInput);
+  if (firstSave !== null && firstSave !== 'save-busy') return firstSave;
+  const abortRefusal = await abortStepOfLane(ctx, lane, saveInput);
+  if (abortRefusal !== null) return abortRefusal;
+  if (firstSave === 'save-busy') {
+    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+    if (!(await saveOk(ctx, lane.laneId, saveInput)).ok) return refusedLane('save-failed', lane.laneId);
+  }
+  return null;
+}
+
+/** adopt is AR2c's; anything not already completed refuses; then the redispatch intent only. */
+async function adoptAndRedispatchLane(ctx: WaveContext, lane: PlanLane): Promise<ApplyRelaunchResult | null> {
+  if (lane.steps.some((entry) => entry.step === 'adopt')) {
+    if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+    if (ctx.statusOf(lane.laneId, 'adopt') !== 'completed') {
+      return refusedLane('adopt-not-implemented', lane.laneId);
+    }
+  }
+  // redispatch: the intent only; the conductor starts the fix from it.
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  const redispatchStatus = ctx.statusOf(lane.laneId, 'redispatch');
+  if (redispatchStatus === 'intent-only' || redispatchStatus === 'completed') return null;
+  if (ctx.counts.liveConductedRuns + ctx.counts.handedOffNotIdle >= ctx.maxActiveRuns) {
+    return refusedLane('active-run-cap-reached', lane.laneId);
+  }
+  const redispatchStep = lane.steps.find((entry) => entry.step === 'redispatch');
+  if (redispatchStep === undefined) return refusedLane('step-inconsistent', lane.laneId);
+  if (!(await appendEntry(ctx, { key: redispatchStep.idempotencyKey, kind: 'intent' }))) {
+    return refusedLane('journal-write-failed', lane.laneId);
+  }
+  ctx.counts.handedOffNotIdle += 1;
+  return null;
+}
+
+/** Execute the wave, lane by lane, step by step. */
+async function executeWave(
+  ctx: WaveContext,
+  storedPlan: RelaunchPlanRecord,
+  saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>,
+  targetWave: number,
+): Promise<ApplyRelaunchResult | null> {
   for (const lane of storedPlan.lanes) {
     if (lane.population === 'conducted' || lane.admissionWave !== targetWave) continue;
     // The preflight proved this exists for every non-conducted lane.
     const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
-
-    // save (I2: save before abort — a save refusal other than `worktree-busy`
-    // stops the lane before any abort, so a diff finding never costs a live
-    // process) and abort (I3: intent before action, termination only without
-    // a confirmed result). `saveLaneEdits` refuses a busy worktree while a
-    // runner session is live there; that one refusal is cleared by the abort,
-    // after which the save is retried against the intent already journaled.
-    // Aborting the runner session never touches worktree contents, so the
-    // post-abort save still captures the edits before the lane is
-    // redispatched.
-    const saveWave = async (): Promise<ApplyRelaunchResult | 'save-busy' | null> => {
-      if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-      const saveStep = lane.steps.find((entry) => entry.step === 'save');
-      const saveStatus = statusOf(lane.laneId, 'save');
-      if (saveStep === undefined || saveStatus === 'completed') return null;
-      if (saveStatus === 'inconsistent') return refusedLane('step-inconsistent', lane.laneId);
-      if (saveStatus === 'refused' || saveStatus === 'ambiguous') {
-        return refusedLane('save-failed', lane.laneId);
-      }
-      if (saveStatus === 'absent') {
-        const canonicalJson = canonicalSaveInputJson(planDigest, saveInput);
-        if (canonicalJson === null) return refusal('invalid-request');
-        let saveInputDigest: string;
-        try {
-          saveInputDigest = deps.computeDigest(canonicalJson);
-        } catch {
-          return refusal('invalid-request');
-        }
-        if (!(await appendEntry({ key: saveStep.idempotencyKey, kind: 'intent', digest: saveInputDigest }))) {
-          return refusedLane('journal-write-failed', lane.laneId);
-        }
-        const saveOutcome = await saveOk(lane.laneId, saveInput);
-        if (saveOutcome.ok) return null;
-        return saveOutcome.busy ? 'save-busy' : refusedLane('save-failed', lane.laneId);
-      } else {
-        // 'intent-only': `verifyLaneSaveInput` already proved the digest
-        // matches; `saveLaneEdits` recovers an intent-only save.
-        const saveOutcome = await saveOk(lane.laneId, saveInput);
-        if (saveOutcome.ok) return null;
-        return saveOutcome.busy ? 'save-busy' : refusedLane('save-failed', lane.laneId);
-      }
-      return null;
-    };
-
-    const abortWave = async (): Promise<ApplyRelaunchResult | null> => {
-      const abortStep = lane.steps.find((entry) => entry.step === 'abort');
-      if (abortStep === undefined) return null;
-      if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-      const abortStatus = statusOf(lane.laneId, 'abort');
-      if (abortStatus === 'refused' || abortStatus === 'inconsistent') {
-        return refusedLane('abort-failed', lane.laneId);
-      }
-      if (abortStatus === 'intent-only' || abortStatus === 'ambiguous') {
-        // Reconcile read-only; never re-call `abortWorktreeRun` (I7).
-        let state: unknown;
-        try {
-          state = await runner.inspectWorktreeRun!({
-            attemptId: saveInput.attemptId,
-            worktreePath: saveInput.worktreePath,
-            runner: saveInput.recordedHost,
-          });
-        } catch {
-          return refusedLane('abort-failed', lane.laneId);
-        }
-        const stateKind = readWorktreeStateKind(state);
-        if (stateKind !== 'idle') return refusedLane('abort-failed', lane.laneId);
-        if (
-          !(await appendEntry({
-            key: abortStep.idempotencyKey,
-            kind: 'result',
-            outcome: 'completed',
-            reasonCode: 'reconciled-idle',
-          }))
-        ) {
-          return refusedLane('journal-write-failed', lane.laneId);
-        }
-      } else if (abortStatus === 'absent') {
-        if (!(await appendEntry({ key: abortStep.idempotencyKey, kind: 'intent' }))) {
-          return refusedLane('journal-write-failed', lane.laneId);
-        }
-        let threw = false;
-        let abortOutcome: unknown;
-        try {
-          abortOutcome = await runner.abortWorktreeRun!({
-            attemptId: saveInput.attemptId,
-            worktreePath: saveInput.worktreePath,
-            runner: saveInput.recordedHost,
-            gracePeriodSeconds: 30,
-          });
-        } catch {
-          threw = true;
-        }
-        const decision = decideProcessTreeTermination(
-          threw ? { kind: 'threw' } : { kind: 'result', outcome: own(abortOutcome, 'outcome') },
-        );
-        if (decision.action === 'refuse') return refusedLane('abort-failed', lane.laneId);
-        if (decision.action === 'none') {
-          if (
-            !(await appendEntry({
-              key: abortStep.idempotencyKey,
-              kind: 'result',
-              outcome: 'completed',
-              reasonCode: 'aborted',
-            }))
-          ) {
-            return refusedLane('journal-write-failed', lane.laneId);
-          }
-        } else {
-          if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-          let termination: unknown;
-          try {
-            termination = await deps.processTreeTermination!.terminateWorktreeProcesses({
-              attemptId: saveInput.attemptId,
-              worktreePath: saveInput.worktreePath,
-              runner: saveInput.recordedHost,
-              gracePeriodSeconds: 30,
-            });
-          } catch {
-            termination = null;
-          }
-          const terminated = own(termination, 'outcome') === 'terminated';
-          if (
-            !(await appendEntry({
-              key: abortStep.idempotencyKey,
-              kind: 'result',
-              outcome: terminated ? 'completed' : 'refused',
-              reasonCode: terminated ? 'terminated' : 'terminate-failed',
-            }))
-          ) {
-            return refusedLane('journal-write-failed', lane.laneId);
-          }
-          if (!terminated) return refusedLane('abort-failed', lane.laneId);
-        }
-      }
-      return null;
-    };
-
-    // Save first, always: the save attempt itself decides whether an abort is
-    // allowed. A busy worktree is the only save refusal an abort clears — the
-    // intent is already journaled (this invocation or a previous one), so the
-    // retry calls `saveLaneEdits` directly. Every other save refusal returns
-    // before `abortWorktreeRun`, honouring I2 for a running tree too.
-    const firstSave = await saveWave();
-    if (firstSave !== null && firstSave !== 'save-busy') return firstSave;
-    if (firstSave === 'save-busy') {
-      const abortRefusal = await abortWave();
-      if (abortRefusal !== null) return abortRefusal;
-      if (!(await saveOk(lane.laneId, saveInput)).ok) return refusedLane('save-failed', lane.laneId);
-    } else {
-      const abortRefusal = await abortWave();
-      if (abortRefusal !== null) return abortRefusal;
-    }
-
-    // adopt: AR2c owns it; anything not already completed refuses here.
-    if (lane.steps.some((entry) => entry.step === 'adopt')) {
-      if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-      if (statusOf(lane.laneId, 'adopt') !== 'completed') {
-        return refusedLane('adopt-not-implemented', lane.laneId);
-      }
-    }
-
-    // redispatch: the intent only; the conductor starts the fix from it.
-    if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
-    const redispatchStatus = statusOf(lane.laneId, 'redispatch');
-    if (redispatchStatus !== 'intent-only' && redispatchStatus !== 'completed') {
-      if (liveConductedRuns + handedOffNotIdle >= storedPlan.maxActiveRuns) {
-        return refusedLane('active-run-cap-reached', lane.laneId);
-      }
-      const redispatchStep = lane.steps.find((entry) => entry.step === 'redispatch');
-      if (redispatchStep === undefined) return refusedLane('step-inconsistent', lane.laneId);
-      if (!(await appendEntry({ key: redispatchStep.idempotencyKey, kind: 'intent' }))) {
-        return refusedLane('journal-write-failed', lane.laneId);
-      }
-      handedOffNotIdle += 1;
-    }
+    const refused =
+      (await saveAndAbortLane(ctx, lane, saveInput)) ?? (await adoptAndRedispatchLane(ctx, lane));
+    if (refused !== null) return refused;
   }
+  return null;
+}
 
+function isRefusalResult(value: object): value is ApplyRelaunchResult {
+  return 'outcome' in value;
+}
+
+/**
+ * AR2b: the live apply. One wave per invocation, `save`, `abort` and
+ * `redispatch` (intent-only), under the owner grant. All liveness, input and
+ * port checks run before `authorizeRelaunchApply`, so a failed preflight
+ * never consumes the grant and a replay with the same `grantId`
+ * re-authorizes cleanly. Never calls `prepareFixAttempt`: the conductor
+ * starts the fix from the journaled intent.
+ */
+async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
+  const { deps, planDigest, deadlineMs, saveInputs, storedPlan } = args;
+  const preflight = await preflightLive(args);
+  if (isRefusalResult(preflight)) return preflight;
+  const authorized = await authorizeLive(args);
+  if (isRefusalResult(authorized)) return authorized;
+  const { statusOf, counts, derived } = preflight;
+  const targetWave = selectWave(storedPlan, statusOf);
+  if (targetWave === null) {
+    return { outcome: 'applied', planDigest, wave: null, lanes: derived.summaries };
+  }
+  const ctx: WaveContext = {
+    deps,
+    planDigest,
+    deadlineMs,
+    nowIso: authorized.nowIso,
+    statusOf,
+    maxActiveRuns: storedPlan.maxActiveRuns,
+    counts,
+  };
+  const refused = await executeWave(ctx, storedPlan, saveInputs, targetWave);
+  if (refused !== null) return refused;
   // Re-derive the summaries from the updated journal state.
   const fresh = await loadJournalSnapshot(deps, planDigest);
   if (!fresh.ok) return fresh.result;

@@ -1805,6 +1805,59 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     ]);
   });
 
+  it('U35b: a Proxy array as allowedPathPrefixes or policyProtectedPaths is read through own descriptors only: its get trap never runs, and a bad element still refuses', async () => {
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex('proxy-text-array plan'))]);
+    for (const field of ['allowedPathPrefixes', 'policyProtectedPaths']) {
+      const reads = { count: 0 };
+      const proxy = new Proxy(['src/'], {
+        get(target, property, receiver) {
+          reads.count += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const deps = makeDeps({ plan });
+      // The descriptor-only reader cannot tell a Proxy from a plain array (that
+      // needs util.types, an adapter-layer API), but it never consults the get
+      // trap, so the request proceeds exactly as with the equivalent plain data.
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput({ [field]: proxy })] }),
+      );
+      expect(reads.count).toBe(0);
+      expect(deps.saveLaneEdits).toHaveBeenCalledWith(expect.objectContaining({ [field]: ['src/'] }));
+      // A Proxy whose elements are not bounded text still refuses.
+      const badProxy = new Proxy([7], {
+        get(target, property, receiver) {
+          reads.count += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      expect(
+        await new ApplyRelaunchUseCase(makeDeps({ plan })).applyRelaunch(
+          applyRequest(plan.planDigest, { saveInputs: [saveInput({ [field]: badProxy })] }),
+        ),
+      ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(reads.count).toBe(0);
+    }
+  });
+
+  it('U35c: when the abort clearing a busy save runs past the deadline, the retried save is not attempted (budget-exhausted)', async () => {
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex('retry-deadline plan'))]);
+    let now = CLOCK_NOW;
+    const deps = makeDeps({ plan, clock: () => now, live: { inspect: { state: 'running', sessionId: 's-1' } } });
+    (deps.runner!.abortWorktreeRun as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      now = PAST_DEADLINE;
+      return { outcome: 'aborted', endedAtIso: PAST_DEADLINE };
+    });
+    const save = deps.saveLaneEdits as unknown as ReturnType<typeof vi.fn>;
+    save.mockImplementation(async () => ({ outcome: 'refused', reason: 'worktree-busy', detail: null }));
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput()], deadlineIso: DEADLINE }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
   it('U36: a running lane whose saveLaneEdits refuses on a diff finding returns save-failed without any abort intent, call or termination — the save refusal causes no abort (I2)', async () => {
     const seed = 'diff-refusal plan';
     const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);

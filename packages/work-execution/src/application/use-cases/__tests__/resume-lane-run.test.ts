@@ -908,11 +908,13 @@ describe('ResumeLaneRunUseCase PT1b3a ambiguous intent', () => {
   });
 });
 
+const GATE_FAILED_PARK: LaneRunParkRecord = { reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'gating', questionId: null };
+
 const RETRY_KEY = (retry: number) => `${GATE_KEY}/retry${retry}`;
 
 /** GU2: a run parked from `gating` whose gate already settled `gate-failed`, plus optional failed retries. */
-async function seededGateFailedPark(retries: readonly number[] = []): Promise<Fixture> {
-  const fx = await seededParked();
+async function seededGateFailedPark(retries: readonly number[] = [], park: LaneRunParkRecord = GATE_FAILED_PARK): Promise<Fixture> {
+  const fx = await seededParked(park);
   expect(await fx.journal.append(laneRunIntentEntry('01JB00000000000000000000A1', RUN_ID, GATE_KEY, null, NOW))).toMatchObject({
     outcome: 'appended',
   });
@@ -945,7 +947,7 @@ async function failGateRetryAndRePark(fx: Fixture, retry: number): Promise<void>
   expect(
     await fx.repo.save(
       runRecord({
-        parked: { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null },
+        parked: GATE_FAILED_PARK,
         parkCount: (before?.parkCount ?? 0) + 1,
         revision: (before?.revision ?? 0) + 1,
         lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL },
@@ -1084,5 +1086,49 @@ describe('ResumeLaneRunUseCase GU2 bounded gate retry', () => {
     ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stop-pending' });
     expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
     expect((await fx.repo.get(RUN_ID))?.parked).toMatchObject({ parkedFrom: 'gating' });
+  });
+
+  it('a resume refused as stale-revision mints no gate retry intent and leaves the run parked', async () => {
+    const fx = await seededGateFailedPark();
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    // The record moves on after the request: the recorded expected revision is now stale.
+    const current = await fx.repo.get(RUN_ID);
+    expect(
+      await fx.repo.save({ ...(current as LaneRunRecord), revision: (current?.revision ?? 0) + 1 }, { holderId: HOLDER, fence: 1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'saved' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stale-revision' });
+    const entries = await fx.journal.listForRun(RUN_ID);
+    expect(gateRetryIntents(entries)).toHaveLength(0);
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect((await fx.repo.get(RUN_ID))?.parked).toMatchObject({ parkedFrom: 'gating' });
+  });
+
+  it('returns journal-refused when minting the gate retry intent is refused', async () => {
+    const fx = await seededGateFailedPark();
+    const refusing = Object.create(fx.journal) as LaneRunJournalPort;
+    refusing.append = async (entry) =>
+      entry.kind === 'intent' && entry.key === RETRY_KEY(1)
+        ? { outcome: 'refused', reason: 'storage-unavailable' as never, detail: null }
+        : fx.journal.append(entry);
+    const resume = new ResumeLaneRunUseCase({ runRepo: fx.repo, runJournal: refusing, newUlid: ulidMinter() });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'journal-refused' });
+    expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
+    expect((await fx.repo.get(RUN_ID))?.parked).toMatchObject({ parkedFrom: 'gating' });
+  });
+
+  it('a halted park from gating after gate-failed takes the normal resume path and mints no gate retry', async () => {
+    const fx = await seededGateFailedPark([], { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null });
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded', to: 'gating' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
   });
 });

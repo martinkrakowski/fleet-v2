@@ -313,8 +313,10 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await registerRealCloneProfile(fx);
     await seedProvenLane(fx, RUN_ID);
     await seedShadowLedger(fx.stateDir);
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched', revision: 1 });
+    expect(result).toMatchObject({ releasedParks: 0, vetoHoldParks: 0 });
     expect(code).toBe(0);
     const record = await fs.readFile(path.join(fx.stateDir, 'cutover.json'), 'utf8');
     expect(JSON.parse(record)).toMatchObject({ state: 'switched', revision: 1 });
@@ -410,8 +412,10 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await registerRealCloneProfile(fx);
     await seedProvenLane(fx, RUN_ID);
     await seedShadowLedger(fx.stateDir);
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(result).toMatchObject({ releasedParks: 0, vetoHoldParks: 0 });
     expect(code).toBe(0);
   });
 
@@ -493,8 +497,10 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     expect(listed.hosts[0].riskFlags).not.toContainEqual({ code: 'unknown-worktree-read', count: expect.anything() });
     expect(listed.hosts[0].riskFlags).not.toContainEqual({ code: 'unknown-runner-state', count: expect.anything() });
     await seedShadowLedger(fx.stateDir);
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(result).toMatchObject({ releasedParks: 0, vetoHoldParks: 0 });
     expect(code).toBe(0);
   });
 
@@ -613,9 +619,26 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await seedProvenLane(fx, RUN_ID);
     await seedShadowLedger(fx.stateDir);
     await fs.writeFile(path.join(fx.stateDir, 'killall-train-pause.json'), CORRUPT, 'utf8');
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'train-pause-unreadable' });
     expect(code).toBe(1);
+  });
+
+  it('refuses daemon-not-paused when daemon pause is clear, with zero writes', async () => {
+    // The daemon pause stays `clear`: the switch gate must refuse before the
+    // train-pause gate and write no record and no journal entry.
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'daemon-not-paused' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
   });
 
   it('refuses as unknown when a listed worktree sits outside the clone worktree root', async () => {
@@ -702,8 +725,10 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await fs.writeFile(path.join(fx.stateDir, 'project-profiles.json'), JSON.stringify(profiles), 'utf8');
     await seedProvenLane(fx, RUN_ID);
     await seedShadowLedger(fx.stateDir);
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(result).toMatchObject({ releasedParks: 0, vetoHoldParks: 0 });
     expect(code).toBe(0);
   });
 
@@ -725,8 +750,10 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await seedProvenLane(fx, RUN_ID);
     await seedShadowLedger(fx.stateDir);
     await expect(fs.stat(path.join(fx.stateDir, 'conductor-driver-lease.json'))).rejects.toThrow();
+    await fx.runtime.daemon.pause.write(true, NOW);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(result).toMatchObject({ releasedParks: 0, vetoHoldParks: 0 });
     expect(code).toBe(0);
   });
 

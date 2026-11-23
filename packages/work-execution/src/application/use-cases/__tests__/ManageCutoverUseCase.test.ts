@@ -11,6 +11,9 @@ import {
 } from '../../../infrastructure/adapters/CutoverRecordRepositoryAdapter.adapter.js';
 import { DaemonPauseAdapter } from '../../../infrastructure/adapters/DaemonPauseAdapter.adapter.js';
 import { KillallTrainPauseAdapter } from '../../../infrastructure/adapters/KillallTrainPauseAdapter.adapter.js';
+import { MergeQueueRepositoryAdapter } from '../../../infrastructure/adapters/MergeQueueRepositoryAdapter.adapter.js';
+import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
+import type { MergePolicyRepository } from '../../../application/ports/out/MergePolicyPort.out-port.js';
 import { WORK_EXECUTION_STATE_FILES } from '../../../infrastructure/adapters/state-files.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import {
@@ -18,6 +21,7 @@ import {
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_SHADOW_CRITERIA,
   CUTOVER_SHADOW_MIN_MERGES,
+  buildShadowParkJournalPayload,
   canonicalCutoverSwitchPayload,
   readRetirementLedger,
   type CutoverRecord,
@@ -199,6 +203,8 @@ interface Harness {
   readonly journal: CutoverJournalAdapter;
   readonly daemonPause: DaemonPauseAdapter;
   readonly trainPause: KillallTrainPauseAdapter;
+  readonly mergeQueue: MergeQueueRepositoryAdapter;
+  readonly shadowParkJournal: CutoverJournalAdapter;
   readonly clock: { now: string };
   readonly deps: ManageCutoverDependencies;
   readonly useCase: ManageCutoverUseCase;
@@ -209,6 +215,10 @@ interface Harness {
     readonly journalAppend: MockInstance<CutoverJournalAdapter['append']>;
     readonly repoRead: MockInstance<CutoverRecordRepositoryAdapter['read']>;
     readonly journalList: MockInstance<CutoverJournalAdapter['listByKeyPrefix']>;
+    readonly shadowParkAppend: MockInstance<CutoverJournalAdapter['append']>;
+    readonly shadowParkList: MockInstance<CutoverJournalAdapter['listByKeyPrefix']>;
+    readonly listMergeEntries: MockInstance<MergeQueueRepositoryAdapter['listMergeEntries']>;
+    readonly applyMergeTransition: MockInstance<MergeQueueRepositoryAdapter['applyMergeTransition']>;
   };
 }
 
@@ -227,6 +237,15 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const journal = new CutoverJournalAdapter({ stateDir });
   const daemonPause = new DaemonPauseAdapter({ stateDir });
   const trainPause = new KillallTrainPauseAdapter({ stateDir });
+  // SW2b2: the merge queue the switch releases shadow parks through, and the
+  // separate shadow-park journal (`shadow-park-journal.json` on disk), never
+  // the cutover journal.
+  const mergeQueue = new MergeQueueRepositoryAdapter({ stateDir });
+  const shadowParkJournal = new CutoverJournalAdapter({
+    stateDir,
+    ...(stateDir !== undefined ? { fileName: 'shadow-park-journal.json' } : {}),
+    shadowPark: true,
+  });
   const seed = options.seed === undefined ? switchedRecord(1) : options.seed;
   if (seed !== null) {
     await repo.compareAndSet({ expectedRevision: seed.revision - 1, next: seed });
@@ -246,6 +265,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     daemonPause,
     trainPauseRead: stateDir === undefined ? trainPause : new KillallTrainPauseAdapter({ stateDir, readOnly: true }),
     trainPause,
+    shadowParkJournal,
     computeDigest: sha256HexDigest,
     mintEntryId: () => ulid((sequence += 1)),
     nowIso: () => clock.now,
@@ -258,8 +278,23 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     journalAppend: vi.spyOn(journal, 'append'),
     repoRead: vi.spyOn(repo, 'read'),
     journalList: vi.spyOn(journal, 'listByKeyPrefix'),
+    shadowParkAppend: vi.spyOn(shadowParkJournal, 'append'),
+    shadowParkList: vi.spyOn(shadowParkJournal, 'listByKeyPrefix'),
+    listMergeEntries: vi.spyOn(mergeQueue, 'listMergeEntries'),
+    applyMergeTransition: vi.spyOn(mergeQueue, 'applyMergeTransition'),
   };
-  return { repo, journal, daemonPause, trainPause, clock, deps, useCase: new ManageCutoverUseCase(deps), spies };
+  return {
+    repo,
+    journal,
+    daemonPause,
+    trainPause,
+    mergeQueue,
+    shadowParkJournal,
+    clock,
+    deps,
+    useCase: new ManageCutoverUseCase(deps),
+    spies,
+  };
 }
 
 function resetSpies(h: Harness): void {
@@ -323,7 +358,7 @@ function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string>
 }
 
 function useCaseWithReaders(h: Harness, overrides: Parameters<typeof readers>[0] = {}): ManageCutoverUseCase {
-  return new ManageCutoverUseCase({ ...h.deps, ...readers(overrides) });
+  return new ManageCutoverUseCase({ ...h.deps, mergeQueue: h.mergeQueue, ...readers(overrides) });
 }
 
 /** A switch refused before any port write: no pause set, no record save, no journal entry. */
@@ -358,19 +393,51 @@ function validRetirementLedger(
   return { schemaVersion: 1, rows };
 }
 
+type MergePolicyReader = NonNullable<ManageCutoverDependencies['mergePolicy']>;
+
+/** One merge-policy repository entry, shadow or not. */
+function policyRepo(owner: string, repo: string, shadow: boolean): MergePolicyRepository {
+  return {
+    owner,
+    repo,
+    repositoryKey: `${owner}/${repo}`,
+    projectId: 'project-1',
+    shadow,
+    unattended: true,
+    requiredContexts: [],
+    updateBranch: false,
+    macosProcedure: null,
+    maxAttempts: 3,
+    checksGraceMinutes: 5,
+    veto: { mode: 'shadow', holdConfidence: 0.8 },
+  };
+}
+
 function readers(overrides: {
   readShadowEvidence?: ShadowEvidenceReader;
   countUnrecordedLanes?: UnrecordedLanesCounter;
   readRetirementLedger?: RetirementLedgerReader;
+  mergePolicy?: MergePolicyReader;
 } = {}): {
   readShadowEvidence: ShadowEvidenceReader;
   countUnrecordedLanes: UnrecordedLanesCounter;
   readRetirementLedger: RetirementLedgerReader;
+  mergePolicy: MergePolicyReader;
 } {
   return {
     readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW) }),
     countUnrecordedLanes: async () => ({ status: 'ok', unrecorded: 0, unknownListings: 0 }),
     readRetirementLedger: async () => ({ status: 'ok', ledger: validRetirementLedger() }),
+    // SW2b2 default: a valid policy that marks no repository shadow, so the
+    // existing switch tests keep passing with no park planned at all.
+    mergePolicy: {
+      readMergePolicy: async () => ({
+        outcome: 'known',
+        policyRevision: 'pol-1',
+        repositories: [],
+        daemon: { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' },
+      }),
+    },
     ...overrides,
   };
 }
@@ -975,6 +1042,377 @@ describe('ManageCutoverUseCase switch', () => {
     resetSpies(h);
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
     expect(totalWriteCalls(h)).toBe(0);
+  });
+});
+
+describe('ManageCutoverUseCase switch shadow parks', () => {
+  let entrySequence = 900;
+  const HEAD_OID = 'a'.repeat(40);
+  // The queue adapter validates deadlines against the real clock, so the test
+  // deadline must lie ahead of it, not ahead of the harness clock.
+  const QUEUE_DEADLINE = new Date(Date.now() + 600_000).toISOString();
+
+  /** Enqueues one entry into the harness queue and parks it with reason `checks`. */
+  async function parkedEntry(h: Harness, owner: string, repo: string, pr: number): Promise<MergeQueueEntryRecord> {
+    entrySequence += 1;
+    const created = await h.mergeQueue.enqueueMergeEntry({
+      repository: { owner, repo },
+      pullRequest: pr,
+      headOid: HEAD_OID,
+      tier: 1,
+      enqueuedBy: 'cli',
+      runId: null,
+      entryId: ulid(entrySequence),
+      successorEntryId: ulid(entrySequence),
+      enqueuedAtIso: NOW,
+      deadlineIso: QUEUE_DEADLINE,
+    });
+    if (created.outcome !== 'created') {
+      throw new Error(`enqueue refused: ${created.outcome} ${'reason' in created ? created.reason : ''}`);
+    }
+    const transition = await h.mergeQueue.applyMergeTransition({
+      entryId: created.record.entryId,
+      expectedRevision: created.record.revision,
+      next: { ...created.record, revision: created.record.revision + 1, state: 'parked', reason: 'checks' },
+      successor: null,
+      deadlineIso: QUEUE_DEADLINE,
+    });
+    if (transition.outcome !== 'applied') {
+      throw new Error(`park refused: ${transition.outcome}`);
+    }
+    return transition.record;
+  }
+
+  /** A policy reader that marks exactly the given repositories shadow. */
+  function shadowPolicy(...keys: readonly string[]): MergePolicyReader {
+    return {
+      readMergePolicy: async () => ({
+        outcome: 'known',
+        policyRevision: 'pol-1',
+        repositories: keys.map((key) => policyRepo(key.split('/')[0], key.split('/')[1], true)),
+        daemon: { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' },
+      }),
+    };
+  }
+
+  /** The shadow-park journal intents recorded for `cutover/shadow-park-...` keys. */
+  async function parkIntents(h: Harness): Promise<readonly { key: string; digest: string | null | undefined }[]> {
+    const listed = await h.shadowParkJournal.listByKeyPrefix('cutover/shadow-park-');
+    return listed.outcome === 'listed'
+      ? listed.entries.filter((e) => e.kind === 'intent').map((e) => ({ key: e.key, digest: e.digest }))
+      : [];
+  }
+
+  it('releases every ordinary shadow-repo parked entry to queued and journals its intent after the cutover intent', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const first = await parkedEntry(h, 'octo', 'repo', 1);
+    const second = await parkedEntry(h, 'octo', 'repo', 2);
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    resetSpies(h);
+    const result = await useCase.execute(switchRequest());
+    expect(result).toMatchObject({ outcome: 'completed', state: 'switched', releasedParks: 2, vetoHoldParks: 0 });
+
+    // Both entries are back in the queue, with their attempt history kept.
+    const listed = await h.mergeQueue.listMergeEntries({ deadlineIso: QUEUE_DEADLINE });
+    const states = new Map(listed.map((e) => [e.entryId, { state: e.state, reason: e.reason, notBeforeIso: e.notBeforeIso, attempt: e.attempt }]));
+    expect(states.get(first.entryId)).toEqual({ state: 'queued', reason: null, notBeforeIso: null, attempt: first.attempt });
+    expect(states.get(second.entryId)).toEqual({ state: 'queued', reason: null, notBeforeIso: null, attempt: second.attempt });
+
+    // The shadow-park journal holds one intent per park, keyed by its entry digest.
+    const expectedKeys = [first, second]
+      .map((e) => `cutover/shadow-park-${sha256HexDigest(e.entryId).slice(0, 32)}@${e.revision}`)
+      .sort();
+    expect((await parkIntents(h)).map((e) => e.key).sort()).toEqual(expectedKeys);
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+      expect.objectContaining({ kind: 'intent' }),
+      expect.objectContaining({ kind: 'result', outcome: 'completed' }),
+    ]);
+    expect(h.spies.applyMergeTransition).toHaveBeenCalledTimes(2);
+  });
+
+  it('never touches non-shadow repositories and never releases a veto-hold, but reports its count', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const shadow = await parkedEntry(h, 'octo', 'repo', 1);
+    const live = await parkedEntry(h, 'live', 'repo', 2);
+    // Park the shadow entry again as a veto-hold via a direct transition.
+    const veto = await h.mergeQueue.applyMergeTransition({
+      entryId: shadow.entryId,
+      expectedRevision: 99,
+      next: { ...shadow, state: 'parked', reason: 'veto-hold' },
+      successor: null,
+      deadlineIso: QUEUE_DEADLINE,
+    });
+    expect(veto.outcome).toBe('refused');
+    const vetoed = await h.mergeQueue.applyMergeTransition({
+      entryId: shadow.entryId,
+      expectedRevision: shadow.revision,
+      next: { ...shadow, revision: shadow.revision + 1, state: 'parked', reason: 'veto-hold' },
+      successor: null,
+      deadlineIso: QUEUE_DEADLINE,
+    });
+    if (vetoed.outcome !== 'applied') throw new Error('veto park failed');
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    resetSpies(h);
+    const result = await useCase.execute(switchRequest());
+    expect(result).toMatchObject({ outcome: 'completed', state: 'switched', releasedParks: 0, vetoHoldParks: 1 });
+    expect(await parkIntents(h)).toEqual([]);
+    const listed = await h.mergeQueue.listMergeEntries({ deadlineIso: QUEUE_DEADLINE });
+    const byId = new Map(listed.map((e) => [e.entryId, e]));
+    expect(byId.get(shadow.entryId)).toMatchObject({ state: 'parked', reason: 'veto-hold' });
+    expect(byId.get(live.entryId)).toMatchObject({ state: 'parked', reason: 'checks' });
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+  });
+
+  it('refuses merge-queue-absent, merge-policy-absent and park-journal-append-failed when a dependency is missing', async () => {
+    for (const [label, missing, expected] of [
+      ['mergeQueueRead', 'mergeQueueRead', 'merge-queue-absent'],
+      ['mergeQueue', 'mergeQueue', 'merge-queue-absent'],
+      ['mergePolicy', 'mergePolicy', 'merge-policy-absent'],
+      ['shadowParkJournal', 'shadowParkJournal', 'park-journal-append-failed'],
+    ] as const) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      const deps: Record<string, unknown> = { ...h.deps, mergeQueue: h.mergeQueue, ...readers({ mergePolicy: shadowPolicy('octo/repo') }) };
+      delete deps[missing === 'mergeQueueRead' ? 'mergeQueue' : missing];
+      if (missing === 'mergeQueueRead') deps.mergeQueue = undefined;
+      if (missing === 'mergeQueue') deps.mergeQueueRead = undefined;
+      const useCase = new ManageCutoverUseCase(deps as unknown as ManageCutoverDependencies);
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: { outcome: 'refused', reason: expected } });
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+      expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+      expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns merge-policy-unreadable when mergePolicy throws, answers unknown, or carries a non-boolean shadow', async () => {
+    const boom = (): never => {
+      throw new Error('boom');
+    };
+    const badRepo = { ...policyRepo('octo', 'repo', true), shadow: 'yes' };
+    const cases: Array<[string, MergePolicyReader]> = [
+      ['throws', { readMergePolicy: boom }],
+      ['unknown', { readMergePolicy: async () => ({ outcome: 'unknown', reason: 'installation-unreadable' }) }],
+      ['non-boolean shadow', { readMergePolicy: async () => ({ outcome: 'known', policyRevision: 'pol-1', repositories: [badRepo as unknown as MergePolicyRepository], daemon: { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' } }) }],
+    ];
+    for (const [label, mergePolicy] of cases) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      const useCase = useCaseWithReaders(h, { mergePolicy });
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: { outcome: 'unknown', reason: 'merge-policy-unreadable' } });
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns merge-queue-unreadable when listMergeEntries throws or returns a malformed entry', async () => {
+    const valid = await (async () => {
+      const h = await harness({ seed: null, daemonPaused: true });
+      return parkedEntry(h, 'octo', 'repo', 1);
+    })();
+    const boom = (): never => {
+      throw new Error('boom');
+    };
+    const cases: Array<[string, Pick<MergeQueueRepositoryAdapter, 'listMergeEntries'>]> = [
+      ['throws', { listMergeEntries: boom }],
+      ['null', { listMergeEntries: async () => null as unknown as readonly MergeQueueEntryRecord[] }],
+      ['array-like', { listMergeEntries: async () => ({ length: 1, 0: valid }) as unknown as readonly MergeQueueEntryRecord[] }],
+      ['sparse hole', { listMergeEntries: async () => Object.assign([valid], { 1: undefined, length: 2 }) as unknown as readonly MergeQueueEntryRecord[] }],
+      ['malformed element', { listMergeEntries: async () => [{ ...valid, revision: 0 }] as unknown as readonly MergeQueueEntryRecord[] }],
+    ];
+    for (const [label, mergeQueueRead] of cases) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      const useCase = new ManageCutoverUseCase({
+        ...h.deps,
+        mergeQueue: h.mergeQueue,
+        mergeQueueRead,
+        ...readers({ mergePolicy: shadowPolicy('octo/repo') }),
+      });
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: { outcome: 'unknown', reason: 'merge-queue-unreadable' } });
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses park-digest-mismatch before any append or release', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const entry = await parkedEntry(h, 'octo', 'repo', 1);
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    // Seed the shadow-park journal with a valid intent for this park's key
+    // whose digest and record cannot match the planned park.
+    const seeded = buildShadowParkJournalPayload(entry);
+    if (!seeded.ok) throw new Error('seed payload refused');
+    await h.shadowParkJournal.append({
+      key: `cutover/shadow-park-${sha256HexDigest(entry.entryId).slice(0, 32)}@${entry.revision}`,
+      kind: 'intent',
+      entryId: ulid(950),
+      recordedAtIso: NOW,
+      digest: 'f'.repeat(64),
+      shadowPark: { ...seeded.record, attempt: seeded.record.attempt + 1 },
+    });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'park-digest-mismatch' });
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    // Pre-intent refusals leave the cutover journal untouched.
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
+  });
+
+  it('resumes after a crash between the park release and the record save, skipping already-released entries', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const first = await parkedEntry(h, 'octo', 'repo', 1);
+    const second = await parkedEntry(h, 'octo', 'repo', 2);
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    // The first release applies (crash right after it), the second throws:
+    // both park intents are journaled, one park is back in the queue.
+    const realTransition = Object.getPrototypeOf(h.mergeQueue).applyMergeTransition as MergeQueueRepositoryAdapter['applyMergeTransition'];
+    h.spies.applyMergeTransition.mockImplementationOnce(async (command) => realTransition.call(h.mergeQueue, command));
+    h.spies.applyMergeTransition.mockImplementationOnce(async () => {
+      throw new Error('disk gone');
+    });
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'merge-queue-write-failed' });
+    expect(await parkIntents(h)).toHaveLength(2);
+    const afterCrash = new Map(
+      (await h.mergeQueue.listMergeEntries({ deadlineIso: QUEUE_DEADLINE })).map((e) => [e.entryId, e.state]),
+    );
+    expect(afterCrash.get(first.entryId)).toBe('queued');
+    expect(afterCrash.get(second.entryId)).toBe('parked');
+
+    // The retry replays the recorded intents, releases only the still-parked
+    // entry, and counts exactly one release.
+    const result = await useCase.execute(switchRequest());
+    expect(result).toMatchObject({ outcome: 'completed', state: 'switched', releasedParks: 1, vetoHoldParks: 0 });
+    const listed = await h.mergeQueue.listMergeEntries({ deadlineIso: QUEUE_DEADLINE });
+    const byId = new Map(listed.map((e) => [e.entryId, e.state]));
+    expect(byId.get(first.entryId)).toBe('queued');
+    expect(byId.get(second.entryId)).toBe('queued');
+    expect((await parkIntents(h)).map((e) => e.key)).toHaveLength(2);
+  });
+
+  it('answers deadline-exceeded for the policy, queue, journal and write steps, with no cutover journal entry', async () => {
+    const deadlineIso = new Date(Date.parse(NOW) + 30_000).toISOString();
+    const advance = (h: Harness): void => {
+      h.clock.now = new Date(Date.parse(NOW) + 60_000).toISOString();
+    };
+    const cases: Array<[string, (h: Harness) => ManageCutoverUseCase]> = [
+      // The clock passes the deadline inside the train-pause preflight read, so
+      // the guarded merge-policy read answers `deadline` without calling it.
+      ['policy read', (h) => {
+        (h.deps as { trainPauseRead: unknown }).trainPauseRead = {
+          read: async () => {
+            advance(h);
+            return { status: 'clear' };
+          },
+        };
+        return useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+      }],
+      // The clock passes inside the policy read, so the queue list answers `deadline`.
+      ['queue list', (h) => useCaseWithReaders(h, {
+        mergePolicy: {
+          readMergePolicy: async () => {
+            advance(h);
+            return {
+              outcome: 'known',
+              policyRevision: 'pol-1',
+              repositories: [policyRepo('octo', 'repo', true)],
+              daemon: { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' },
+            };
+          },
+        },
+      })],
+      // The clock passes inside the queue list, so the journal list answers `deadline`.
+      ['journal list', (h) => {
+        h.spies.listMergeEntries.mockImplementationOnce(async () => {
+          advance(h);
+          return [];
+        });
+        return useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+      }],
+      // The clock passes inside the journal list, so the shadow-park append answers `deadline`.
+      ['park append', (h) => {
+        h.spies.listMergeEntries.mockImplementationOnce(async () => {
+          advance(h);
+          return [];
+        });
+        h.spies.shadowParkList.mockImplementation(async () => {
+          advance(h);
+          return { outcome: 'listed', entries: [] };
+        });
+        return useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+      }],
+    ];
+    for (const [label, build] of cases) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      const useCase = build(h);
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest({ deadlineIso })) }).toEqual({ label, result: { outcome: 'unknown', reason: 'deadline-exceeded' } });
+      expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+      expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses park-journal-append-failed when the shadow-park append refuses or throws, with no queue release', async () => {
+    for (const [label, behaviour] of [
+      ['refuses', async () => ({ outcome: 'refused' as const, reason: 'store-read-only' as const })],
+      ['throws', async (): Promise<never> => {
+        throw new Error('boom');
+      }],
+    ] as const) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      h.spies.shadowParkAppend.mockImplementation(behaviour as unknown as CutoverJournalAdapter['append']);
+      const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: { outcome: 'refused', reason: 'park-journal-append-failed' } });
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+      expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses park-release-conflict on a revision conflict and answers merge-queue-write-failed otherwise', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    await parkedEntry(h, 'octo', 'repo', 1);
+    h.spies.applyMergeTransition.mockResolvedValueOnce({ outcome: 'refused', reason: 'revision-conflict' });
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'park-release-conflict' });
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+
+    const other = await harness({ seed: null, daemonPaused: true });
+    await parkedEntry(other, 'octo', 'repo', 1);
+    other.spies.applyMergeTransition.mockResolvedValueOnce({ outcome: 'refused', reason: 'unknown-entry' });
+    const otherUseCase = useCaseWithReaders(other, { mergePolicy: shadowPolicy('octo/repo') });
+    expect(await otherUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'merge-queue-write-failed' });
+    expect(other.spies.compareAndSet).not.toHaveBeenCalled();
+  });
+
+  it('refuses invalid-park-record when a queue entry passes the record reader but fails park planning, with zero writes', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const entry = await parkedEntry(h, 'octo', 'repo', 1);
+    // A revision beyond the park key's cap: the queue record reader accepts
+    // any positive safe-integer revision, but `cutoverShadowParkKey` refuses
+    // one past MAX_REVISION, so planning refuses before any write.
+    const hostile = { ...entry, revision: 2_000_000_000 };
+    const useCase = new ManageCutoverUseCase({
+      ...h.deps,
+      mergeQueue: h.mergeQueue,
+      mergeQueueRead: { listMergeEntries: async () => [hostile] },
+      ...readers({ mergePolicy: shadowPolicy('octo/repo') }),
+    });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'invalid-park-record' });
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
   });
 });
 

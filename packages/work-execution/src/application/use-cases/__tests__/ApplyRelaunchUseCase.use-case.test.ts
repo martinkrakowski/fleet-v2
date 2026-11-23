@@ -1744,14 +1744,15 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     );
   });
 
-  it('U35: a running lane aborts before its save (the real saveLaneEdits refuses a busy worktree) while an idle lane saves before its abort — both waves reach abort and adopt still refuses', async () => {
+  it('U35: a running lane saves first — the busy refusal clears via abort and a retried save — while an idle lane saves before its abort; a diff-refused save aborts nothing (I2)', async () => {
     const seed = 'ordering plan';
     const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
     const digest = plan.planDigest;
     const request = (): unknown =>
       applyRequest(plan.planDigest, { saveInputs: [saveInput()] });
-    // Running worktree: the preflight observed `running`, so the abort intent,
-    // the abort and its result all happen before the save is attempted.
+    // Running worktree: the first save attempt is refused `worktree-busy`
+    // (the runner session is live), so the abort runs and the save retries
+    // against the intent journaled by the first attempt.
     const running = makeDeps({ plan, live: { inspect: { state: 'running', sessionId: 's-1' } } });
     const order: string[] = [];
     const runningAbort = running.runner!.abortWorktreeRun as unknown as ReturnType<typeof vi.fn>;
@@ -1762,23 +1763,23 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const runningSave = running.saveLaneEdits as unknown as ReturnType<typeof vi.fn>;
     runningSave.mockImplementation(async () => {
       order.push('save');
-      return { outcome: 'saved' };
+      return order.length <= 1 ? { outcome: 'refused', reason: 'worktree-busy', detail: null } : { outcome: 'saved' };
     });
     expect(await new ApplyRelaunchUseCase(running).applyRelaunch(request())).toEqual({
       outcome: 'refused',
       reason: 'adopt-not-implemented',
       laneId: 'lane-2',
     });
-    // The abort ran first and the lane reached it — an implementation that
-    // saved first would stop at save-failed and never call abortWorktreeRun.
-    expect(order).toEqual(['abort', 'save']);
+    expect(order).toEqual(['save', 'abort', 'save']);
     expect(running.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['intent', key(digest, 'lane-2', 'save')],
       ['intent', key(digest, 'lane-2', 'abort')],
       ['result', key(digest, 'lane-2', 'abort')],
-      ['intent', key(digest, 'lane-2', 'save')],
     ]);
     expect(running.processTreeTermination!.terminateWorktreeProcesses).not.toHaveBeenCalled();
-    // Idle worktree (same plan): save-before-abort is preserved (I2).
+    // A save refusal that no abort clears (a diff finding) stops the lane
+    // before `abortWorktreeRun` — I2 for a running tree too (U36 below).
+    // Idle worktree (same plan, honest save): save-before-abort (I2).
     const idle = makeDeps({ plan, live: { inspect: { state: 'idle' } } });
     const idleOrder: string[] = [];
     const idleAbort = idle.runner!.abortWorktreeRun as unknown as ReturnType<typeof vi.fn>;
@@ -1801,6 +1802,90 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ['intent', key(digest, 'lane-2', 'save')],
       ['intent', key(digest, 'lane-2', 'abort')],
       ['result', key(digest, 'lane-2', 'abort')],
+    ]);
+  });
+
+  it('U36: a running lane whose saveLaneEdits refuses on a diff finding returns save-failed without any abort intent, call or termination — the save refusal causes no abort (I2)', async () => {
+    const seed = 'diff-refusal plan';
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
+    const deps = makeDeps({
+      plan,
+      live: {
+        inspect: { state: 'running', sessionId: 's-1' },
+        save: { outcome: 'refused', reason: 'diff-check-findings', detail: { 'rule-x': 1 } },
+      },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'save-failed', laneId: 'lane-2' });
+    expect(deps.runner!.abortWorktreeRun).not.toHaveBeenCalled();
+    expect(deps.processTreeTermination!.terminateWorktreeProcesses).not.toHaveBeenCalled();
+    // The save intent was journaled (it precedes the save call), but no
+    // abort entry ever reached the journal.
+    expect(deps.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['intent', key(plan.planDigest, 'lane-2', 'save')],
+    ]);
+  });
+
+  it('U37: a pending hand-off whose worktree still reports idle counts toward the active-run cap — the conductor has not started the lane yet, so a later wave cannot exceed maxActiveRuns', async () => {
+    // lane-2 (wave 1) holds a redispatch intent but its worktree reports
+    // idle: the conductor has not started the handed-off lane. With
+    // maxActiveRuns 2, one wave-2 lane hands off and the second must refuse
+    // before its intent is written; an implementation that counts only
+    // observed `running` states would let both through.
+    const lane = (id: string): FixtureLane => ({
+      ...idleLane('x', id, ['lane-2']),
+      hostName: `host-${id}`,
+      admissionWave: 2,
+    });
+    const setup = (maxActiveRuns: number): { plan: RelaunchPlanRecord; inputs: Record<string, unknown>[]; entries: unknown[] } => {
+      const plan = buildPlan(
+        [{ ...idleLane('x', 'lane-2', []), hostName: 'host-lane-2' }, lane('lane-3'), lane('lane-4')],
+        maxActiveRuns,
+      );
+      const inputs = [
+        saveInput(),
+        saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' }),
+        saveInput({ laneId: 'lane-4', attemptId: 'attempt-4' }),
+      ];
+      const entries = [
+        ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
+        ...completedAdopt(plan.planDigest, 'lane-2'),
+        intent(key(plan.planDigest, 'lane-2', 'redispatch')),
+        ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
+        ...completedAdopt(plan.planDigest, 'lane-3'),
+        ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
+        ...completedAdopt(plan.planDigest, 'lane-4'),
+      ];
+      return { plan, inputs, entries };
+    };
+    // Cap 2: the pending hand-off on lane-2 counts (its worktree is idle),
+    // so lane-3 fills the cap (1 + 1 = 2) and lane-4 crosses it.
+    const capped = setup(2);
+    const deps = makeDeps({ plan: capped.plan, entries: capped.entries, live: { inspect: { state: 'idle' } } });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-4' });
+    expect(
+      deps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
+    ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
+    // Cap 3: the pending hand-off plus both wave-2 lanes fit.
+    const roomier = setup(3);
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { inspect: { state: 'idle' } } });
+    expect(
+      await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
+        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs }),
+      ),
+    ).toMatchObject({ outcome: 'applied', wave: 2 });
+    expect(
+      roomierDeps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
+    ).toEqual([
+      key(roomier.plan.planDigest, 'lane-3', 'redispatch'),
+      key(roomier.plan.planDigest, 'lane-4', 'redispatch'),
     ]);
   });
 });

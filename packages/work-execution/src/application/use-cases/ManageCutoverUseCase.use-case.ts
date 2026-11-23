@@ -789,6 +789,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     // readability gate. With no intent yet, this pass's read is what the digest records.
     const plan = recorded ?? this.newSwitchIntent(request, preflight.trainPausedBefore);
 
+    // The pause check is held through the switch: the preflight read alone does
+    // not pin the marker, so it is re-read here, immediately before the write
+    // phase (intent, train pause, record). A marker an operator cleared between
+    // the preflight read and this recheck still refuses the move with zero
+    // writes instead of letting the switch complete while daemon ticks run.
+    const pauseStillHeld = await this.daemonPauseFailure(deadlineIso);
+    if (pauseStillHeld !== null) {
+      return pauseStillHeld;
+    }
+
     const normalizedNowIso = normalizeIso(nowIso);
     const intentFailure = await this.appendIntentUnlessRecorded(
       journal.intent,

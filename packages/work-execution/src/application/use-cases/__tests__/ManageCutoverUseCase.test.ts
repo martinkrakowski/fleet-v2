@@ -801,6 +801,21 @@ describe('ManageCutoverUseCase switch', () => {
     expect(totalWriteCalls(h)).toBe(0);
   });
 
+  it('refuses daemon-not-paused with zero writes when the marker is cleared between the preflight read and the write phase', async () => {
+    // The preflight read sees `paused`, the marker is cleared before the write
+    // phase, and the recheck before the first write must refuse with zero
+    // writes: no intent, no train-pause set, no record swap.
+    const h = await harness({ seed: null, daemonPaused: true });
+    const states = ['paused', 'clear'];
+    (h.deps as { daemonPauseRead: unknown }).daemonPauseRead = {
+      read: async () => ({ state: states.shift() ?? 'clear' }),
+    };
+    const useCase = useCaseWithReaders(h);
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'daemon-not-paused' });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
   it('switch sets the train pause and saves a switched record when evidence passes and no lane is unrecorded', async () => {
     const h = await harness({ seed: null, daemonPaused: true });
     const useCase = useCaseWithReaders(h);

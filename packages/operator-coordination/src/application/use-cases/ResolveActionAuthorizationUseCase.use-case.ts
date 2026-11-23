@@ -818,7 +818,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     const payloadResult = shadowImportDigestPayload(shadowGrant);
     const expectedRequestId = payloadResult.ok
-      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${computeDigest(payloadResult.value)}`
+      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${computeDigest.call(this.deps, payloadResult.value)}`
       : null;
     if (!payloadResult.ok || candidate.getId() !== expectedRequestId) {
       return blocked('grant-digest-mismatch');
@@ -966,13 +966,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (computeDigest === undefined) {
       return blocked('digest-unavailable');
     }
-    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${computeDigest(
-      relaunchApplyDigestPayload({
-        projectId: refreshed.projectId,
-        proposalDigest: refreshed.proposalDigest,
-        createdAtIso: refreshed.createdAtIso,
-      }),
-    )}`;
+    const payload = relaunchApplyDigestPayload({
+      projectId: refreshed.projectId,
+      proposalDigest: refreshed.proposalDigest,
+      createdAtIso: refreshed.createdAtIso,
+    });
+    const expectedRequestId = `${RELAUNCH_APPLY_DIGEST_PREFIX}${computeDigest.call(this.deps, payload)}`;
     return refreshed.id === expectedRequestId ? null : blocked('grant-request-digest-mismatch');
   }
 

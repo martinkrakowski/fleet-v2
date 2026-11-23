@@ -2211,3 +2211,97 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
 });
+
+describe('ResolveActionAuthorizationUseCase dependency receivers (AR3a)', () => {
+  const NOW_ISO = '2026-11-18T00:00:00.000Z';
+
+  // A valid computeDigest that depends on its receiver: it reads `this.salt`,
+  // so it only works when invoked as a method of the dependencies object.
+  class SaltedDeps {
+    readonly salt = 'receiver-salt:';
+    readonly shadowImportClock = { nowIso: (): string => NOW_ISO };
+    constructor(
+      readonly requestRepo: CoordinationRequestRepositoryPort,
+      readonly decisionTransport: DecisionTransportPort,
+    ) {}
+
+    computeDigest(payload: string): string {
+      return createHash('sha256').update(this.salt + payload).digest('hex');
+    }
+  }
+
+  const baseRecord = (overrides: Partial<CoordinationRequestRecord>): CoordinationRequestRecord => ({
+    id: 'placeholder',
+    projectId: 'proj-1',
+    kind: 'action-decision',
+    state: 'approved',
+    actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+    expectedHeadSha: null,
+    proposalDigest: 'sha256-proposal',
+    policyRevision: 'pol-rev-1',
+    decisionRevision: 'dec-rev-1',
+    grantId: 'grant-salted',
+    consumptions: [],
+    acknowledgements: [],
+    deliveryStatus: 'delivered',
+    deliveryGapReason: null,
+    revision: 1,
+    createdAtIso: NOW_ISO,
+    updatedAtIso: NOW_ISO,
+    ...overrides,
+  });
+
+  it('keeps the receiver of computeDigest for a shadow import grant', async () => {
+    const expiresAtIso = '2026-12-16T00:00:00Z';
+    const salted = (p: string): string => createHash('sha256').update(`receiver-salt:${p}`).digest('hex');
+    const record = baseRecord({
+      id: `shadow-import-${salted(
+        JSON.stringify({ scope: SHADOW_IMPORT_ACTION_SCOPE, owner: 'octo', repo: 'hello', expiresAtIso }),
+      )}`,
+      shadowImportGrant: { repository: { owner: 'octo', repo: 'hello' }, expiresAtIso },
+    });
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(record);
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase(
+      new SaltedDeps(requestRepo, signer.deps.decisionTransport),
+    ).resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      authorizationGrantId: 'grant-salted',
+      repository: { owner: 'octo', repo: 'hello' },
+    } as never);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-salted', requestId: record.id });
+  });
+
+  it('keeps the receiver of computeDigest for a relaunch-apply grant', async () => {
+    const proposalDigest = 'b'.repeat(64);
+    const createdAtIso = '2026-11-17T00:00:00.000Z';
+    const salted = (p: string): string => createHash('sha256').update(`receiver-salt:${p}`).digest('hex');
+    const record = baseRecord({
+      id: `${RELAUNCH_APPLY_DIGEST_PREFIX}${salted(
+        relaunchApplyDigestPayload({ projectId: RELAUNCH_APPLY_PROJECT_ID, proposalDigest, createdAtIso }),
+      )}`,
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      proposalDigest,
+      createdAtIso,
+      updatedAtIso: createdAtIso,
+    });
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(record);
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase(
+      new SaltedDeps(requestRepo, signer.deps.decisionTransport),
+    ).resolveActionAuthorization({
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      expectedHeadSha: '',
+      authorizationGrantId: 'grant-salted',
+      proposalDigest,
+    } as never);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-salted', requestId: record.id });
+  });
+});

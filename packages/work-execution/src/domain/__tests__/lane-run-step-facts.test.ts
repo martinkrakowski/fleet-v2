@@ -22,6 +22,7 @@ import {
   laneRunResultEntry,
   laneRunStopsIssued,
   laneRunTimedOut,
+  planGateFailedRetry,
 } from '../lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../lane-run-step-facts.js';
 import type { LaneRunKeyStep } from '../lane-run-records.js';
@@ -561,5 +562,250 @@ describe('a malformed run id', () => {
     expect(laneRunRefusedStep(entries, BAD_RUN_ID, 0)).toBeNull();
     expect(laneRunDispatchedAtIso(entries, BAD_RUN_ID, ATTEMPT)).toBeNull();
     expect(laneRunParkedConductCount(entries, BAD_RUN_ID)).toBe(0);
+  });
+});
+
+describe('planGateFailedRetry', () => {
+  function gateKeyOf(round: number, seatIndex: number, head12: string | null, retry: number | null): string {
+    return keyOf({ round, step: 'gate', seatIndex, head12, retry });
+  }
+
+  function failedEntries(parts: { round?: number; seatIndex?: number; head12?: string; retries?: number[]; reason?: LaneRunResultReasonCode } = {}): LaneRunJournalEntryRecord[] {
+    const round = parts.round ?? 0;
+    const seatIndex = parts.seatIndex ?? 0;
+    const head12 = parts.head12 ?? HEAD;
+    const reason = parts.reason ?? 'gate-failed';
+    const base = gateKeyOf(round, seatIndex, head12, null);
+    const out: LaneRunJournalEntryRecord[] = [intent(base)];
+    if (parts.retries === undefined || parts.retries.length === 0) {
+      out.push(result(base, 'completed', reason));
+      return out;
+    }
+    out.push(result(base, 'completed', parts.reason === undefined ? 'gate-failed' : reason));
+    for (const retry of parts.retries) {
+      const key = gateKeyOf(round, seatIndex, head12, retry);
+      out.push(intent(key));
+      out.push(result(key, 'completed', reason));
+    }
+    return out;
+  }
+
+  it('mints retry1 when the round\u2019s last gate intent settled gate-failed', () => {
+    const plan = planGateFailedRetry(failedEntries(), RUN_ID, 0);
+    expect(plan).toEqual({
+      kind: 'mint',
+      key: gateKeyOf(0, 0, HEAD, null) + '/retry1',
+      retry: 1,
+      head12: HEAD,
+      seatIndex: 0,
+    });
+  });
+
+  it('uses the LAST gate intent\u2019s head12 and seatIndex when the round has several heads', () => {
+    const entries = [
+      ...failedEntries({ head12: HEAD, seatIndex: 0 }),
+      ...failedEntries({ head12: OTHER_HEAD, seatIndex: 1 }),
+    ];
+    const plan = planGateFailedRetry(entries, RUN_ID, 0);
+    expect(plan).toEqual({
+      kind: 'mint',
+      key: gateKeyOf(0, 1, OTHER_HEAD, null) + '/retry1',
+      retry: 1,
+      head12: OTHER_HEAD,
+      seatIndex: 1,
+    });
+  });
+
+  it('mints past six congestion retries when the highest run settled gate-failed (the failed run is retry7, next is retry8)', () => {
+    // Six congestion retries (over their congested base run) never mint and
+    // never count; the failed run at retry7 is the highest, so next is 8.
+    const entries = failedEntries({ reason: 'gate-congested', retries: [1, 2, 3, 4, 5, 6] });
+    const failedKey = gateKeyOf(0, 0, HEAD, 7);
+    entries.push(intent(failedKey), result(failedKey, 'completed', 'gate-failed'));
+    const plan = planGateFailedRetry(entries, RUN_ID, 0);
+    expect(plan).toEqual({
+      kind: 'mint',
+      key: gateKeyOf(0, 0, HEAD, null) + '/retry8',
+      retry: 8,
+      head12: HEAD,
+      seatIndex: 0,
+    });
+  });
+
+  it('counts a retry whose predecessor failed but not one whose predecessor was congested', () => {
+    // base failed, retry1 congested (its predecessor failed: it counts),
+    // retry2 failed: failedRetries 1, next 3 — the congestion retry is not counted.
+    const entries = failedEntries();
+    const congestedKey = gateKeyOf(0, 0, HEAD, 1);
+    entries.push(intent(congestedKey), result(congestedKey, 'completed', 'gate-congested'));
+    const failedKey = gateKeyOf(0, 0, HEAD, 2);
+    entries.push(intent(failedKey), result(failedKey, 'completed', 'gate-failed'));
+    expect(planGateFailedRetry(entries, RUN_ID, 0)).toEqual({
+      kind: 'mint',
+      key: gateKeyOf(0, 0, HEAD, null) + '/retry3',
+      retry: 3,
+      head12: HEAD,
+      seatIndex: 0,
+    });
+  });
+
+  it('returns cap-reached with failedRetries 3 after three gate-failed-predecessor retries', () => {
+    const plan = planGateFailedRetry(failedEntries({ retries: [1, 2, 3] }), RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'cap-reached', failedRetries: 3, next: 4 });
+  });
+
+  it('returns cap-reached when next exceeds LANE_RUN_MAX_RETRY (eight congestion retries and a failed retry9)', () => {
+    const entries = failedEntries({ reason: 'gate-congested', retries: [1, 2, 3, 4, 5, 6, 7, 8] });
+    const failedKey = gateKeyOf(0, 0, HEAD, 9);
+    entries.push(intent(failedKey), result(failedKey, 'completed', 'gate-failed'));
+    const plan = planGateFailedRetry(entries, RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'cap-reached', failedRetries: 0, next: 10 });
+  });
+
+  it('returns none when the highest retry\u2019s final result is not gate-failed', () => {
+    for (const reason of ['gate-passed', 'gate-congested', 'gate-unknown', LANE_RUN_INTENT_ABANDONED_REASON_CODE] as const) {
+      expect(planGateFailedRetry(failedEntries({ reason }), RUN_ID, 0)).toEqual({ kind: 'none' });
+    }
+  });
+
+  it('returns none when the highest retry has no final result (pending) or only an ambiguous one', () => {
+    const base = gateKeyOf(0, 0, HEAD, null);
+    expect(planGateFailedRetry([intent(base)], RUN_ID, 0)).toEqual({ kind: 'none' });
+    expect(planGateFailedRetry([intent(base), result(base, 'ambiguous', 'gate-unknown')], RUN_ID, 0)).toEqual({ kind: 'none' });
+  });
+
+  it('returns none when the round has no gate intent or the last one carries no head', () => {
+    expect(planGateFailedRetry([], RUN_ID, 0)).toEqual({ kind: 'none' });
+    const otherRound = failedEntries({ round: 1 });
+    expect(planGateFailedRetry(otherRound, RUN_ID, 0)).toEqual({ kind: 'none' });
+  });
+
+  it('ignores another run\u2019s entries', () => {
+    const entries = failedEntries().map((entry) => (
+      entry.kind === 'conduct' ? entry : { ...entry, runId: OTHER_RUN_ID }
+    )) as LaneRunJournalEntryRecord[];
+    expect(planGateFailedRetry(entries, RUN_ID, 0)).toEqual({ kind: 'none' });
+  });
+
+  it('ignores a final result whose key matches but whose runId belongs to another run', () => {
+    // A result for the target key stamped with another run's id must never be
+    // read as this run's gate failure: the runId participates in the lookup.
+    const base = gateKeyOf(0, 0, HEAD, null);
+    const foreign = { ...result(base, 'completed', 'gate-failed'), runId: OTHER_RUN_ID };
+    expect(planGateFailedRetry([intent(base), foreign], RUN_ID, 0)).toEqual({ kind: 'none' });
+    // The same entries wholly under their own run still plan the retry, so the
+    // refusal above comes from the runId mismatch, not from the entries.
+    const foreignBase = { ...intent(base), runId: OTHER_RUN_ID };
+    const foreignResult = { ...result(base, 'completed', 'gate-failed'), runId: OTHER_RUN_ID };
+    // The key embeds the run id, so the foreign pair needs its own key.
+    const foreignKey = foreignBase.key === null ? null : foreignBase.key.replace(RUN_ID, OTHER_RUN_ID);
+    expect(planGateFailedRetry([{ ...foreignBase, key: foreignKey }, { ...foreignResult, key: foreignKey }], OTHER_RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 1 });
+  });
+
+  it('refuses a getter installed at an array index without running it', () => {
+    let getterRan = false;
+    const lying = intent(gateKeyOf(0, 0, HEAD, null));
+    const entries: unknown[] = [];
+    entries.length = 1;
+    Object.defineProperty(entries, 0, {
+      enumerable: true,
+      get: () => {
+        getterRan = true;
+        return lying;
+      },
+    });
+    // A plain gate-failed entry alone would mint; the accessor slot must not
+    // be read (no getter ever runs) and must not contribute a mintable entry.
+    const plan = planGateFailedRetry(entries, RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'none' });
+    expect(getterRan).toBe(false);
+  });
+
+  it('refuses the whole input when an accessor slot sits beside valid gate-failed entries', () => {
+    let reads = 0;
+    const entries: unknown[] = [...failedEntries(), undefined];
+    Object.defineProperty(entries, entries.length - 1, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return intent(gateKeyOf(0, 0, HEAD, null));
+      },
+    });
+    expect(planGateFailedRetry(entries, RUN_ID, 0)).toEqual({ kind: 'none' });
+    expect(reads).toBe(0);
+  });
+
+  it('refuses the whole input when an entry has an accessor field, getter or setter, never running it', () => {
+    let reads = 0;
+    for (const accessor of [
+      { get: () => { reads += 1; return 'x'; } },
+      { set: () => { reads += 1; } },
+    ]) {
+      const hostile: Record<string, unknown> = { kind: 'intent', runId: RUN_ID };
+      Object.defineProperty(hostile, 'key', { enumerable: true, ...accessor });
+      expect(planGateFailedRetry([...failedEntries(), hostile], RUN_ID, 0)).toEqual({ kind: 'none' });
+      expect(reads).toBe(0);
+    }
+  });
+
+  it('refuses the whole input when any entry carries a prototype-polluting own key, even with a valid gate-failed entry present', () => {
+    const polluting = JSON.parse('{"__proto__": {}, "kind": "intent"}') as object;
+    const plan = planGateFailedRetry([...failedEntries(), polluting], RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'none' });
+  });
+
+  it('refuses hostile inputs without throwing or running getters', () => {
+    const entry = intent(gateKeyOf(0, 0, HEAD, null));
+    const throwing: Record<string, unknown> = { kind: 'intent' };
+    Object.defineProperty(throwing, 'key', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    const holed: unknown[] = [entry, intent(gateKeyOf(0, 0, HEAD, 1))];
+    delete holed[0];
+    const huge: unknown[] = [];
+    huge.length = 100_001;
+    const badEntries: unknown[] = [
+      null,
+      undefined,
+      42,
+      'entries',
+      { length: 1, 0: entry }, // array-like, not an array
+      holed,
+      huge,
+      [entry, throwing],
+      [entry, JSON.parse('{"__proto__": {}, "kind": "intent"}') as object],
+    ];
+    for (const bad of badEntries) {
+      expect(planGateFailedRetry(bad, RUN_ID, 0)).toEqual({ kind: 'none' });
+    }
+    for (const badRunId of [null, undefined, 7, BAD_RUN_ID]) {
+      expect(planGateFailedRetry(failedEntries(), badRunId, 0)).toEqual({ kind: 'none' });
+    }
+    for (const badRound of [null, undefined, '0', 1.5, -1, 3, Number.NaN]) {
+      expect(planGateFailedRetry(failedEntries(), RUN_ID, badRound)).toEqual({ kind: 'none' });
+    }
+  });
+
+  it('refuses the whole input for a throwing-getter entry instead of planning from the rest', () => {
+    const base = gateKeyOf(0, 0, HEAD, null);
+    const throwing: Record<string, unknown> = { kind: 'intent' };
+    Object.defineProperty(throwing, 'key', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    const plan = planGateFailedRetry([throwing, intent(base), result(base, 'completed', 'gate-failed')], RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'none' });
+  });
+
+  it('stays under the cap for one or two gate-failed retries and mints the next retry', () => {
+    // A lone failed base run is under the cap: one mint is planned.
+    expect(planGateFailedRetry(failedEntries(), RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 1 });
+    // A failed base run plus two failed retries stays under the cap of three.
+    expect(planGateFailedRetry(failedEntries({ retries: [1, 2] }), RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 3 });
   });
 });

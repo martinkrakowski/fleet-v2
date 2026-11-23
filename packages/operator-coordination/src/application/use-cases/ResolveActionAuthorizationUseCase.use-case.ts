@@ -21,9 +21,13 @@ import {
   readReleaseNonce,
   releaseRootsAgree,
   isShadowImportActionScope,
+  isRelaunchApplyActionScope,
   isSignedDecisionRequired,
   releaseGrantDigestPayload,
   RELEASE_GRANT_DIGEST_PREFIX,
+  RELAUNCH_APPLY_ACTION_SCOPE,
+  RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS,
+  RELAUNCH_APPLY_PROJECT_ID,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   shadowImportDigestPayload,
@@ -215,6 +219,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         repository: snapshotRepository(snapshot['repository']),
       };
       return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
+    }
+    if (isRelaunchApplyActionScope(scope)) {
+      if (snapshot === null) {
+        return blocked('invalid-request');
+      }
+      // AR3a: the relaunch-apply resolve is head-free like the shadow import
+      // one. It reads only the descriptor-safe snapshot — never the original
+      // request — so no getter or Proxy trap can run after the freeze.
+      return this.resolveRelaunchApply(snapshot as unknown as ResolveActionAuthorizationRequest);
     }
     // Fix round 3 (BL02g): the non-shadow validation reads no field off the
     // original request. The emptiness check and the required-field values come
@@ -543,6 +556,97 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     // KEY0c2: a standing shadow import grant is also re-bound to a verified
     // signed answer when a decision transport is injected.
+    const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
+    if (signatureBlock !== null) {
+      return signatureBlock;
+    }
+    return {
+      outcome: 'authorized',
+      grantId,
+      requestId: candidate.getId(),
+      expectedHeadSha: '',
+      policyRevision: candidate.getPolicyRevision(),
+    };
+  }
+
+  /**
+   * AR3a: the explicit head-free resolve path for a standing
+   * `relaunch:apply` grant. The grant is bound to the plan digest it names —
+   * never a commit — to the one `relaunch` project id, and to a short capped
+   * expiry of `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days measured with the
+   * injected clock alone, never a request field, so a caller cannot backdate
+   * the clock past expiry. An unwired clock fails closed. Nothing is bound
+   * and no consumption is checked: a standing grant resolves until it expires
+   * or is revoked. The grant id and the plan digest are non-secret handles,
+   * but neither is ever echoed into a refusal reason.
+   */
+  private async resolveRelaunchApply(
+    request: ResolveActionAuthorizationRequest,
+  ): Promise<ResolveActionAuthorizationResult> {
+    // Cost bound: O(1) — a fixed count of field reads, one bounded 64-hex
+    // pattern test and two bounded ISO parses; nothing scales with input size.
+    if (!isFilled(request.projectId) || request.projectId.trim() !== RELAUNCH_APPLY_PROJECT_ID) {
+      return blocked('grant-wrong-project');
+    }
+    if (!isFilled(request.authorizationGrantId)) {
+      return blocked('grant-missing');
+    }
+    const grantId = request.authorizationGrantId.trim();
+    if (typeof request.proposalDigest !== 'string' || !/^[0-9a-f]{64}$/.test(request.proposalDigest)) {
+      return blocked('invalid-request');
+    }
+    if (this.deps?.shadowImportClock === undefined) {
+      return blocked('clock-unavailable');
+    }
+    const nowIso = this.deps.shadowImportClock.nowIso();
+    if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
+      return blocked('invalid-now-iso');
+    }
+    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
+    if (recorded === null) {
+      return blocked('grant-missing');
+    }
+    const refreshedResult = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshedResult.refusalReason !== undefined) {
+      // A pinned owner-key refusal blocks before any grant state is checked.
+      return blocked(refreshedResult.refusalReason);
+    }
+    const refreshed = refreshedResult.record;
+    if (refreshed.state === 'cancelled') {
+      return blocked('grant-revoked');
+    }
+    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
+      return blocked('grant-not-approved');
+    }
+    let candidate: CoordinationRequest;
+    try {
+      candidate = CoordinationRequest.fromRecord(refreshed);
+    } catch {
+      return blocked('grant-wrong-scope');
+    }
+    if (candidate.getActionScope() !== RELAUNCH_APPLY_ACTION_SCOPE || refreshed.expectedHeadSha !== null) {
+      return blocked('grant-wrong-scope');
+    }
+    if (refreshed.projectId !== RELAUNCH_APPLY_PROJECT_ID) {
+      return blocked('grant-wrong-project');
+    }
+    if (refreshed.proposalDigest !== request.proposalDigest) {
+      return blocked('grant-digest-mismatch');
+    }
+    // The expiry is measured with the trusted clock alone: a request-supplied
+    // `nowIso` can never revive an expired grant. The boundary is exclusive —
+    // exactly `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days after creation is
+    // already expired.
+    const createdAtMs = Date.parse(refreshed.createdAtIso);
+    const nowMs = Date.parse(nowIso);
+    if (
+      !Number.isFinite(createdAtMs) ||
+      nowMs >= createdAtMs + RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000
+    ) {
+      return blocked('grant-expired');
+    }
+    // A signed owner decision is re-verified before anything is authorized:
+    // the stored approved state alone is never authority.
     const signatureBlock = await this.verifyOwnerDecisionForRecord(candidate, refreshed);
     if (signatureBlock !== null) {
       return signatureBlock;

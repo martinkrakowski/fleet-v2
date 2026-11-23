@@ -12,6 +12,13 @@ export interface ResolveActionAuthorizationRequest {
   readonly expectedHeadSha: string;
   readonly authorizationGrantId?: string;
   /**
+   * The 64-lowercase-hex digest of the plan the relaunch-apply grant is bound
+   * to (AR3a). The grant is head-free: it authorizes a plan digest, never a
+   * commit. Only the relaunch-apply resolve reads it; a missing or malformed
+   * one fails closed as `invalid-request`.
+   */
+  readonly proposalDigest?: string;
+  /**
    * The attempt the action is for (CO24e). A grant that records an attempt must match it; an
    * owner grant that records none is bound to it by this resolve.
    */

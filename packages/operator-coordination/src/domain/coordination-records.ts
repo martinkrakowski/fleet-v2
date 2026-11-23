@@ -567,6 +567,26 @@ export function isShadowImportActionScope(actionScope: string): boolean {
   return actionScope === SHADOW_IMPORT_ACTION_SCOPE;
 }
 
+/**
+ * The exact scope of a relaunch-apply grant (AR3a): the head-free owner grant
+ * that authorizes relaunch apply. Like the shadow import grant it is head-free
+ * — bound by the plan digest it names, never by a commit — and it is short-
+ * lived: at most `RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS` days from its creation
+ * instant, revocable, and never consumable.
+ */
+export const RELAUNCH_APPLY_ACTION_SCOPE = 'relaunch:apply' as const;
+
+/** The only project id a relaunch-apply grant may be recorded under. */
+export const RELAUNCH_APPLY_PROJECT_ID = 'relaunch' as const;
+
+/** The longest time a relaunch-apply grant may live from its creation instant. */
+export const RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS = 7 as const;
+
+/** True only for the exact relaunch apply scope; any other scope is not a relaunch apply. */
+export function isRelaunchApplyActionScope(actionScope: string): boolean {
+  return actionScope === RELAUNCH_APPLY_ACTION_SCOPE;
+}
+
 const SHADOW_IMPORT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
 const SHADOW_IMPORT_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const SHADOW_IMPORT_EXPIRES_AT_PATTERN =

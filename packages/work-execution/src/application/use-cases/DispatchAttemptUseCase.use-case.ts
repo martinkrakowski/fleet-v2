@@ -44,9 +44,14 @@ import type { ExecutionObservationPort } from '../ports/out/ExecutionObservation
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import type {
+  IsStrictDescendantResult,
+  WorkspacePort,
+} from '../ports/out/WorkspacePort.out-port.js';
 import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
+import type { LaneDiffCheckPort } from '../ports/out/LaneDiffCheckPort.out-port.js';
+import { readBoundedDenseArray } from '../../domain/plain-record-reads.js';
 
 export interface DispatchAttemptDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
@@ -81,6 +86,41 @@ export interface DispatchAttemptDependencies {
    * unchanged.
    */
   readonly processTreeTermination?: ProcessTreeTerminationPort;
+  /**
+   * SN2: the lane diff check for a clean strict-descendant head adoption.
+   * Either a fixed check (legacy, single-host) or a per-recorded-host
+   * resolver; with neither wired, a descendant head is never adopted and the
+   * dispatch refuses with the existing head-mismatch refusal.
+   */
+  readonly laneDiffCheck?: LaneDiffCheckPort;
+  /** SN2: resolve the diff check through the dispatching runner's host. */
+  readonly laneDiffCheckFor?: (recorded: AttemptRunnerRecord | null) => LaneDiffCheckPort | null;
+  /** SN2: policy additions to the fixed protected-path list, passed through. */
+  readonly policyProtectedPaths?: readonly string[];
+}
+
+/**
+ * SN2: the bound on how many allowed path prefixes an adopted head's brief
+ * manifest may declare, shared with the edit-only commit. Cost:
+ * `readBoundedDenseArray` refuses a length above this cap in O(1) before any
+ * traversal, then O(cap) for the element checks.
+ */
+const ADOPTION_PREFIX_CAP = 4096;
+
+/** A non-empty string data value; the element check for adopted prefixes. */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * SN2: the commit-SHA shape a strict-descendant adoption accepts: 40 or 64
+ * lowercase hex, never all zeros. A short or abbreviated SHA cannot prove
+ * ancestry, so it keeps the existing refusal.
+ */
+const ADOPTION_COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function isAdoptableCommitSha(value: string): boolean {
+  return ADOPTION_COMMIT_SHA_PATTERN.test(value) && !/^0+$/.test(value);
 }
 
 /** Boolean capabilities a dispatch may require the runner to enforce. */
@@ -348,13 +388,48 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       // a legacy runner describes no host and keeps the configured executor.
       recordedHost: runner.describeRunner?.() ?? null,
     });
+    // SN2: a head that is not the expected checkout may still be adopted
+    // when it is a clean strict descendant of it and the lane diff check
+    // proves the change set clean. Every other case keeps the existing
+    // head-mismatch refusal, so prepare-dispatch never parks step-refused
+    // for a legitimate descendant commit.
+    let adoptedHead: string | null = null;
     if (!inspection.matchesBaseCommit) {
-      return {
-        outcome: 'refused',
-        reason: dispatchedOnPriorHead
-          ? `Worktree ${request.worktreePath} does not match the prior attempt's head (checked out ${inspection.checkedOutCommit})`
-          : `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
-      };
+      const checkedOutCommit = inspection.checkedOutCommit;
+      const recordedRunner = runner.describeRunner?.() ?? null;
+      const adoptable =
+        // A dirty worktree (even a handover) is never a clean adoption.
+        inspection.uncommittedPaths.length === 0 &&
+        inspection.untrackedPaths.length === 0 &&
+        this.deps.workspace.isStrictDescendant !== undefined &&
+        recordedRunner?.kind !== 'agy' &&
+        isAdoptableCommitSha(expectedCheckout) &&
+        isAdoptableCommitSha(checkedOutCommit) &&
+        expectedCheckout !== checkedOutCommit;
+      if (adoptable) {
+        let verdict: IsStrictDescendantResult;
+        try {
+          verdict = await this.deps.workspace.isStrictDescendant!({
+            worktreePath: request.worktreePath,
+            ancestorCommit: expectedCheckout,
+            descendantCommit: checkedOutCommit,
+            recordedHost: recordedRunner,
+          });
+        } catch (error) {
+          verdict = { outcome: 'unknown', reason: `isStrictDescendant threw: ${String(error)}` };
+        }
+        if (verdict.outcome === 'strict-descendant') {
+          adoptedHead = checkedOutCommit;
+        }
+      }
+      if (adoptedHead === null) {
+        return {
+          outcome: 'refused',
+          reason: dispatchedOnPriorHead
+            ? `Worktree ${request.worktreePath} does not match the prior attempt's head (checked out ${inspection.checkedOutCommit})`
+            : `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
+        };
+      }
     }
     // GB3a: a handed-over worktree is accepted as-is — the previous fix seat's
     // uncommitted or untracked work is intended, not a refusal. The head-match
@@ -481,6 +556,63 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         outcome: 'refused',
         reason: `Frozen brief digest mismatch for attempt ${request.attemptId}: the brief or its manifest changed after it was prepared; run 'brief prepare' again`,
       };
+    }
+
+    // SN2: an adopted head dispatches only on a brief whose manifest proves
+    // the change set's allowed paths and a lane diff check that reports the
+    // expected-checkout..adopted-head change set clean. Both run before any
+    // journal write, save or runner contact.
+    if (adoptedHead !== null) {
+      const densePrefixes = readBoundedDenseArray(parsedManifest['allowedPathPrefixes'], ADOPTION_PREFIX_CAP);
+      if (
+        densePrefixes === null ||
+        densePrefixes.length === 0 ||
+        !densePrefixes.array.every((entry) => isNonEmptyString(entry))
+      ) {
+        return {
+          outcome: 'refused',
+          reason:
+            "Frozen brief manifest 'allowedPathPrefixes' must be a non-empty bounded array of non-empty strings when a strict-descendant head is adopted",
+        };
+      }
+      const diffCheck =
+        this.deps.laneDiffCheckFor?.(runner.describeRunner?.() ?? null) ?? this.deps.laneDiffCheck ?? null;
+      if (diffCheck === null) {
+        return {
+          outcome: 'refused',
+          reason: `No lane diff check is wired for attempt ${request.attemptId}; a clean strict-descendant head cannot be adopted`,
+        };
+      }
+      let diffVerdict: Awaited<ReturnType<LaneDiffCheckPort['checkLaneDiff']>>;
+      try {
+        diffVerdict = await diffCheck.checkLaneDiff({
+          worktreePath: request.worktreePath,
+          baseCommit: expectedCheckout,
+          allowedPathPrefixes: densePrefixes.array as readonly string[],
+          ...(this.deps.policyProtectedPaths !== undefined
+            ? { policyProtectedPaths: this.deps.policyProtectedPaths }
+            : {}),
+        });
+      } catch {
+        return {
+          outcome: 'refused',
+          reason: `The lane diff check could not run for attempt ${request.attemptId}; the strict-descendant head was not adopted`,
+        };
+      }
+      if (diffVerdict.outcome === 'error') {
+        return {
+          outcome: 'refused',
+          reason: `The lane diff check could not run for attempt ${request.attemptId}; the strict-descendant head was not adopted`,
+        };
+      }
+      if (diffVerdict.outcome === 'findings') {
+        // Findings carry path, line and rule name only; a matched secret
+        // value is never echoed into the refusal.
+        return {
+          outcome: 'refused',
+          reason: `The lane diff check reported ${diffVerdict.findings.length} finding(s) against the adopted head; the strict-descendant head was not adopted`,
+        };
+      }
     }
 
     const manifestModelAssignment = parsedManifest.modelAssignment as
@@ -707,6 +839,20 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       sessionId: null,
       detail: 'Dispatch intent recorded before runner start',
     });
+
+    // SN2: an adopted head is journalled by name, next to the intent entry.
+    if (adoptedHead !== null) {
+      await appendJournalEntry(this.deps.journal, {
+        attemptId: request.attemptId,
+        workOrderId: request.workOrderId,
+        action: 'dispatch',
+        baseCommit: request.baseCommit,
+        recordedAtIso: nowIso,
+        status: 'intent-recorded',
+        sessionId: null,
+        detail: `Clean strict-descendant head adopted: expected checkout ${expectedCheckout}, adopted head ${adoptedHead}`,
+      });
+    }
 
     if (request.seatOverride) {
       await appendJournalEntry(this.deps.journal, {

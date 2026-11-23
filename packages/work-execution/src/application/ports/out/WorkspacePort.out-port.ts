@@ -447,9 +447,51 @@ export type ReadFilesystemSpaceResult =
   | { readonly outcome: 'read'; readonly freeBytes: number; readonly totalBytes: number }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
+/**
+ * SN2: the request of one strict-descendant probe. `ancestorCommit` is the
+ * expected checkout (the recorded base or the prior attempt's sealed head);
+ * `descendantCommit` is the commit the worktree currently has checked out.
+ */
+export interface IsStrictDescendantRequest {
+  /** The disposable worktree to probe. */
+  readonly worktreePath: string;
+  /** The commit the probe requires as an ancestor. */
+  readonly ancestorCommit: string;
+  /** The commit the probe requires as a strict descendant of the ancestor. */
+  readonly descendantCommit: string;
+  /**
+   * H9b2. The dispatching runner's recorded block: the probe runs on the
+   * host that holds the worktree. Absent or null keeps the configured
+   * executor (legacy mode).
+   */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+/**
+ * SN2: the answer of one strict-descendant probe. `refused` means the
+ * request itself was malformed and no command ran; `unknown` means the
+ * probe could not be answered (an executor error, a timeout or a git
+ * failure other than the ancestor answer); `not-descendant` is a real
+ * negative answer, including the equal-SHA case.
+ */
+export type IsStrictDescendantResult =
+  | { readonly outcome: 'strict-descendant' }
+  | { readonly outcome: 'not-descendant' }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' }
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
+
+  /**
+   * SN2: read-only probe of whether `descendantCommit` strictly descends
+   * from `ancestorCommit` in the given worktree (`git cat-file -t` on both,
+   * then `git merge-base --is-ancestor`). Never writes; a malformed request
+   * is `refused` before any command, and every unanswered probe is
+   * `unknown`, never a pass.
+   */
+  isStrictDescendant?(request: IsStrictDescendantRequest): Promise<IsStrictDescendantResult>;
 
   /**
    * GB3: preserve the worktree's uncommitted tracked edits as a patch file

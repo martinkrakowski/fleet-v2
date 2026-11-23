@@ -23,6 +23,8 @@ import * as path from 'node:path';
 
 import {
   WorktreePathRefusedError,
+  type IsStrictDescendantRequest,
+  type IsStrictDescendantResult,
   type RemoveUntrackedFilesRequest,
   type RemoveUntrackedFilesResult,
   type ResolveBaseTipRequest,
@@ -482,6 +484,46 @@ function snapshotRemoveUntrackedRequest(request: unknown): RemoveUntrackedFilesR
     return null;
   }
   return snap as unknown as RemoveUntrackedFilesRequest;
+}
+
+/**
+ * SN2: a bound, typed git commit SHA: 40 or 64 lowercase hex, never all
+ * zeros. Anything else cannot name a commit object.
+ */
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function isCommitSha(value: unknown): value is string {
+  return typeof value === 'string' && COMMIT_SHA_PATTERN.test(value) && !/^0+$/.test(value);
+}
+
+/**
+ * SN2: a descriptor-safe snapshot of one `isStrictDescendant` request. A
+ * null, a non-object, a request with a throwing getter, a non-enumerable or
+ * accessor key, or a prototype-polluting key reads as null; the caller
+ * answers `invalid-request` and never throws. Cost: `O(K)` own-key count
+ * plus `O(1)` field checks.
+ */
+function snapshotStrictDescendantRequest(request: unknown): IsStrictDescendantRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  if (!isBoundedAbsolutePath(snap['worktreePath'])) {
+    return null;
+  }
+  if (!isCommitSha(snap['ancestorCommit']) || !isCommitSha(snap['descendantCommit'])) {
+    return null;
+  }
+  const host = snap['recordedHost'];
+  if (host !== undefined && host !== null && typeof host !== 'object') {
+    return null;
+  }
+  return snap as unknown as IsStrictDescendantRequest;
 }
 
 /**
@@ -1409,6 +1451,71 @@ export class WorkspaceAdapter implements WorkspacePort {
       );
     }
     return result.stdout;
+  }
+
+  /**
+   * SN2: `git cat-file -t` on both commits, then `git merge-base
+   * --is-ancestor`. Every command runs through the recorded host's executor
+   * with the shared git budget. `exit 0` on the merge-base is the only pass;
+   * `exit 1` is a real negative; a command that never answered (`exitCode`
+   * null, an error or a timeout), a thrown executor rejection, a failed
+   * `cat-file`, or an empty type output is `unknown` — never a pass.
+   */
+  async isStrictDescendant(request: IsStrictDescendantRequest): Promise<IsStrictDescendantResult> {
+    const snap = snapshotStrictDescendantRequest(request);
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const { worktreePath } = snap;
+    const ancestorCommit = snap['ancestorCommit'] as string;
+    const descendantCommit = snap['descendantCommit'] as string;
+    if (ancestorCommit === descendantCommit) {
+      return { outcome: 'not-descendant' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(snap['recordedHost'] as AttemptRunnerRecord | null | undefined);
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the probe's executor could not be resolved: ${String(error)}` };
+    }
+    try {
+      for (const commit of [ancestorCommit, descendantCommit]) {
+        const type = await executor.run(['git', '-C', worktreePath, 'cat-file', '-t', commit], {
+          timeoutMs: GIT_TIMEOUT_MS,
+        });
+        if (type.exitCode === null || type.error !== undefined) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} never answered` };
+        }
+        if (type.exitCode !== 0) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} failed with exit ${String(type.exitCode)}` };
+        }
+        if (type.stdout.trim() === '') {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} answered with no type` };
+        }
+        if (type.stdout.trim() !== 'commit') {
+          return { outcome: 'not-descendant' };
+        }
+      }
+      const ancestor = await executor.run(
+        ['git', '-C', worktreePath, 'merge-base', '--is-ancestor', ancestorCommit, descendantCommit],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (ancestor.exitCode === null || ancestor.error !== undefined) {
+        return { outcome: 'unknown', reason: 'git merge-base --is-ancestor never answered' };
+      }
+      if (ancestor.exitCode === 0) {
+        return { outcome: 'strict-descendant' };
+      }
+      if (ancestor.exitCode === 1) {
+        return { outcome: 'not-descendant' };
+      }
+      return {
+        outcome: 'unknown',
+        reason: `git merge-base --is-ancestor failed with exit ${String(ancestor.exitCode)}`,
+      };
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the strict-descendant probe threw: ${String(error)}` };
+    }
   }
 
   /** Existence of one absolute path in the worktree's filesystem. */

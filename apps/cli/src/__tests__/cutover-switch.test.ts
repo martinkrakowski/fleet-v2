@@ -15,7 +15,7 @@ import { promisify } from 'node:util';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { parseInstallation, type FleetInstallation } from '@fleet/installation';
+import { parseInstallation, type FleetInstallation, type LoadResult } from '@fleet/installation';
 import {
   CUTOVER_SHADOW_CRITERIA,
   LaneRun,
@@ -23,6 +23,7 @@ import {
   ShadowEvidenceAdapter,
   type InventoryRelaunchResult,
   type ManageCutoverResult,
+  type MergeQueueEntryRecord,
 } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, summarizeInventoryForCutover, type FleetCliRuntime } from '../composition.js';
@@ -59,10 +60,11 @@ if (name.startsWith('run-')) {
 process.exit(0);
 `;
 
-function installation(root: string): FleetInstallation {
+function installation(root: string, policy?: unknown): FleetInstallation {
   const parsed = parseInstallation({
     schemaVersion: 2,
     forge: { mode: 'none' },
+    ...(policy === undefined ? {} : { policy }),
     hosts: {
       [HOST]: {
         transport: 'local',
@@ -96,6 +98,10 @@ interface Fixture {
 interface FixtureOptions {
   /** Real linked worktrees to create under the clone's worktree root. */
   readonly worktrees?: readonly string[];
+  /** A `policy` block parsed into the installation, so `daemon.mergePolicy` is configured. */
+  readonly policy?: unknown;
+  /** Overrides the installation load the merge-policy seam reads (SW2b3 unreadable-policy test). */
+  readonly mergePolicyLoad?: () => LoadResult;
 }
 
 async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -117,7 +123,12 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
   const ocmRunBin = path.join(root, 'ocm-run');
   writeFileSync(ocmRunBin, FAKE_OCM_RUN);
   chmodSync(ocmRunBin, 0o755);
-  const runtime = createFleetCliRuntime({ stateDir, installation: installation(root), ocmRunBin });
+  const runtime = createFleetCliRuntime({
+    stateDir,
+    installation: installation(root, options.policy),
+    ocmRunBin,
+    ...(options.mergePolicyLoad === undefined ? {} : { loadInstallationForMergePolicy: options.mergePolicyLoad }),
+  });
   return { root, stateDir, clonePath, worktreeRoot, runtime };
 }
 
@@ -284,6 +295,75 @@ async function listFileBytes(root: string): Promise<Map<string, string>> {
 
 async function snapshotState(dir: string): Promise<Map<string, string>> {
   return listFileBytes(dir);
+}
+
+/** Enqueues one merge-queue entry and parks it (SW2b3 shadow-park CLI tests). */
+let entrySequence = 700;
+const HEAD_OID = 'a'.repeat(40);
+/** The queue adapter validates deadlines against the real clock, so the test deadline lies ahead of it. */
+const QUEUE_DEADLINE = new Date(Date.now() + 600_000).toISOString();
+
+function ulid(n: number): string {
+  return '01JB' + String(n).padStart(22, '0');
+}
+
+async function seedParkedEntry(
+  fx: Fixture,
+  owner: string,
+  repo: string,
+  pr: number,
+  overrides: { readonly reason?: 'checks' | 'veto-hold'; readonly notBeforeIso?: string | null; readonly attempt?: number } = {},
+): Promise<MergeQueueEntryRecord> {
+  entrySequence += 1;
+  const queue = fx.runtime.execution.mergeQueueRepository;
+  const created = await queue.enqueueMergeEntry({
+    repository: { owner, repo },
+    pullRequest: pr,
+    headOid: HEAD_OID,
+    tier: 1,
+    enqueuedBy: 'cli',
+    runId: null,
+    entryId: ulid(entrySequence),
+    successorEntryId: ulid(entrySequence),
+    enqueuedAtIso: NOW,
+    deadlineIso: QUEUE_DEADLINE,
+  });
+  if (created.outcome !== 'created') throw new Error(`enqueue refused: ${created.outcome}`);
+  const parked = await queue.applyMergeTransition({
+    entryId: created.record.entryId,
+    expectedRevision: created.record.revision,
+    next: {
+      ...created.record,
+      revision: created.record.revision + 1,
+      state: 'parked',
+      reason: 'checks',
+      ...(overrides.notBeforeIso === undefined ? {} : { notBeforeIso: overrides.notBeforeIso }),
+      ...(overrides.attempt === undefined ? {} : { attempt: overrides.attempt }),
+    },
+    successor: null,
+    deadlineIso: QUEUE_DEADLINE,
+  });
+  if (parked.outcome !== 'applied') throw new Error(`park refused: ${parked.outcome}`);
+  if (overrides.reason === 'veto-hold') {
+    const vetoed = await queue.applyMergeTransition({
+      entryId: created.record.entryId,
+      expectedRevision: parked.record.revision,
+      next: { ...parked.record, revision: parked.record.revision + 1, state: 'parked', reason: 'veto-hold' },
+      successor: null,
+      deadlineIso: QUEUE_DEADLINE,
+    });
+    if (vetoed.outcome !== 'applied') throw new Error(`veto park refused: ${vetoed.outcome}`);
+    return vetoed.record;
+  }
+  return parked.record;
+}
+
+/** The seeds every switch must pass before its merge-policy and shadow-park phases run. */
+async function seedPassingPreflight(fx: Fixture): Promise<void> {
+  await registerRealCloneProfile(fx);
+  await seedProvenLane(fx, RUN_ID);
+  await seedShadowLedger(fx.stateDir);
+  await fx.runtime.daemon.pause.write(true, NOW);
 }
 
 /** One raw profile record shaped like the ghost profile below (registration refuses these shapes). */
@@ -833,4 +913,121 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     expect(code).toBe(1);
     expect(await snapshotState(fx.stateDir)).toEqual(before);
   });
+});
+
+describe('cutover switch merge-policy wiring (SW2b3)', () => {
+  /** A configured policy with no shadow repository: every listed repo is live. */
+  const LIVE_ONLY_POLICY = {
+    merge: { repos: { 'live-owner/live-repo': { projectId: 'proj-1', shadow: false } } },
+  };
+  /** One shadow repository (the parse default) and one live repository. */
+  const MIXED_POLICY = {
+    merge: {
+      repos: {
+        'shadow-owner/shadow-repo': { projectId: 'proj-1' },
+        'live-owner/live-repo': { projectId: 'proj-1', shadow: false },
+      },
+    },
+  };
+
+  it('completes with a configured merge policy that names no shadow repository', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID], policy: LIVE_ONLY_POLICY });
+    await seedPassingPreflight(fx);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      move: 'switch',
+      state: 'switched',
+      releasedParks: 0,
+      vetoHoldParks: 0,
+    });
+    expect(code).toBe(0);
+  });
+
+  it('counts a shadow veto-hold, releases nothing, and leaves a live-repo parked entry untouched', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID], policy: MIXED_POLICY });
+    await seedPassingPreflight(fx);
+    const vetoed = await seedParkedEntry(fx, 'shadow-owner', 'shadow-repo', 1, { reason: 'veto-hold' });
+    const live = await seedParkedEntry(fx, 'live-owner', 'live-repo', 2, { notBeforeIso: NOW, attempt: 2 });
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      move: 'switch',
+      state: 'switched',
+      releasedParks: 0,
+      vetoHoldParks: 1,
+    });
+    expect(code).toBe(0);
+    const listed = await fx.runtime.execution.mergeQueueRepository.listMergeEntries({ deadlineIso: QUEUE_DEADLINE });
+    const byId = new Map(listed.map((entry) => [entry.entryId, entry]));
+    expect(byId.get(vetoed.entryId)).toMatchObject({ state: 'parked', reason: 'veto-hold' });
+    // The live repository's parked entry is not the switch's to release: the
+    // first live daemon pass owns it, notBeforeIso and attempt history intact.
+    expect(byId.get(live.entryId)).toMatchObject({
+      state: 'parked',
+      reason: 'checks',
+      notBeforeIso: NOW,
+      attempt: 2,
+    });
+  });
+
+  it('answers unknown with merge-policy-unreadable when the installation merge policy is invalid', async () => {
+    const fx = await fixture({
+      worktrees: [RUN_ID],
+      mergePolicyLoad: () => ({ status: 'invalid', file: '/private/install.json', errors: ['invalid'] }),
+    });
+    await seedPassingPreflight(fx);
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toEqual({ outcome: 'unknown', reason: 'merge-policy-unreadable' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
+    await expect(fs.stat(path.join(fx.stateDir, 'shadow-park-journal.json'))).rejects.toThrow();
+  });
+
+  for (const [label, argv] of [
+    ['missing --expected-revision', ['cutover', 'switch', '--operation-id', 'op-1', '--relaunch-plan-digest', DIGEST]],
+    [
+      'malformed --expected-revision',
+      ['cutover', 'switch', '--expected-revision', 'abc', '--operation-id', 'op-1', '--relaunch-plan-digest', DIGEST],
+    ],
+    ['missing --operation-id', ['cutover', 'switch', '--expected-revision', '0', '--relaunch-plan-digest', DIGEST]],
+    [
+      'blank --operation-id',
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', '', '--relaunch-plan-digest', DIGEST],
+    ],
+    [
+      'missing --relaunch-plan-digest',
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1'],
+    ],
+    [
+      'malformed --relaunch-plan-digest',
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1', '--relaunch-plan-digest', 'zz'],
+    ],
+    [
+      'an unknown flag',
+      [
+        'cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1',
+        '--relaunch-plan-digest', DIGEST, '--nonsense',
+      ],
+    ],
+    [
+      'an extra positional',
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1', '--relaunch-plan-digest', DIGEST, 'extra'],
+    ],
+  ] as const) {
+    it(`refuses ${label} with exit 2 without touching state`, async () => {
+      const fx = await fixture({});
+      const before = await snapshotState(fx.stateDir);
+      const io = capture();
+      const code = await runCli(argv, io, fx.runtime);
+      expect(code).toBe(2);
+      expect(io.err.join('')).not.toBe('');
+      expect(await snapshotState(fx.stateDir)).toEqual(before);
+      await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+      await expect(fs.stat(path.join(fx.stateDir, 'shadow-park-journal.json'))).rejects.toThrow();
+    });
+  }
 });

@@ -257,7 +257,11 @@ export class CommitEditOnlyAttemptUseCase {
       dispatchHead = attempt.baseCommit;
     }
     const baseCommitForEntry = attempt.baseCommit;
-    const expectedHead = dispatchHead;
+    // SN2: a dispatch that adopted a clean strict-descendant head records it;
+    // that head, not the base or the prior head, is what the worktree is
+    // expected to be checked out at, so output left dirty after the adoption
+    // goes through the same scan, preserve and refuse path as any other.
+    const expectedHead = isNonEmptyString(attempt.adoptedHeadCommit) ? attempt.adoptedHeadCommit : dispatchHead;
     const nowIso = request.nowIso ?? new Date().toISOString();
 
     // SN1: a not-edit-only seat proceeds only when its worktree is still

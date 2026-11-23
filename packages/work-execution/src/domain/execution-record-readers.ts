@@ -591,6 +591,7 @@ interface AttemptOptionalFields {
   stopReason?: StopReasonValue;
   reviewerSeat?: string | null;
   dispatchedTimeLimitSeconds?: number;
+  adoptedHeadCommit?: string;
   ownerDecisionReferences?: readonly string[];
 }
 
@@ -673,6 +674,13 @@ function assignAttemptScalarFields(snap: Record<string, unknown>): AttemptOption
   const reviewerSeat = readOptionalReviewerSeat(snap.reviewerSeat);
   if (reviewerSeat !== undefined) {
     out.reviewerSeat = reviewerSeat;
+  }
+  const adoptedHeadCommit = readOptionalString(snap, 'adoptedHeadCommit');
+  if (adoptedHeadCommit !== undefined) {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(adoptedHeadCommit)) {
+      malformed();
+    }
+    out.adoptedHeadCommit = adoptedHeadCommit;
   }
   if (snap.ownerDecisionReferences !== undefined) {
     out.ownerDecisionReferences = copyNonEmptyStringArray(snap.ownerDecisionReferences);

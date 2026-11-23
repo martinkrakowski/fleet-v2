@@ -28,12 +28,17 @@ import type {
 } from '../src/application/ports/out/CommandExecutorPort.out-port.js';
 import type { IsStrictDescendantRequest } from '../src/application/ports/out/WorkspacePort.out-port.js';
 import { WorkspaceAdapter } from '../src/infrastructure/adapters/WorkspaceAdapter.adapter.js';
+import { GIT_CONFIG_ARGS } from '../src/infrastructure/adapters/LaneDiffCheckAdapter.adapter.js';
 
 const ANCESTOR = 'a'.repeat(40);
 const DESCENDANT = 'b'.repeat(40);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 const HARDENED = [
   'env',
+  '-u',
+  'GIT_CONFIG_COUNT',
+  '-u',
+  'GIT_CONFIG_PARAMETERS',
   'GIT_NO_REPLACE_OBJECTS=1',
   'GIT_GRAFT_FILE=/nonexistent/fleet-v2-ancestry-probe-no-grafts',
   'git',
@@ -84,10 +89,10 @@ describe('WorkspaceAdapter.isStrictDescendant (SN2)', () => {
     const result = await makeAdapter(port).isStrictDescendant(validRequest());
     expect(result).toEqual({ outcome: 'strict-descendant' });
     expect(calls).toEqual([
-      [...HARDENED, '-C', WORKTREE, 'cat-file', '-t', ANCESTOR],
-      [...HARDENED, '-C', WORKTREE, 'cat-file', '-t', DESCENDANT],
-      [...HARDENED, '-C', WORKTREE, 'merge-base', '--is-ancestor', ANCESTOR, DESCENDANT],
-      [...HARDENED, '-C', WORKTREE, 'rev-list', '--min-parents=2', '--max-count=1', `${ANCESTOR}..${DESCENDANT}`],
+      [...HARDENED, '-C', WORKTREE, ...GIT_CONFIG_ARGS, 'cat-file', '-t', ANCESTOR],
+      [...HARDENED, '-C', WORKTREE, ...GIT_CONFIG_ARGS, 'cat-file', '-t', DESCENDANT],
+      [...HARDENED, '-C', WORKTREE, ...GIT_CONFIG_ARGS, 'merge-base', '--is-ancestor', ANCESTOR, DESCENDANT],
+      [...HARDENED, '-C', WORKTREE, ...GIT_CONFIG_ARGS, 'rev-list', '--min-parents=2', '--max-count=1', `${ANCESTOR}..${DESCENDANT}`],
     ]);
   });
 

@@ -19,6 +19,7 @@
  * of the transport decision (documented, tested change).
  */
 
+import { GIT_CONFIG_ARGS } from './LaneDiffCheckAdapter.adapter.js';
 import * as path from 'node:path';
 
 import {
@@ -562,11 +563,22 @@ function snapshotRecordedHost(value: unknown): AttemptRunnerRecord | null | unde
  */
 const ANCESTRY_GIT_PREFIX = [
   'env',
+  // Ambient config injected through the environment is cleared, like the
+  // lane diff check's pinned `-c` overrides that follow `-C <worktree>`.
+  '-u',
+  'GIT_CONFIG_COUNT',
+  '-u',
+  'GIT_CONFIG_PARAMETERS',
   'GIT_NO_REPLACE_OBJECTS=1',
   'GIT_GRAFT_FILE=/nonexistent/fleet-v2-ancestry-probe-no-grafts',
   'git',
   '--no-replace-objects',
 ] as const;
+
+/** The full hardened argv of one ancestry-probe git command. */
+function ancestryGitArgv(worktreePath: string, argv: readonly string[]): string[] {
+  return [...ANCESTRY_GIT_PREFIX, '-C', worktreePath, ...GIT_CONFIG_ARGS, ...argv];
+}
 
 /**
  * SN2: a descriptor-safe snapshot of one `isStrictDescendant` request. A
@@ -1553,7 +1565,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
     try {
       for (const commit of [ancestorCommit, descendantCommit]) {
-        const type = await executor.run([...ANCESTRY_GIT_PREFIX, '-C', worktreePath, 'cat-file', '-t', commit], {
+        const type = await executor.run(ancestryGitArgv(worktreePath, ['cat-file', '-t', commit]), {
           timeoutMs: GIT_TIMEOUT_MS,
         });
         if (type.exitCode === null || type.error !== undefined) {
@@ -1570,7 +1582,7 @@ export class WorkspaceAdapter implements WorkspacePort {
         }
       }
       const ancestor = await executor.run(
-        [...ANCESTRY_GIT_PREFIX, '-C', worktreePath, 'merge-base', '--is-ancestor', ancestorCommit, descendantCommit],
+        ancestryGitArgv(worktreePath, ['merge-base', '--is-ancestor', ancestorCommit, descendantCommit]),
         { timeoutMs: GIT_TIMEOUT_MS },
       );
       if (ancestor.exitCode === null || ancestor.error !== undefined) {
@@ -1604,15 +1616,12 @@ export class WorkspaceAdapter implements WorkspacePort {
     descendantCommit: string,
   ): Promise<IsStrictDescendantResult> {
     const merges = await executor.run(
-      [
-        ...ANCESTRY_GIT_PREFIX,
-        '-C',
-        worktreePath,
+      ancestryGitArgv(worktreePath, [
         'rev-list',
         '--min-parents=2',
         '--max-count=1',
         `${ancestorCommit}..${descendantCommit}`,
-      ],
+      ]),
       { timeoutMs: GIT_TIMEOUT_MS },
     );
     if (merges.exitCode === null || merges.error !== undefined) {

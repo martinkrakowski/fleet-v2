@@ -56,6 +56,8 @@ import type {
   LaneDiffCheckPort,
   LaneDiffCheckRequest,
   LaneDiffCheckResult,
+  LaneDiffCommitRangeRequest,
+  LaneDiffCommitRangeResult,
 } from '../src/application/ports/out/LaneDiffCheckPort.out-port.js';
 import { DispatchAttemptUseCase } from '../src/application/use-cases/DispatchAttemptUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../src/application/use-cases/PrepareBriefPackageUseCase.use-case.js';
@@ -255,14 +257,23 @@ function makeWorkspace(options: {
   return { port, descendantCalls };
 }
 
-function makeDiffCheck(answer: LaneDiffCheckResult): { port: LaneDiffCheckPort; calls: LaneDiffCheckRequest[] } {
+function makeDiffCheck(
+  answer: LaneDiffCheckResult,
+  rangeAnswer: LaneDiffCommitRangeResult = { outcome: 'clean' },
+): { port: LaneDiffCheckPort; calls: LaneDiffCheckRequest[]; rangeCalls: LaneDiffCommitRangeRequest[] } {
   const calls: LaneDiffCheckRequest[] = [];
+  const rangeCalls: LaneDiffCommitRangeRequest[] = [];
   return {
     calls,
+    rangeCalls,
     port: {
       async checkLaneDiff(request) {
         calls.push(request);
         return answer;
+      },
+      async checkLaneDiffCommitRange(request) {
+        rangeCalls.push(request);
+        return rangeAnswer;
       },
     },
   };
@@ -533,9 +544,13 @@ describe('DispatchAttemptUseCase adopts a clean strict-descendant head (SN2)', (
       const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
       const setup = makeSetup({ workspace, laneDiffCheck: makeDiffCheck(answer).port });
       const reason = headMismatch(await setup.useCase.dispatchAttempt(dispatchRequest()));
-      // The refusal names the outcome only; matched secret values never leak.
-      expect(reason).toContain('lane diff check');
-      expect(reason).not.toContain('example-secret-value');
+      // The refusal is exactly one of the two fixed texts: it names the count
+      // or the failure to run, never a path, a rule or any matched value.
+      const expected =
+        answer.outcome === 'findings'
+          ? 'The lane diff check reported 1 finding(s) against the adopted head; the strict-descendant head was not adopted'
+          : `The lane diff check could not run for attempt attempt-1; the strict-descendant head was not adopted`;
+      expect(reason).toBe(expected);
       expect(setup.startCalls).toEqual([]);
       expect(setup.journal.entries.some((entry) => entry.detail.includes('strict-descendant'))).toBe(false);
     }
@@ -590,5 +605,173 @@ describe('DispatchAttemptUseCase adopts a clean strict-descendant head (SN2)', (
       expect(setup.startCalls).toEqual([]);
       expect(setup.journal.entries.some((entry) => entry.detail.includes('strict-descendant'))).toBe(false);
     }
+  });
+
+  it('adopts a clean strict descendant of the prior attempt head and journals the prior head as the expected checkout', async () => {
+    const PRIOR = 'c'.repeat(40);
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const diff = makeDiffCheck({ outcome: 'clean' });
+    const setup = makeSetup({ workspace, laneDiffCheck: diff.port });
+    setup.attemptRepo.attempts.set('prior-1', {
+      id: 'prior-1',
+      workOrderId: 'wo-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE,
+      baseCommit: BASE,
+      state: 'collected',
+      outcome: null,
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: { headCommit: PRIOR, commitsSinceBase: [], collectedArtifactPaths: [], notes: 'present' },
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    setup.attemptRepo.attempts.set('attempt-1', {
+      id: 'attempt-1',
+      workOrderId: 'wo-1',
+      kind: 'fix',
+      fixNumber: 1,
+      priorAttemptId: 'prior-1',
+      worktreePath: WORKTREE,
+      baseCommit: BASE,
+      state: 'created',
+      outcome: null,
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    const result = await setup.useCase.dispatchAttempt(dispatchRequest());
+    expect(result.outcome).toBe('started');
+    expect(workspace.descendantCalls[0]?.ancestorCommit).toBe(PRIOR);
+    expect(diff.calls[0]?.baseCommit).toBe(PRIOR);
+    expect(diff.rangeCalls[0]).toMatchObject({ baseCommit: PRIOR, headCommit: DESCENDANT });
+    const adoption = setup.journal.entries.find((entry) => entry.detail.includes('strict-descendant'));
+    expect(adoption?.detail).toContain(`expected checkout ${PRIOR}`);
+    expect(setup.attemptRepo.attempts.get('attempt-1')?.adoptedHeadCommit).toBe(DESCENDANT);
+  });
+
+  it('records the adopted head on the saved attempt so collection can re-baseline on it', async () => {
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const setup = makeSetup({ workspace, laneDiffCheck: makeDiffCheck({ outcome: 'clean' }).port });
+    expect((await setup.useCase.dispatchAttempt(dispatchRequest())).outcome).toBe('started');
+    expect(setup.attemptRepo.saved.length).toBeGreaterThan(0);
+    expect(setup.attemptRepo.saved.every((record) => record.adoptedHeadCommit === DESCENDANT)).toBe(true);
+  });
+
+  it('refuses adoption when the per-commit range scan finds a finding the final tree does not have', async () => {
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const diff = makeDiffCheck(
+      { outcome: 'clean' },
+      { outcome: 'findings', findings: [{ path: 'packages/example/src/a.ts', line: 1, rule: 'github-token' }] },
+    );
+    const setup = makeSetup({ workspace, laneDiffCheck: diff.port });
+    const reason = headMismatch(await setup.useCase.dispatchAttempt(dispatchRequest()));
+    expect(reason).toBe(
+      'The lane diff check reported 1 finding(s) against the adopted head; the strict-descendant head was not adopted',
+    );
+    expect(diff.rangeCalls).toHaveLength(1);
+    expect(setup.startCalls).toEqual([]);
+    expect(setup.journal.entries.some((entry) => entry.detail.includes('strict-descendant'))).toBe(false);
+  });
+
+  it('refuses adoption with a typed refusal when the range is too large, and when the check has no range scan', async () => {
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const tooLarge = makeDiffCheck({ outcome: 'clean' }, { outcome: 'range-too-large', limit: 'commits' });
+    const setupLarge = makeSetup({ workspace, laneDiffCheck: tooLarge.port });
+    expect(headMismatch(await setupLarge.useCase.dispatchAttempt(dispatchRequest()))).toBe(
+      'The adopted range exceeds the commits budget; the strict-descendant head was not adopted',
+    );
+    expect(setupLarge.startCalls).toEqual([]);
+    const noRange: LaneDiffCheckPort = {
+      async checkLaneDiff() {
+        return { outcome: 'clean' };
+      },
+    };
+    const setupNone = makeSetup({ workspace: makeWorkspace({ checkedOutCommit: DESCENDANT }), laneDiffCheck: noRange });
+    expect(headMismatch(await setupNone.useCase.dispatchAttempt(dispatchRequest()))).toContain(
+      'cannot scan the commit range',
+    );
+    expect(setupNone.startCalls).toEqual([]);
+  });
+
+  it('never invokes a getter on the runner description and refuses adoption instead of falling back', async () => {
+    let getterRuns = 0;
+    const hostile = {
+      kind: 'opencode',
+      remotePort: 4166,
+      host: null,
+      hostName: null,
+      agent: null,
+      variant: null,
+      get model(): string {
+        getterRuns += 1;
+        return 'model-example-1';
+      },
+    } as unknown as AttemptRunnerRecord;
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const diff = makeDiffCheck({ outcome: 'clean' });
+    const forCalls: unknown[] = [];
+    const fallbackCheck = makeDiffCheck({ outcome: 'clean' });
+    const attemptRepo = makeAttemptRepo();
+    const journal = makeJournal();
+    const runner = makeRunner(() => hostile);
+    const useCase = new DispatchAttemptUseCase({
+      workOrderRepo: makeWorkOrderRepo(),
+      attemptRepo,
+      journal,
+      workspace: {
+        ...workspace.port,
+        // The ancestry probe is the workspace's own snapshotting concern; this
+        // test is about what the dispatch hands the host resolver.
+        isStrictDescendant: async () => ({ outcome: 'strict-descendant' }),
+      },
+      runner: runner.port,
+      laneDiffCheck: fallbackCheck.port,
+      laneDiffCheckFor: (recorded) => {
+        forCalls.push(recorded);
+        return diff.port;
+      },
+    });
+    await journal.saveCapacityReservation({
+      id: 'res-1',
+      attemptId: 'attempt-1',
+      hostId: 'host-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+    const result = await useCase.dispatchAttempt(dispatchRequest());
+    expect(result.outcome).toBe('refused');
+    expect(getterRuns).toBe(0);
+    expect(forCalls).toEqual([]);
+    expect(fallbackCheck.calls).toEqual([]);
+    expect(runner.startCalls).toEqual([]);
+  });
+
+  it('hands the host resolver a plain-data copy of the runner description, not the live object', async () => {
+    const workspace = makeWorkspace({ checkedOutCommit: DESCENDANT });
+    const diff = makeDiffCheck({ outcome: 'clean' });
+    const forCalls: unknown[] = [];
+    const setup = makeSetup({
+      workspace,
+      laneDiffCheckFor: (recorded) => {
+        forCalls.push(recorded);
+        return diff.port;
+      },
+    });
+    expect((await setup.useCase.dispatchAttempt(dispatchRequest())).outcome).toBe('started');
+    expect(forCalls).toHaveLength(1);
+    expect(forCalls[0]).toEqual(OPENCODE_RUNNER_RECORD);
+    expect(forCalls[0]).not.toBe(OPENCODE_RUNNER_RECORD);
   });
 });

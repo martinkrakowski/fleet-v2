@@ -50,8 +50,8 @@ import type {
 } from '../ports/out/WorkspacePort.out-port.js';
 import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
-import type { LaneDiffCheckPort } from '../ports/out/LaneDiffCheckPort.out-port.js';
-import { readBoundedDenseArray } from '../../domain/plain-record-reads.js';
+import type { LaneDiffCheckPort, LaneDiffCommitRangeResult } from '../ports/out/LaneDiffCheckPort.out-port.js';
+import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 
 export interface DispatchAttemptDependencies {
   readonly workOrderRepo: WorkOrderRepositoryPort;
@@ -118,6 +118,31 @@ function isNonEmptyString(value: unknown): value is string {
  * ancestry, so it keeps the existing refusal.
  */
 const ADOPTION_COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** Sentinel: the runner's description was not plain data. */
+const INVALID_RUNNER_DESCRIPTION = Symbol('invalid-runner-description');
+
+/**
+ * SN2: one fresh `describeRunner()` result as plain data before it reaches
+ * the host resolver: absent and null pass through as null; anything else must
+ * be a plain object of enumerable data properties (no getter ever runs), and
+ * is copied. Cost: `O(K)` own keys.
+ */
+function snapshotRunnerDescription(
+  runner: ExecutionRunnerPort,
+): AttemptRunnerRecord | null | typeof INVALID_RUNNER_DESCRIPTION {
+  let raw: unknown;
+  try {
+    raw = runner.describeRunner?.();
+  } catch {
+    return INVALID_RUNNER_DESCRIPTION;
+  }
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  const snap = snapshotPlainDataRecord(raw);
+  return snap === null ? INVALID_RUNNER_DESCRIPTION : ({ ...snap } as unknown as AttemptRunnerRecord);
+}
 
 function isAdoptableCommitSha(value: string): boolean {
   return ADOPTION_COMMIT_SHA_PATTERN.test(value) && !/^0+$/.test(value);
@@ -559,59 +584,20 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     }
 
     // SN2: an adopted head dispatches only on a brief whose manifest proves
-    // the change set's allowed paths and a lane diff check that reports the
-    // expected-checkout..adopted-head change set clean. Both run before any
-    // journal write, save or runner contact.
+    // the change set's allowed paths, a lane diff check that reports the
+    // expected-checkout..adopted-head change set clean, and a per-commit scan
+    // of every commit in the range. All run before any journal write, save or
+    // runner contact.
     if (adoptedHead !== null) {
-      const densePrefixes = readBoundedDenseArray(parsedManifest['allowedPathPrefixes'], ADOPTION_PREFIX_CAP);
-      if (
-        densePrefixes === null ||
-        densePrefixes.length === 0 ||
-        !densePrefixes.array.every((entry) => isNonEmptyString(entry))
-      ) {
-        return {
-          outcome: 'refused',
-          reason:
-            "Frozen brief manifest 'allowedPathPrefixes' must be a non-empty bounded array of non-empty strings when a strict-descendant head is adopted",
-        };
-      }
-      const diffCheck =
-        this.deps.laneDiffCheckFor?.(runner.describeRunner?.() ?? null) ?? this.deps.laneDiffCheck ?? null;
-      if (diffCheck === null) {
-        return {
-          outcome: 'refused',
-          reason: `No lane diff check is wired for attempt ${request.attemptId}; a clean strict-descendant head cannot be adopted`,
-        };
-      }
-      let diffVerdict: Awaited<ReturnType<LaneDiffCheckPort['checkLaneDiff']>>;
-      try {
-        diffVerdict = await diffCheck.checkLaneDiff({
-          worktreePath: request.worktreePath,
-          baseCommit: expectedCheckout,
-          allowedPathPrefixes: densePrefixes.array as readonly string[],
-          ...(this.deps.policyProtectedPaths !== undefined
-            ? { policyProtectedPaths: this.deps.policyProtectedPaths }
-            : {}),
-        });
-      } catch {
-        return {
-          outcome: 'refused',
-          reason: `The lane diff check could not run for attempt ${request.attemptId}; the strict-descendant head was not adopted`,
-        };
-      }
-      if (diffVerdict.outcome === 'error') {
-        return {
-          outcome: 'refused',
-          reason: `The lane diff check could not run for attempt ${request.attemptId}; the strict-descendant head was not adopted`,
-        };
-      }
-      if (diffVerdict.outcome === 'findings') {
-        // Findings carry path, line and rule name only; a matched secret
-        // value is never echoed into the refusal.
-        return {
-          outcome: 'refused',
-          reason: `The lane diff check reported ${diffVerdict.findings.length} finding(s) against the adopted head; the strict-descendant head was not adopted`,
-        };
+      const adoptionRefusal = await this.verifyAdoption(
+        request,
+        runner,
+        expectedCheckout,
+        adoptedHead,
+        parsedManifest,
+      );
+      if (adoptionRefusal !== null) {
+        return adoptionRefusal;
       }
     }
 
@@ -886,9 +872,16 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // must not survive a re-dispatch, so the field is removed from the prior
     // record first; it is added back only when the new request carries a
     // positive safe integer.
-    const { dispatchedTimeLimitSeconds: _staleDispatchedTimeLimitSeconds, ...previousAttemptBase } =
-      existingAttempt ?? ({} as AttemptRecord);
+    const {
+      dispatchedTimeLimitSeconds: _staleDispatchedTimeLimitSeconds,
+      adoptedHeadCommit: _staleAdoptedHeadCommit,
+      ...previousAttemptBase
+    } = existingAttempt ?? ({} as AttemptRecord);
     void _staleDispatchedTimeLimitSeconds;
+    void _staleAdoptedHeadCommit;
+    // SN2: the adopted head is recorded so collection treats it as the
+    // expected head; a re-dispatch that adopts nothing leaves it absent.
+    const adoptedHeadField = adoptedHead !== null ? { adoptedHeadCommit: adoptedHead } : {};
     const dispatchedTimeLimitField =
       Number.isSafeInteger(request.timeLimitSeconds) && request.timeLimitSeconds > 0
         ? { dispatchedTimeLimitSeconds: request.timeLimitSeconds }
@@ -911,6 +904,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           ownerDecisionReferences,
           ...seatBinding.fields,
           ...dispatchedTimeLimitField,
+          ...adoptedHeadField,
           updatedAtIso: nowIso,
         }
       : {
@@ -936,6 +930,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           ownerDecisionReferences,
           ...seatBinding.fields,
           ...dispatchedTimeLimitField,
+          ...adoptedHeadField,
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };
@@ -1166,6 +1161,91 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         seatSelection: seatSelectionRecord('first-pass', seatIndex, plan.getSeats('first-pass')[seatIndex]),
       },
     };
+  }
+
+  /**
+   * SN2: the adoption checks that need the frozen manifest: the allowed path
+   * prefixes, the final-tree lane diff check and the per-commit range scan.
+   * Returns a refusal, or null when the adopted head may dispatch. Findings
+   * carry path, line and rule only; a matched value is never echoed.
+   */
+  private async verifyAdoption(
+    request: DispatchAttemptRequest,
+    runner: ExecutionRunnerPort,
+    expectedCheckout: string,
+    adoptedHead: string,
+    parsedManifest: Record<string, unknown>,
+  ): Promise<DispatchAttemptResult | null> {
+    const densePrefixes = readBoundedDenseArray(parsedManifest['allowedPathPrefixes'], ADOPTION_PREFIX_CAP);
+    if (
+      densePrefixes === null ||
+      densePrefixes.length === 0 ||
+      !densePrefixes.array.every((entry) => isNonEmptyString(entry))
+    ) {
+      return {
+        outcome: 'refused',
+        reason:
+          "Frozen brief manifest 'allowedPathPrefixes' must be a non-empty bounded array of non-empty strings when a strict-descendant head is adopted",
+      };
+    }
+    const recorded = snapshotRunnerDescription(runner);
+    if (recorded === INVALID_RUNNER_DESCRIPTION) {
+      return { outcome: 'refused', reason: `The runner description for attempt ${request.attemptId} is not plain data; the strict-descendant head was not adopted` };
+    }
+    const deps = this.deps!;
+    const resolvedCheck = deps.laneDiffCheckFor?.(recorded) ?? deps.laneDiffCheck ?? null;
+    if (resolvedCheck === null) {
+      return {
+        outcome: 'refused',
+        reason: `No lane diff check is wired for attempt ${request.attemptId}; a clean strict-descendant head cannot be adopted`,
+      };
+    }
+    const diffCheck: LaneDiffCheckPort = resolvedCheck;
+    const notAdopted = `The lane diff check could not run for attempt ${request.attemptId}; the strict-descendant head was not adopted`;
+    const scanRequest = {
+      worktreePath: request.worktreePath,
+      baseCommit: expectedCheckout,
+      allowedPathPrefixes: densePrefixes.array as readonly string[],
+      ...(deps.policyProtectedPaths !== undefined ? { policyProtectedPaths: deps.policyProtectedPaths } : {}),
+    };
+    const finalTree = await this.runAdoptionScan(() => diffCheck.checkLaneDiff(scanRequest), notAdopted);
+    if (finalTree !== null) {
+      return finalTree;
+    }
+    if (diffCheck.checkLaneDiffCommitRange === undefined) {
+      return { outcome: 'refused', reason: `${notAdopted}: the lane diff check cannot scan the commit range` };
+    }
+    const rangeCheck = diffCheck.checkLaneDiffCommitRange.bind(diffCheck);
+    return this.runAdoptionScan(() => rangeCheck({ ...scanRequest, headCommit: adoptedHead }), notAdopted);
+  }
+
+  /** Run one scan; any verdict but `clean`, or a throw, is a refusal. */
+  private async runAdoptionScan(
+    scan: () => Promise<LaneDiffCommitRangeResult>,
+    notAdopted: string,
+  ): Promise<DispatchAttemptResult | null> {
+    let verdict: LaneDiffCommitRangeResult;
+    try {
+      verdict = await scan();
+    } catch {
+      return { outcome: 'refused', reason: notAdopted };
+    }
+    if (verdict.outcome === 'clean') {
+      return null;
+    }
+    if (verdict.outcome === 'findings') {
+      return {
+        outcome: 'refused',
+        reason: `The lane diff check reported ${verdict.findings.length} finding(s) against the adopted head; the strict-descendant head was not adopted`,
+      };
+    }
+    if (verdict.outcome === 'range-too-large') {
+      return {
+        outcome: 'refused',
+        reason: `The adopted range exceeds the ${verdict.limit} budget; the strict-descendant head was not adopted`,
+      };
+    }
+    return { outcome: 'refused', reason: notAdopted };
   }
 
   /**

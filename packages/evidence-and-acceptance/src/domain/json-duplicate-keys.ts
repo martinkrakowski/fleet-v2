@@ -123,9 +123,8 @@ function decodeStringBody(body: string): string | null {
 
 type Refusal = { readonly ok: false; readonly reason: JsonDuplicateKeyRefusal };
 
-const INVALID_JSON: Refusal = { ok: false, reason: 'invalid-json' };
-const INVALID_INPUT: Refusal = { ok: false, reason: 'invalid-input' };
-const DUPLICATE_KEY: Refusal = { ok: false, reason: 'duplicate-key' };
+/** Fresh object per call: a caller mutating one result must not affect later calls. */
+const refuse = (reason: JsonDuplicateKeyRefusal): Refusal => ({ ok: false, reason });
 
 /** Mutable scanner position shared by the step helpers. */
 interface ScanContext {
@@ -190,14 +189,14 @@ function scanStringBody(ctx: ScanContext): string | null {
 function acceptKey(ctx: ScanContext, body: string): StepResult {
   const top = topOf(ctx.stack);
   if (top === undefined || !top.isObject) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   const key = decodeStringBody(body);
   if (key === null) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   if (top.keys.has(key)) {
-    return DUPLICATE_KEY;
+    return refuse('duplicate-key');
   }
   top.keys.add(key);
   ctx.state = 'expect-colon';
@@ -208,7 +207,7 @@ function acceptStringValue(ctx: ScanContext, body: string): StepResult {
   // String values are decoded too, so an invalid escape or a raw
   // control character inside a value is refused like JSON.parse would.
   if (decodeStringBody(body) === null) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   markArrayValue(ctx.stack);
   ctx.state = stateAfterValue(ctx.stack);
@@ -219,7 +218,7 @@ function stepString(ctx: ScanContext): StepResult {
   ctx.index += 1;
   const body = scanStringBody(ctx);
   if (body === null) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   if (isKeyState(ctx.state)) {
     return acceptKey(ctx, body);
@@ -227,15 +226,15 @@ function stepString(ctx: ScanContext): StepResult {
   if (isValueState(ctx.state)) {
     return acceptStringValue(ctx, body);
   }
-  return INVALID_JSON;
+  return refuse('invalid-json');
 }
 
 function stepOpen(ctx: ScanContext, char: string): StepResult {
   if (!isValueState(ctx.state)) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   if (ctx.stack.length >= MAX_JSON_SCAN_DEPTH) {
-    return INVALID_INPUT;
+    return refuse('invalid-input');
   }
   if (char === '{') {
     ctx.stack.push({ isObject: true, keys: new Set<string>() });
@@ -259,13 +258,13 @@ function closesEmptyContainer(char: string, state: ScanState, top: Frame): boole
 function stepClose(ctx: ScanContext, char: string): StepResult {
   const top = topOf(ctx.stack);
   if (top === undefined) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   if (top.isObject !== (char === '}')) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   if (!closesEmptyContainer(char, ctx.state, top) && ctx.state !== 'expect-comma-or-close') {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   ctx.stack.pop();
   ctx.state = stateAfterValue(ctx.stack);
@@ -276,7 +275,7 @@ function stepClose(ctx: ScanContext, char: string): StepResult {
 
 function stepColon(ctx: ScanContext): StepResult {
   if (ctx.state !== 'expect-colon') {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   ctx.state = 'expect-value';
   ctx.index += 1;
@@ -285,11 +284,11 @@ function stepColon(ctx: ScanContext): StepResult {
 
 function stepComma(ctx: ScanContext): StepResult {
   if (ctx.state !== 'expect-comma-or-close') {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   const top = topOf(ctx.stack);
   if (top === undefined) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   ctx.state = top.isObject ? 'expect-key' : 'expect-value';
   ctx.index += 1;
@@ -298,7 +297,7 @@ function stepComma(ctx: ScanContext): StepResult {
 
 function stepPrimitive(ctx: ScanContext): StepResult {
   if (!isValueState(ctx.state)) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   const { text } = ctx;
   const tokenStart = ctx.index;
@@ -306,7 +305,7 @@ function stepPrimitive(ctx: ScanContext): StepResult {
     ctx.index += 1;
   }
   if (!isValidPrimitiveToken(text.slice(tokenStart, ctx.index))) {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   markArrayValue(ctx.stack);
   ctx.state = stateAfterValue(ctx.stack);
@@ -332,7 +331,7 @@ function stepChar(ctx: ScanContext, char: string): StepResult {
       if (isNumberStart(char) || char === 't' || char === 'f' || char === 'n') {
         return stepPrimitive(ctx);
       }
-      return INVALID_JSON;
+      return refuse('invalid-json');
   }
 }
 
@@ -354,7 +353,7 @@ function scanText(text: string): JsonDuplicateKeyCheckResult {
     }
   }
   if (ctx.stack.length !== 0 || ctx.state !== 'after-root-value') {
-    return INVALID_JSON;
+    return refuse('invalid-json');
   }
   return { ok: true };
 }
@@ -372,10 +371,10 @@ export function checkJsonDuplicateKeys(
 ): JsonDuplicateKeyCheckResult {
   try {
     if (typeof text !== 'string' || !isValidMaxLength(maxLength) || text.length > maxLength) {
-      return INVALID_INPUT;
+      return refuse('invalid-input');
     }
     return scanText(text);
   } catch {
-    return INVALID_INPUT;
+    return refuse('invalid-input');
   }
 }

@@ -177,4 +177,21 @@ describe('checkJsonDuplicateKeys', () => {
     const atLimit = '['.repeat(MAX_JSON_SCAN_DEPTH) + ']'.repeat(MAX_JSON_SCAN_DEPTH);
     expect(checkJsonDuplicateKeys(atLimit)).toEqual({ ok: true });
   });
+
+  it('returns a fresh result object per call, so mutating one cannot change later calls', () => {
+    const cases: Array<[unknown, string]> = [
+      ['{"a":1,"a":2}', 'duplicate-key'],
+      ['{', 'invalid-json'],
+      [42, 'invalid-input'],
+    ];
+    for (const [input, reason] of cases) {
+      const first = checkJsonDuplicateKeys(input) as { ok: boolean; reason: string };
+      first.reason = 'mutated';
+      first.ok = true;
+      expect(checkJsonDuplicateKeys(input)).toEqual({ ok: false, reason });
+    }
+    const okFirst = checkJsonDuplicateKeys('{}') as { ok: boolean; extra?: number };
+    okFirst.extra = 1;
+    expect(checkJsonDuplicateKeys('{}')).toEqual({ ok: true });
+  });
 });

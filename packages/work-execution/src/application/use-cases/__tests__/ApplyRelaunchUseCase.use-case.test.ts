@@ -2263,6 +2263,82 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     expect(deps.appended).toEqual([]);
   });
 
+  it('AR3b-3b: AR3b-3 without lane-2\'s adopt input refuses stale-plan-state before the grant instead of admitting lane-3 past the cap', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      result(key(digest, 'lane-2', 'redispatch'), 'completed'),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const deps = makeDeps({
+      plan,
+      entries,
+      live: {
+        inspect: { state: 'idle' },
+        runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+        runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'running')] : []),
+      },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [lane3AdoptInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    expect(deps.adoptLane).not.toHaveBeenCalled();
+    expect(deps.appended).toEqual([]);
+  });
+
+  it('AR3b-3c: a resent adopt input whose ids the journaled adopt digest does not reproduce refuses stale-plan-state before the grant; the true input is accepted', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const identityOf = (input: Record<string, unknown>): string => {
+      const wo = input['workOrder'] as Record<string, unknown>;
+      const brief = input['brief'] as Record<string, unknown>;
+      const attempt = input['attempt'] as Record<string, unknown>;
+      const run = input['run'] as Record<string, unknown>;
+      return computeDigest(JSON.stringify([
+        'adopt-lane-ids/1', 'proj-1', 'plan-1', 'lane-2', wo['workOrderId'], brief['briefId'], attempt['attemptId'], run['runId'],
+      ]));
+    };
+    const trueInput = adoptInput();
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      intent(adoptKey(digest, 'lane-2', 'work-order'), identityOf(trueInput)),
+      { ...result(adoptKey(digest, 'lane-2', 'work-order'), 'completed'), digest: identityOf(trueInput) },
+      ...(['brief', 'attempt', 'run'] as const).flatMap((sub) => [
+        intent(adoptKey(digest, 'lane-2', sub)),
+        result(adoptKey(digest, 'lane-2', sub), 'completed'),
+      ]),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      result(key(digest, 'lane-2', 'redispatch'), 'completed'),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const live = {
+      inspect: { state: 'idle' },
+      runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+      runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'running')] : []),
+    };
+    const forged = adoptInput({ workOrder: { ...(trueInput['workOrder'] as object), workOrderId: 'wo-other' } });
+    const refusedDeps = makeDeps({ plan, entries, live });
+    expect(
+      await new ApplyRelaunchUseCase(refusedDeps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [forged, lane3AdoptInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(refusedDeps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    // The true input reproduces the journaled digest, matches the live run and is counted: the cap holds.
+    const trueDeps = makeDeps({ plan, entries, live });
+    expect(
+      await new ApplyRelaunchUseCase(trueDeps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [trueInput, lane3AdoptInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-3' });
+  });
+
   it('AR3b-4: a failed handed-off append whose journal re-read shows the result completed continues; one that does not show completed refuses journal-write-failed', async () => {
     const { plan, inputs } = handoffPlan(2);
     const digest = plan.planDigest;

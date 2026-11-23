@@ -1227,6 +1227,71 @@ function reconcileHandoffs(
 }
 
 /**
+ * The digest `AdoptLaneUseCase` journals over every id an adoption writes
+ * (`identityDigest`), recomputed from the adopt input; `null` when a field is
+ * unreadable or `computeDigest` throws. The journal holds this digest, never
+ * the ids, so it is the only trusted record a resent input can be checked
+ * against.
+ */
+function adoptInputIdentity(deps: ApplyRelaunchDependencies, laneId: string, adoptInput: ApplyRelaunchAdoptInput): string | null {
+  try {
+    const parts = [
+      own(adoptInput, 'projectId'),
+      own(own(adoptInput, 'planRef'), 'planId'),
+      laneId,
+      own(own(adoptInput, 'workOrder'), 'workOrderId'),
+      own(own(adoptInput, 'brief'), 'briefId'),
+      own(own(adoptInput, 'attempt'), 'attemptId'),
+      own(own(adoptInput, 'run'), 'runId'),
+    ];
+    return deps.computeDigest(JSON.stringify(['adopt-lane-ids/1', ...parts]));
+  } catch {
+    return null;
+  }
+}
+
+/** `true` when the lane's journaled adopt work-order result carries a digest the resent input does not reproduce. */
+function adoptInputContradictsJournal(
+  args: LiveApplyArgs,
+  snapshot: readonly SnapshotEntry[],
+  lane: PlanLane,
+  adoptInput: ApplyRelaunchAdoptInput,
+): boolean {
+  const key = `relaunch/${args.planDigest}/${lane.laneId}/adopt/work-order`;
+  const recorded = snapshot.find((entry) => entry.key === key && entry.kind === 'result' && entry.outcome === 'completed');
+  if (recorded === undefined || typeof recorded.digest !== 'string') return false;
+  return adoptInputIdentity(args.deps, lane.laneId, adoptInput) !== recorded.digest;
+}
+
+/**
+ * AR3b (fix round): a participant whose adopt is `partial` or `completed`
+ * must have a resolvable work order id that agrees with its journaled adopt
+ * result, else its capacity cannot be counted: `stale-plan-state` in
+ * preflight, before the grant. An unrecorded plan id with no usable adopt
+ * input, or an input whose ids the journaled adopt digest does not reproduce,
+ * is never treated as an idle lane.
+ */
+function participantAdoptRefusal(
+  args: LiveApplyArgs,
+  snapshot: readonly SnapshotEntry[],
+  participants: readonly PlanLane[],
+  statusOf: StatusOf,
+): ApplyRelaunchResult | null {
+  for (const lane of participants) {
+    const adoptStatus = statusOf(lane.laneId, 'adopt');
+    if (adoptStatus !== 'partial' && adoptStatus !== 'completed') continue;
+    const adoptInput = args.adoptInputs.get(lane.laneId);
+    if (lane.workOrderId === null && readAdoptWorkOrderId(adoptInput) === null) {
+      return refusedLane('stale-plan-state', lane.laneId);
+    }
+    if (adoptInput !== undefined && adoptInputContradictsJournal(args, snapshot, lane, adoptInput)) {
+      return refusedLane('stale-plan-state', lane.laneId);
+    }
+  }
+  return null;
+}
+
+/**
  * AR3b: reconcile redispatch hand-offs against the run repository before the
  * grant is spent. A lane whose redispatch is `intent-only` or `completed` may
  * have a live run the plan's own record no longer names: the run repository
@@ -1240,12 +1305,15 @@ function reconcileHandoffs(
 async function reconcileRedispatchRuns(
   args: LiveApplyArgs,
   statusOf: StatusOf,
+  snapshot: readonly SnapshotEntry[],
 ): Promise<RunReconciliation | ApplyRelaunchResult> {
   const { deps, storedPlan, adoptInputs } = args;
   if (deps.runRepo === undefined || deps.runJournal === undefined) return refusal('stale-plan-state');
   const runs = await listReconciledRuns(deps.runRepo);
   if (runs === null) return refusal('stale-plan-state');
   const participants = redispatchParticipants(storedPlan, statusOf);
+  const unresolvable = participantAdoptRefusal(args, snapshot, participants, statusOf);
+  if (unresolvable !== null) return unresolvable;
   const matchedByLane = matchParticipantRuns(participants, runs, adoptInputs);
   if (isRefusalResult(matchedByLane)) return matchedByLane;
   const runIds: string[] = [];
@@ -1395,7 +1463,7 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
   const statusOf: StatusOf = (laneId, step) =>
     derived.value.derivations.get(laneId)?.stepStatuses.find((entry) => entry.step === step)?.status ?? 'absent';
   if (!hasLivePorts(deps)) return refusal('stale-plan-state');
-  const reconciliation = await reconcileRedispatchRuns(args, statusOf);
+  const reconciliation = await reconcileRedispatchRuns(args, statusOf, snapshotStep.value);
   if (isRefusalResult(reconciliation)) return reconciliation;
   const savedSources = new Map<string, AdoptLaneSource>();
   const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };

@@ -72,6 +72,7 @@ class FakeStore implements ReleaseStorePort {
   unreadable = false;
   entryMissing = false;
   pruneUnreadable = false;
+  repointRestoreFailed = false;
   readonly calls: string[] = [];
   readonly removed: string[] = [];
 
@@ -124,10 +125,15 @@ class FakeStore implements ReleaseStorePort {
     sha: string;
     opId?: string;
     fence?: () => Promise<boolean>;
-  }): Promise<ReleaseStoreWriteResult | { outcome: 'fenced' }> {
+  }): Promise<ReleaseStoreWriteResult | { outcome: 'fenced' } | { outcome: 'restore-failed' }> {
     this.calls.push(`repoint ${input.sha}`);
     if (!this.builds.some((entry) => entry.sha === input.sha)) {
       return { outcome: 'not-found' };
+    }
+    if (this.repointRestoreFailed) {
+      // BL02ct: the adapter could neither land the repoint nor restore the
+      // store to a state without its own marker.
+      return { outcome: 'restore-failed' };
     }
     if (input.fence !== undefined && !(await input.fence())) {
       return { outcome: 'fenced' };
@@ -2007,6 +2013,16 @@ describe('ManageReleaseUseCase', () => {
     store.unreadable = true;
     const { useCase } = make({ store });
     expect(await manage(useCase, request())).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+  });
+
+  it('refuses store-restore-failed when store.repoint returns restore-failed', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    store.repointRestoreFailed = true;
+    const { useCase } = granted(SWAP, A, { store });
+    expect(await manage(useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'store-restore-failed',
+    });
   });
 
   it('refuses not-found when swap names a sha that is not kept', async () => {

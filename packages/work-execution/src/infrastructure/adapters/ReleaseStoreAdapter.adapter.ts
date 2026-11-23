@@ -89,7 +89,23 @@ const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
 type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readonly ok: false };
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
 
+/**
+ * The filesystem surface the store reads and writes. Every operation defaults
+ * to `node:fs/promises`; a caller may inject partial overrides (tests inject a
+ * delegating fake so one forced failure is deterministic).
+ */
+export type ReleaseStoreFs = Pick<
+  typeof fs,
+  'lstat' | 'readdir' | 'readlink' | 'readFile' | 'writeFile' | 'mkdir' | 'symlink' | 'rename' | 'rm'
+>;
+
 export class ReleaseStoreAdapter implements ReleaseStorePort {
+  private readonly fsOps: ReleaseStoreFs;
+
+  constructor(fsOps?: Partial<ReleaseStoreFs>) {
+    this.fsOps = { ...fs, ...fsOps } as ReleaseStoreFs;
+  }
+
   async prepare(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStagingResult> {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'unreadable' };
@@ -114,12 +130,12 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
 
   async list(input: { readonly root: string }): Promise<ReleaseStoreListing> {
     try {
-      const entries = await readRoot(input.root);
+      const entries = await readRoot(input.root, this.fsOps);
       if (entries === null) {
         return { outcome: 'read', current: null, builds: [] };
       }
-      const current = await readCurrent(input.root);
-      const builds = await readBuilds(input.root, entries);
+      const current = await readCurrent(input.root, this.fsOps);
+      const builds = await readBuilds(input.root, entries, this.fsOps);
       if (!current.ok || !builds.ok) {
         return { outcome: 'unreadable' };
       }
@@ -193,7 +209,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     let previousMarker: string | null = null;
     let markerWritten = false;
     try {
-      const existing = await lstatOrNull(path.join(input.root, CURRENT_NAME));
+      const existing = await lstatOrNull(path.join(input.root, CURRENT_NAME), this.fsOps);
       if (existing !== null && !existing.isSymbolicLink()) {
         return { outcome: 'unreadable' };
       }
@@ -209,36 +225,55 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       // marker claiming a repoint that did not land (fail-closed: a failed
       // repoint must not appear to be the operation that last wrote
       // `current`).
-      previousMarker = await readSmall(markerPath);
-      await fs.symlink(input.sha, temp);
-      await fs.mkdir(opsDir, { recursive: true });
+      previousMarker = await readSmall(markerPath, this.fsOps);
+      await this.fsOps.symlink(input.sha, temp);
+      await this.fsOps.mkdir(opsDir, { recursive: true });
       await writeAtomically(
         opsDir,
         CURRENT_OP_NAME,
         JSON.stringify({ version: 1, sha: input.sha, opId: input.opId ?? null }),
+        this.fsOps,
       );
       markerWritten = true;
       if (input.fence !== undefined && !(await passesFence(input.fence))) {
-        await fs.rm(temp, { force: true }).catch(() => undefined);
+        await this.fsOps.rm(temp, { force: true }).catch(() => undefined);
         if (previousMarker === null) {
-          await fs.rm(markerPath, { force: true }).catch(() => undefined);
+          // BL02ct fix round: the marker written before the fence must not
+          // survive a refused fence, and its removal failing is not a swallowed
+          // cleanup detail -- a marker left behind claims a repoint that did
+          // not land, so this is a distinct typed failure the caller refuses
+          // on (ManageReleaseUseCase maps it to `store-restore-failed`).
+          try {
+            await this.fsOps.rm(markerPath, { force: true });
+          } catch {
+            return { outcome: 'restore-failed' };
+          }
         } else {
-          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker);
+          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker, this.fsOps);
         }
         return { outcome: 'fenced' };
       }
       // Nothing is awaited between the fence and this one atomic rename.
-      await fs.rename(temp, path.join(input.root, CURRENT_NAME));
+      await this.fsOps.rename(temp, path.join(input.root, CURRENT_NAME));
       return { outcome: 'ok' };
     } catch {
-      await fs.rm(temp, { force: true }).catch(() => undefined);
+      await this.fsOps.rm(temp, { force: true }).catch(() => undefined);
       if (markerWritten) {
         if (previousMarker === null) {
-          await fs.rm(markerPath, { force: true }).catch(() => undefined);
-          return { outcome: 'unreadable' };
+          // BL02ct fix round: same rule as the fenced path -- when there was no
+          // previous marker, the failed repoint's own marker must be removed,
+          // and a failed removal means the store may claim an operation that
+          // never landed, so it is a distinct typed failure, never smoothed
+          // into `unreadable`.
+          try {
+            await this.fsOps.rm(markerPath, { force: true });
+            return { outcome: 'unreadable' };
+          } catch {
+            return { outcome: 'restore-failed' };
+          }
         }
         try {
-          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker);
+          await writeAtomically(opsDir, CURRENT_OP_NAME, previousMarker, this.fsOps);
           return { outcome: 'unreadable' };
         } catch {
           // BL02c fix round: the restore of the previous marker failed too, so
@@ -251,7 +286,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
           // maps it to `store-restore-failed`). When even the removal fails
           // the typed failure still stands; only the marker's absence cannot
           // be guaranteed.
-          await fs.rm(markerPath, { force: true, recursive: true }).catch(() => undefined);
+          await this.fsOps.rm(markerPath, { force: true, recursive: true }).catch(() => undefined);
           return { outcome: 'restore-failed' };
         }
       }
@@ -669,9 +704,9 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /** The text of a small file; null when it does not exist; any other failure throws. */
-async function readSmall(file: string): Promise<string | null> {
+async function readSmall(file: string, ops: ReleaseStoreFs = fs): Promise<string | null> {
   try {
-    const text = await fs.readFile(file, 'utf8');
+    const text = await ops.readFile(file, 'utf8');
     if (text.length > MARKER_MAX_BYTES) {
       throw new Error('too large');
     }
@@ -808,13 +843,13 @@ function shasToPrune(builds: readonly ReleaseBuildRecord[], current: string | nu
 }
 
 /** The root's entries, null when nothing at all exists at the root; any other failure throws. */
-async function readRoot(root: string): Promise<Dirent[] | null> {
+async function readRoot(root: string, ops: ReleaseStoreFs = fs): Promise<Dirent[] | null> {
   try {
-    return await fs.readdir(root, { withFileTypes: true });
+    return await ops.readdir(root, { withFileTypes: true });
   } catch (error) {
     // Only a root that is truly absent is a first-install store; a dangling
     // symlink at the root also reads as ENOENT, and it is unreadable.
-    if (isErrno(error, 'ENOENT') && (await lstatOrNull(root)) === null) {
+    if (isErrno(error, 'ENOENT') && (await lstatOrNull(root, ops)) === null) {
       return null;
     }
     throw error;
@@ -902,16 +937,16 @@ async function currentStill(root: string, expected: string | null): Promise<bool
   }
 }
 
-async function readCurrent(root: string): Promise<CurrentRead> {
+async function readCurrent(root: string, ops: ReleaseStoreFs = fs): Promise<CurrentRead> {
   const link = path.join(root, CURRENT_NAME);
-  const stat = await lstatOrNull(link);
+  const stat = await lstatOrNull(link, ops);
   if (stat === null) {
     return { ok: true, sha: null };
   }
   if (!stat.isSymbolicLink()) {
     return { ok: false };
   }
-  const target = path.resolve(root, await fs.readlink(link));
+  const target = path.resolve(root, await ops.readlink(link));
   const name = path.basename(target);
   if (path.dirname(target) !== path.resolve(root) || !SHA_PATTERN.test(name)) {
     return { ok: false };
@@ -919,13 +954,17 @@ async function readCurrent(root: string): Promise<CurrentRead> {
   return { ok: true, sha: name };
 }
 
-async function readBuilds(root: string, entries: readonly Dirent[]): Promise<BuildsRead> {
+async function readBuilds(
+  root: string,
+  entries: readonly Dirent[],
+  ops: ReleaseStoreFs = fs,
+): Promise<BuildsRead> {
   const builds: ReleaseBuildRecord[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !SHA_PATTERN.test(entry.name)) {
       continue;
     }
-    const marker = await readMarker(path.join(root, entry.name, MARKER_NAME), entry.name);
+    const marker = await readMarker(path.join(root, entry.name, MARKER_NAME), entry.name, ops);
     if (marker === 'absent') {
       continue;
     }
@@ -952,8 +991,12 @@ function compareBuildRecords(a: ReleaseBuildRecord, b: ReleaseBuildRecord): numb
 }
 
 /** The marker's record, 'absent' when there is no marker, null when it cannot be read or parsed. */
-async function readMarker(file: string, sha: string): Promise<ReleaseBuildRecord | 'absent' | null> {
-  const stat = await lstatOrNull(file);
+async function readMarker(
+  file: string,
+  sha: string,
+  ops: ReleaseStoreFs = fs,
+): Promise<ReleaseBuildRecord | 'absent' | null> {
+  const stat = await lstatOrNull(file, ops);
   if (stat === null) {
     return 'absent';
   }
@@ -962,7 +1005,7 @@ async function readMarker(file: string, sha: string): Promise<ReleaseBuildRecord
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await fs.readFile(file, 'utf8'));
+    parsed = JSON.parse(await ops.readFile(file, 'utf8'));
   } catch {
     return null;
   }
@@ -978,20 +1021,25 @@ async function readMarker(file: string, sha: string): Promise<ReleaseBuildRecord
   return typeof builtAtIso === 'string' && isZonedIso(builtAtIso) ? { sha, builtAtIso } : null;
 }
 
-async function writeAtomically(dir: string, name: string, content: string): Promise<void> {
+async function writeAtomically(
+  dir: string,
+  name: string,
+  content: string,
+  ops: ReleaseStoreFs = fs,
+): Promise<void> {
   const temp = path.join(dir, `.${name}.${randomSuffix()}.tmp`);
   try {
-    await fs.writeFile(temp, content, { encoding: 'utf8', flag: 'wx' });
-    await fs.rename(temp, path.join(dir, name));
+    await ops.writeFile(temp, content, { encoding: 'utf8', flag: 'wx' });
+    await ops.rename(temp, path.join(dir, name));
   } catch (error) {
-    await fs.rm(temp, { force: true }).catch(() => undefined);
+    await ops.rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
 }
 
-async function lstatOrNull(target: string): Promise<Stats | null> {
+async function lstatOrNull(target: string, ops: ReleaseStoreFs = fs): Promise<Stats | null> {
   try {
-    return await fs.lstat(target);
+    return await ops.lstat(target);
   } catch (error) {
     if (isErrno(error, 'ENOENT')) {
       return null;

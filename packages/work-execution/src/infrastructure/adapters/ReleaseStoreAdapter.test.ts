@@ -1,9 +1,9 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, type RmOptions } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ReleaseStoreAdapter } from './ReleaseStoreAdapter.adapter.js';
+import { ReleaseStoreAdapter, type ReleaseStoreFs } from './ReleaseStoreAdapter.adapter.js';
 
 const sha = (digit: string): string => digit.repeat(40);
 const A = sha('a');
@@ -474,6 +474,110 @@ describe('ReleaseStoreAdapter', () => {
       await adapter.repoint({ root: root2, sha: A, opId: 'a'.repeat(32), fence: blockingFence }),
     ).toEqual({ outcome: 'unreadable' });
     expect(await adapter.readLastCurrentOp({ root: root2 })).toEqual({ outcome: 'none' });
+  });
+
+  it('repoint returns restore-failed when fence rejects with no previous marker and removing the new marker fails', async () => {
+    await verified('a', 1);
+    const markerPath = path.join(root, '.release-ops', 'current-op.json');
+    // Only the marker removal fails; every other fs call delegates to the real
+    // node:fs/promises (the temp-link cleanup must still work).
+    const removingMarkerFails: Partial<ReleaseStoreFs> = {
+      rm: async (target: Parameters<typeof fs.rm>[0], options?: RmOptions): Promise<void> => {
+        if (target === markerPath) {
+          throw new Error('forced rm failure');
+        }
+        return fs.rm(target, options);
+      },
+    };
+    const fenced = new ReleaseStoreAdapter(removingMarkerFails);
+    // No previous marker: this is the first repoint, the fence refuses, and the
+    // marker written before the fence must be removed. A failed removal means
+    // the store may claim an operation that never landed.
+    expect(await fenced.repoint({ root, sha: A, fence: async () => false })).toEqual({
+      outcome: 'restore-failed',
+    });
+    // The fence refused before the rename, so `current` was never repointed.
+    expect(await fs.lstat(path.join(root, 'current')).then(() => true, () => false)).toBe(false);
+  });
+
+  it('repoint returns restore-failed when rename fails with no previous marker and removing the new marker fails', async () => {
+    await verified('a', 1);
+    const markerPath = path.join(root, '.release-ops', 'current-op.json');
+    const removingMarkerFails: Partial<ReleaseStoreFs> = {
+      rm: async (target: Parameters<typeof fs.rm>[0], options?: RmOptions): Promise<void> => {
+        if (target === markerPath) {
+          throw new Error('forced rm failure');
+        }
+        return fs.rm(target, options);
+      },
+    };
+    const broken = new ReleaseStoreAdapter(removingMarkerFails);
+    const renameFails = async (): Promise<boolean> => {
+      // The rename cannot land: `current` becomes a non-empty directory.
+      await fs.mkdir(path.join(root, 'current', 'kept'), { recursive: true });
+      return true;
+    };
+    expect(await broken.repoint({ root, sha: A, fence: renameFails })).toEqual({
+      outcome: 'restore-failed',
+    });
+    // The failed removal cannot guarantee the marker's absence (the documented
+    // residual): the stale marker still names the sha it was written for, but
+    // the typed failure is what the caller refuses on.
+    expect(await adapter.readLastCurrentOp({ root })).toEqual({ outcome: 'read', sha: A, opId: null });
+  });
+
+  it('repoint returns restore-failed on triple failure when rename, marker restore, and marker removal all fail', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    expect(await adapter.repoint({ root, sha: A, opId: 'a'.repeat(32) })).toEqual({ outcome: 'ok' });
+    const markerPath = path.join(root, '.release-ops', 'current-op.json');
+    let currentOpRenames = 0;
+    const failing: Partial<ReleaseStoreFs> = {
+      rename: async (from: Parameters<typeof fs.rename>[0], to: Parameters<typeof fs.rename>[1]): Promise<void> => {
+        // The first rename onto the marker (the new marker's atomic write)
+        // must succeed; only the SECOND one -- the restore of the previous
+        // marker after the failed rename onto `current` -- fails.
+        if (to === markerPath) {
+          currentOpRenames += 1;
+          if (currentOpRenames === 2) {
+            throw new Error('forced restore rename failure');
+          }
+        }
+        return fs.rename(from, to);
+      },
+      rm: async (target: Parameters<typeof fs.rm>[0], options?: RmOptions): Promise<void> => {
+        if (target === markerPath) {
+          throw new Error('forced rm failure');
+        }
+        return fs.rm(target, options);
+      },
+    };
+    const broken = new ReleaseStoreAdapter(failing);
+    const renameFails = async (): Promise<boolean> => {
+      // The rename cannot land: `current` becomes a non-empty directory.
+      await fs.rm(path.join(root, 'current'), { force: true });
+      await fs.mkdir(path.join(root, 'current', 'kept'), { recursive: true });
+      return true;
+    };
+    expect(await broken.repoint({ root, sha: B, opId: 'b'.repeat(32), fence: renameFails })).toEqual({
+      outcome: 'restore-failed',
+    });
+  });
+
+  it('repoint returns unreadable when readlink on current fails before any write', async () => {
+    await verified('a', 1);
+    expect(await adapter.repoint({ root, sha: A })).toEqual({ outcome: 'ok' });
+    const readlinkFails: Partial<ReleaseStoreFs> = {
+      readlink: async () => {
+        throw new Error('forced readlink failure');
+      },
+    };
+    const broken = new ReleaseStoreAdapter(readlinkFails);
+    // The read failure happens in the pre-write `list`, before the temp link
+    // or the marker is written, so `unreadable` is the intended reading of
+    // scope here.
+    expect(await broken.repoint({ root, sha: B })).toEqual({ outcome: 'unreadable' });
+    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
   });
 
   it('readLastCurrentOp returns none when no marker exists', async () => {

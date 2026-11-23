@@ -562,6 +562,14 @@ export function composeExecution(input: ComposeExecutionInput) {
     stateDir !== undefined && stateDir.trim().length > 0
       ? new CutoverJournalAdapter({ stateDir, fileName: 'shadow-intake-journal.json' })
       : new CutoverJournalAdapter();
+  // SW2a2: the shadow-park journal — a third CutoverJournalAdapter instance in
+  // shadowPark mode, storing to its own `shadow-park-journal.json` (schemaVersion
+  // 3); in-memory without a durable state directory. `cutover-journal.json` and
+  // `shadow-intake-journal.json` stay untouched at schemaVersion 2.
+  const shadowParkJournal =
+    stateDir !== undefined && stateDir.trim().length > 0
+      ? new CutoverJournalAdapter({ stateDir, fileName: 'shadow-park-journal.json', shadowPark: true })
+      : new CutoverJournalAdapter({ shadowPark: true });
   const importTrainState = new ImportTrainStateUseCase({
     legacyState: legacyTrainState,
     queue: mergeQueueRepository,
@@ -723,6 +731,8 @@ export function composeExecution(input: ComposeExecutionInput) {
     listMergeQueue,
     importTrainState,
     legacyTrainState,
+    // SW2a2: the shadow-park journal (`shadow-park-journal.json`, schemaVersion 3).
+    shadowParkJournal,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

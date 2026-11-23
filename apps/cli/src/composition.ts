@@ -163,6 +163,7 @@ import {
   type TelemetryResourceInput,
   type RunTelemetryMarkPort,
   type HostAudibleAlertPort,
+  type CutoverJournalPort,
 } from '@fleet/work-execution';
 import { readCurrentReleaseSha } from './shadow-release-sha.js';
 
@@ -891,6 +892,8 @@ export interface FleetCliRuntime {
     readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
     /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
     readonly cutoverJournal: CutoverJournalAdapter;
+    /** SW2a2: the shadow-park journal (`shadow-park-journal.json`, schemaVersion 3), a `CutoverJournalPort`. */
+    readonly shadowParkJournal: CutoverJournalPort;
     /** CO30a: the killall train-pause record `cutover rollback` lifts when the cutover set it. */
     readonly killallTrainPause: KillallTrainPauseAdapter;
     /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */

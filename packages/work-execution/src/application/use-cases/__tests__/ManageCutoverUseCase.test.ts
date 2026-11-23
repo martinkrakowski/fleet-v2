@@ -1194,6 +1194,8 @@ describe('ManageCutoverUseCase switch shadow parks', () => {
     const badRepo = { ...policyRepo('octo', 'repo', true), shadow: 'yes' };
     const cases: Array<[string, MergePolicyReader]> = [
       ['throws', { readMergePolicy: boom }],
+      ['null answer', { readMergePolicy: async () => null as unknown as Awaited<ReturnType<MergePolicyReader['readMergePolicy']>> }],
+      ['undefined answer', { readMergePolicy: async () => undefined as unknown as Awaited<ReturnType<MergePolicyReader['readMergePolicy']>> }],
       ['unknown', { readMergePolicy: async () => ({ outcome: 'unknown', reason: 'installation-unreadable' }) }],
       ['non-boolean shadow', { readMergePolicy: async () => ({ outcome: 'known', policyRevision: 'pol-1', repositories: [badRepo as unknown as MergePolicyRepository], daemon: { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' } }) }],
     ];
@@ -1358,6 +1360,99 @@ describe('ManageCutoverUseCase switch shadow parks', () => {
       expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
       expect(h.spies.compareAndSet).not.toHaveBeenCalled();
     }
+  });
+
+  it('returns journal-unreadable when shadowParkJournal list throws, answers null or unreadable, or carries a hostile entries array', async () => {
+    // A listed entry whose own `key` is an enumerable getter: the snapshot
+    // reader refuses accessors without running them, so the entry can never
+    // reach the match loop.
+    const getterEntry = Object.defineProperty({}, 'key', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const cases: Array<[string, unknown]> = [
+      ['throws', () => Promise.reject(new Error('boom'))],
+      ['null response', null],
+      ['undefined response', undefined],
+      ['unreadable', { outcome: 'unreadable' }],
+      ['null entries', { outcome: 'listed', entries: null }],
+      ['undefined entries', { outcome: 'listed', entries: undefined }],
+      ['array-like entries', { outcome: 'listed', entries: { length: 1, 0: { key: 'k', kind: 'intent' } } }],
+      ['getter entry', { outcome: 'listed', entries: [getterEntry] }],
+    ];
+    for (const [label, behaviour] of cases) {
+      const h = await harness({ seed: null, daemonPaused: true });
+      await parkedEntry(h, 'octo', 'repo', 1);
+      h.spies.shadowParkList.mockImplementation(
+        (typeof behaviour === 'function' ? behaviour : async () => behaviour) as unknown as CutoverJournalAdapter['listByKeyPrefix'],
+      );
+      const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: { outcome: 'unknown', reason: 'journal-unreadable' } });
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+      expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+      expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
+    }
+  });
+
+  it('refuses too-many-shadow-parks when one switch plans more parks than the per-switch cap, with zero writes', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    const base = await parkedEntry(h, 'octo', 'repo', 1);
+    // 501 valid parked records on the shadow repository: one more than
+    // MAX_SHADOW_PARKS_PER_SWITCH, each with a distinct entry id so every
+    // park plans a distinct journal key.
+    const overflow = Array.from({ length: 501 }, (_, i) => ({ ...base, entryId: ulid(10_000 + i), pullRequest: 10_000 + i }));
+    h.spies.listMergeEntries.mockImplementationOnce(async () => overflow as unknown as MergeQueueEntryRecord[]);
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'too-many-shadow-parks' });
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
+  });
+
+  it('refuses journal-capacity-exceeded when the shadow-park journal is one entry short of its cap, with zero writes', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    await parkedEntry(h, 'octo', 'repo', 1);
+    // 9996 pre-existing journal entries + 1 new park + the switch reserve of
+    // 4 exceeds MAX_CUTOVER_JOURNAL_ENTRIES (10_000) by one, while the listing
+    // itself stays inside the bounded-array cap.
+    const full = Array.from({ length: 9996 }, (_, i) => ({ key: `cutover/other-${i}`, kind: 'result' }));
+    h.spies.shadowParkList.mockImplementationOnce(async () => ({ outcome: 'listed', entries: full }) as unknown as Awaited<ReturnType<CutoverJournalAdapter['listByKeyPrefix']>>);
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'journal-capacity-exceeded' });
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(h.spies.shadowParkAppend).not.toHaveBeenCalled();
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([]);
+  });
+
+  it('answers deadline-exceeded when the deadline passes between the park append and the queue release, releasing nothing', async () => {
+    const h = await harness({ seed: null, daemonPaused: true });
+    await parkedEntry(h, 'octo', 'repo', 1);
+    const deadlineIso = new Date(Date.parse(NOW) + 30_000).toISOString();
+    // The park intent append succeeds but moves the harness clock past the
+    // deadline, so the guarded `applyMergeTransition` call answers `deadline`
+    // before the queue is ever written.
+    const realAppend = Object.getPrototypeOf(h.shadowParkJournal).append as CutoverJournalAdapter['append'];
+    h.spies.shadowParkAppend.mockImplementationOnce(async (...args: Parameters<CutoverJournalAdapter['append']>) => {
+      h.clock.now = new Date(Date.parse(NOW) + 60_000).toISOString();
+      return realAppend.apply(h.shadowParkJournal, args);
+    });
+    const useCase = useCaseWithReaders(h, { mergePolicy: shadowPolicy('octo/repo') });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest({ deadlineIso }))).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(h.spies.applyMergeTransition).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    // The cutover intent was already recorded, but no result was.
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([expect.objectContaining({ kind: 'intent' })]);
   });
 
   it('refuses park-journal-append-failed when the shadow-park append refuses or throws, with no queue release', async () => {

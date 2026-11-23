@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -5,6 +7,8 @@ import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { CutoverJournalAdapter } from '../../../infrastructure/adapters/CutoverJournalAdapter.adapter.js';
+import { LaneDiffCheckAdapter } from '../../../infrastructure/adapters/LaneDiffCheckAdapter.adapter.js';
+import { LocalExecutor } from '../../../infrastructure/adapters/LocalExecutor.adapter.js';
 import type { CutoverJournalPort } from '../../ports/out/CutoverJournalPort.out-port.js';
 import type { LaneDiffCheckResult } from '../../ports/out/LaneDiffCheckPort.out-port.js';
 import type { LaneEditSaveResult } from '../../ports/out/LaneEditSavePort.out-port.js';
@@ -142,7 +146,7 @@ describe('SaveLaneEditsUseCase', () => {
     const h = harness();
     h.state.runner = { state: 'running', sessionId: 'ses-1' };
     expect(await h.useCase.execute(validRequest())).toEqual({ outcome: 'refused', reason: 'worktree-busy', detail: null });
-    expect(h.events).toEqual(['runner']);
+    expect(h.events).toEqual(['diff', 'runner']);
   });
 
   it('an unknown runner state is refused as worktree-state-unknown, never treated as idle', async () => {
@@ -165,7 +169,7 @@ describe('SaveLaneEditsUseCase', () => {
     const h = harness();
     h.state.diff = { outcome: 'error', reason: `could not read ${PATH_TEXT}` };
     expect(await h.useCase.execute(validRequest())).toEqual({ outcome: 'refused', reason: 'diff-check-error', detail: null });
-    expect(h.events).toEqual(['runner', 'diff']);
+    expect(h.events).toEqual(['diff']);
   });
 
   it('a diff check finding is refused with counts by rule code only', async () => {
@@ -191,7 +195,73 @@ describe('SaveLaneEditsUseCase', () => {
     const result = await h.useCase.execute(validRequest());
     expect(result).toMatchObject({ outcome: 'refused', reason: 'diff-check-findings' });
     expect(h.saves).toHaveLength(0);
-    expect(h.events).toEqual(['runner', 'diff']);
+    expect(h.events).toEqual(['diff']);
+  });
+
+  it('a diff finding or error on a running lane is refused before the runner is ever called', async () => {
+    // Cost bound: one diff verdict per call; the runner inspect never runs.
+    const h = harness();
+    h.state.runner = { state: 'running', sessionId: 'ses-1' };
+    h.state.diff = { outcome: 'findings', findings: [{ path: 'packages/a.ts', line: 1, rule: 'secret-pattern:aws-key' }] };
+    expect(await h.useCase.execute(validRequest())).toEqual({
+      outcome: 'refused', reason: 'diff-check-findings',
+      detail: { 'secret-pattern:aws-key': 1 },
+    });
+    expect(h.events).toEqual(['diff']);
+    h.state.diff = { outcome: 'error', reason: 'diff failed' };
+    expect(await h.useCase.execute(validRequest())).toEqual({
+      outcome: 'refused', reason: 'diff-check-error', detail: null,
+    });
+    expect(h.events).toEqual(['diff', 'diff']);
+    expect(h.saves).toHaveLength(0);
+    const listed = await h.journal.listByKeyPrefix(`relaunch/${PLAN}/lane-1/`);
+    expect(listed.outcome === 'listed' && listed.entries).toEqual([]);
+  });
+
+  it('a real diff adapter refuses a running lane with a token-shaped file before any runner call', async () => {
+    // Real LaneDiffCheckAdapter over a temp git repo; the fake token is
+    // assembled from harmless parts. Cost: one git diff per call.
+    const tok = `ghp_${'abcdefghij'}${'0123456789'}`;
+    const dir = await mkdtemp(path.join(tmpdir(), 'save-lane-edits-real-'));
+    const worktree = mkdtempSync(path.join(tmpdir(), 'save-lane-edits-wt-'));
+    try {
+      const run = (args: string[]): void => {
+        execFileSync(args[0], args.slice(1), { cwd: worktree, encoding: 'utf8' });
+      };
+      run(['git', 'init', '-q', '.']);
+      run(['git', 'config', 'user.email', 't@example.invalid']);
+      run(['git', 'config', 'user.name', 't']);
+      mkdirSync(path.join(worktree, 'packages/x/src'), { recursive: true });
+      writeFileSync(path.join(worktree, 'packages/x/src/a.ts'), 'export const a = 1;\n');
+      run(['git', 'add', '.']);
+      run(['git', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'init']);
+      const baseCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8' }).trim();
+      writeFileSync(path.join(worktree, 'packages/x/src/b.ts'), `const t = "${tok}";\n`);
+      let runnerCalls = 0;
+      let saveCalls = 0;
+      const useCase = new SaveLaneEditsUseCase({
+        diffCheck: new LaneDiffCheckAdapter(new LocalExecutor()),
+        runner: { inspectWorktreeRun: async () => { runnerCalls += 1; return { state: 'running', sessionId: 'ses-1' }; } },
+        laneSave: { saveLaneEdits: async () => { saveCalls += 1; return saved(); } },
+        journal: new CutoverJournalAdapter({ stateDir: dir }),
+        mintEntryId: () => '01HZ0000000000000000000001',
+      });
+      const request = { ...validRequest(), worktreePath: worktree, clonePath: worktree, baseCommit };
+      const result = await useCase.execute(request);
+      expect(result.outcome).toBe('refused');
+      if (result.outcome !== 'refused') throw new Error('expected a refusal');
+      expect(result.reason).toBe('diff-check-findings');
+      if (result.reason === 'diff-check-findings' && result.detail !== null) {
+        expect(Object.keys(result.detail)).toEqual(['secret-pattern:github-token']);
+      }
+      expect(runnerCalls).toBe(0);
+      expect(saveCalls).toBe(0);
+      const listed = await new CutoverJournalAdapter({ stateDir: dir }).listByKeyPrefix(`relaunch/${PLAN}/lane-1/`);
+      expect(listed.outcome === 'listed' && listed.entries).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
   });
 
   it('the intent is journaled before the save and the result after it', async () => {
@@ -200,7 +270,7 @@ describe('SaveLaneEditsUseCase', () => {
     expect(result).toEqual({
       outcome: 'saved', planDigest: PLAN, laneId: 'lane-1', journalKey: KEY, saveRef: SAVE_REF, commitId: COMMIT, treeDigest: TREE,
     });
-    expect(h.events).toEqual(['runner', 'diff', 'journal:intent', 'save', 'journal:result']);
+    expect(h.events).toEqual(['diff', 'runner', 'journal:intent', 'save', 'journal:result']);
     expect(h.saves[0]).toMatchObject({ saveRef: SAVE_REF, commitMessage: `fleet-v2 lane save ${PLAN.slice(0, 12)}` });
     const listed = await h.journal.listByKeyPrefix(`relaunch/${PLAN}/lane-1/`);
     expect(listed.outcome === 'listed' && listed.entries.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
@@ -233,7 +303,7 @@ describe('SaveLaneEditsUseCase', () => {
     await h.journal.append({ key: KEY, kind: 'intent', entryId: '01HZ9999999999999999999999', recordedAtIso: '2026-11-06T09:00:00Z' });
     const result = await h.useCase.execute(validRequest());
     expect(result).toMatchObject({ outcome: 'saved', commitId: COMMIT });
-    expect(h.events).toEqual(['runner', 'diff', 'save', 'journal:result']);
+    expect(h.events).toEqual(['diff', 'runner', 'save', 'journal:result']);
     const listed = await h.journal.listByKeyPrefix(KEY);
     expect(listed.outcome === 'listed' && listed.entries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
   });

@@ -342,5 +342,38 @@ describe('CLI installation wiring', () => {
       expect(saved?.usage?.reason).toBe('no session id');
     });
   });
+
+  describe('coordination resolve-auth head requirement (GR1a2 M5)', () => {
+    it('exits 2 for a non-shadow scope without --expected-head-sha and reaches the use case head-free for merge:import-shadow', async () => {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+
+      // A non-shadow scope keeps the head requirement: a missing flag is a
+      // usage error at the CLI boundary, never the use case's
+      // not-implemented throw.
+      const nonShadow = createMockIo();
+      const nonShadowCode = await runCli(
+        ['coordination', 'resolve-auth', '--projectId', 'proj-1', '--actionScope', 'forge:merge-pr'],
+        nonShadow.io,
+        runtime,
+      );
+      expect(nonShadowCode).toBe(2);
+      expect(nonShadow.stderr.join('')).toContain('--expected-head-sha');
+      expect(nonShadow.stdout).toEqual([]);
+
+      // The standing shadow import grant is head-free: the same invocation
+      // without the flag reaches the use case, which answers with its own
+      // typed result (no grant is recorded in this fixture, so the resolve is
+      // blocked at `grant-missing`).
+      const shadow = createMockIo();
+      const shadowCode = await runCli(
+        ['coordination', 'resolve-auth', '--projectId', 'proj-1', '--actionScope', 'merge:import-shadow'],
+        shadow.io,
+        runtime,
+      );
+      expect(shadowCode).toBe(1);
+      const parsed = JSON.parse(shadow.stdout.join('')) as { outcome: string; reason: string };
+      expect(parsed).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+    });
+  });
 });
 

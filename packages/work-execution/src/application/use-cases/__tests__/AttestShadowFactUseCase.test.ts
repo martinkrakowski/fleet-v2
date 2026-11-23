@@ -348,6 +348,26 @@ describe('AttestShadowFactUseCase (AT1)', () => {
     });
   });
 
+  it('refuses a retry of a refused operation under the same operation id with a different payload, before replay and without writing', async () => {
+    // A refused execution still records its intent and final refused result
+    // under `cutover/attest@<operationId>`. Retrying that operation id with
+    // a different payload mismatches the intent's digest: the conflict is
+    // answered before the prior final result is replayed, and the retry
+    // writes nothing at all.
+    const { useCase: attest, deps } = useCase();
+    const refused = await attest.execute(baseInput({ expectedRevision: 5 }));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+    const final = deps.journal.entries.find((entry) => entry.kind === 'result');
+    expect(final?.outcome).toBe('refused');
+    const entriesAfterRefusal = deps.journal.entries.length;
+    const writesAfterRefusal = deps.attestations.writes;
+
+    const retried = await attest.execute(baseInput({ expectedRevision: 5, note: 'a different payload' }));
+    expect(retried).toEqual({ outcome: 'refused', reason: 'operation-id-conflict' });
+    expect(deps.journal.entries.length).toBe(entriesAfterRefusal);
+    expect(deps.attestations.writes).toBe(writesAfterRefusal);
+  });
+
   it('completes a crashed intent as attested (recovered) when the fact is already stored with a matching digest', async () => {
     // Crash after the compare-and-set landed but before the completed result
     // was appended: the intent has no result, the ledger holds the fact, and

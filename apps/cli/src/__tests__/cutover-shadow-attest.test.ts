@@ -170,39 +170,40 @@ describe('cutover shadow attest (AT1)', () => {
     const { stateDir, fixtureDir } = newDirs();
     await fs.writeFile(path.join(fixtureDir, 'queue'), '');
     const runtime = runtimeFor(stateDir);
-    // record-day through the same composition, reading the attested facts.
-    // The clock is pinned so the attested day and "yesterday" are stable:
-    // attest on the pinned day, then advance one day so the pinned day is
-    // recordable (record-day refuses today as too-early) and the facts'
-    // observedDay is on or before the evaluation day.
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
-    let revision = 0;
-    let operation = 0;
-    for (const fact of SHADOW_ATTESTATION_FACTS) {
-      operation += 1;
-      const result = await cli(
-        runtime,
-        attestArgs([
-          '--fact',
-          fact,
-          '--note',
-          'round-trip',
-          '--expected-revision',
-          String(revision),
-          '--operation-id',
-          `round-trip-${operation}`,
-          '--authority',
-          'ops-lead-7',
-        ]),
-      );
-      expect(result.code).toBe(0);
-      const body = JSON.parse(result.out) as { outcome: string; ledger: { revision: number } };
-      expect(body.outcome).toBe('attested');
-      revision = body.ledger.revision;
-    }
-    vi.setSystemTime(new Date('2026-06-16T12:00:00.000Z'));
     try {
+      // The clock is pinned so the attested day and "yesterday" are stable:
+      // attest on the pinned day, then advance one day so the pinned day is
+      // recordable (record-day refuses today as too-early) and the facts'
+      // observedDay is on or before the evaluation day. The fake timers live
+      // inside the try: a failed attest must never leak them past the
+      // finally.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+      let revision = 0;
+      let operation = 0;
+      for (const fact of SHADOW_ATTESTATION_FACTS) {
+        operation += 1;
+        const result = await cli(
+          runtime,
+          attestArgs([
+            '--fact',
+            fact,
+            '--note',
+            'round-trip',
+            '--expected-revision',
+            String(revision),
+            '--operation-id',
+            `round-trip-${operation}`,
+            '--authority',
+            'ops-lead-7',
+          ]),
+        );
+        expect(result.code).toBe(0);
+        const body = JSON.parse(result.out) as { outcome: string; ledger: { revision: number } };
+        expect(body.outcome).toBe('attested');
+        revision = body.ledger.revision;
+      }
+      vi.setSystemTime(new Date('2026-06-16T12:00:00.000Z'));
       const day = '2026-06-15';
       const recorded = await cli(runtime, [
         'cutover',
@@ -221,13 +222,17 @@ describe('cutover shadow attest (AT1)', () => {
         unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
       };
       expect(body.outcome).toBe('recorded');
-      // The attested facts cleared `not-yet-observed` for S2 and S3; with no
-      // release tree wired, the remaining unevaluated reason (if any) is the
-      // release binding, not a missing fact — that is not this use case's
-      // concern.
+      // The attested facts cleared `not-yet-observed` for S3. No release is
+      // pinned in this fixture, so S2 stays unknown at `release-unpinned` —
+      // this round-trip does not treat S2 as proven; S2 is proven by the
+      // evaluateShadowOneTimeCriteria tests and the no-attestation control
+      // tests above.
       for (const item of body.unevaluated) {
-        if (item.criterion === 'S2' || item.criterion === 'S3') {
+        if (item.criterion === 'S3') {
           expect(item.reason).not.toBe('not-yet-observed');
+        }
+        if (item.criterion === 'S2') {
+          expect(item.reason).toBe('release-unpinned');
         }
       }
     } finally {

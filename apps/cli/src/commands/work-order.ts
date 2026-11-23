@@ -3,6 +3,7 @@
 import {
   CLOSE_WORK_ORDER_STATES,
   WORK_ORDER_RISKS,
+  parseBaseBranch,
   resolveWorkOrderBaseBranch,
   resolveWorkOrderRisk,
 } from '@fleet/work-execution';
@@ -146,6 +147,12 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       if (Object.hasOwn(source, 'pullRequestTitle') && typeof source.pullRequestTitle !== 'string') {
         return { outcome: 'refused', reason: 'invalid-pull-request-title' };
       }
+      // A stored base branch is copied through only when it still parses as a
+      // supported base (`main` or `chain/<name>`); a stored record from before
+      // that restriction (or a tampered value) is left absent, so the
+      // registration falls back to the profile default instead of turning the
+      // stored base into an explicit-base refusal.
+      const storedBaseBranch = parseBaseBranch(resolveWorkOrderBaseBranch(source));
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: newId,
         projectId: source.projectId,
@@ -155,7 +162,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         ownedPaths: source.ownedPaths,
         policyRevision: source.policyRevision,
         risk: resolveWorkOrderRisk(source),
-        baseBranch: resolveWorkOrderBaseBranch(source),
+        ...(storedBaseBranch === undefined ? {} : { baseBranch: storedBaseBranch }),
         baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
         prerequisiteWorkOrderIds: [],
         supersedesWorkOrderId: from,

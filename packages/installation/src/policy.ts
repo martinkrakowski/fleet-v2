@@ -1035,11 +1035,14 @@ function readMergePremergePosterLoginField(
   if (typeof value !== 'string') {
     return MERGE_INVALID;
   }
-  if (containsSecretShape(value)) {
-    return MERGE_SECRET;
-  }
+  // Cost bound: the length check inside `isValidGithubLogin` is O(1) and runs
+  // before the O(n) secret scan, so an enormous string never reaches
+  // `containsSecretShape`.
   if (!isValidGithubLogin(value)) {
     return MERGE_INVALID;
+  }
+  if (containsSecretShape(value)) {
+    return MERGE_SECRET;
   }
   return mergeOk(value);
 }

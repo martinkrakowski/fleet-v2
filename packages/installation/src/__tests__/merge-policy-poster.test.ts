@@ -131,18 +131,23 @@ describe('parseInstallation premergePosterLogin', () => {
     expect(Object.hasOwn(repo ?? {}, 'premergePosterLogin')).toBe(false);
   });
 
-  it('the parsed installation carries a written valid premergePosterLogin verbatim', () => {
-    const parsed = parsePolicy({
-      repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: 'octocat' } },
-    });
-    if (!parsed.ok) {
-      throw new Error(parsed.errors.join('; '));
+  it('the parsed installation carries each written valid premergePosterLogin verbatim', () => {
+    // Every shape the login rule admits: a single character, a plain name, a
+    // name with an interior hyphen, and the maximum 39-character length.
+    const login39 = `o${'c'.repeat(37)}t`;
+    for (const login of ['octocat', 'a', 'fleet-bot-1', login39]) {
+      const parsed = parsePolicy({
+        repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: login } },
+      });
+      if (!parsed.ok) {
+        throw new Error(parsed.errors.join('; '));
+      }
+      const { model } = deriveInstallationModel(parsed.installation);
+      expect(model.policy?.merge?.repos?.['owner/repo']).toEqual({
+        projectId: 'p',
+        premergePosterLogin: login,
+      });
     }
-    const { model } = deriveInstallationModel(parsed.installation);
-    expect(model.policy?.merge?.repos?.['owner/repo']).toEqual({
-      projectId: 'p',
-      premergePosterLogin: 'octocat',
-    });
   });
 
   it('refuses null premergePosterLogin with a typed error naming the field and not the value', () => {
@@ -220,6 +225,20 @@ describe('parseInstallation premergePosterLogin', () => {
       expect(parsed.ok, `length ${value.length}`).toBe(false);
       expect(parseRefusalNamesFieldWithoutEchoing(parsed, value), `length ${value.length}`).toBe(true);
     }
+
+    // The length check also precedes the O(n) secret scan: an enormous value
+    // that would be secret-shaped is still refused with the login error, so
+    // `containsSecretShape` never runs on it.
+    const hugeSecretShaped = `ghp_${'a'.repeat(100_000)}`;
+    const parsed = parsePolicy({
+      repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: hugeSecretShaped } },
+    });
+    expect(parsed.ok).toBe(false);
+    expect(parseRefusalNamesFieldWithoutEchoing(parsed, hugeSecretShaped)).toBe(true);
+    if (!parsed.ok) {
+      expect(parsed.errors.some((error) => error.includes('must be a valid GitHub login'))).toBe(true);
+      expect(parsed.errors.some((error) => error.includes('secret-shaped'))).toBe(false);
+    }
   });
 
   it('refuses a leading or trailing hyphen in premergePosterLogin', () => {
@@ -291,7 +310,10 @@ describe('parseInstallation premergePosterLogin', () => {
 
   it('refuses a secret-shaped premergePosterLogin naming the field and never the value', () => {
     // Built from parts so no credential-shaped literal appears in this file.
-    const value = `ghp_${'a'.repeat(36)}`;
+    // The 20-character AWS shape passes the login format, so only the secret
+    // scan can refuse it — this pins the secret check to run after the O(1)
+    // length check but before acceptance.
+    const value = `AKIA${'0123456789ABCDEF'}`;
     const parsed = parsePolicy({
       repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: value } },
     });
@@ -306,20 +328,47 @@ describe('parseInstallation premergePosterLogin', () => {
 });
 
 describe('resolveMergePolicy premergePosterLogin', () => {
-  it('resolves an absent premergePosterLogin to no own property and preserves the golden mergePolicyRevision', () => {
+  it('resolves an absent premergePosterLogin to an entry the adapter answers known, with the pinned pre-EV1a canonical JSON and revision', () => {
     const resolved = expectResolved(resolveMergePolicy(reposWith({ projectId: 'p' })));
     expect(resolved.repositories).toHaveLength(1);
     const repo = resolved.repositories[0];
     expect(Object.hasOwn(repo, 'premergePosterLogin')).toBe(false);
     expect(repo.premergePosterLogin).toBeUndefined();
 
-    // The digest over the resolved entry is byte-identical to the digest over
-    // the pre-EV1a golden shape, which never carried the key.
-    const golden = { repositories: [repository()], daemon: daemonDefaults };
-    expect(canonicalMergePolicyJson({ repositories: [repo], daemon: daemonDefaults })).toBe(
-      canonicalMergePolicyJson(golden),
+    // `MergePolicyAdapter` (the later composition lane) requires exactly the
+    // pre-EV1a repository key set — an unexpected key makes the whole answer
+    // `installation-invalid`. The resolved entry must therefore carry exactly
+    // these own properties, so an installation without the key still answers
+    // `known` through the adapter.
+    expect(Object.getOwnPropertyNames(repo).sort()).toEqual(
+      [
+        'checksGraceMinutes',
+        'macosProcedure',
+        'maxAttempts',
+        'owner',
+        'projectId',
+        'repo',
+        'repositoryKey',
+        'requiredContexts',
+        'shadow',
+        'unattended',
+        'updateBranch',
+        'veto',
+      ].sort(),
     );
-    expect(resolved.policyRevision).toBe(mergePolicyRevision(golden));
+
+    // The digest is pinned to a literal pre-EV1a canonical JSON string (the
+    // golden shape, which never carried the key), so a change to the
+    // canonicalizer or the revision function cannot silently alter the digest
+    // that existing installations already recorded.
+    const goldenJson =
+      '{"daemon":{"budgetSeconds":45,"intervalSeconds":60,"settleSeconds":20},"merge":{"repos":{"owner/repo":{"checksGraceMinutes":30,"macosProcedure":null,"maxAttempts":9,"projectId":"p","requiredContexts":["gate","premerge"],"shadow":true,"unattended":false,"updateBranch":false,"veto":{"holdConfidence":0.8,"mode":"off"}}}}}';
+    const goldenRevision = 'a63d06362c6a';
+    const golden = { repositories: [repository()], daemon: daemonDefaults };
+    expect(canonicalMergePolicyJson({ repositories: [repo], daemon: daemonDefaults })).toBe(goldenJson);
+    expect(canonicalMergePolicyJson(golden)).toBe(goldenJson);
+    expect(resolved.policyRevision).toBe(goldenRevision);
+    expect(mergePolicyRevision(golden)).toBe(goldenRevision);
   });
 
   it('resolves a written premergePosterLogin to the written string and changes mergePolicyRevision versus absent', () => {
@@ -351,6 +400,10 @@ describe('resolveMergePolicy premergePosterLogin', () => {
       '\t',
       'x'.repeat(40),
       'x'.repeat(100_000),
+      // Huge and secret-shaped: only the O(1) length check runs before the
+      // O(n) secret scan, so the refusal is the length refusal, never
+      // `policy-secret-shape`.
+      `ghp_${'a'.repeat(100_000)}`,
       '-octo',
       'octo-',
       '-',
@@ -366,7 +419,10 @@ describe('resolveMergePolicy premergePosterLogin', () => {
   });
 
   it('refuses a secret-shaped premergePosterLogin with policy-secret-shape', () => {
-    const value = `ghp_${'a'.repeat(36)}`;
+    // The 20-character AWS shape passes the login format, so only the secret
+    // scan can refuse it — this pins the secret check to run after the O(1)
+    // length check but before acceptance.
+    const value = `AKIA${'0123456789ABCDEF'}`;
     expectInvalid(
       resolveMergePolicy(reposWith({ projectId: 'p', premergePosterLogin: value })),
       'policy-secret-shape',
@@ -391,11 +447,38 @@ describe('resolveMergePolicy premergePosterLogin', () => {
     expectInvalid(resolveMergePolicy(reposWith(entry)), 'policy-merge-invalid');
   });
 
-  it('refuses a non-plain-object repository entry and an unreadable top-level policy', () => {
+  it('refuses a non-plain-object repository entry, a hostile Proxy, and an unreadable top-level policy', () => {
     const instance = new (class Repository {})();
     expectInvalid(resolveMergePolicy(reposWith(instance)), 'policy-merge-invalid');
 
+    // A Proxy whose `getPrototypeOf` trap throws: the reader's plain-record
+    // probe must yield a typed refusal, never a thrown error and never a pass.
+    const hostileProxy = new Proxy(
+      { projectId: 'p' },
+      {
+        getPrototypeOf: () => {
+          throw new Error('trap ran');
+        },
+      },
+    );
+    expectInvalid(resolveMergePolicy(reposWith(hostileProxy)), 'policy-unreadable');
+
+    // A Proxy over an array target is not a plain record even though the trap
+    // forwards `getPrototypeOf` (arrays share `Object.prototype`).
+    const arrayProxy = new Proxy(['yarn', 'build'], {});
+    expectInvalid(resolveMergePolicy(reposWith(arrayProxy)), 'policy-merge-invalid');
+
     const classInstance = new (class Policy {})() as PolicySection;
     expectInvalid(resolveMergePolicy(classInstance), 'policy-unreadable');
+
+    const hostileTopProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          throw new Error('trap ran');
+        },
+      },
+    );
+    expectInvalid(resolveMergePolicy(hostileTopProxy as PolicySection), 'policy-unreadable');
   });
 });

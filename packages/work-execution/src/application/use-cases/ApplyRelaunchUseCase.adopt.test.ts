@@ -487,6 +487,58 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     expect(deps.appended).toEqual([]);
   });
 
+  it('applies a lane whose plan has no adopt step without requiring an adoptInput', async () => {
+    // Fix-round item 2 (documented residual): the adopt-input requirement and
+    // its cross-checks are gated on the lane having an `adopt` step, matching
+    // the AR2c brief exactly. The stored-plan grammar (`validateLaneStepOrder`)
+    // itself refuses a non-conducted lane without an adopt step as
+    // `invalid-plan` before preflight, so the gating is defensive and this
+    // test pins that the grammar refusal still holds — the public entry never
+    // reaches a no-adopt-step preflight lane.
+    const lane = {
+      ...heldLane(hex('no-adopt-step plan')),
+      steps: [
+        step(hex('no-adopt-step plan'), 'lane-2', 'save'),
+        step(hex('no-adopt-step plan'), 'lane-2', 'redispatch'),
+      ],
+    };
+    const plan = buildPlan([conductedLaneWithRun(), lane]);
+    const deps = makeDeps({ plan, live: { adopt: adopted() } });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(plan.planDigest, { saveInputs: [saveInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-plan' });
+    expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    expect(deps.appended).toEqual([]);
+  });
+
+  it('refuses adopt-failed when a lying Proxy adoptLane result throws in its reflection traps', async () => {
+    // Fix-round item 3: `own` reads the result through `getPrototypeOf` and
+    // `getOwnPropertyDescriptor`; a Proxy that throws in those traps must
+    // fail closed as `adopt-failed`, never propagate the exception out of
+    // `applyRelaunch`.
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('proxy-result plan'))]);
+    const digest = plan.planDigest;
+    const hostile = new Proxy(adopted(), {
+      getPrototypeOf(): never {
+        throw new Error('trap must not escape');
+      },
+      getOwnPropertyDescriptor(): never {
+        throw new Error('trap must not escape');
+      },
+    });
+    const deps = makeDeps({ plan, live: { adopt: hostile } });
+    await expect(
+      new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput()], adoptInputs: [adoptInput()] }),
+      ),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(
+      deps.appended!.every((entry) => entry.key !== key(digest, 'lane-2', 'redispatch')),
+    ).toBe(true);
+  });
+
   it('refuses invalid-request for hostile adoptInputs shapes without invoking getters', async () => {
     const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('hostile plan'))]);
     const valid = adoptInput();
@@ -539,6 +591,23 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       await refused([withPollutingKey(polluting, valid)]);
       expect((pristine as Record<string, unknown>)['untouched']).toBe(true);
       expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'untouched')).toBe(false);
+    }
+    // Fix-round item 1: a NESTED own `constructor` or `prototype` key
+    // survives both the snapshot helper and `structuredClone`, so the parse
+    // must refuse it explicitly (the top-level reader alone does not see it).
+    for (const nested of ['constructor', 'prototype']) {
+      await refused([
+        adoptInput({ workOrder: withPollutingKey(nested, 'hostile') }),
+      ]);
+      await refused([
+        adoptInput({
+          brief: {
+            ...(valid['brief'] as object),
+            acceptanceSpec: { commands: [withPollutingKey(nested, ['yarn', 'test'])] },
+          },
+        }),
+      ]);
+      expect((pristine as Record<string, unknown>)['untouched']).toBe(true);
     }
     // Over-deep: a container nested past MAX_ADOPT_SCAN_DEPTH = 8 is unreadable.
     let deep: unknown = ['x'];

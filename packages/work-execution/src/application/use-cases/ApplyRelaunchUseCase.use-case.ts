@@ -272,6 +272,42 @@ function readSaveInputs(value: unknown): Map<string, ApplyRelaunchSaveInput> | '
  * secret scan of at most `MAX_ADOPT_SCAN_NODES` nodes at most
  * `MAX_ADOPT_SCAN_DEPTH` deep with strings capped at `MAX_BRIEF_TEXT_LENGTH`.
  */
+/**
+ * Whether any nested plain record in the graph carries an own `__proto__`,
+ * `constructor` or `prototype` key. Fix-round item 1: the snapshot helper
+ * rejects `__proto__` but permits the other two, and `structuredClone`
+ * retains them, so a hostile adopt input must be refused explicitly instead
+ * of riding through to the port. Traversal mirrors `scanForSecret` and
+ * shares the adopt bounds, so the cost is at most `MAX_ADOPT_SCAN_NODES`
+ * nodes at most `maxDepth` deep; an unreadable graph (an accessor, over-deep
+ * or over-wide) is a refusal, never a pass.
+ */
+function containsPollutingKey(value: unknown, depth: number, budget: { nodes: number }, maxDepth: number): boolean | null {
+  if (value === null || typeof value !== 'object') return false;
+  if (depth >= maxDepth) return null;
+  if (Array.isArray(value)) {
+    const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_ENTRIES);
+    if (dense === null) return null;
+    for (const element of dense.array) {
+      budget.nodes -= 1;
+      if (budget.nodes < 0) return null;
+      const found = containsPollutingKey(element, depth + 1, budget, maxDepth);
+      if (found !== false) return found;
+    }
+    return false;
+  }
+  const snapshot = snapshotPlainDataRecord(value);
+  if (snapshot === null) return null;
+  for (const key of Object.keys(snapshot)) {
+    budget.nodes -= 1;
+    if (budget.nodes < 0) return null;
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return true;
+    const found = containsPollutingKey(snapshot[key], depth + 1, budget, maxDepth);
+    if (found !== false) return found;
+  }
+  return false;
+}
+
 function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> | 'secret-detected' | null {
   const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
   if (dense === null) return null;
@@ -285,6 +321,10 @@ function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> |
     const secret = scanForSecret(element, 0, { nodes: MAX_ADOPT_SCAN_NODES }, MAX_ADOPT_SCAN_DEPTH, MAX_BRIEF_TEXT_LENGTH);
     if (secret === true) return 'secret-detected';
     if (secret === null) return null;
+    // Fix-round item 1: a nested own `constructor` or `prototype` key would
+    // survive the snapshot helper and the clone, so it is refused here.
+    const polluting = containsPollutingKey(element, 0, { nodes: MAX_ADOPT_SCAN_NODES }, MAX_ADOPT_SCAN_DEPTH);
+    if (polluting !== false) return null;
     const laneId: unknown = fields['laneId'];
     if (typeof laneId !== 'string' || !LANE_ID.test(laneId)) return null;
     if (map.has(laneId)) return null;
@@ -901,18 +941,22 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
   const counts: RunCounts = { liveConductedRuns: 0, handedOffNotIdle: 0 };
   for (const lane of storedPlan.lanes) {
     if (lane.population !== 'conducted') {
-      // AR2c: a lane whose adopt is not already completed must carry an adopt
-      // input, and every adopt input must agree with the plan lane and the
-      // save input — all before the grant is spent.
-      const adoptStatus = statusOf(lane.laneId, 'adopt');
-      const adoptInput = adoptInputs.get(lane.laneId);
-      if (adoptStatus !== 'completed' && adoptInput === undefined) {
-        return refusedLane('stale-plan-state', lane.laneId);
-      }
-      if (adoptInput !== undefined) {
-        const saveInput = saveInputs.get(lane.laneId);
-        if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
+      // AR2c (fix-round item 2): the adopt-input requirement and its
+      // cross-checks apply only to a lane whose plan actually has an `adopt`
+      // step — a valid lane without one carries no adopt input — and every
+      // adopt input must agree with the plan lane and the save input, all
+      // before the grant is spent.
+      if (lane.steps.some((entry) => entry.step === 'adopt')) {
+        const adoptStatus = statusOf(lane.laneId, 'adopt');
+        const adoptInput = adoptInputs.get(lane.laneId);
+        if (adoptStatus !== 'completed' && adoptInput === undefined) {
           return refusedLane('stale-plan-state', lane.laneId);
+        }
+        if (adoptInput !== undefined) {
+          const saveInput = saveInputs.get(lane.laneId);
+          if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
+            return refusedLane('stale-plan-state', lane.laneId);
+          }
         }
       }
       const saved = savedSourceForLane(planDigest, lane.laneId, snapshotStep.value);
@@ -1294,7 +1338,16 @@ async function adoptAndRedispatchLane(
       } catch {
         return refusedLane('adopt-failed', lane.laneId);
       }
-      const outcome = own(adoptResult, 'outcome');
+      // Fix-round item 3: `own` consults `getPrototypeOf` and
+      // `getOwnPropertyDescriptor`, and a lying Proxy may throw in either
+      // trap; the exception must not escape, so a throwing read fails closed
+      // as `adopt-failed`.
+      let outcome: unknown;
+      try {
+        outcome = own(adoptResult, 'outcome');
+      } catch {
+        return refusedLane('adopt-failed', lane.laneId);
+      }
       if (outcome === 'budget-exhausted') return refusal('budget-exhausted');
       if (outcome === 'adopted') {
         // An `absent` adopt occupies a run from this wave on; a `partial`

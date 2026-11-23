@@ -15,6 +15,7 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { MAX_CUTOVER_JOURNAL_ENTRIES, readCutoverShadowParkRecord, type CutoverShadowParkRecord } from '../../domain/cutover-records.js';
 import type {
   CutoverJournalAppendResult,
   CutoverJournalEntry,
@@ -34,11 +35,24 @@ import {
   writeJsonAtomically,
   type VersionedRecordParseResult,
 } from './file-store.js';
+import { sha256HexDigest } from './AttemptArtifactAdapter.adapter.js';
 
 export const CUTOVER_JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('cutover-journal.json', {
   // v2: an intent may carry a request digest; v1 and unversioned records still load (v1 intents never held one).
   writerVersion: 2,
   acceptedVersions: [1, 2],
+});
+
+/**
+ * SW2a2: the shadow-park journal's own version policy (`shadow-park-journal.json`).
+ * The writer stamps schemaVersion 3; the reader accepts 2 and 3 only because the
+ * shared policy assertion requires the previous version, and the stored-record
+ * parser still refuses every `schemaVersion !== 3` record — a v2 record inside
+ * the shadow-park journal is corrupt, never loaded.
+ */
+export const CUTOVER_SHADOW_PARK_JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('shadow-park-journal.json', {
+  writerVersion: 3,
+  acceptedVersions: [2, 3],
 });
 
 export interface CutoverJournalAdapterOptions {
@@ -48,6 +62,13 @@ export interface CutoverJournalAdapterOptions {
   readonly fileName?: string;
   /** Read-only: every append is refused as `store-read-only`; reads never quarantine. */
   readonly readOnly?: boolean;
+  /**
+   * SW2a2: shadow-park mode. The instance then stores to `shadow-park-journal.json`
+   * (the only file name it accepts, defaulted when omitted), writes schemaVersion 3
+   * records, requires every entry to carry a valid `shadowPark` record and refuses
+   * at the entry cap with `journal-capacity-exceeded`.
+   */
+  readonly shadowPark?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'cutover-journal.json';
@@ -81,8 +102,13 @@ const ENTRY_FIELDS = ['key', 'kind', 'entryId', 'recordedAtIso', 'outcome', 'rea
 const RESULT_ONLY_FIELDS = ['outcome', 'reasonCode', 'commitId', 'saveRef'] as const;
 const MAX_PREFIX_LENGTH = 256;
 const MAX_ISO_LENGTH = 64;
-const MAX_JOURNAL_ENTRIES = 10_000;
 const MAX_JOURNAL_BYTES = 16 * 1024 * 1024;
+/** SW2a2: the only file name a shadow-park instance accepts, and its default. */
+const SHADOW_PARK_FILE_NAME = 'shadow-park-journal.json';
+/** SW2a2: `cutover/shadow-park-<32 hex>@<revision>`; capture 1 is the entryId digest. */
+const SHADOW_PARK_KEY = /^cutover\/shadow-park-([0-9a-f]{32})@[0-9]+$/;
+/** SW2a2: the base fields plus the `shadowPark` record, allowed only in shadow-park mode. */
+const SHADOW_PARK_ENTRY_FIELDS = [...ENTRY_FIELDS, 'shadowPark'];
 
 export function isCutoverJournalKey(key: unknown): key is string {
   return typeof key === 'string' && (CUTOVER_KEY.test(key) || RELAUNCH_KEY.test(key) || SHADOW_IMPORT_KEY.test(key));
@@ -90,6 +116,11 @@ export function isCutoverJournalKey(key: unknown): key is string {
 
 export type CutoverJournalEntryRead =
   | { readonly ok: true; readonly entry: CutoverJournalEntry }
+  | { readonly ok: false; readonly reason: 'invalid-entry' | 'invalid-key' };
+
+/** SW2a2: a shadow-park entry read also carries the validated park record. */
+export type ShadowParkJournalEntryRead =
+  | { readonly ok: true; readonly entry: CutoverJournalEntry; readonly park: CutoverShadowParkRecord }
   | { readonly ok: false; readonly reason: 'invalid-entry' | 'invalid-key' };
 
 function optionalMatch(value: unknown, pattern: RegExp): string | null | undefined {
@@ -151,9 +182,9 @@ export function prepareCutoverJournalAppend(
   // Each existing entry is read once into plain values inside the try: a stateful getter cannot answer differently later.
   const held: { readonly key: string; readonly kind: string; readonly entryId: string; readonly outcome: unknown }[] = [];
   try {
-    if (!Array.isArray(existing) || existing.length > MAX_JOURNAL_ENTRIES) return { ok: false, reason: 'invalid-entry' };
+    if (!Array.isArray(existing) || existing.length > MAX_CUTOVER_JOURNAL_ENTRIES) return { ok: false, reason: 'invalid-entry' };
     // A full journal takes no further entry: record 10,001 would make the next read reject the whole file.
-    if (existing.length >= MAX_JOURNAL_ENTRIES) return { ok: false, reason: 'store-unreadable' };
+    if (existing.length >= MAX_CUTOVER_JOURNAL_ENTRIES) return { ok: false, reason: 'store-unreadable' };
     for (let index = 0; index < existing.length; index += 1) {
       const raw: unknown = index in existing ? existing[index] : undefined;
       if (typeof raw !== 'object' || raw === null) return { ok: false, reason: 'invalid-entry' };
@@ -197,12 +228,127 @@ export function readStoredCutoverJournalRecord(raw: unknown): VersionedRecordPar
   return { status: 'ok', record: read.entry, schemaVersion: versionCheck.schemaVersion };
 }
 
+/**
+ * SW2a2: read one shadow-park journal entry. The walk mirrors
+ * `readCutoverJournalEntry`'s descriptor-first single-read snapshotting (a
+ * throwing, stateful or accessor property is refused without ever running a
+ * getter) but on `SHADOW_PARK_ENTRY_FIELDS`, so `shadowPark` — and nothing
+ * else new — is allowed. `shadowPark` must be present and valid through
+ * `readCutoverShadowParkRecord`, and the key must be
+ * `cutover/shadow-park-<32 hex>@<revision>` whose hex segment is the first 32
+ * hex chars of the sha256 of the park's `entryId`. The base fields are
+ * validated by `readCutoverJournalEntry` over a snapshot-built plain copy, so
+ * the v2 grammar (intents/results, result-only fields, bounded text) is
+ * inherited without `ENTRY_FIELDS` being touched.
+ */
+export function readShadowParkJournalEntry(input: unknown, stored = false): ShadowParkJournalEntryRead {
+  const invalid = { ok: false, reason: 'invalid-entry' } as const;
+  try {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) return invalid;
+    const proto: unknown = Object.getPrototypeOf(input);
+    if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(input).length > 0) return invalid;
+    const names = Object.keys(input);
+    if (names.length > SHADOW_PARK_ENTRY_FIELDS.length + (stored ? 1 : 0)) return invalid;
+    // Descriptor first: an accessor property is refused before it is ever read,
+    // so a throwing or stateful getter is never executed.
+    for (const name of names) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, name);
+      if (descriptor === undefined || !('value' in descriptor) || descriptor.get !== undefined) return invalid;
+    }
+    // One read per property: a stateful getter cannot answer twice.
+    const snap: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const name of names) snap[name] = (input as Record<string, unknown>)[name];
+    if (!isCutoverJournalKey(snap.key)) return { ok: false, reason: 'invalid-key' };
+    const allowed = stored ? [...SHADOW_PARK_ENTRY_FIELDS, 'schemaVersion'] : SHADOW_PARK_ENTRY_FIELDS;
+    if (names.some((name) => !allowed.includes(name))) return invalid;
+    if (typeof snap.shadowPark !== 'object' || snap.shadowPark === null || Array.isArray(snap.shadowPark)) return invalid;
+    const parkRead = readCutoverShadowParkRecord(snap.shadowPark);
+    if (!parkRead.ok) return invalid;
+    const base: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const name of ENTRY_FIELDS) if (name in snap) base[name] = snap[name];
+    const read = readCutoverJournalEntry(base);
+    if (!read.ok) return { ok: false, reason: read.reason };
+    const match = SHADOW_PARK_KEY.exec(read.entry.key);
+    if (match === null) return { ok: false, reason: 'invalid-key' };
+    if (match[1] !== sha256HexDigest(parkRead.record.entryId).slice(0, 32)) return invalid;
+    return { ok: true, entry: { ...read.entry, shadowPark: parkRead.record }, park: parkRead.record };
+  } catch {
+    return invalid;
+  }
+}
+
+/** Pure: whether one shadow-park entry may follow `existing` (the whole journal, in append order). */
+export function prepareShadowParkJournalAppend(
+  existing: readonly CutoverJournalEntry[],
+  input: unknown,
+): CutoverJournalDecision {
+  const held: { readonly key: string; readonly kind: string; readonly entryId: string; readonly outcome: unknown }[] = [];
+  try {
+    if (!Array.isArray(existing) || existing.length > MAX_CUTOVER_JOURNAL_ENTRIES) return { ok: false, reason: 'invalid-entry' };
+    // A full journal takes no further entry: the cap is a typed refusal here, not unreadable state.
+    if (existing.length >= MAX_CUTOVER_JOURNAL_ENTRIES) return { ok: false, reason: 'journal-capacity-exceeded' };
+    for (let index = 0; index < existing.length; index += 1) {
+      const raw: unknown = index in existing ? existing[index] : undefined;
+      if (typeof raw !== 'object' || raw === null) return { ok: false, reason: 'invalid-entry' };
+      const fields = raw as Record<string, unknown>;
+      const { key, kind, entryId, outcome } = fields;
+      if (typeof key !== 'string' || typeof kind !== 'string' || typeof entryId !== 'string') {
+        return { ok: false, reason: 'invalid-entry' };
+      }
+      held.push({ key, kind, entryId, outcome });
+    }
+  } catch {
+    return { ok: false, reason: 'invalid-entry' };
+  }
+  const read = readShadowParkJournalEntry(input);
+  if (!read.ok) return read;
+  const entry = read.entry;
+  if (held.some((prior) => prior.entryId === entry.entryId)) return { ok: false, reason: 'invalid-entry' };
+  const sameKey = held.filter((prior) => prior.key === entry.key);
+  const hasIntent = sameKey.some((prior) => prior.kind === 'intent');
+  const hasResult = sameKey.some((prior) => prior.kind === 'result');
+  if (entry.kind === 'intent') {
+    if (hasResult) return { ok: false, reason: 'intent-after-result' };
+    return hasIntent ? { ok: false, reason: 'duplicate-intent' } : { ok: true, entry };
+  }
+  if (!hasIntent) return { ok: false, reason: 'result-without-intent' };
+  if (sameKey.some((prior) => prior.kind === 'result' && prior.outcome !== 'ambiguous')) {
+    return { ok: false, reason: 'result-after-final-result' };
+  }
+  return { ok: true, entry };
+}
+
+/**
+ * SW2a2: read one stored shadow-park record. `readStoreRecordSchemaVersion` runs
+ * under the shadow-park policy (which accepts 2 only to satisfy the shared
+ * policy assertion), and every `schemaVersion !== 3` record is invalid — a v2
+ * record inside `shadow-park-journal.json` is corrupt, never loaded.
+ */
+export function readStoredShadowParkJournalRecord(raw: unknown): VersionedRecordParseResult<CutoverJournalEntry> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, CUTOVER_SHADOW_PARK_JOURNAL_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') return versionCheck;
+  if (versionCheck.schemaVersion !== 3) return { status: 'invalid' };
+  const read = readShadowParkJournalEntry(raw, true);
+  if (!read.ok) return { status: 'invalid' };
+  return { status: 'ok', record: read.entry, schemaVersion: versionCheck.schemaVersion };
+}
+
 export class CutoverJournalAdapter implements CutoverJournalPort {
   private readonly inMemoryEntries: CutoverJournalEntry[] = [];
   private readonly target: string | null;
 
   constructor(private readonly options?: CutoverJournalAdapterOptions) {
     const { stateDir, fileName } = options ?? {};
+    const shadowParkMode = options?.shadowPark === true;
+    if (shadowParkMode) {
+      // SW2a2: a shadow-park instance stores only to the shadow-park journal.
+      if (fileName !== undefined && fileName !== SHADOW_PARK_FILE_NAME) {
+        throw new Error('CutoverJournalAdapter in shadowPark mode stores only to shadow-park-journal.json');
+      }
+    } else if (fileName === SHADOW_PARK_FILE_NAME) {
+      // And the shadow-park journal is written only in shadowPark mode.
+      throw new Error('CutoverJournalAdapter refuses shadow-park-journal.json without shadowPark mode');
+    }
     if (fileName !== undefined) {
       if (OTHER_STORE_FILE_NAMES.includes(fileName)) {
         throw new Error('CutoverJournalAdapter refuses a fileName that collides with another store');
@@ -212,29 +358,53 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
       }
     }
     this.target =
-      stateDir === undefined || stateDir.trim().length === 0 ? null : path.join(stateDir, fileName ?? DEFAULT_FILE_NAME);
+      stateDir === undefined || stateDir.trim().length === 0
+        ? null
+        : path.join(stateDir, fileName ?? (shadowParkMode ? SHADOW_PARK_FILE_NAME : DEFAULT_FILE_NAME));
   }
 
   async append(entry: CutoverJournalEntry): Promise<CutoverJournalAppendResult> {
     try {
       assertStoreWritable(this.options?.readOnly === true, 'CutoverJournalAdapter');
+      const shadowParkMode = this.options?.shadowPark === true;
       const target = this.target;
       if (target === null) {
         // No await between the decision and the push: two racing appends cannot both pass.
-        if (this.inMemoryEntries.length >= MAX_JOURNAL_ENTRIES) return { outcome: 'refused', reason: 'store-unreadable' };
+        if (shadowParkMode) {
+          const decision = prepareShadowParkJournalAppend(this.inMemoryEntries, entry);
+          if (!decision.ok) return { outcome: 'refused', reason: decision.reason };
+          this.inMemoryEntries.push(decision.entry);
+          return { outcome: 'appended', entry: { ...decision.entry } };
+        }
+        if (this.inMemoryEntries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) return { outcome: 'refused', reason: 'store-unreadable' };
         const decision = prepareCutoverJournalAppend(this.inMemoryEntries, entry);
         if (!decision.ok) return { outcome: 'refused', reason: decision.reason };
         this.inMemoryEntries.push(decision.entry);
         return { outcome: 'appended', entry: { ...decision.entry } };
       }
       return await withFileLock(`${target}.lock`, async (): Promise<CutoverJournalAppendResult> => {
-        const entries = await this.readEntriesFromDisk(target, false);
-        const decision = prepareCutoverJournalAppend(entries, entry);
+        const entries = await this.readEntriesFromDisk(
+          target,
+          false,
+          shadowParkMode ? readStoredShadowParkJournalRecord : readStoredCutoverJournalRecord,
+        );
+        if (shadowParkMode && entries.length >= MAX_CUTOVER_JOURNAL_ENTRIES) {
+          return { outcome: 'refused', reason: 'journal-capacity-exceeded' };
+        }
+        const decision = shadowParkMode
+          ? prepareShadowParkJournalAppend(entries, entry)
+          : prepareCutoverJournalAppend(entries, entry);
         if (!decision.ok) return { outcome: 'refused', reason: decision.reason };
         entries.push(decision.entry);
         await writeJsonAtomically(
           target,
-          entries.map((held) => ({ ...held, schemaVersion: CUTOVER_JOURNAL_STORE_VERSION_POLICY.writerVersion })),
+          entries.map((held) => ({
+            ...held,
+            schemaVersion: (shadowParkMode
+              ? CUTOVER_SHADOW_PARK_JOURNAL_STORE_VERSION_POLICY
+              : CUTOVER_JOURNAL_STORE_VERSION_POLICY
+            ).writerVersion,
+          })),
         );
         return { outcome: 'appended', entry: { ...decision.entry } };
       });
@@ -246,7 +416,14 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
   async listByKeyPrefix(prefix: string): Promise<CutoverJournalListResult> {
     if (typeof prefix !== 'string' || prefix.length > MAX_PREFIX_LENGTH) return { outcome: 'unreadable' };
     try {
-      const entries = this.target === null ? this.inMemoryEntries : await this.readEntriesFromDisk(this.target, true);
+      const entries =
+        this.target === null
+          ? this.inMemoryEntries
+          : await this.readEntriesFromDisk(
+              this.target,
+              true,
+              this.options?.shadowPark === true ? readStoredShadowParkJournalRecord : readStoredCutoverJournalRecord,
+            );
       return { outcome: 'listed', entries: entries.filter((held) => held.key.startsWith(prefix)).map((held) => ({ ...held })) };
     } catch {
       return { outcome: 'unreadable' };
@@ -254,7 +431,11 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
   }
 
   /** A read never quarantines (`readOnlyRead`); a writer quarantines the unreadable bytes under the lock. */
-  private async readEntriesFromDisk(target: string, readOnlyRead: boolean): Promise<CutoverJournalEntry[]> {
+  private async readEntriesFromDisk(
+    target: string,
+    readOnlyRead: boolean,
+    parseRecord: (raw: unknown) => VersionedRecordParseResult<CutoverJournalEntry>,
+  ): Promise<CutoverJournalEntry[]> {
     let buffer: Buffer;
     try {
       const info = await fs.stat(target);
@@ -265,12 +446,12 @@ export class CutoverJournalAdapter implements CutoverJournalPort {
       if (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT') return [];
       throw error;
     }
-    const inspection = inspectVersionedRecordListBytes(buffer, readStoredCutoverJournalRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseRecord);
     if (inspection.status === 'unknown-version') throw new StateFileUnknownVersionError(target, inspection.recordIndex);
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, readOnlyRead || this.options?.readOnly === true);
     }
-    if (inspection.records.length > MAX_JOURNAL_ENTRIES) throw new Error('cutover journal holds too many entries');
+    if (inspection.records.length > MAX_CUTOVER_JOURNAL_ENTRIES) throw new Error('cutover journal holds too many entries');
     return [...inspection.records];
   }
 }

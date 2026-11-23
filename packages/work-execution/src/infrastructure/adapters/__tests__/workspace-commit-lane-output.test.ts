@@ -98,7 +98,7 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     });
     const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
     expect(subcommands).toEqual([
-      'rev-parse', 'symbolic-ref', 'add', 'write-tree', 'rev-parse', 'diff-tree', 'commit-tree', 'update-ref',
+      'rev-parse', 'symbolic-ref', 'rev-parse', 'rev-parse', 'rev-parse', 'add', 'write-tree', 'rev-parse', 'diff-tree', 'commit-tree', 'update-ref',
     ]);
     for (const argv of recorded) {
       expect(argv.slice(0, 3 + COMMIT_CONFIG.length)).toEqual(['git', '-C', WORKTREE, ...COMMIT_CONFIG]);
@@ -360,7 +360,7 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     });
     const result = await adapter.commitLaneOutput!({ ...defaultRequest, recordedHost });
     expect(result).toEqual({ outcome: 'committed', headCommit: NEW, branchRef: BRANCH });
-    expect(recordedScript.recorded.length).toBe(8);
+    expect(recordedScript.recorded.length).toBe(11);
     expect(defaultScript.recorded).toEqual([]);
   });
 
@@ -436,5 +436,46 @@ describe('WorkspaceAdapter commitLaneOutput', () => {
     const adapter = new WorkspaceAdapter({ executor });
     const result = await adapter.commitLaneOutput!(defaultRequest);
     expect(result.outcome).not.toBe('refused');
+  });
+
+  it.each(['MERGE_HEAD', 'REBASE_HEAD', 'CHERRY_PICK_HEAD'])(
+    'refuses merge-state-present when %s exists, staging and committing nothing',
+    async (ref) => {
+      const answers: Record<string, CommandRunResult> = {
+        ...happyAnswers,
+        ['rev-parse --verify -q ' + ref]: { exitCode: 0, signal: null, stdout: HEAD_B + '\n', stderr: '' },
+      };
+      const { executor, recorded } = scripted(answers);
+      const adapter = new WorkspaceAdapter({ executor });
+      expect(await adapter.commitLaneOutput!(defaultRequest)).toEqual({ outcome: 'refused', reason: 'merge-state-present' });
+      const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+      expect(subcommands).not.toContain('add');
+      expect(subcommands).not.toContain('commit-tree');
+    },
+  );
+
+  it('refuses staged-content-findings when the staged re-scan finds something, committing nothing', async () => {
+    const { executor, recorded } = scripted(happyAnswers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!({ ...defaultRequest, verifyStagedContent: async () => 'findings' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'staged-content-findings' });
+    const subcommands = recorded.map((argv) => argv[3 + COMMIT_CONFIG.length]);
+    expect(subcommands).toContain('add');
+    expect(subcommands).not.toContain('commit-tree');
+    expect(subcommands).not.toContain('update-ref');
+  });
+
+  it.each(['error', 'throw'])('reports an error, committing nothing, when the staged re-scan is %s', async (mode) => {
+    const { executor, recorded } = scripted(happyAnswers);
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.commitLaneOutput!({
+      ...defaultRequest,
+      verifyStagedContent: async () => {
+        if (mode === 'throw') throw new Error('boom');
+        return 'error';
+      },
+    });
+    expect(result.outcome).toBe('error');
+    expect(recorded.map((argv) => argv[3 + COMMIT_CONFIG.length])).not.toContain('commit-tree');
   });
 });

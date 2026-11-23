@@ -870,7 +870,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.stopRequests).toHaveLength(0);
   });
 
-  it('test 5: collecting an ended opencode attempt collects without the commit step', async () => {
+  it('test 5: collecting an ended opencode attempt runs the commit step first (SN1) and then collects', async () => {
     const ended = endedAttempt({ runner: CONDUCTED_RUNNER });
     const harness = await makeHarness(runRecord(), [ended]);
     await conduct(harness, 'collecting', NOW);
@@ -882,7 +882,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       result: 'completed',
       reasonCode: 'collected',
     });
-    expect(harness.commitRequests).toHaveLength(0);
+    expect(harness.commitRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
     expect(harness.collectRequests).toHaveLength(1);
     expect(harness.collectRequests[0]).toEqual({
       attemptId: 'attempt-example-1',
@@ -910,7 +910,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.commitRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
   });
 
-  it('test 6b: a commit refusal refuses the collect and the next advance parks step-refused collect', async () => {
+  it('test 6b: a diff-findings commit refusal journals edits-outside-owned-paths and the next advance parks step-refused collect', async () => {
     const findings: readonly LaneDiffFinding[] = [
       { path: 'packages/example/secret.txt', line: 3, rule: 'secret-shape' },
     ];
@@ -924,7 +924,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       step: 'collect',
       key: collectKey(),
       result: 'refused',
-      reasonCode: 'edit-only-refused',
+      reasonCode: 'edits-outside-owned-paths',
     });
     expect(harness.collectRequests).toHaveLength(0);
     const parked = await advance(harness);
@@ -2217,7 +2217,8 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       reasonCode: 'dispatch-refused',
     });
     expect((await harness.attemptRepo.findAttemptById(attempt2 as string))?.state).toBe('cancelled');
-    expect(dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+    // SN1: the round-0 pivot seat's first dispatch already carries the handover.
+    expect(dispatchRequests[0]?.allowUncommittedHandover).toBe(true);
     refuseDispatch = false;
 
     // Advance 3: the handover re-prepares seat 0 in the same round as a3.

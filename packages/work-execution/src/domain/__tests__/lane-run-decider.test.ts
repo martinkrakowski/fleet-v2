@@ -850,6 +850,65 @@ describe('collecting state', () => {
       kind: 'park', reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting',
     });
   });
+
+  // GD1: a clean gate-driven fix round round >= 1 with no prior re-gate this
+  // round enters gating once; every other shape keeps the park.
+  it('GD1: a clean gate-driven fix round at round >= 1 re-gates once', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      attempt: attemptFact({ round: 1, collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }),
+      fixRoundGateDriven: true,
+      worktreeCleanForReGate: true,
+      gateLatestRound: null,
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'gating' });
+  });
+
+  it('GD1: an already re-gated round parks fix-no-progress (at most once per round)', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      attempt: attemptFact({ round: 1, collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }),
+      fixRoundGateDriven: true,
+      worktreeCleanForReGate: true,
+      gateLatestRound: 1,
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting',
+    });
+  });
+
+  it('GD1: a dirty worktree, a non-gate-driven round or round 0 parks fix-no-progress', () => {
+    const base = {
+      state: 'collecting' as const,
+      attempt: attemptFact({ round: 1, collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }),
+    };
+    for (const extra of [
+      { fixRoundGateDriven: true, worktreeCleanForReGate: false, gateLatestRound: null },
+      { fixRoundGateDriven: false, worktreeCleanForReGate: true, gateLatestRound: null },
+      { fixRoundGateDriven: true, worktreeCleanForReGate: true, gateLatestRound: null, attempt: attemptFact({ round: 0, collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }) },
+      {}, // absent facts read as not gate-driven and not clean
+    ]) {
+      const facts = baseFacts({ ...base, ...extra });
+      assertDecision(facts, record({}), decide(record({}), facts), {
+        kind: 'park', reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting',
+      });
+    }
+  });
+
+  it('GD1: an unsealed manifest parks artifacts-unsealed even on an unchanged head', () => {
+    for (const manifest of ['missing', 'mismatch'] as const) {
+      const facts = baseFacts({
+        state: 'collecting',
+        attempt: attemptFact({ round: 1, collection: { headUnchanged: true, commits: 1, manifest } }),
+        fixRoundGateDriven: true,
+        worktreeCleanForReGate: true,
+        gateLatestRound: null,
+      });
+      assertDecision(facts, record({}), decide(record({}), facts), {
+        kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
+      });
+    }
+  });
 });
 
 describe('gating state', () => {
@@ -999,6 +1058,98 @@ describe('gating state', () => {
     assertDecision(roundTwo, rec, decide(rec, roundTwo), {
       kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'gating',
     });
+  });
+
+  // GD1: the round's single gate-failed run retries once under /retry<n+1>.
+  it('GD1: a single gate-failed run retries once under /retry<n+1>', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateFailed: { retry: 0, failedCount: 1 },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('GD1: a gate-failed after congestion retries still gets its one retry', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateFailed: { retry: 2, failedCount: 1 },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry3`, round: 0, seatIndex: 0, head12: HEAD, retry: 3,
+    });
+  });
+
+  it('GD1: a second gate-failed at the same (round, head12) takes the failure path', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateFailed: { retry: 0, failedCount: 2 },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('GD1: a gate-failed past LANE_RUN_MAX_RETRY takes the failure path', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateFailed: { retry: LANE_RUN_MAX_RETRY, failedCount: 1 },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('GD1: ignores malformed gateFailed facts and falls through to afterFailure', () => {
+    for (const gateFailed of [null, undefined, { retry: -1, failedCount: 1 }, { retry: 1.5, failedCount: 1 }, { retry: 0, failedCount: 0 }, 'failed', 7]) {
+      const facts = baseFacts({
+        state: 'gating',
+        gate: 'failed',
+        head12: HEAD,
+        attempt: attemptFact(),
+        gateFailed: gateFailed as never,
+      });
+      assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+    }
+  });
+
+  it('GD1: gate none without any attempt waits facts-inconsistent', () => {
+    const facts = baseFacts({ state: 'gating', gate: 'none', head12: HEAD });
+    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('GD1: a gate intent from an earlier round acts this round\u2019s own run 0 gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      gateLatestRound: 0,
+      head12: HEAD,
+      attempt: attemptFact({ round: 1 }),
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r1/gate/0@${HEAD}`, round: 1, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it('GD1: a gate intent of this round never re-runs run 0 (the re-gate bound holds)', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'failed',
+      gateLatestRound: 1,
+      head12: HEAD,
+      attempt: attemptFact({ round: 1 }),
+      gateFailed: { retry: 0, failedCount: 2 },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
   });
 
   it('T6: a congested gate within the backoff waits gate-congested', () => {

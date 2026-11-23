@@ -195,18 +195,18 @@ export function laneRunTimedOut(entries: readonly LaneRunJournalEntryRecord[], r
   return false;
 }
 
-/** The gate intent at head12 with the highest retry (no retry = run 0), or null. */
+/** The gate intent at head12 with the highest round, then the highest retry (no retry = run 0), or null. */
 function highestRetryGateIntent(
   entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string,
-): { readonly key: string; readonly retry: number } | null {
-  let latest: { readonly key: string; readonly retry: number } | null = null;
+): { readonly key: string; readonly round: number; readonly retry: number } | null {
+  let latest: { readonly key: string; readonly round: number; readonly retry: number } | null = null;
   for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
     if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
       continue;
     }
     const retry = parsed.retry ?? 0;
-    if (latest === null || retry > latest.retry) {
-      latest = { key: entry.key, retry };
+    if (latest === null || parsed.round > latest.round || (parsed.round === latest.round && retry > latest.retry)) {
+      latest = { key: entry.key, round: parsed.round, retry };
     }
   }
   return latest;
@@ -314,6 +314,7 @@ interface GateRetryEntrySnapshot {
   readonly runId: unknown;
   readonly outcome: unknown;
   readonly reasonCode: unknown;
+  readonly state: unknown;
 }
 
 /**
@@ -348,16 +349,16 @@ function snapshotGateRetryEntry(source: unknown): { readonly status: 'ok'; reado
       values.push(descriptor.value);
     }
   }
-  const [kind, key, runId, outcome, reasonCode] = values;
+  const [kind, key, runId, outcome, reasonCode, state] = values;
   return {
     status: 'ok',
     snapshot: {
-      kind, key, runId, outcome, reasonCode,
+      kind, key, runId, outcome, reasonCode, state,
     },
   };
 }
 
-const GATE_RETRY_ENTRY_FIELDS = ['kind', 'key', 'runId', 'outcome', 'reasonCode'] as const;
+const GATE_RETRY_ENTRY_FIELDS = ['kind', 'key', 'runId', 'outcome', 'reasonCode', 'state'] as const;
 
 const REFUSED_GATE_RETRY_ENTRY = { status: 'refused' } as const;
 
@@ -517,6 +518,227 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
   } catch {
     // A lying proxy trap must never escape the planner.
     return GATE_RETRY_NONE;
+  }
+}
+
+/**
+ * Hostile-input-safe snapshotting shared by the GD1 gate readers: `entries`
+ * must be a dense `Array` of at most {@link GATE_RETRY_MAX_ENTRIES} entries (a
+ * non-array, an array-like, an enormous length, an array hole, a non-iterable
+ * or an accessor slot refuses the whole input); each slot is snapshotted
+ * through its own property descriptor so a getter is never invoked, a
+ * prototype-polluting key or an accessor field refuses the whole input, and a
+ * non-plain entry is skipped (read as `null`). Cost: O(N) one pass, one
+ * descriptor read per slot per field. A proxy that lies consistently in every
+ * trap is an accepted residual.
+ */
+function snapshotGateReaderEntries(entries: unknown): readonly (GateRetryEntrySnapshot | null)[] | null {
+  try {
+    if (!Array.isArray(entries) || entries.length > GATE_RETRY_MAX_ENTRIES) {
+      return null;
+    }
+    // Dense-array check: O(N), one hasOwn per index, no hole ever read.
+    for (let index = 0; index < entries.length; index += 1) {
+      if (!Object.hasOwn(entries, index)) {
+        return null;
+      }
+    }
+    const snapshots: (GateRetryEntrySnapshot | null)[] = new Array(entries.length);
+    for (let index = 0; index < entries.length; index += 1) {
+      const slot = Object.getOwnPropertyDescriptor(entries, index);
+      if (slot === undefined || !('value' in slot)) {
+        return null;
+      }
+      const snapshotted = snapshotGateRetryEntry(slot.value);
+      if (snapshotted.status === 'polluted') {
+        return null;
+      }
+      snapshots[index] = snapshotted.status === 'ok' ? snapshotted.snapshot : null;
+    }
+    return snapshots;
+  } catch {
+    return null;
+  }
+}
+
+/** The snapshot's parsed gate-intent parts at `head12`, or null when it is not one. */
+function gateIntentPartsOf(
+  snapshot: GateRetryEntrySnapshot, runId: string, head12: string,
+): { readonly key: string; readonly round: number; readonly retry: number } | null {
+  if (snapshot.kind !== 'intent' || snapshot.runId !== runId || typeof snapshot.key !== 'string') {
+    return null;
+  }
+  const parsed = parseLaneRunKey(snapshot.key);
+  if (
+    parsed === null || parsed.kind !== 'step' || parsed.step !== 'gate' ||
+    parsed.runId !== runId || parsed.head12 !== head12
+  ) {
+    return null;
+  }
+  return { key: snapshot.key, round: parsed.round, retry: parsed.retry ?? 0 };
+}
+
+/**
+ * GD1: the round of the gate intent at `head12` with the highest round, then
+ * highest retry (no retry = run 0); `null` when there is no such intent or the
+ * input is hostile. Pure: never throws, never runs a getter, never mutates its
+ * input. Cost: a single O(N) pass over `entries` plus O(N) key parses in the
+ * worst case (a 12-hex head check bounds each parse).
+ */
+export function laneRunGateLatestRound(entries: unknown, runId: unknown, head12: unknown): number | null {
+  try {
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+      return null;
+    }
+    if (typeof head12 !== 'string' || head12 === '') {
+      return null;
+    }
+    const snapshots = snapshotGateReaderEntries(entries);
+    if (snapshots === null) {
+      return null;
+    }
+    let latest: { readonly round: number; readonly retry: number } | null = null;
+    for (const snapshot of snapshots) {
+      if (snapshot === null) {
+        continue;
+      }
+      const parts = gateIntentPartsOf(snapshot, runId, head12);
+      if (parts === null) {
+        continue;
+      }
+      if (latest === null || parts.round > latest.round || (parts.round === latest.round && parts.retry > latest.retry)) {
+        latest = { round: parts.round, retry: parts.retry };
+      }
+    }
+    return latest === null ? null : latest.round;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GD1: the failed gate run at `head12` the decider may retry once. When the
+ * gate intent at `head12` with the highest (round, retry) has a final
+ * `gate-failed` result, returns that intent's `retry` (0 = run 0) and
+ * `failedCount` — the count of distinct gate intents in the same
+ * `(round, head12)` whose final result is `gate-failed`; otherwise `null`
+ * (including a pending, passed, congested or unknown latest run, and any
+ * hostile input). Cost: a single O(N) pass over `entries` that collects the
+ * gate intents and indexes each key's final result, then one pass over the
+ * collected intents of the highest round — O(N) overall, never a per-intent
+ * rescan of the snapshots.
+ */
+export function laneRunGateFailed(
+  entries: unknown, runId: unknown, head12: unknown,
+): { readonly retry: number; readonly failedCount: number } | null {
+  try {
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+      return null;
+    }
+    if (typeof head12 !== 'string' || head12 === '') {
+      return null;
+    }
+    const snapshots = snapshotGateReaderEntries(entries);
+    if (snapshots === null) {
+      return null;
+    }
+    // One pass: collect the gate intents at (runId, head12) and index each
+    // key's final (non-ambiguous) result — the first such result wins, as the
+    // per-key final-result reader it replaces returned.
+    const intents: { readonly key: string; readonly round: number; readonly retry: number }[] = [];
+    const finals = new Map<string, GateRetryEntrySnapshot>();
+    for (const snapshot of snapshots) {
+      if (snapshot === null) {
+        continue;
+      }
+      const parts = gateIntentPartsOf(snapshot, runId, head12);
+      if (parts !== null) {
+        intents.push(parts);
+      }
+      if (
+        snapshot.kind === 'result' && snapshot.runId === runId &&
+        typeof snapshot.key === 'string' && snapshot.outcome !== 'ambiguous' &&
+        !finals.has(snapshot.key)
+      ) {
+        finals.set(snapshot.key, snapshot);
+      }
+    }
+    // The highest (round, retry) gate intent at head12 decides.
+    let highest: { readonly key: string; readonly round: number; readonly retry: number } | null = null;
+    for (const parts of intents) {
+      if (
+        highest === null || parts.round > highest.round ||
+        (parts.round === highest.round && parts.retry > highest.retry)
+      ) {
+        highest = parts;
+      }
+    }
+    if (highest === null) {
+      return null;
+    }
+    const final = finals.get(highest.key);
+    if (final === undefined || final.reasonCode !== 'gate-failed') {
+      return null;
+    }
+    // The distinct gate intents of the same (round, head12) that failed.
+    let failedCount = 0;
+    const counted = new Set<string>();
+    for (const parts of intents) {
+      if (parts.round !== highest.round || counted.has(parts.key)) {
+        continue;
+      }
+      counted.add(parts.key);
+      const intentFinal = finals.get(parts.key);
+      if (intentFinal !== undefined && intentFinal.reasonCode === 'gate-failed') {
+        failedCount += 1;
+      }
+    }
+    return { retry: highest.retry, failedCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GD1: whether the run's latest `fixing` conduct entry was driven into the fix
+ * round by a gate failure — `true` exactly when that entry is immediately
+ * preceded (in journal order, over the run's conduct entries) by a `gating`
+ * conduct entry. `false` on any invalid or hostile input, when there is no
+ * `fixing` conduct entry, or when the preceding conduct state is anything
+ * else. Cost: a single O(N) pass over `entries`.
+ */
+export function laneRunFixRoundGateDriven(entries: unknown, runId: unknown): boolean {
+  try {
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+      return false;
+    }
+    const snapshots = snapshotGateReaderEntries(entries);
+    if (snapshots === null) {
+      return false;
+    }
+    const states: string[] = [];
+    for (const snapshot of snapshots) {
+      if (
+        snapshot === null || snapshot.kind !== 'conduct' || snapshot.runId !== runId ||
+        typeof snapshot.state !== 'string'
+      ) {
+        continue;
+      }
+      // A parked conduct sits outside the driving sequence: the fix round was
+      // resumed into, so the park's own conduct never breaks the adjacency.
+      if (snapshot.state === 'parked') {
+        continue;
+      }
+      states.push(snapshot.state);
+    }
+    const latestFixing = states.lastIndexOf('fixing');
+    if (latestFixing < 1) {
+      // No fixing conduct, or none that a preceding conduct could have driven.
+      return false;
+    }
+    return states[latestFixing - 1] === 'gating';
+  } catch {
+    return false;
   }
 }
 

@@ -27,7 +27,7 @@
 
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
+import { DEFAULT_BASE_BRANCH, parseBaseBranch, resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
 import { isConductorHalted } from '../../domain/conductor-halt.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
@@ -411,7 +411,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       attempt,
       clone.path,
       recordedHost,
-      resolveWorkOrderBaseBranch(workOrder),
+      // RP1: a work order may carry a profile base (e.g. `staging`); the
+      // workspace port still declares declared branches only until RP1b, so
+      // an undeclared value reads as `main`, as an unparsable value always has.
+      parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? DEFAULT_BASE_BRANCH,
     );
     if (baseTip.outcome === 'refused') {
       return baseTip.result;
@@ -515,7 +518,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
         branchName: branchForRun(request.runId),
-        baseBranch: resolveWorkOrderBaseBranch(workOrder),
+        baseBranch: parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? DEFAULT_BASE_BRANCH,
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };

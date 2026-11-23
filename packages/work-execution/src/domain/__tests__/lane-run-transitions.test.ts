@@ -19,6 +19,7 @@ import {
   afterLaneRunPreMergePass,
   canEnterLaneRunState,
   checkLaneRunResume,
+  checkParkEscalation,
   implementerRoleFor,
   laneRunBranchBehindExit,
   laneRunDrainContinues,
@@ -36,6 +37,14 @@ import {
   normalizePremergeMode,
   PREMERGE_MODES,
 } from '../lane-run-transitions.js';
+import { PARK_ESCALATION_HISTORY_MAX } from '../park-escalation.js';
+
+const PARKED_FIX_NO_PROGRESS = {
+  reason: 'fix-no-progress',
+  qualifier: null,
+  parkedFrom: 'collecting',
+  questionId: null,
+};
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const BASE_RECORD = {
@@ -605,5 +614,168 @@ describe('speed-plan rows (KS1: D19, D20, D22, D24)', () => {
     for (const step of LANE_RUN_REVIEWS_IN_FLIGHT.steps) {
       expect(LANE_RUN_DRAIN_STEPS).not.toContain(step);
     }
+  });
+});
+
+describe('park escalation (CE1)', () => {
+  const DIRTY = { trackedFilesChanged: 2 };
+
+  it('an escalated park may enter fixing while a plain park may not', () => {
+    expect(canEnterLaneRunState('parked', 'fixing', 'collecting')).toBe(false);
+    expect(canEnterLaneRunState('parked', 'fixing', null, false, undefined, true)).toBe(true);
+    // The exception opens nothing else and nothing from a non-parked state.
+    expect(canEnterLaneRunState('parked', 'gating', null, false, undefined, true)).toBe(false);
+    expect(canEnterLaneRunState('gating', 'fixing', null, false, undefined, true)).toBe(true);
+    expect(canEnterLaneRunState('merged', 'fixing', null, false, undefined, true)).toBe(false);
+  });
+
+  it('escalates a fix-no-progress park with a dirty worktree and a clean history', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: true, to: 'fixing', mode: 'commit-pending', journalReasonCode: 'park-escalated', journalDetail: 'commit-pending' });
+  });
+
+  it('returns malformed-input for hostile or malformed transition inputs', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    const base: Record<string, unknown> = {
+      record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+    };
+    // a missing required key and an extra key are refused
+    const withoutHistory = { ...base } as Record<string, unknown>;
+    delete withoutHistory.history;
+    expect(checkParkEscalation(withoutHistory as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, extra: 1 } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    // non-plain record / bad revision / unknown state
+    expect(checkParkEscalation({ ...base, record: [] } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, record: Object.create(null) } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, record: { ...rec, revision: 1.5 } } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, record: { ...rec, revision: '1' } } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, state: 'XYZZY' } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(checkParkEscalation({ ...base, state: 7 } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+
+    // a throwing getter on the record's revision is refused, never thrown
+    const throwingRecord: Record<string, unknown> = { ...rec };
+    Object.defineProperty(throwingRecord, 'revision', { enumerable: true, get() { throw new Error('boom'); } });
+    expect(checkParkEscalation({ ...base, record: throwingRecord } as never)).toEqual({ ok: false, reason: 'malformed-input' });
+
+    // a Proxy with a non-plain prototype on the input is refused via the shared reader
+    const traps: string[] = [];
+    expect(
+      checkParkEscalation(new Proxy(base, {
+        getPrototypeOf() { traps.push('getPrototypeOf'); return Array.prototype; },
+        get(t, k) { traps.push('get'); return Reflect.get(t, k); },
+      }) as never),
+    ).toEqual({ ok: false, reason: 'malformed-input' });
+    expect(traps).toEqual(['getPrototypeOf']);
+  });
+
+  it('refuses stopped run with run-stopped before revision or park checks', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    // Even a stale revision and a dirty worktree lose to run-stopped.
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'stopped', stopMode: 'force', expectedRevision: rec.revision + 5, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'run-stopped' });
+  });
+
+  it('refuses mismatched expectedRevision with stale-revision', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision + 1, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'stale-revision' });
+  });
+
+  it('refuses pending stopMode with stop-pending', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    for (const stopMode of ['graceful', 'force'] as const) {
+      expect(
+        checkParkEscalation({
+          record: rec, state: 'parked', stopMode, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+        }),
+      ).toEqual({ ok: false, reason: 'stop-pending' });
+    }
+  });
+
+  it('refuses non-parked state or null parked record with not-parked', () => {
+    const rec = record({});
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'running', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'not-parked' });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'not-parked' });
+  });
+
+  it('refuses stop-unconfirmed and stop-refused parks with stop-pending', () => {
+    for (const parked of [PARKED_UNCONFIRMED, PARKED_REFUSED]) {
+      const rec = record({ parked, parkCount: 1 });
+      expect(
+        checkParkEscalation({
+          record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+        }),
+      ).toEqual({ ok: false, reason: 'stop-pending' });
+    }
+  });
+
+  it('refuses one-way-door park with one-way-door', () => {
+    const rec = record({ parked: PARKED_ONE_WAY, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'one-way-door' });
+  });
+
+  it('propagates decideParkEscalation stay-parked reasons as typed transition refusals', () => {
+    // not fix-no-progress
+    const blocker = record({ parked: PARKED_BLOCKER, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: blocker, state: 'parked', stopMode: null, expectedRevision: blocker.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'park-reason-not-escalatable' });
+    // missing fact
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    expect(
+      checkParkEscalation({ record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [] }),
+    ).toEqual({ ok: false, reason: 'missing-dirty-worktree-fact' });
+    // clean worktree
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: { trackedFilesChanged: 0 },
+      }),
+    ).toEqual({ ok: false, reason: 'worktree-clean' });
+    // already escalated
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision,
+        history: [{ reasonCode: 'park-escalated', detail: 'commit-pending' }], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'already-escalated' });
+    // malformed history (array holes)
+    const sparse: unknown[] = new Array(PARK_ESCALATION_HISTORY_MAX - 1);
+    sparse[0] = { reasonCode: 'gate-failed' };
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: sparse, dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'malformed-history' });
+    // history too long
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision,
+        history: new Array(PARK_ESCALATION_HISTORY_MAX + 1).fill({ reasonCode: 'gate-failed' }), dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: false, reason: 'history-too-long' });
   });
 });

@@ -1,0 +1,95 @@
+import { describe, expect, it } from 'vitest';
+
+import { MAX_JSON_SCAN_DEPTH, checkJsonDuplicateKeys } from '../json-duplicate-keys.js';
+import { MAX_REVIEW_REPLY_LENGTH } from '../review-answer-schema.js';
+
+describe('checkJsonDuplicateKeys', () => {
+  it('accepts a valid reviewer reply object with unique keys', () => {
+    expect(checkJsonDuplicateKeys('{"verdict":"PASS","findings":[]}')).toEqual({ ok: true });
+  });
+
+  it('accepts nested unique objects and arrays', () => {
+    expect(checkJsonDuplicateKeys(
+      '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"a.ts","line":1,"summary":"s"}]}',
+    )).toEqual({ ok: true });
+  });
+
+  it('refuses a top-level FAIL-then-PASS duplicate verdict key', () => {
+    expect(
+      checkJsonDuplicateKeys('{"verdict":"FAIL","findings":[],"verdict":"PASS"}'),
+    ).toEqual({ ok: false, reason: 'duplicate-key' });
+  });
+
+  it('refuses a top-level PASS-then-FAIL duplicate verdict key', () => {
+    expect(
+      checkJsonDuplicateKeys('{"verdict":"PASS","findings":[],"verdict":"FAIL"}'),
+    ).toEqual({ ok: false, reason: 'duplicate-key' });
+  });
+
+  it('refuses a nested duplicate severity key inside a finding', () => {
+    expect(checkJsonDuplicateKeys(
+      '{"verdict":"PASS","findings":[{"severity":"blocker","file":"a.ts","line":1,"summary":"s","severity":"nit"}]}',
+    )).toEqual({ ok: false, reason: 'duplicate-key' });
+  });
+
+  it('refuses a duplicate key deeply nested inside an array of objects', () => {
+    expect(checkJsonDuplicateKeys(
+      '{"verdict":"PASS","findings":[[{"a":1},{"a":2,"a":3}]]}',
+    )).toEqual({ ok: false, reason: 'duplicate-key' });
+  });
+
+  it('does not count keys inside string values', () => {
+    expect(checkJsonDuplicateKeys(
+      '{"verdict":"PASS","findings":[],"summary":"\\"verdict\\":\\"FAIL\\""}',
+    )).toEqual({ ok: true });
+  });
+
+  it('handles escaped quotes and escaped backslashes and refuses unicode-escaped duplicate keys', () => {
+    expect(checkJsonDuplicateKeys('{"a":"quote \\" and backslash \\\\","b":"x"}')).toEqual({ ok: true });
+    expect(
+      checkJsonDuplicateKeys('{"verdict":"PASS","\\u0076erdict":"FAIL","findings":[]}'),
+    ).toEqual({ ok: false, reason: 'duplicate-key' });
+  });
+
+  it('accepts leading whitespace before the root value and trailing whitespace after it', () => {
+    expect(checkJsonDuplicateKeys('  \n\t {"verdict":"PASS","findings":[]} \r\n ')).toEqual({ ok: true });
+  });
+
+  it('refuses malformed JSON and trailing non-whitespace tokens', () => {
+    expect(checkJsonDuplicateKeys('{"verdict":')).toEqual({ ok: false, reason: 'invalid-json' });
+    expect(checkJsonDuplicateKeys('{"verdict":"PASS"}x')).toEqual({ ok: false, reason: 'invalid-json' });
+    expect(checkJsonDuplicateKeys('{"verdict":"PASS"} {"a":1}')).toEqual({ ok: false, reason: 'invalid-json' });
+    expect(checkJsonDuplicateKeys('{"verdict":"PASS"}')).toEqual({ ok: true });
+  });
+
+  it('refuses duplicate __proto__ keys and never mutates Object.prototype', () => {
+    const before = Object.prototype as unknown as Record<string, unknown>;
+    expect(
+      checkJsonDuplicateKeys('{"__proto__":1,"__proto__":2}'),
+    ).toEqual({ ok: false, reason: 'duplicate-key' });
+    expect(
+      checkJsonDuplicateKeys('{"__proto__":{},"verdict":"PASS","findings":[]}'),
+    ).toEqual({ ok: true });
+    expect((before as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('returns a typed invalid-input result on hostile non-string inputs without throwing', () => {
+    for (const hostile of [null, undefined, 42, true, { length: 2, 0: '{', 1: '}' }]) {
+      expect(() => checkJsonDuplicateKeys(hostile)).not.toThrow();
+      expect(checkJsonDuplicateKeys(hostile)).toEqual({ ok: false, reason: 'invalid-input' });
+    }
+  });
+
+  it('enforces the reply-length cost bound in O(1) before scanning', () => {
+    const oversized = '"' + 'a'.repeat(MAX_REVIEW_REPLY_LENGTH) + '"';
+    expect(oversized.length).toBeGreaterThan(MAX_REVIEW_REPLY_LENGTH);
+    expect(checkJsonDuplicateKeys(oversized)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('enforces the nesting depth cost bound', () => {
+    const tooDeep = '['.repeat(MAX_JSON_SCAN_DEPTH + 1);
+    expect(checkJsonDuplicateKeys(tooDeep)).toEqual({ ok: false, reason: 'invalid-input' });
+    const atLimit = '['.repeat(MAX_JSON_SCAN_DEPTH) + ']'.repeat(MAX_JSON_SCAN_DEPTH);
+    expect(checkJsonDuplicateKeys(atLimit)).toEqual({ ok: true });
+  });
+});

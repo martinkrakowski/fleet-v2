@@ -976,7 +976,9 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
 
   /**
    * Every record is read before any is matched: one unreadable or unknown-version
-   * record fails the whole store closed instead of being skipped.
+   * record fails the whole store closed instead of being skipped. The scan is
+   * linear in the number of stored grants, capped by the named constant
+   * `MAX_ACTION_AUTHORIZATION_GRANTS` (rejected above it before any scan).
    */
   private scanGrantsForMatch(
     grants: Map<string, ActionAuthorizationGrantEntry>,
@@ -989,6 +991,11 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         readonly consumedByOther: boolean;
       } {
     let match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+    // CO14 follow-up (#4g): a resumable release grant (already consumed by
+    // exactly this resolve's action id) is preferred over an unrelated
+    // unconsumed grant, so a retry after a crash between the consumption and
+    // the release's write never spends a second approved grant.
+    let resumableMatch: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
     let rootConflict = false;
     let consumedByOther = false;
     for (const [rawGrantId, rawEntry] of grants) {
@@ -1019,12 +1026,17 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         continue;
       }
       if (isResolvableGrant(grant, request)) {
-        match = { id: rawGrantId, grant };
+        const entry = { id: rawGrantId, grant };
+        if (grant.consumedByActionId === null) {
+          match = entry;
+        } else {
+          resumableMatch = entry;
+        }
         continue;
       }
       consumedByOther = true;
     }
-    return { match, rootConflict, consumedByOther };
+    return { match: resumableMatch ?? match, rootConflict, consumedByOther };
   }
 
   private bindGrantInPlace(

@@ -19,6 +19,13 @@ export type ShadowDivergenceCode = (typeof SHADOW_DIVERGENCE_CODES)[number];
 /** At most this many divergences are listed; the rest set `truncated`. */
 export const SHADOW_DIVERGENCE_MAX = 50;
 
+/**
+ * At most this many items are accepted per side. An over-cap `fleet` or
+ * `shell` list is refused before any element is read, so a hostile sparse
+ * array of length `2**32 - 1` can never drive a traversal.
+ */
+export const SHADOW_SIDE_MAX_ITEMS = 10_000;
+
 export interface ShadowDivergence {
   /** The compared key: ids only (pull request, head oid, base, chain name, predicate, brief id). */
   readonly key: string;
@@ -62,7 +69,6 @@ const BRIEF_VERDICT_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 
 interface ValidatedEntry { readonly key: string; readonly value: string; }
 type ItemValidator = (item: unknown, side: 'fleet' | 'shell') => ValidatedEntry | null;
-type ComparePair<T> = { readonly fleet: readonly T[]; readonly shell: readonly T[] };
 
 /**
  * A plain object whose own properties are all data properties. An accessor
@@ -162,14 +168,64 @@ function makeDivergence(key: string, code: ShadowDivergenceCode, fleet: string |
   return Object.freeze({ key, code, fleet, shell });
 }
 
+// A Proxy can rig its `getOwnPropertyDescriptor` trap to report a length that
+// disagrees with everything its `get` path reports (commit 6e50a07a tried to
+// catch this by cross-checking index descriptors, but a Proxy can lie
+// consistently across `length` and index descriptors). The two read paths are
+// separate traps, so the descriptor length is accepted only when the object's
+// own `get` path reports the same value. A plain array's `length` is always a
+// data property, so this read never runs a getter; a Proxy `get` trap that
+// throws or disagrees is a refusal.
+function readsConsistentLength(input: readonly unknown[], length: number): boolean {
+  try {
+    return (input as { length?: unknown }).length === length;
+  } catch {
+    return false;
+  }
+}
+
 function collectSide(side: 'fleet' | 'shell', input: unknown, validate: ItemValidator, divergences: ShadowDivergence[]): readonly ValidatedEntry[] {
   if (!Array.isArray(input)) {
     divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
     return [];
   }
+  // The length is read exactly once, through its own data descriptor, and
+  // captured in a local: a Proxy `get` trap can lie differently on every
+  // read (report `0` to pass the cap check, then a huge value in the loop
+  // condition), so no property read ever supplies the loop bound.
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(input, 'length');
+  if (
+    lengthDescriptor === undefined || !('value' in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0
+  ) {
+    divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
+    return [];
+  }
+  const length: number = lengthDescriptor.value;
+  // Refused before any traversal: a sparse array of length 2**32 - 1 must
+  // never walk its indices.
+  if (length > SHADOW_SIDE_MAX_ITEMS) {
+    divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
+    return [];
+  }
+  // Refused before any traversal: a Proxy whose descriptor trap lies about the
+  // list's length cannot make its `get` path agree with the lie.
+  if (!readsConsistentLength(input, length)) {
+    divergences.push(makeDivergence(`invalid-${side}-list`, 'invalid-item', null, null));
+    return [];
+  }
   const entries: ValidatedEntry[] = [];
-  for (let index = 0; index < input.length; index += 1) {
-    const entry = validate(input[index], side);
+  for (let index = 0; index < length; index += 1) {
+    // Read through the own data descriptor only: an array hole, a prototype
+    // index property, or a Proxy get trap yields no own data descriptor, so
+    // the element is invalid and no getter or trap ever runs.
+    const descriptor = Object.getOwnPropertyDescriptor(input, index);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      divergences.push(makeDivergence(`invalid-${side}-${index}`, 'invalid-item', null, null));
+      continue;
+    }
+    const entry = validate(descriptor.value, side);
     if (entry === null) {
       divergences.push(makeDivergence(`invalid-${side}-${index}`, 'invalid-item', null, null));
     } else {
@@ -223,13 +279,36 @@ function fallbackResult(kind: ShadowComparisonKind): ShadowComparisonResult {
   });
 }
 
-type CompareInput = Readonly<Record<string, unknown>>;
+type CompareInput = unknown;
 
+/**
+ * True when `value` carries an own prototype-polluting key (`__proto__`,
+ * `constructor` or `prototype`), as `JSON.parse` can produce. Such a key is
+ * never treated as data.
+ */
+function hasPrototypePollutingKey(value: Record<string, unknown>): boolean {
+  return Reflect.ownKeys(value).some(
+    (key) => key === '__proto__' || key === 'constructor' || key === 'prototype',
+  );
+}
+
+/**
+ * Compare the two sides of one shadow record. Cost: linear in the capped
+ * input — at most `SHADOW_SIDE_MAX_ITEMS` elements per side, each validated
+ * once, plus a key map build; at most `SHADOW_DIVERGENCE_MAX` divergences are
+ * listed. The root `input` is read through its own data-property descriptors
+ * only: a null, primitive, array, non-plain object, object carrying any
+ * accessor property, or object with an own prototype-polluting key returns
+ * the fallback result before any property is read, so no getter and no Proxy
+ * `get` trap ever runs.
+ */
 function compareShadowLists(kind: ShadowComparisonKind, input: CompareInput, validate: ItemValidator): ShadowComparisonResult {
   try {
+    if (!isRecordObject(input) || hasPrototypePollutingKey(input)) return fallbackResult(kind);
+    const [fleetValue, shellValue] = ownFields(input, ['fleet', 'shell']);
     const divergences: ShadowDivergence[] = [];
-    const fleetEntries = collectSide('fleet', input.fleet, validate, divergences);
-    const shellEntries = collectSide('shell', input.shell, validate, divergences);
+    const fleetEntries = collectSide('fleet', fleetValue, validate, divergences);
+    const shellEntries = collectSide('shell', shellValue, validate, divergences);
 
     const duplicated = duplicatedKeys([fleetEntries, shellEntries]);
     for (const key of duplicated) {
@@ -277,21 +356,51 @@ function compareShadowLists(kind: ShadowComparisonKind, input: CompareInput, val
   }
 }
 
-export function compareShadowMergeSets(input: ComparePair<ShadowMergeSetItem>): ShadowComparisonResult {
+/**
+ * Compare the merge sets of both sides. Cost: linear in the capped input —
+ * at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowMergeSets(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('merge-set', input, validateMergeSetItem);
 }
-export function compareShadowGateVerdicts(input: ComparePair<ShadowGateVerdictItem>): ShadowComparisonResult {
+/**
+ * Compare the gate verdicts of both sides. Cost: linear in the capped input —
+ * at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowGateVerdicts(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('gate-verdict', input, validateGateVerdictItem);
 }
-export function compareShadowPremergeStatuses(input: ComparePair<ShadowPremergeStatusItem>): ShadowComparisonResult {
+/**
+ * Compare the premerge statuses of both sides. Cost: linear in the capped
+ * input — at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowPremergeStatuses(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('premerge-status', input, validatePremergeStatusItem);
 }
-export function compareShadowEnqueueSets(input: ComparePair<ShadowEnqueueSetItem>): ShadowComparisonResult {
+/**
+ * Compare the enqueue sets of both sides. Cost: linear in the capped input —
+ * at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowEnqueueSets(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('enqueue-set', input, validateEnqueueSetItem);
 }
-export function compareShadowChainMembers(input: ComparePair<ShadowChainMemberItem>): ShadowComparisonResult {
+/**
+ * Compare the chain members of both sides. Cost: linear in the capped input —
+ * at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowChainMembers(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('chain-members', input, validateChainMemberItem);
 }
-export function compareShadowBriefVerdicts(input: ComparePair<ShadowBriefVerdictItem>): ShadowComparisonResult {
+/**
+ * Compare the brief verdicts of both sides. Cost: linear in the capped input —
+ * at most `SHADOW_SIDE_MAX_ITEMS` elements per side, with
+ * `SHADOW_DIVERGENCE_MAX` divergences listed and `truncated` set beyond it.
+ */
+export function compareShadowBriefVerdicts(input: CompareInput): ShadowComparisonResult {
   return compareShadowLists('brief-verdict', input, validateBriefVerdictItem);
 }

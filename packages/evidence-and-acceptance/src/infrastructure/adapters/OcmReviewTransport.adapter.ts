@@ -12,6 +12,7 @@ import {
   isSafeRelativeFilePath,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
+import { checkJsonDuplicateKeys } from '../../domain/json-duplicate-keys.js';
 import { parseReviewStreamGrammar } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
@@ -1272,6 +1273,13 @@ function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string):
     };
   }
   if (fence.kind === 'invalid') {
+    return UNPARSEABLE;
+  }
+  // RV2: `JSON.parse` silently keeps the last value of a duplicate key, so
+  // the exact `fence.jsonText` handed to `JSON.parse` is first scanned for
+  // duplicate object keys at any depth; a duplicate is a malformed answer.
+  const duplicateKeyCheck = checkJsonDuplicateKeys(fence.jsonText);
+  if (!duplicateKeyCheck.ok) {
     return UNPARSEABLE;
   }
   let parsed: unknown;

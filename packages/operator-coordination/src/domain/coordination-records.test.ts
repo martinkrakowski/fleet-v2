@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { CoordinationRequestRecord } from './coordination-records.js';
-import { isSignedDecisionRequired, verifySignedDecisionBinding } from './coordination-records.js';
+import { isSignedDecisionRequired, parseShadowImportGrant, verifySignedDecisionBinding } from './coordination-records.js';
 
 function requestRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
   return {
@@ -491,5 +491,108 @@ describe('verifySignedDecisionBinding', () => {
       code: 'decision-binding-invalid-input',
     });
     expect(trapCalls).toBe(1);
+  });
+});
+
+/**
+ * BL06a: `parseShadowImportGrant` takes `unknown` at its boundary and never
+ * throws — every refusal below asserts the specific named error code, and no
+ * accessor or Proxy `get` trap ever runs. (The sibling exhaustive battery
+ * lives in `shadow-import-grant.test.ts`; these cover the boundary contract
+ * for this module's own readers.)
+ */
+describe('parseShadowImportGrant boundary refusals', () => {
+  const VALID_REPOSITORY = { owner: 'atlas', repo: 'fleet' };
+  const VALID_EXPIRES_AT_ISO = '2026-12-01T00:00:00.000Z';
+
+  function validGrant(): Record<string, unknown> {
+    return { repository: { ...VALID_REPOSITORY }, expiresAtIso: VALID_EXPIRES_AT_ISO };
+  }
+
+  it('refuses null as not-object', () => {
+    expect(parseShadowImportGrant(null)).toEqual({ ok: false, code: 'shadow-import-grant-not-object' });
+  });
+
+  it('refuses undefined as not-object', () => {
+    expect(parseShadowImportGrant(undefined)).toEqual({ ok: false, code: 'shadow-import-grant-not-object' });
+  });
+
+  it('refuses a wrong primitive (a number where a grant object is due) as not-object', () => {
+    expect(parseShadowImportGrant(42)).toEqual({ ok: false, code: 'shadow-import-grant-not-object' });
+  });
+
+  it('refuses an array as not-object', () => {
+    expect(parseShadowImportGrant([validGrant()])).toEqual({ ok: false, code: 'shadow-import-grant-not-object' });
+  });
+
+  it('refuses a wrong prototype (not Object.prototype) as not-object', () => {
+    expect(parseShadowImportGrant(Object.create({ repository: VALID_REPOSITORY }))).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-not-object',
+    });
+  });
+
+  it('refuses a revoked Proxy without throwing as invalid-input', () => {
+    const { proxy, revoke } = Proxy.revocable(validGrant(), {});
+    revoke();
+    expect(parseShadowImportGrant(proxy)).toEqual({ ok: false, code: 'shadow-import-grant-invalid-input' });
+  });
+
+  it.each(['__proto__', 'constructor', 'prototype'])('refuses the forbidden own key %s as forbidden-key', (key) => {
+    const raw = JSON.parse(`{"repository":{"owner":"a","repo":"b"},"expiresAtIso":"2026-12-01T00:00:00.000Z","${key}":{}}`) as object;
+    expect(parseShadowImportGrant(raw)).toEqual({ ok: false, code: 'shadow-import-grant-forbidden-key' });
+  });
+
+  it('refuses an unexpected extra key as unexpected-key', () => {
+    expect(parseShadowImportGrant({ ...validGrant(), extra: true })).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-unexpected-key',
+    });
+  });
+
+  it('refuses an accessor property without ever running the getter', () => {
+    let getterCalls = 0;
+    const raw: Record<string, unknown> = { repository: { ...VALID_REPOSITORY }, expiresAtIso: VALID_EXPIRES_AT_ISO };
+    Object.defineProperty(raw, 'extra', {
+      get() {
+        getterCalls += 1;
+        return true;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    // The descriptor snapshot runs before the key-set comparison, so the
+    // accessor is reported by its own code.
+    expect(parseShadowImportGrant(raw)).toEqual({ ok: false, code: 'shadow-import-grant-accessor-forbidden' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses an invalid repository segment as invalid-repository', () => {
+    expect(parseShadowImportGrant({ repository: { owner: 'bad owner!', repo: 'fleet' }, expiresAtIso: VALID_EXPIRES_AT_ISO })).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-invalid-repository',
+    });
+  });
+
+  it('refuses an invalid expiry as invalid-expiry', () => {
+    expect(parseShadowImportGrant({ repository: { ...VALID_REPOSITORY }, expiresAtIso: 'not-a-date' })).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-invalid-expiry',
+    });
+  });
+
+  it('accepts a valid grant, and the check is not satisfiable by a constant or an identity echo', () => {
+    expect(parseShadowImportGrant(validGrant())).toEqual({
+      ok: true,
+      value: { repository: VALID_REPOSITORY, expiresAtIso: VALID_EXPIRES_AT_ISO },
+    });
+    // Not a constant verdict: a hostile input gives a different result.
+    expect(parseShadowImportGrant(null).ok).toBe(false);
+    // Not an identity echo: the value is a frozen normalized copy.
+    const read = parseShadowImportGrant(validGrant());
+    if (read.ok) {
+      expect(Object.isFrozen(read.value)).toBe(true);
+      expect(read.value).not.toBe(validGrant());
+    }
   });
 });

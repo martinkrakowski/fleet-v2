@@ -661,6 +661,52 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
   });
 
+  it('answers unreadable when a top-level driver-lease-unknown flag is present', () => {
+    // CO30c follow-up: an inventoried result can still carry a
+    // `driver-lease-unknown` flag when the lease record itself read but its
+    // state could not be determined. That is not evidence of an idle driver,
+    // so the summary answers `unreadable` — between the live-lease refusal
+    // (which stays `refused`) and the non-`inventoried` outcome path.
+    const inventoried: InventoryRelaunchResult = {
+      outcome: 'inventoried',
+      nowIso: NOW,
+      conductor: { halted: false, driverLease: 'absent', runCount: 0 },
+      riskFlags: [{ code: 'driver-lease-unknown', count: 1 }],
+      hosts: [
+        {
+          hostName: HOST,
+          cloneCount: 1,
+          worktreeCount: 0,
+          counts: { conducted: 0, attemptRecorded: 0, unrecorded: 0 },
+          riskFlags: [],
+          lanes: [],
+        },
+      ],
+    };
+    expect(summarizeInventoryForCutover(inventoried, 1)).toEqual({ status: 'unreadable' });
+    expect(summarizeInventoryForCutover(inventoried)).toEqual({ status: 'unreadable' });
+  });
+
+  it('completes the switch when two active profiles share one clone', async () => {
+    // CO30c follow-up: two active profiles declaring the same clone (same
+    // host, path and worktree root) name one clone, not two. Before the
+    // deduplication the declared count doubled and the inventory's inspected
+    // count could never reach it, so every shared-clone installation failed
+    // the gate as unknown. The registration use case refuses a second
+    // project over the same clone, so the fixture seeds the second record
+    // directly.
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    const profiles = JSON.parse(await fs.readFile(path.join(fx.stateDir, 'project-profiles.json'), 'utf8')) as unknown[];
+    profiles.push(rawProfile('proj-2', { [HOST]: { path: fx.clonePath, worktreeRoot: fx.worktreeRoot } }));
+    await fs.writeFile(path.join(fx.stateDir, 'project-profiles.json'), JSON.stringify(profiles), 'utf8');
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(code).toBe(0);
+  });
+
   it('answers unknown when the driver lease file is unreadable', async () => {
     const fx = await fixture({ worktrees: [RUN_ID] });
     await registerRealCloneProfile(fx);

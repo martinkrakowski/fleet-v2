@@ -279,6 +279,8 @@ function completedResult(kind: MoveKind, key: string, replayed: boolean, record:
     state: kind.state,
     revision: record.revision,
     record,
+    // SW2b1 placeholder: SW2b2 replaces these with the actual release counts.
+    ...(kind.move === 'switch' ? { releasedParks: 0, vetoHoldParks: 0 } : {}),
   } as ManageCutoverResult;
 }
 
@@ -787,6 +789,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     // readability gate. With no intent yet, this pass's read is what the digest records.
     const plan = recorded ?? this.newSwitchIntent(request, preflight.trainPausedBefore);
 
+    // The pause check is held through the switch: the preflight read alone does
+    // not pin the marker, so it is re-read here, immediately before the write
+    // phase (intent, train pause, record). A marker an operator cleared between
+    // the preflight read and this recheck still refuses the move with zero
+    // writes instead of letting the switch complete while daemon ticks run.
+    const pauseStillHeld = await this.daemonPauseFailure(deadlineIso);
+    if (pauseStillHeld !== null) {
+      return pauseStillHeld;
+    }
+
     const normalizedNowIso = normalizeIso(nowIso);
     const intentFailure = await this.appendIntentUnlessRecorded(
       journal.intent,
@@ -858,9 +870,9 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   }
 
   /**
-   * The switch gates after the state precondition, in order: evidence, lane coverage, daemon,
-   * train pause. The train-pause read runs on every pass and answers whether the train was
-   * already paused.
+   * The switch gates after the state precondition, in order: evidence, lane
+   * coverage, daemon status, daemon pause, train pause. The train-pause read
+   * runs on every pass and answers whether the train was already paused.
    */
   private async switchPreflight(
     request: ManageCutoverSwitchRequest,
@@ -869,7 +881,8 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const failure =
       (await this.shadowEvidenceFailure(request, deadlineIso)) ??
       (await this.unrecordedLanesFailure(deadlineIso)) ??
-      (await this.daemonStatusFailure(deadlineIso));
+      (await this.daemonStatusFailure(deadlineIso)) ??
+      (await this.daemonPauseFailure(deadlineIso));
     return failure ?? this.readTrainPausedBefore(deadlineIso);
   }
 
@@ -993,6 +1006,28 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (status.kind === 'threw') return unknown('daemon-status-unreadable');
     if (status.value.status !== 'ok' && status.value.status !== 'missing') {
       return unknown('daemon-status-unreadable');
+    }
+    return null;
+  }
+
+  /**
+   * The daemon-pause gate: a switch only runs while the daemon is paused.
+   * Unreadable or malformed is `unknown`, `clear` is refused, and the deadline
+   * is honoured through the guarded read.
+   */
+  private async daemonPauseFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const pause = await this.guarded(deadlineIso, () => this.deps.daemonPauseRead.read());
+    if (pause.kind === 'deadline') return unknown('deadline-exceeded');
+    if (
+      pause.kind === 'threw' ||
+      typeof pause.value !== 'object' ||
+      pause.value === null ||
+      (pause.value.state !== 'paused' && pause.value.state !== 'clear')
+    ) {
+      return unknown('daemon-pause-unreadable');
+    }
+    if (pause.value.state !== 'paused') {
+      return refuse('daemon-not-paused');
     }
     return null;
   }

@@ -113,6 +113,21 @@ const POLLUTING_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 const LANE_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/**
+ * The identifier grammar of every plan record's name-like string (a host
+ * name, a project, run, attempt or work-order id, a dispatch endpoint key):
+ * a leading alphanumeric and then alphanumerics, dots, underscores or
+ * hyphens, at most 128 characters. It is deliberately narrower than
+ * "any clean string": no `/` (so no path can enter a record whose contract
+ * forbids paths), no whitespace, no separator characters, no free text.
+ */
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** The same grammar with a host name's longer bound (253, as in DNS). */
+const HOST_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/;
+/** The scheduling caps of the plan contract: at most 64 concurrent runs. */
+const MAX_PLAN_MAX_ACTIVE_RUNS = 64;
+/** The scheduling caps of the plan contract: at most 10 minutes of stagger. */
+const MAX_PLAN_DISPATCH_STAGGER_MS = 600_000;
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/; // eslint-disable-line no-control-regex -- the validator's job is refusing control characters, not matching text containing them
 
 export type StoredRelaunchPlanValidation =
@@ -157,6 +172,21 @@ function isSecretFreeString(value: unknown): value is string {
 /** `null` or a clean string. */
 function isNullableCleanString(value: unknown): boolean {
   return value === null || isCleanString(value);
+}
+
+/** A clean string that also matches the plan's identifier grammar. */
+function isCleanIdentifier(value: unknown): value is string {
+  return isCleanString(value) && IDENTIFIER_PATTERN.test(value);
+}
+
+/** A clean host name: the identifier grammar at the host-name bound. */
+function isCleanHostName(value: unknown): value is string {
+  return isCleanString(value) && HOST_NAME_PATTERN.test(value);
+}
+
+/** `null` or a clean identifier. */
+function isNullableCleanIdentifier(value: unknown): boolean {
+  return value === null || isCleanIdentifier(value);
 }
 
 /** A safe integer within an inclusive range. */
@@ -315,11 +345,11 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   const laneId = record['laneId'];
   if (typeof laneId !== 'string' || !LANE_ID_PATTERN.test(laneId)) return null;
   if (!isSecretFreeString(laneId)) return null;
-  if (!isCleanString(record['hostName'])) return null;
-  if (!isNullableCleanString(record['projectId'])) return null;
-  if (!isNullableCleanString(record['runId'])) return null;
-  if (!isNullableCleanString(record['attemptId'])) return null;
-  if (!isNullableCleanString(record['workOrderId'])) return null;
+  if (!isCleanHostName(record['hostName'])) return null;
+  if (!isNullableCleanIdentifier(record['projectId'])) return null;
+  if (!isNullableCleanIdentifier(record['runId'])) return null;
+  if (!isNullableCleanIdentifier(record['attemptId'])) return null;
+  if (!isNullableCleanIdentifier(record['workOrderId'])) return null;
   const population = record['population'];
   if (
     population !== 'conducted' &&
@@ -344,7 +374,7 @@ function readSnapshotLane(value: unknown, planDigest: string): SnapshotLane | nu
   const admissionWave = record['admissionWave'] as number;
   if (!isSafeIntegerWithin(admissionWave, 0, Number.MAX_SAFE_INTEGER)) return null;
   const dispatchEndpointKey = record['dispatchEndpointKey'];
-  if (!isNullableCleanString(dispatchEndpointKey)) return null;
+  if (!isNullableCleanIdentifier(dispatchEndpointKey)) return null;
   const staggerOffsetMs = record['staggerOffsetMs'];
   if (!isNullableSafeIntegerWithin(staggerOffsetMs)) return null;
   const steps = readBoundedDenseArray(record['steps'], MAX_RELAUNCH_APPLY_STEPS);
@@ -422,8 +452,8 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
     if (hostFilter !== null) {
       if (!isCleanString(hostFilter) || (hostFilter as string).length > 4096) return INVALID_PLAN;
     }
-    if (!isSafeIntegerWithin(record['maxActiveRuns'], 1, Number.MAX_SAFE_INTEGER)) return INVALID_PLAN;
-    if (!isSafeIntegerWithin(record['dispatchStaggerMs'], 0, Number.MAX_SAFE_INTEGER)) return INVALID_PLAN;
+    if (!isSafeIntegerWithin(record['maxActiveRuns'], 1, MAX_PLAN_MAX_ACTIVE_RUNS)) return INVALID_PLAN;
+    if (!isSafeIntegerWithin(record['dispatchStaggerMs'], 0, MAX_PLAN_DISPATCH_STAGGER_MS)) return INVALID_PLAN;
     const conductorRecord = readExactPlainRecord(record['conductor'], [
       'halted',
       'driverLease',
@@ -450,11 +480,42 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
       laneIds.add(lane.laneId);
       snapshotLanes.push(lane);
     }
+    // Dependency graph: membership, wave ordering (a lane admits strictly
+    // after every lane it depends on) and acyclicity (Kahn's algorithm), so
+    // only topologically schedulable plans pass.
+    const laneById = new Map(snapshotLanes.map((lane) => [lane.laneId, lane]));
     for (const lane of snapshotLanes) {
       for (const dependency of lane.dependsOnLaneIds) {
-        if (!laneIds.has(dependency)) return INVALID_PLAN;
+        const dependencyLane = laneById.get(dependency);
+        if (dependencyLane === undefined) return INVALID_PLAN;
+        if (dependencyLane.admissionWave >= lane.admissionWave) return INVALID_PLAN;
       }
     }
+    const indegree = new Map<string, number>(snapshotLanes.map((lane) => [lane.laneId, 0]));
+    const dependents = new Map<string, string[]>();
+    for (const lane of snapshotLanes) {
+      for (const dependency of lane.dependsOnLaneIds) {
+        indegree.set(lane.laneId, (indegree.get(lane.laneId) ?? 0) + 1);
+        const dependentList = dependents.get(dependency);
+        if (dependentList === undefined) dependents.set(dependency, [lane.laneId]);
+        else dependentList.push(lane.laneId);
+      }
+    }
+    const ready: string[] = [];
+    for (const [laneId, degree] of indegree) {
+      if (degree === 0) ready.push(laneId);
+    }
+    let scheduled = 0;
+    while (ready.length > 0) {
+      const laneId = ready.pop() as string;
+      scheduled += 1;
+      for (const dependent of dependents.get(laneId) ?? []) {
+        const remaining = (indegree.get(dependent) ?? 0) - 1;
+        indegree.set(dependent, remaining);
+        if (remaining === 0) ready.push(dependent);
+      }
+    }
+    if (scheduled !== snapshotLanes.length) return INVALID_PLAN;
     // Digest recomputation runs last, after every field set has validated.
     const digest = pureSha256Hex(
       canonicalPlanBodyJson({

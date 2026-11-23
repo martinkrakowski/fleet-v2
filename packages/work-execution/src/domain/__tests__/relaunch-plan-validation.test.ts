@@ -155,6 +155,38 @@ const canonicalDigestOf = (plan: Record<string, unknown>): string =>
  */
 const CANONICAL_ONLY_SECRET = `AIza${'a'.repeat(30)}`;
 
+/**
+ * A plan mutated by `mutate`, given its true canonical digest and rebuilt
+ * step keys (conducted lanes keep no step; other lanes get the idle
+ * `save`, `adopt`, `redispatch` sequence). Any refusal of a redigested plan
+ * therefore comes from a rule other than a digest or idempotency-key match.
+ */
+const redigested = (mutate: (plan: Record<string, unknown>) => void): Record<string, unknown> => {
+  const plan = validPlan();
+  mutate(plan);
+  // Rebuild the step codes first (conducted lanes keep no step; other lanes
+  // get the idle `save`, `adopt`, `redispatch` sequence), then compute the
+  // digest over that body, then bind each step's idempotency key to it.
+  for (const lane of plan['lanes'] as Record<string, unknown>[]) {
+    lane['steps'] =
+      lane['population'] === 'conducted'
+        ? []
+        : (['save', 'adopt', 'redispatch'] as const).map((code) => ({
+            step: code,
+            idempotencyKey: 'pending',
+          }));
+  }
+  const digest = canonicalDigestOf(plan);
+  plan['planDigest'] = digest;
+  for (const lane of plan['lanes'] as Record<string, unknown>[]) {
+    const laneId = lane['laneId'] as string;
+    for (const entry of lane['steps'] as Record<string, unknown>[]) {
+      entry['idempotencyKey'] = `relaunch/${digest}/${laneId}/${entry['step'] as string}`;
+    }
+  }
+  return plan;
+};
+
 describe('validateStoredRelaunchPlan (V1: a valid stored plan passes)', () => {
   it('V1 accepts the pinned valid plan with its true canonical digest', () => {
     expect(validateStoredRelaunchPlan(validPlan())).toEqual({ ok: true });
@@ -288,6 +320,20 @@ describe('validateStoredRelaunchPlan (V4: malformed plan-level fields refuse)', 
   rejects('a conductor with a negative runCount', (plan) => {
     (plan['conductor'] as Record<string, unknown>)['runCount'] = -1;
   });
+
+  it('V4 refuses a maxActiveRuns over the plan cap of 64 even when the digest matches', () => {
+    const plan = redigested((p) => {
+      p['maxActiveRuns'] = 100;
+    });
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V4 refuses a dispatchStaggerMs over the contract maximum of 600000 even when the digest matches', () => {
+    const plan = redigested((p) => {
+      p['dispatchStaggerMs'] = 600_001;
+    });
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
 });
 
 describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => {
@@ -378,6 +424,72 @@ describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => 
   it('V5 refuses a duplicate laneId across lanes', () => {
     const plan = validPlan();
     (plan['lanes'] as Record<string, unknown>[])[1]['laneId'] = 'lane-1';
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V5 refuses a path-shaped hostName even when the digest matches', () => {
+    // '/tmp/private-runner' is a clean, secret-free string; only the
+    // identifier grammar of the plan contract refuses it.
+    const plan = validPlan();
+    (plan['lanes'] as Record<string, unknown>[])[1]['hostName'] = '/tmp/private-runner';
+    const digest = canonicalDigestOf(plan);
+    plan['planDigest'] = digest;
+    (plan['lanes'] as Record<string, unknown>[])[1]['steps'] = [
+      step(digest, 'lane-2', 'save'),
+      step(digest, 'lane-2', 'adopt'),
+      step(digest, 'lane-2', 'redispatch'),
+    ];
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V5 refuses a project, run or endpoint identifier outside the plan grammar even when the digest matches', () => {
+    for (const [key, value] of [
+      ['projectId', 'a/path'],
+      ['runId', 'run 1'],
+      ['workOrderId', 'wo;drop'],
+      ['dispatchEndpointKey', 'ep key'],
+    ] as const) {
+      const plan = validPlan();
+      (plan['lanes'] as Record<string, unknown>[])[1][key] = value;
+      const digest = canonicalDigestOf(plan);
+      plan['planDigest'] = digest;
+      (plan['lanes'] as Record<string, unknown>[])[1]['steps'] = [
+        step(digest, 'lane-2', 'save'),
+        step(digest, 'lane-2', 'adopt'),
+        step(digest, 'lane-2', 'redispatch'),
+      ];
+      expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+    }
+  });
+
+  it('V5 refuses a dependency cycle that cannot be topologically scheduled', () => {
+    const plan = redigested((p) => {
+      const lanes = p['lanes'] as Record<string, unknown>[];
+      lanes[0]['population'] = 'unrecorded';
+      lanes[0]['runnerState'] = 'idle';
+      lanes[0]['admissionWave'] = 2;
+      lanes[0]['dispatchEndpointKey'] = 'ep-key-0';
+      lanes[0]['staggerOffsetMs'] = 0;
+      lanes[0]['dependsOnLaneIds'] = ['lane-2'];
+      lanes[1]['admissionWave'] = 1;
+      lanes[1]['dependsOnLaneIds'] = ['lane-1'];
+    });
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V5 refuses a dependency on a lane admitted in the same wave', () => {
+    const plan = redigested((p) => {
+      const lanes = p['lanes'] as Record<string, unknown>[];
+      // Both lanes redispatch in wave 1; lane-2 depends on lane-1. Membership
+      // and acyclicity pass; only the strictly-earlier-wave rule refuses it.
+      lanes[0]['population'] = 'unrecorded';
+      lanes[0]['runnerState'] = 'idle';
+      lanes[0]['admissionWave'] = 1;
+      lanes[0]['dispatchEndpointKey'] = 'ep-key-0';
+      lanes[0]['staggerOffsetMs'] = 0;
+      lanes[1]['admissionWave'] = 1;
+      lanes[1]['dependsOnLaneIds'] = ['lane-1'];
+    });
     expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
   });
 

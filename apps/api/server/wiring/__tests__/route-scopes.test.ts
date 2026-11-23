@@ -231,36 +231,52 @@ describe("requiredScope and normalizePath hostile-input refusals", () => {
     expect(() => requiredScope(["GET"] as unknown as string, "/v1/questions")).toThrow(TypeError);
   });
 
-  it("refuses objects with throwing getters without running them and hostile Proxies without returning a scope", () => {
-    // A throwing getter is never invoked: refusal happens on the first
-    // missing property access (`indexOf` for a path, `toUpperCase` for a
-    // method), so the failure is a TypeError and the getter body below never
-    // executes. If the implementation ever ran the getter, the counter would
-    // move and the RangeError would surface instead of the TypeError.
-    let pathGetterRuns = 0;
+  it("refuses objects with throwing getters on the properties the functions actually read, and hostile Proxies, without returning a scope", () => {
+    // `normalizePath` reads `path.indexOf` as its very first access, so the
+    // throwing getter sits on `indexOf`: the RangeError surfaces exactly at
+    // the property the implementation reads, proving the function is refused
+    // there and never reaches the later `split`/`decodeURI` steps. If the
+    // implementation skipped `indexOf` or read a different property first,
+    // `splitRuns` would move and these assertions would fail.
+    let indexOfGetterRuns = 0;
+    let splitRuns = 0;
     const hostilePath = {
-      get split(): string[] {
-        pathGetterRuns += 1;
+      get indexOf(): (searchValue: string) => number {
+        indexOfGetterRuns += 1;
         throw new RangeError("getter must never be run");
+      },
+      get split(): string[] {
+        splitRuns += 1;
+        throw new RangeError("split must never be reached");
       },
     };
     // O(1): the failure happens on the first property access; nothing scans
-    // and no getter is read.
-    expect(() => normalizePath(hostilePath as unknown as string)).toThrow(TypeError);
-    expect(() => requiredScope("GET", hostilePath as unknown as string)).toThrow(TypeError);
-    expect(pathGetterRuns).toBe(0);
+    // and no scope is produced.
+    expect(() => normalizePath(hostilePath as unknown as string)).toThrow(
+      "getter must never be run",
+    );
+    expect(() => requiredScope("GET", hostilePath as unknown as string)).toThrow(
+      "getter must never be run",
+    );
+    expect(indexOfGetterRuns).toBeGreaterThan(0);
+    expect(splitRuns).toBe(0);
 
-    let methodGetterRuns = 0;
+    // `requiredScope` resolves the method through `method.toUpperCase()`. With
+    // a valid string path, `normalizePath` succeeds and the refusal surfaces
+    // exactly at the `toUpperCase` read, proving the function is refused at
+    // the property it actually reads on the method (the old `length` getter
+    // was never read by any code path).
+    let toUpperCaseGetterRuns = 0;
     const hostileMethod = {
-      get length(): number {
-        methodGetterRuns += 1;
+      get toUpperCase(): () => string {
+        toUpperCaseGetterRuns += 1;
         throw new RangeError("getter must never be run");
       },
     };
-    expect(() => requiredScope(hostileMethod as unknown as string, "/v1/questions")).toThrow(
-      TypeError,
-    );
-    expect(methodGetterRuns).toBe(0);
+    expect(() =>
+      requiredScope(hostileMethod as unknown as string, "/v1/questions"),
+    ).toThrow("getter must never be run");
+    expect(toUpperCaseGetterRuns).toBe(1);
     // A Proxy that lies consistently in every trap: it advertises an indexOf
     // that succeeds but no split, so the lie is still refused by TypeError.
     const lyingProxy = new Proxy(

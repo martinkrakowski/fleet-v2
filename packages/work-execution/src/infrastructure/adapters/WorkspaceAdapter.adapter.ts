@@ -980,22 +980,51 @@ export async function writeAndVerifyPatch(
     return 'git-refused';
   }
   const tempPath = mkTemp.stdout.trim();
-  const diffRun = await executor.run(
-    [
-      'git',
-      '-C',
-      worktreePath,
-      ...RECOVERY_GIT_CONFIG,
-      'diff',
-      '--binary',
-      '--no-ext-diff',
-      '--no-textconv',
-      '--no-color',
-      'HEAD',
-      `--output=${tempPath}`,
-    ],
+  // SN1: untracked files are part of the preserved change set. They are
+  // staged into a TEMPORARY index (the worktree's own index is never touched)
+  // and diffed against HEAD from there, so the patch holds the tracked edits
+  // and the new files alike before anything resets or cleans the worktree.
+  const tempIndexMk = await executor.run(
+    ['mktemp', path.join(physicalParent, '.fleet-index.XXXXXX')],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
+  if (tempIndexMk.exitCode !== 0 || tempIndexMk.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  const tempIndex = tempIndexMk.stdout.trim();
+  const cleanupTemps = async (): Promise<void> => {
+    await executor.run(['rm', '-f', tempPath, tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
+  };
+  // git needs the index file absent (an empty file is a corrupt index).
+  await executor.run(['rm', '-f', tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
+  const filterOverrides = await collectFilterDriverOverrides(executor, worktreePath);
+  if (filterOverrides === null) {
+    await cleanupTemps();
+    return 'git-refused';
+  }
+  const indexGit = (...args: readonly string[]): string[] => [
+    'env',
+    `GIT_INDEX_FILE=${tempIndex}`,
+    'git',
+    '-C',
+    worktreePath,
+    ...RECOVERY_GIT_CONFIG,
+    ...filterOverrides,
+    ...args,
+  ];
+  for (const stage of [['read-tree', 'HEAD'], ['add', '-A', '--', '.']]) {
+    const run = await executor.run(indexGit(...stage), { timeoutMs: GIT_TIMEOUT_MS });
+    if (run.exitCode !== 0 || run.error !== undefined) {
+      await cleanupTemps();
+      return 'git-refused';
+    }
+  }
+  const diffRun = await executor.run(
+    indexGit('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD', `--output=${tempPath}`),
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  await executor.run(['rm', '-f', tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
   if (diffRun.exitCode !== 0 || diffRun.error !== undefined) {
     await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
     return 'git-refused';
@@ -1508,6 +1537,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     worktreePath: string,
     expectedHead: string,
     allowedPathPrefixes: readonly string[],
+    verifyStagedContent?: CommitLaneOutputRequest['verifyStagedContent'],
   ): Promise<LaneCommitStep<{ tree: string }>> {
     // 6–7. Stage the change set, write the staged tree and compare it with
     // HEAD's tree (the shared comparison helper).
@@ -1531,7 +1561,52 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (stagedTreeOutsideAllowedPaths(diffTreeRun.stdout, allowedPathPrefixes)) {
       return { failure: { outcome: 'refused', reason: 'outside-allowed-paths' } };
     }
+
+    // 7c. SN1: the paths passed; the staged CONTENT is scanned for secrets
+    // too, so a secret written between the diff check and staging is never
+    // committed. Nothing is committed and no ref moves.
+    if (verifyStagedContent !== undefined) {
+      let verdict: 'clean' | 'findings' | 'error';
+      try {
+        verdict = await verifyStagedContent();
+      } catch {
+        verdict = 'error';
+      }
+      if (verdict === 'findings') {
+        return { failure: { outcome: 'refused', reason: 'staged-content-findings' } };
+      }
+      if (verdict !== 'clean') {
+        return { failure: { outcome: 'error', reason: 'the staged content re-scan could not run' } };
+      }
+    }
     return { data: { tree } };
+  }
+
+  /**
+   * SN1: refuse while `MERGE_HEAD`, `REBASE_HEAD` or `CHERRY_PICK_HEAD`
+   * exists (exit 0 of `rev-parse --verify -q`; exit 1 is absent; anything
+   * else is an error). `null` means none exists.
+   */
+  private async laneCommitMergeState(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<CommitLaneOutputResult | null> {
+    for (const ref of ['MERGE_HEAD', 'REBASE_HEAD', 'CHERRY_PICK_HEAD']) {
+      const probe = await executor.run(
+        ['git', '-C', worktreePath, ...COMMIT_GIT_CONFIG, 'rev-parse', '--verify', '-q', ref],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (probe.error !== undefined || probe.exitCode === null) {
+        return { outcome: 'error', reason: 'git rev-parse failed' };
+      }
+      if (probe.exitCode === 0) {
+        return { outcome: 'refused', reason: 'merge-state-present' };
+      }
+      if (probe.exitCode !== 1) {
+        return { outcome: 'error', reason: 'git rev-parse failed' };
+      }
+    }
+    return null;
   }
 
   /**
@@ -1607,6 +1682,11 @@ export class WorkspaceAdapter implements WorkspacePort {
       return this.alreadyCommittedOutcome(executor, request, worktreePath, head, branchRef);
     }
 
+    // 5b. SN1: a merge, rebase or cherry-pick in progress is never staged
+    // or committed over.
+    const mergeState = await this.laneCommitMergeState(executor, worktreePath);
+    if (mergeState !== null) return mergeState;
+
     // 6–7b. Stage the change set, compare the staged tree with HEAD's tree
     // and re-check the allowed-path prefixes on the committed tree.
     const stagedTree = await this.laneCommitStagedTree(
@@ -1614,6 +1694,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       worktreePath,
       request.expectedHead,
       request.allowedPathPrefixes,
+      request.verifyStagedContent,
     );
     if ('failure' in stagedTree) return stagedTree.failure;
 

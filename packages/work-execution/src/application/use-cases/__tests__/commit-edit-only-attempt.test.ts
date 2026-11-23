@@ -585,6 +585,8 @@ describe('CommitEditOnlyAttemptUseCase', () => {
       'detached-head',
       'ref-moved',
       'outside-allowed-paths',
+      'merge-state-present',
+      'staged-content-findings',
     ] as const) {
       const lane = makeLane({ workspaceOutcome: { outcome: 'refused', reason } });
       const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
@@ -604,6 +606,24 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     const lane = makeLane();
     await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
     expect(lane.commits[0]!.allowedPathPrefixes).toEqual(['packages/example/']);
+  });
+
+  it('hands the commit a staged-content re-scan that runs the same diff check again and maps its verdict', async () => {
+    const lane = makeLane();
+    await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    const verify = lane.commits[0]!.verifyStagedContent;
+    expect(verify).toBeDefined();
+    const before = lane.diffRequests.length;
+    expect(await verify!()).toBe('clean');
+    expect(lane.diffRequests.length).toBe(before + 1);
+    expect(lane.diffRequests[before]).toMatchObject({
+      worktreePath: '/lanes/attempt-1',
+      allowedPathPrefixes: ['packages/example/'],
+    });
+    lane.setDiffOutcome({ outcome: 'findings', findings: [{ path: 'packages/example/a.ts', line: 1, rule: 'secret' }] } as never);
+    expect(await verify!()).toBe('findings');
+    lane.setDiffOutcome({ outcome: 'error', reason: 'x' } as never);
+    expect(await verify!()).toBe('error');
   });
 
   it('a missing attempt is refused attempt-missing', async () => {

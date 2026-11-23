@@ -107,13 +107,23 @@ export async function runCollectBody(ctx: AdvanceStepContext,
       // normalized before the refusal is journalled, so the next attempt
       // starts from a clean worktree; other refusals keep `edit-only-refused`.
       let reasonCode: 'edit-only-refused' | 'edits-outside-owned-paths' = 'edit-only-refused';
-      if (committed.reason === 'diff-findings' || committed.reason === 'outside-allowed-paths') {
-        await normalizeRefusedWorktree(ctx, latest);
+      const normalize =
+        committed.reason === 'diff-findings' ||
+        committed.reason === 'outside-allowed-paths' ||
+        committed.reason === 'staged-content-findings';
+      if (normalize) {
         reasonCode = 'edits-outside-owned-paths';
       }
+      // SN1: the refused result is journaled BEFORE anything is reset or
+      // cleaned. If the append fails, the worktree is untouched, so a re-run
+      // reads the same refusal and parks; it can never see a clean tree and
+      // collect over a refusal that was never recorded.
       const resultRefusal = await appendRunResult(ctx, request, key, 'refused', reasonCode);
       if (resultRefusal !== null) {
         return refusedResult(resultRefusal);
+      }
+      if (normalize) {
+        await normalizeRefusedWorktree(ctx, latest);
       }
       return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode };
     }
@@ -180,8 +190,13 @@ async function normalizeRefusedWorktree(
     if (preserved === null || preserved.outcome !== 'preserved') {
       return;
     }
+    // The preserved patch holds the tracked edits AND the untracked files; only
+    // now is anything reset or removed. A failed reset skips the clean.
     if (recovery.resetWorktreeToHead !== undefined) {
-      await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost: runner });
+      const reset = await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost: runner });
+      if (reset.outcome !== 'reset') {
+        return;
+      }
     }
     if (recovery.removeUntrackedFiles !== undefined) {
       await recovery.removeUntrackedFiles({ worktreePath: latest.worktreePath, recordedHost: runner });

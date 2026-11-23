@@ -56,6 +56,13 @@ export interface CommitLaneOutputRequest {
    * staging is never committed; at least one non-empty string is required.
    */
   readonly allowedPathPrefixes: readonly string[];
+  /**
+   * SN1: the secret re-scan of the content that is staged, run after staging
+   * and before the commit is written. `findings` refuses the commit and
+   * `error` is an unknown (nothing is committed either way). Absent: the
+   * path re-check alone applies.
+   */
+  readonly verifyStagedContent?: () => Promise<'clean' | 'findings' | 'error'>;
   /** The attempt's recorded runner block: the commit runs on that host's executor. */
   readonly recordedHost?: AttemptRunnerRecord | null;
 }
@@ -65,7 +72,11 @@ export type CommitLaneOutputRefusal =
   | 'outside-allowed-paths'
   | 'head-moved'
   | 'detached-head'
-  | 'ref-moved';
+  | 'ref-moved'
+  /** A merge, rebase or cherry-pick is in progress in the worktree: nothing is staged or committed. */
+  | 'merge-state-present'
+  /** The staged content re-scan found a finding: nothing is committed. */
+  | 'staged-content-findings';
 
 export type CommitLaneOutputResult =
   | { readonly outcome: 'committed'; readonly headCommit: string; readonly branchRef: string }

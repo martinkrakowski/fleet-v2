@@ -365,6 +365,21 @@ export class CommitEditOnlyAttemptUseCase {
       attemptId: attempt.id,
       implementerModel,
       allowedPathPrefixes,
+      // SN1: the staged content is scanned again with the same check, after
+      // staging and before the commit is written.
+      verifyStagedContent: async () => {
+        try {
+          const verdict = await diffCheck.checkLaneDiff({
+            worktreePath: attempt.worktreePath,
+            baseCommit: attempt.baseCommit,
+            allowedPathPrefixes,
+            policyProtectedPaths: deps.policyProtectedPaths,
+          });
+          return verdict.outcome === 'findings' ? 'findings' : verdict.outcome === 'error' ? 'error' : 'clean';
+        } catch {
+          return 'error';
+        }
+      },
       recordedHost: attempt.runner ?? null,
     });
 

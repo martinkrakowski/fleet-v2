@@ -653,6 +653,27 @@ describe('ActionAuthorizationAdapter.authorizeRelaunchApply (AR3a)', () => {
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
 
+  it('refuses an array-like request (own length / index) and a non-ISO nowIso as invalid-request', async () => {
+    let calls = 0;
+    const adapter = new ActionAuthorizationAdapter({
+      authorizeRelaunchApply: async () => {
+        calls += 1;
+        return { outcome: 'authorized', grantId: 'grant-relaunch-1' };
+      },
+    });
+    const hostile: unknown[] = [
+      { ...relaunchRequest(), length: 1 },
+      { ...relaunchRequest(), 0: 'x' },
+      relaunchRequest({ nowIso: '0' }),
+      relaunchRequest({ nowIso: '2026' }),
+    ];
+    for (const request of hostile) {
+      const result = await adapter.authorizeRelaunchApply(request as AuthorizeRelaunchApplyRequest);
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+    expect(calls).toBe(0);
+  });
+
   it('refuses an own __proto__ key as invalid-request without mutating the prototype', async () => {
     const adapter = new ActionAuthorizationAdapter({
       authorizeRelaunchApply: async () => ({ outcome: 'authorized', grantId: 'grant-relaunch-1' }),

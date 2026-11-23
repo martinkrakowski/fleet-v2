@@ -692,13 +692,16 @@ function readRelaunchApplyRequest(request: unknown): Validated<AuthorizeRelaunch
   // authorized. The descriptor read is O(1) and never runs an accessor; a
   // throwing trap here is the same hostile refusal as anywhere else. The
   // prototype itself is never written: the key is refused, not copied.
-  let protoKeyDescriptor: PropertyDescriptor | undefined;
   try {
-    protoKeyDescriptor = Object.getOwnPropertyDescriptor(request, '__proto__');
+    // Own `__proto__` and own array-like markers (`length`, index `0`) are
+    // refused: `readPlainRecord` ignores undeclared keys, so without this an
+    // array-like plain object carrying valid fields would validate clean.
+    for (const key of ['__proto__', 'length', '0']) {
+      if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+        return { ok: false, reason: 'invalid-request' };
+      }
+    }
   } catch {
-    return { ok: false, reason: 'invalid-request' };
-  }
-  if (protoKeyDescriptor !== undefined) {
     return { ok: false, reason: 'invalid-request' };
   }
   const read = readPlainRecord(request, {
@@ -713,7 +716,8 @@ function readRelaunchApplyRequest(request: unknown): Validated<AuthorizeRelaunch
   if (
     !/^[0-9a-f]{64}$/.test(value.planDigest) ||
     !isSafeId(value.grantId, MAX_GRANT_ID_LENGTH, true) ||
-    !isCleanText(value.nowIso, 64)
+    !isCleanText(value.nowIso, 64) ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.nowIso)
   ) {
     return { ok: false, reason: 'invalid-request' };
   }

@@ -2024,12 +2024,23 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
 
   it('blocks relaunch-apply with invalid-now-iso when clock returns invalid timestamp', async () => {
     const record = relaunchRecord();
-    for (const nowIso of ['not-a-timestamp', '', 7 as unknown as string]) {
+    for (const nowIso of ['not-a-timestamp', '', '0', '2026', '1', 7 as unknown as string]) {
       const result = await resolve(
         { ...signedDeps(repositoryWith(record), record), ...clockAt(nowIso) },
         relaunchRequest(),
       );
       expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-now-iso' });
+    }
+  });
+
+  it('refuses an array-like plain relaunch request carrying length and an index as invalid-request', async () => {
+    const record = relaunchRecord();
+    for (const extra of [{ length: 1 }, { 0: 'x' }, { length: 1, 0: 'x' }]) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        relaunchRequest(extra),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     }
   });
 

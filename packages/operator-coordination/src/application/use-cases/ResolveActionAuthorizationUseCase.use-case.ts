@@ -89,6 +89,14 @@ const MAX_RELAUNCH_GRANT_ID_LENGTH = 256;
  */
 const PROTOTYPE_POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
 
+// A plain object that carries an own `length` or own index key is an
+// array-like disguised as a record; the relaunch reader refuses it with two
+// O(1) descriptor reads (never a key walk).
+const ARRAY_LIKE_KEYS: readonly string[] = ['length', '0'];
+
+/** Strict ISO-8601 UTC instant (`Date.parse` alone accepts values like "0"). */
+const STRICT_ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
 /**
  * The fixed field names the relaunch-apply resolve reads. The relaunch path
  * never enumerates the request: each field is read by name with exactly one
@@ -247,6 +255,11 @@ function readRelaunchRequestFields(
 } | null {
   for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
     if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
+      return null;
+    }
+  }
+  for (const arrayLike of ARRAY_LIKE_KEYS) {
+    if (Object.getOwnPropertyDescriptor(input, arrayLike) !== undefined) {
       return null;
     }
   }
@@ -793,7 +806,11 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return blocked('clock-unavailable');
     }
     const nowIso = this.deps.shadowImportClock.nowIso();
-    if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
+    if (
+      typeof nowIso !== 'string' ||
+      !STRICT_ISO_INSTANT.test(nowIso) ||
+      !Number.isFinite(Date.parse(nowIso))
+    ) {
       return blocked('invalid-now-iso');
     }
     const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);

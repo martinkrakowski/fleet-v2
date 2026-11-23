@@ -23,6 +23,8 @@ import * as path from 'node:path';
 
 import {
   WorktreePathRefusedError,
+  type RemoveUntrackedFilesRequest,
+  type RemoveUntrackedFilesResult,
   type ResolveBaseTipRequest,
   type ResolveBaseTipResult,
   type WorktreeInspection,
@@ -453,6 +455,33 @@ function snapshotRemoveWorktreeRequest(request: unknown): RemoveWorktreeRequest 
     return null;
   }
   return snap as unknown as RemoveWorktreeRequest;
+}
+
+/**
+ * SN1: a descriptor-safe snapshot of one `removeUntrackedFiles` request. A
+ * null, a non-object or a request with a throwing getter reads as null; the
+ * caller answers `invalid-request` and never throws. `recordedHost` must be
+ * absent, null or a plain record.
+ */
+function snapshotRemoveUntrackedRequest(request: unknown): RemoveUntrackedFilesRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  const host = snap['recordedHost'];
+  if (host !== undefined && host !== null && typeof host !== 'object') {
+    return null;
+  }
+  const worktreePath = snap['worktreePath'];
+  if (typeof worktreePath !== 'string' || worktreeRootRefusal(worktreePath) !== null) {
+    return null;
+  }
+  return snap as unknown as RemoveUntrackedFilesRequest;
 }
 
 /**
@@ -1973,6 +2002,42 @@ export class WorkspaceAdapter implements WorkspacePort {
     } catch {
       return { outcome: 'refused', reason: 'git-refused' };
     }
+  }
+
+  /**
+   * SN1: remove untracked files (`git clean -fd`) from one worktree after its
+   * tracked edits were preserved elsewhere. Tracked paths are never touched.
+   * The request is snapshotted through its property descriptors, so no getter
+   * ever runs; a malformed request is refused before any command. A non-zero
+   * git exit is a refusal; a run that ends without an exit code or reports an
+   * error (a timeout included) is an error — nothing is known about what was
+   * removed.
+   */
+  async removeUntrackedFiles(request: RemoveUntrackedFilesRequest): Promise<RemoveUntrackedFilesResult> {
+    // 1. Snapshot without running getters, then validate before any command.
+    const snap = snapshotRemoveUntrackedRequest(request);
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    // 2. The clean runs on the recorded host's executor; an unresolvable host
+    //    is a transport failure, like the other workspace writes.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(snap.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+    const result = await executor.run(
+      ['git', '-C', snap.worktreePath, ...RECOVERY_GIT_CONFIG, 'clean', '-fd'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (result.exitCode === null || result.error !== undefined) {
+      return { outcome: 'error', reason: 'git clean did not complete' };
+    }
+    if (result.exitCode !== 0) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    return { outcome: 'removed' };
   }
 
   /**

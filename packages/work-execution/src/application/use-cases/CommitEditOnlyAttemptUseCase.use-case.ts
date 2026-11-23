@@ -31,6 +31,7 @@ import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { LaneDiffCheckPort } from '../ports/out/LaneDiffCheckPort.out-port.js';
+import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import type {
   CommitEditOnlyAttemptRequest,
@@ -40,7 +41,13 @@ import type {
 export interface CommitEditOnlyAttemptDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly journal: Pick<ExecutionJournalPort, 'appendJournalEntry' | 'listJournalEntriesForAttempt'>;
-  readonly workspace: Pick<WorkspacePort, 'commitLaneOutput'>;
+  /**
+   * SN1: the workspace may also inspect the worktree, so a not-edit-only
+   * seat's dirty worktree can be normalized (committed here) at collect.
+   * Absent `inspectWorktree` makes that normalization `unknown`.
+   */
+  readonly workspace: Pick<WorkspacePort, 'commitLaneOutput'> &
+    Partial<Pick<WorkspacePort, 'inspectWorktree'>>;
   readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
   /** The diff check on the attempt's recorded host; null when that host cannot be reached. */
   readonly laneDiffCheckFor: (attempt: AttemptRecord) => LaneDiffCheckPort | null;
@@ -78,8 +85,119 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+/**
+ * SN1: the bound on how many dirty paths one worktree inspection may report.
+ * Cost of every check below: O(1) per descriptor read plus O(cap) for each
+ * validated array, with cap = 4096 — a hostile enormous length is refused in
+ * O(1) before any traversal.
+ */
+const INSPECTION_PATH_CAP = 4096;
+
+/** A string data property read through its own descriptor, so no getter runs. */
+function dataStringValue(record: Record<string, unknown>, key: string): string | null {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(record, key);
+  } catch {
+    return null;
+  }
+  if (
+    descriptor === undefined ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined ||
+    !isNonEmptyString(descriptor.value)
+  ) {
+    return null;
+  }
+  return descriptor.value;
+}
+
+/**
+ * SN1: a descriptor-safe read of one worktree inspection. The whole record is
+ * snapshotted through its property descriptors (no getter ever runs), then
+ * `checkedOutCommit` must be a non-empty string and `uncommittedPaths` /
+ * `untrackedPaths` dense arrays of non-empty strings bounded by
+ * `INSPECTION_PATH_CAP`. Anything else — a non-object, a getter, a Proxy that
+ * lies in any descriptor, an array hole, an array-like, an enormous length —
+ * reads as null, and the caller answers `unknown`, never a pass.
+ */
+function safeInspectionSnapshot(inspection: unknown): {
+  checkedOutCommit: string;
+  uncommittedPaths: readonly string[];
+  untrackedPaths: readonly string[];
+} | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(inspection);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  const checkedOutCommit = dataStringValue(snap, 'checkedOutCommit');
+  if (checkedOutCommit === null) {
+    return null;
+  }
+  const collected: string[][] = [];
+  for (const key of ['uncommittedPaths', 'untrackedPaths']) {
+    const dense = readBoundedDenseArray(snap[key], INSPECTION_PATH_CAP);
+    // `filter` copies the bounded dense array once: O(cap), no getter runs.
+    const items = dense?.array.filter((item): item is string => isNonEmptyString(item)) ?? null;
+    if (dense === null || items === null || items.length !== dense.length) {
+      return null;
+    }
+    collected.push(items);
+  }
+  return {
+    checkedOutCommit,
+    uncommittedPaths: collected[0]!,
+    untrackedPaths: collected[1]!,
+  };
+}
+
 export class CommitEditOnlyAttemptUseCase {
   constructor(private readonly deps?: CommitEditOnlyAttemptDependencies) {}
+
+  /**
+   * SN1: the not-edit-only normalization gate. The workspace must be able to
+   * inspect the worktree; the inspection (on the attempt's recorded host)
+   * must report the dispatch head checked out and at least one uncommitted
+   * or untracked path. Every unreadable state is `unknown`, never a pass;
+   * `null` means "continue to the commit steps".
+   */
+  private async normalizeDirtyWorktree(
+    deps: CommitEditOnlyAttemptDependencies,
+    attempt: AttemptRecord,
+    expectedHead: string,
+  ): Promise<CommitEditOnlyAttemptResult | null> {
+    const inspectWorktree = deps.workspace.inspectWorktree;
+    if (inspectWorktree === undefined) {
+      return { outcome: 'unknown', reason: 'the workspace cannot inspect the worktree' };
+    }
+    let inspection: unknown;
+    try {
+      inspection = await inspectWorktree({
+        worktreePath: attempt.worktreePath,
+        baseCommit: expectedHead,
+        expectedArtifactPaths: [],
+        recordedHost: attempt.runner ?? null,
+      });
+    } catch {
+      return { outcome: 'unknown', reason: 'inspecting the worktree failed' };
+    }
+    const snapshot = safeInspectionSnapshot(inspection);
+    if (snapshot === null) {
+      return { outcome: 'unknown', reason: 'worktree inspection was malformed' };
+    }
+    if (snapshot.checkedOutCommit !== expectedHead) {
+      return { outcome: 'not-applicable' };
+    }
+    if (snapshot.uncommittedPaths.length === 0 && snapshot.untrackedPaths.length === 0) {
+      return { outcome: 'not-applicable' };
+    }
+    return null;
+  }
 
   async commitEditOnlyAttempt(
     request: CommitEditOnlyAttemptRequest,
@@ -95,11 +213,11 @@ export class CommitEditOnlyAttemptUseCase {
       return { outcome: 'refused', reason: 'attempt-missing', findings: [] };
     }
 
-    // Step 2: only an edit-only agy seat commits here.
+    // Step 2: only an edit-only agy seat commits here — except for SN1: a
+    // not-edit-only seat that left its worktree dirty at its dispatch head
+    // has its change set committed here too, so collection can refuse the
+    // edits outside the owned paths (see `normalizeDirtyWorktree`).
     const editOnly = deps.editOnlyModeOf(attempt);
-    if (editOnly === 'not-edit-only') {
-      return { outcome: 'not-applicable' };
-    }
     if (editOnly === 'unknown') {
       return { outcome: 'unknown', reason: "the recorded host's agy mode is unknown" };
     }
@@ -130,6 +248,16 @@ export class CommitEditOnlyAttemptUseCase {
     const baseCommitForEntry = attempt.baseCommit;
     const expectedHead = dispatchHead;
     const nowIso = request.nowIso ?? new Date().toISOString();
+
+    // SN1: a not-edit-only seat proceeds only when its worktree is still
+    // checked out at the dispatch head AND dirty; a clean worktree (or a
+    // moved head) keeps this step not-applicable — the seat commits itself.
+    if (editOnly === 'not-edit-only') {
+      const normalized = await this.normalizeDirtyWorktree(deps, attempt, expectedHead);
+      if (normalized !== null) {
+        return normalized;
+      }
+    }
 
     // Step 5: the frozen brief must be unchanged, and its prefixes present.
     const brief = await this.readFrozenBrief(attempt);

@@ -1339,15 +1339,22 @@ async function dispatchedOutcomeResult(
 }
 
 /**
- * GB3a/GB3c: a fix dispatch or a round-0 pivot dispatch following a
- * dirty-worktree refusal carries the handed-over worktree as-is, so the
- * next seat's uncommitted work is accepted instead of refused again.
+ * GB3a/GB3c, SN1: a fix dispatch or a round-0 pivot dispatch carries the
+ * handed-over worktree as-is, so the next seat's uncommitted work is accepted
+ * instead of refused again. A fix attempt still waits for a prior
+ * dirty-worktree refusal; a round-0 pivot seat (an initial attempt prepared
+ * after an earlier seat failed) hands its worktree over on its first
+ * dispatch, because the worktree may already hold the pivot's handed-over
+ * work before any dispatch of its own has been refused.
  */
-async function dirtyHandoverRequested(
+export async function dirtyHandoverRequested(
   ctx: AdvanceStepContext,
   latest: AttemptRecord,
   record: LaneRunRecord,
 ): Promise<boolean> {
+  if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
+    return true;
+  }
   return handsOverDirtyWorktree(latest) &&
     lastDispatchLeftDirtyWorktree(await ctx.deps.runJournal.listForRun(record.runId), record.runId);
 }

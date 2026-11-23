@@ -70,6 +70,7 @@ import type {
   ResetWorktreeToHeadResult,
 } from '../src/application/ports/out/WorkspacePort.out-port.js';
 import { lastDispatchLeftDirtyWorktree } from '../src/application/use-cases/advance-lane-run/dirty-handover.js';
+import { dirtyHandoverRequested } from '../src/application/use-cases/advance-lane-run/prepare-dispatch.js';
 import { DispatchAttemptUseCase } from '../src/application/use-cases/DispatchAttemptUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -1124,5 +1125,33 @@ describe('GB3a: refused fix dispatch hands the dirty worktree to the next seat',
     });
     expect(later.dispatchRequests).toHaveLength(1);
     expect(later.dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+  });
+});
+
+describe('dirtyHandoverRequested (SN1)', () => {
+  const record = { runId: 'run-01JB0000000000000000000000' } as never;
+  const ctx = {
+    deps: {
+      runJournal: {
+        listForRun: async () => [] as unknown[],
+      },
+    },
+  } as never;
+
+  it('a round-0 pivot seat (initial with a prior) hands over on its first dispatch, with no journal at all', async () => {
+    const pivot = { ...collectedAttempt(), id: 'attempt-example-2', priorAttemptId: 'attempt-example-1' };
+    expect(await dirtyHandoverRequested(ctx, pivot, record)).toBe(true);
+  });
+
+  it('the very first attempt (no prior) still waits for a dirty refusal', async () => {
+    expect(await dirtyHandoverRequested(ctx, collectedAttempt(), record)).toBe(false);
+  });
+
+  it('a fix attempt with no prior dirty refusal (first dispatch) still waits: undefined handover', async () => {
+    const fix = buildFixAttempt(
+      { fixAttemptId: 'attempt-fix-a', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+      0,
+    );
+    expect(await dirtyHandoverRequested(ctx, fix, record)).toBe(false);
   });
 });

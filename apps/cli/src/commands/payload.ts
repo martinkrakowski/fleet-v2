@@ -130,8 +130,8 @@ export function requiredNested<T>(payload: Payload, key: string, label: string):
 
 /** A closed enum value the request shape requires; a usage error when absent. */
 export function enumOf<T extends string>(payload: Payload, key: string, allowed: readonly T[], label: string): T {
-  const value = str(payload, key);
-  if ((allowed as readonly string[]).includes(value)) {
+  const value = payload[key];
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) {
     return value as T;
   }
   throw new CliUsageError(`${label} must be one of: ${allowed.join(', ')}`);

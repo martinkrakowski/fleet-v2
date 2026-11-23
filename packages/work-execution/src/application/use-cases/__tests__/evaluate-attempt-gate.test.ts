@@ -1197,4 +1197,20 @@ describe('evaluateAttemptGate output-tail archiving (GD2)', () => {
       expect.objectContaining({ outputEvidenceRef: 'evidence://dir/file@' + 'a'.repeat(64) }),
     );
   });
+
+  it('returns null for a null, undefined, non-object or throwing-detail record instead of throwing', () => {
+    // A stored journal row is untrusted input: a missing record and a record
+    // whose `detail` accessor throws are both ignored as null (O(1) guards;
+    // the JSON parse stays bounded by the stored detail's length).
+    expect(parseStoredPredicateResult(null as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult(undefined as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult(42 as unknown as ActionJournalEntryRecord)).toBeNull();
+    expect(parseStoredPredicateResult([1, 2, 3] as unknown as ActionJournalEntryRecord)).toBeNull();
+    const throwingDetail = {
+      get detail(): string {
+        throw new Error('hostile detail getter must be ignored, never thrown');
+      },
+    };
+    expect(parseStoredPredicateResult(throwingDetail as unknown as ActionJournalEntryRecord)).toBeNull();
+  });
 });

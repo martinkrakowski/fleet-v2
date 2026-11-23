@@ -246,12 +246,25 @@ function isCongestionCause(value: unknown): value is GatePredicateCause {
 }
 
 export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
-  if (typeof entry.detail !== 'string') {
+  // PT1a hostile-record guard: a null/undefined record, a non-object or a
+  // record whose `detail` accessor throws is ignored as null — a stored
+  // journal entry is untrusted input, never a crash. The guard itself is
+  // O(1); the JSON parse below is bounded by the stored detail's length.
+  if (entry === null || typeof entry !== 'object') {
+    return null;
+  }
+  let detail: unknown;
+  try {
+    detail = (entry as { detail?: unknown }).detail;
+  } catch {
+    return null;
+  }
+  if (typeof detail !== 'string') {
     return null;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(entry.detail);
+    parsed = JSON.parse(detail);
   } catch {
     return null;
   }

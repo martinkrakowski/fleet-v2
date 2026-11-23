@@ -965,4 +965,31 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     }));
     expect(results[2].kind === 'command' && results[2].outputTail).toBe('error: failed');
   });
+
+  it('bounds the scan of an enormous stream to its last 200 lines and 32 KiB', () => {
+    // A stream far past the bound (several MiB, 100k+ lines): the tail must
+    // still be exactly the last 200 lines capped to 32 KiB, produced by
+    // scanning only the end of the stream — a whole-stream join/strip/split
+    // would allocate and scan every byte first.
+    const long = Array.from({ length: 120000 }, (_, i) => `line ${i}: aaaa`).join('\n');
+    const tail = boundedRedactedOutputTail(long, undefined);
+    expect(tail).toBeDefined();
+    const lines = (tail as string).split('\n');
+    expect(lines.length).toBeLessThanOrEqual(200);
+    expect((tail as string).length).toBeLessThanOrEqual(32 * 1024);
+    expect(lines[0]).toBe('line 119800: aaaa');
+    expect(lines[lines.length - 1]).toBe('line 119999: aaaa');
+    const hugeLine = 'x'.repeat(10_000_000) + '\nlast words';
+    const hugeTail = boundedRedactedOutputTail(hugeLine, undefined);
+    expect(hugeTail).toBe('x'.repeat(32 * 1024 - 11) + '\nlast words');
+  });
+
+  it('returns undefined when only the unscanned head carries non-whitespace content', () => {
+    // A stream whose last 32 KiB is entirely blank: the bounded scan never
+    // reads the non-whitespace head, so the tail is whitespace-only and
+    // undefined — a whole-stream implementation would still emit a
+    // whitespace-only tail string.
+    const tail = boundedRedactedOutputTail('x\n' + ' '.repeat(50000), undefined);
+    expect(tail).toBeUndefined();
+  });
 });

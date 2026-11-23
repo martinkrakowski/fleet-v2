@@ -286,11 +286,26 @@ function isSecretShapedLine(line: string): boolean {
  */
 export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
   const parts: string[] = [];
-  if (typeof stdout === 'string') {
-    parts.push(stdout);
+  // GD2: each stream is cut to its last 32 KiB (+ one join newline of slack)
+  // BEFORE any join, strip or split: ANSI stripping only removes characters,
+  // so the final 32 KiB / 200-line tail window of the stripped combined text
+  // always lies inside these retained slices. Every later step therefore
+  // costs O(64 KiB) regardless of how much a failing command printed.
+  const bounded = (stream: unknown): string | undefined => {
+    if (typeof stream !== 'string') {
+      return undefined;
+    }
+    return stream.length > MAX_OUTPUT_TAIL_BYTES + 1
+      ? stream.slice(stream.length - (MAX_OUTPUT_TAIL_BYTES + 1))
+      : stream;
+  };
+  const boundedStdout = bounded(stdout);
+  const boundedStderr = bounded(stderr);
+  if (boundedStdout !== undefined) {
+    parts.push(boundedStdout);
   }
-  if (typeof stderr === 'string') {
-    parts.push(stderr);
+  if (boundedStderr !== undefined) {
+    parts.push(boundedStderr);
   }
   if (parts.length === 0) {
     return undefined;

@@ -682,4 +682,48 @@ describe('renderHandoverBrief output tails (GD2)', () => {
     );
     expect(result).toEqual({ ok: false, reason: 'handover-too-large' });
   });
+
+  it('refuses hostile gatePredicates records with a typed reason and never invokes a getter or throws', () => {
+    // Each hostile shape is O(1) per predicate to refuse (descriptor reads and
+    // type checks only; the secret-shape scan is bounded by the capped name).
+    const hostileShapes: { title: string; gatePredicates: unknown }[] = [
+      { title: 'a throwing Proxy as a predicate', gatePredicates: [new Proxy({}, { get() { throw new Error('trap'); }, getOwnPropertyDescriptor() { throw new Error('trap'); }, ownKeys() { throw new Error('trap'); } })] },
+      { title: 'a throwing Proxy as the array itself', gatePredicates: new Proxy([predicate()], { get() { throw new Error('trap'); } }) },
+      { title: 'a non-iterable array-like', gatePredicates: { length: 1, 0: predicate() } },
+      { title: 'a name getter', gatePredicates: [{ get name(): string { throw new Error('getter'); }, verdict: 'fail', exitCode: 1 }] },
+      { title: 'a non-string name', gatePredicates: [{ name: 7, verdict: 'fail', exitCode: 1 }] },
+      { title: 'a wrong verdict', gatePredicates: [{ name: 'yarn build', verdict: 'pass', exitCode: 1 }] },
+      { title: 'a non-number exit code', gatePredicates: [{ name: 'yarn build', verdict: 'fail', exitCode: '1' }] },
+      { title: 'a negative exit code', gatePredicates: [{ name: 'yarn build', verdict: 'fail', exitCode: -1 }] },
+      { title: 'an inherited name', gatePredicates: [Object.assign(Object.create({ name: 'yarn build' }), { verdict: 'fail', exitCode: 1 })] },
+    ];
+    for (const shape of hostileShapes) {
+      const result = renderHandoverBrief(
+        input({ source: 'gate', gatePredicates: shape.gatePredicates as RenderHandoverBriefInput['gatePredicates'] }),
+      );
+      expect(result, shape.title).toEqual({ ok: false, reason: 'invalid-gate-predicate' });
+    }
+  });
+
+  it('renders 200 maximal tails (32 KiB each) within the cap in linear time', () => {
+    // The largest allowed input: 200 tails of 32 KiB split into short lines —
+    // over a million tail lines. The truncation pass measures the static
+    // prefix/suffix once and subtracts each dropped line's length, so the
+    // whole render stays linear in the tail size; a per-iteration re-join of
+    // the remaining lines (the previous implementation) is quadratic and
+    // cannot finish this render in a normal test timeout.
+    const oneTail = Array.from({ length: 2200 }, (_, i) => `e${String(i).padStart(3, '0')} ========`).join('\n');
+    expect(oneTail.length).toBeLessThanOrEqual(32768);
+    const result = renderHandoverBrief(
+      input({
+        source: 'gate',
+        gatePredicates: Array.from({ length: 200 }, () => predicate({ outputTail: oneTail })),
+      }),
+    );
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(result.text.length).toBeLessThanOrEqual(60000);
+    expect(result.text).toContain('========');
+  });
 });

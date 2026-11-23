@@ -30,6 +30,7 @@ import {
   laneRunConductEntry,
   laneRunIntentEntry,
   laneRunResultEntry,
+  planGateFailedRetry,
 } from '../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../domain/lane-run-step-facts.js';
 import { checkLaneRunResume } from '../../domain/lane-run-transitions.js';
@@ -161,6 +162,9 @@ function branchNameOf(record: LaneRunRecord, latest: AttemptRecord): string | nu
 }
 
 const LANE_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/** GU2: the only park reason a gate-failed park from gating carries (afterLaneRunFailure); every other reason takes the normal resume path. */
+const GATE_RETRY_PARK_REASON = 'blocker-after-round-2';
 
 /**
  * R4a: whether the PR's full validated 40-hex head SHA equals the attempt's
@@ -326,6 +330,15 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', reason: check.reason };
     }
 
+    // GU2: a run parked from `gating` whose gate already failed past the retry
+    // cap stays parked: the resume is refused before any intent is appended.
+    if (record.parked !== null && record.parked.parkedFrom === 'gating' && record.parked.reason === GATE_RETRY_PARK_REASON) {
+      const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
+      if (plan.kind === 'cap-reached') {
+        return { outcome: 'refused', reason: 'gate-retry-cap-reached' };
+      }
+    }
+
     const built = laneRunResumeKey(runId, record.parkCount, via);
     if (!built.ok) {
       return { outcome: 'refused', reason: 'invalid-request' };
@@ -392,7 +405,32 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       );
     }
 
-    return this.conductAndSaveResume(record, pending, facts, resumeDetail, snapshot);
+    // GU2: a bounded operator-driven gate retry for a run parked from `gating`
+    // whose park is a failed-gate park (not a halt, an ambiguity or a stop).
+    // A stop recorded since still wins first (no retry is minted). The retry
+    // intent is only PLANNED here; conductAndSaveResume mints it once the
+    // resume check has accepted, so a refused resume leaves no unread intent
+    // for the decider to reconcile. A replay never mints twice: once the retry
+    // intent exists without a final result the plan is `none`, and a
+    // duplicate-key append is idempotent.
+    let retryKey: string | null = null;
+    if (
+      record.parked.parkedFrom === 'gating' &&
+      facts.stopMode === null &&
+      record.parked.reason === GATE_RETRY_PARK_REASON
+    ) {
+      const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
+      if (plan.kind === 'cap-reached') {
+        await this.appendResult(runId, firstPendingKey, 'refused', 'gate-retry-cap-reached', nowIso);
+        await this.refuseRemainingPendingResumes(runId, pending, nowIso);
+        return { outcome: 'refused', key: firstPendingKey, reason: 'gate-retry-cap-reached' };
+      }
+      if (plan.kind === 'mint') {
+        retryKey = plan.key;
+      }
+    }
+
+    return this.conductAndSaveResume(record, pending, facts, resumeDetail, snapshot, retryKey);
   }
 
   /**
@@ -522,6 +560,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     facts: ResumeFacts,
     resumeDetail: 'review-retry' | null,
     snapshot: ApplyPendingResumeRequest,
+    gateRetryKey: string | null = null,
   ): Promise<ApplyPendingResumeResult> {
     const { runId, lease, nowIso } = snapshot;
     const { holderId, fence } = lease;
@@ -540,6 +579,16 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     if (!(await this.abandonAmbiguousPendingIntent(runId, facts.pendingIntent, nowIso))) {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+    }
+
+    // GU2: the resume is accepted; only now is the gate retry intent minted.
+    if (gateRetryKey !== null) {
+      const minted = await this.deps.runJournal.append(
+        laneRunIntentEntry(this.deps.newUlid(), runId, gateRetryKey, null, nowIso),
+      );
+      if (minted.outcome !== 'appended' && minted.reason !== 'duplicate-key') {
+        return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+      }
     }
 
     const conduct = await this.deps.runJournal.append(

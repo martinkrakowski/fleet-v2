@@ -62,6 +62,49 @@ describe('readJournalPullRequestRef: valid forge entries', () => {
     expect(result).toEqual({ kind: 'valid', ref: { repository: 'owner/repo', number: 7 } });
     expect(getTrapCalls).toBe(0);
   });
+
+  it("returns { kind: 'invalid' } for a Proxy whose getPrototypeOf, ownKeys or getOwnPropertyDescriptor trap throws, without escaping a throw", () => {
+    const traps: readonly [string, () => ProxyHandler<object>][] = [
+      [
+        'getPrototypeOf',
+        () => ({
+          getPrototypeOf: () => {
+            throw new Error('getPrototypeOf trap ran');
+          },
+          ownKeys: (t) => Reflect.ownKeys(t),
+          getOwnPropertyDescriptor: (t, k) => Reflect.getOwnPropertyDescriptor(t, k),
+        }),
+      ],
+      [
+        'ownKeys',
+        () => ({
+          getPrototypeOf: (t) => Reflect.getPrototypeOf(t),
+          ownKeys: () => {
+            throw new Error('ownKeys trap ran');
+          },
+          getOwnPropertyDescriptor: (t, k) => Reflect.getOwnPropertyDescriptor(t, k),
+        }),
+      ],
+      [
+        'getOwnPropertyDescriptor',
+        () => ({
+          getPrototypeOf: (t) => Reflect.getPrototypeOf(t),
+          ownKeys: (t) => Reflect.ownKeys(t),
+          getOwnPropertyDescriptor: () => {
+            throw new Error('getOwnPropertyDescriptor trap ran');
+          },
+        }),
+      ],
+    ];
+    for (const [name, makeHandler] of traps) {
+      const handler = makeHandler();
+      const proxy = new Proxy({ ...validForge }, handler);
+      expect(() => readJournalPullRequestRef('forge', proxy), `throwing ${name} trap must not escape`).not.toThrow();
+      expect(readJournalPullRequestRef('forge', proxy), `throwing ${name} trap must yield 'invalid'`).toEqual({
+        kind: 'invalid',
+      });
+    }
+  });
 });
 
 describe('readJournalPullRequestRef: non-objects and non-plain prototypes', () => {

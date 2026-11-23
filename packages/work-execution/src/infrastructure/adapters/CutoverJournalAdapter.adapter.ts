@@ -247,15 +247,20 @@ export function readShadowParkJournalEntry(input: unknown, stored = false): Shad
     if (typeof input !== 'object' || input === null || Array.isArray(input)) return invalid;
     const proto: unknown = Object.getPrototypeOf(input);
     if ((proto !== Object.prototype && proto !== null) || Object.getOwnPropertySymbols(input).length > 0) return invalid;
-    const names = Object.keys(input);
+    // One descriptor consultation for the whole object: enumerating with
+    // `Object.keys` and then reading each descriptor again would let a Proxy
+    // answer the two calls differently (a key vanishing or turning
+    // non-enumerable between them). `getOwnPropertyDescriptors` snapshots the
+    // metadata exactly once; the names and values below come only from that
+    // snapshot, so an accessor property is refused before any getter runs and
+    // a non-enumerable key is refused rather than silently skipped.
+    const descriptors = Object.getOwnPropertyDescriptors(input) as Record<string, PropertyDescriptor | undefined>;
+    const names = Object.keys(descriptors).filter((name) => descriptors[name]?.enumerable === true);
+    if (Object.keys(descriptors).length !== names.length) return invalid;
     if (names.length > SHADOW_PARK_ENTRY_FIELDS.length + (stored ? 1 : 0)) return invalid;
-    // One descriptor read per property: an accessor property is refused
-    // before it is ever read, so a throwing or stateful getter is never
-    // executed, and the snapshot uses the descriptor's own value rather than
-    // a second `get` a Proxy could answer differently.
     const snap: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const name of names) {
-      const descriptor = Object.getOwnPropertyDescriptor(input, name);
+      const descriptor = descriptors[name];
       if (descriptor === undefined || !('value' in descriptor) || descriptor.get !== undefined) return invalid;
       snap[name] = descriptor.value;
     }

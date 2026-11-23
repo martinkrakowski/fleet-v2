@@ -1,7 +1,9 @@
-// AR2a2 — ApplyRelaunchUseCase tests (U1–U18): request validation, trusted
-// clock and deadline, stored-plan digest verification, journal replay
-// derivation, and the AR2a2 apply-path refusals that never call
-// authorization.
+// AR2b — ApplyRelaunchUseCase tests: request validation, trusted clock and
+// deadline, stored-plan digest verification, journal replay derivation, the
+// dry-run summary, and the AR2b live apply — one wave of `save`, `abort` and
+// `redispatch` (intent-only) under the owner grant, with preflight checks
+// before `authorizeRelaunchApply` so a failed preflight never consumes it.
+// Hostile-input cases are HV1–HV3.
 //
 // Every case feeds plain values — or a Proxy, getter, hole, array-like or
 // polluting key where the inspection itself is the subject — and asserts the
@@ -22,8 +24,27 @@ import {
   canonicalRelaunchPlanBodyJson,
   type RelaunchPlanRecord,
 } from '../../ports/out/RelaunchPlanRepositoryPort.out-port.js';
-import type { CutoverJournalListResult } from '../../ports/out/CutoverJournalPort.out-port.js';
+import type {
+  CutoverJournalAppendResult,
+  CutoverJournalEntry,
+  CutoverJournalListResult,
+} from '../../ports/out/CutoverJournalPort.out-port.js';
 import type { AuthorizeRelaunchApplyResult } from '../../ports/out/ActionAuthorizationPort.out-port.js';
+import type {
+  AbortWorktreeRunRequest,
+  AbortWorktreeRunResult,
+  WorktreeRunRef,
+  WorktreeRunState,
+} from '../../ports/out/ExecutionRunnerPort.out-port.js';
+import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type {
+  SaveLaneEditsRequest,
+  SaveLaneEditsResult,
+} from '../../ports/in/SaveLaneEditsPort.in-port.js';
+import type {
+  TerminateWorktreeProcessesRequest,
+  TerminateWorktreeProcessesResult,
+} from '../../ports/out/ProcessTreeTerminationPort.out-port.js';
 import { ApplyRelaunchUseCase } from '../ApplyRelaunchUseCase.use-case.js';
 
 const NOW = '2026-11-23T10:00:00Z';
@@ -83,6 +104,12 @@ const conductedLane = (laneId = 'lane-1'): FixtureLane => ({
   steps: [],
 });
 
+/** A conducted lane with a recorded run, for the live apply's liveness check. */
+const conductedLaneWithRun = (laneId = 'lane-1', runId = 'run-1'): FixtureLane => ({
+  ...conductedLane(laneId),
+  runId,
+});
+
 const idleLane = (digest: string, laneId = 'lane-2', dependsOnLaneIds = ['lane-1']): FixtureLane => ({
   laneId,
   hostName: 'host-b',
@@ -123,7 +150,7 @@ const runningLane = (digest: string, laneId = 'lane-2'): FixtureLane => ({
  * circularity, and a refusal below can only come from the behaviour under
  * test, never from a digest accident.
  */
-const buildPlan = (lanes: FixtureLane[]): RelaunchPlanRecord => {
+const buildPlan = (lanes: FixtureLane[], maxActiveRuns = 3): RelaunchPlanRecord => {
   const placeholder = '0'.repeat(64);
   const keyed = lanes.map((lane) => ({
     ...lane,
@@ -135,7 +162,7 @@ const buildPlan = (lanes: FixtureLane[]): RelaunchPlanRecord => {
   const body = {
     schemaVersion: 1 as const,
     hostFilter: null,
-    maxActiveRuns: 3,
+    maxActiveRuns,
     dispatchStaggerMs: 250,
     conductor: { halted: true, driverLease: 'lapsed' as const, runCount: 2 },
     lanes: keyed,
@@ -218,17 +245,63 @@ const getterOn = (target: object, key: string, calls: { count: number }): object
 
 interface Deps {
   planRepo: { findByDigest: (planDigest: string) => Promise<FindRelaunchPlanResult> };
-  cutoverJournal: { listByKeyPrefix: (prefix: string) => Promise<CutoverJournalListResult> };
+  cutoverJournal: {
+    listByKeyPrefix: (prefix: string) => Promise<CutoverJournalListResult>;
+    append?: (entry: CutoverJournalEntry) => Promise<CutoverJournalAppendResult>;
+  };
   computeDigest: (text: string) => string;
-  authorization: { authorizeRelaunchApply: (request: unknown) => Promise<AuthorizeRelaunchApplyResult> };
+  authorization?: { authorizeRelaunchApply: (request: unknown) => Promise<AuthorizeRelaunchApplyResult> };
   clock: () => string;
+  runRepo?: { get: (runId: string) => Promise<LaneRunRecord | null> };
+  runner?: {
+    inspectWorktreeRun: (ref: WorktreeRunRef) => Promise<WorktreeRunState>;
+    abortWorktreeRun: (request: AbortWorktreeRunRequest) => Promise<AbortWorktreeRunResult>;
+  };
+  processTreeTermination?: {
+    terminateWorktreeProcesses: (
+      request: TerminateWorktreeProcessesRequest,
+    ) => Promise<TerminateWorktreeProcessesResult>;
+  };
+  saveLaneEdits?: (request: SaveLaneEditsRequest) => Promise<SaveLaneEditsResult>;
+  mintEntryId?: () => string;
+  /** The entries appended through the journal spy, in append order. */
+  appended?: Record<string, unknown>[];
+}
+
+/** Overrides for the live apply's ports; each `no*` drops a port entirely. */
+interface LiveOver {
+  noRunRepo?: boolean;
+  noRunner?: boolean;
+  noTerminate?: boolean;
+  noSave?: boolean;
+  noMint?: boolean;
+  noAppend?: boolean;
+  noAuthorization?: boolean;
+  run?: unknown;
+  runThrows?: boolean;
+  inspect?: unknown;
+  /** Per-attempt inspect results, taking precedence over `inspect`. */
+  inspectByAttempt?: Record<string, unknown>;
+  inspectThrows?: boolean;
+  abort?: unknown;
+  abortThrows?: boolean;
+  terminate?: unknown;
+  terminateThrows?: boolean;
+  save?: unknown;
+  saveThrows?: boolean;
+  authorize?: unknown;
+  authorizeThrows?: boolean;
+  /** Per-append results, consumed in order; the default is `appended`. */
+  appendResults?: unknown[];
+  appendThrows?: boolean;
 }
 
 /**
- * The default environment: the valid default plan under its own digest, an
- * empty journal, a fixed trusted clock before the deadline, and a
- * `authorizeRelaunchApply` spy that must stay at zero calls for the whole
- * suite.
+ * The default environment: the valid default plan under its own digest, a
+ * live (stateful) journal, a fixed trusted clock before the deadline, an
+ * `authorizeRelaunchApply` spy that echoes the request's `grantId`, and a
+ * full set of healthy live ports. The `live` overrides replace each port's
+ * result or drop it entirely.
  */
 const makeDeps = (over: {
   plan?: RelaunchPlanRecord;
@@ -239,9 +312,16 @@ const makeDeps = (over: {
   journalResult?: unknown;
   clock?: () => string;
   computeDigest?: (text: string) => string;
+  live?: LiveOver;
 } = {}): Deps => {
   const plan = over.plan ?? defaultPlan();
-  return {
+  const live = over.live ?? {};
+  // The journal is stateful: `append` adds to the store that `listByKeyPrefix`
+  // reads, so a replay call sees what the previous call wrote.
+  const store: Record<string, unknown>[] = [...((over.entries ?? []) as Record<string, unknown>[])];
+  const appended: Record<string, unknown>[] = [];
+  let entryCounter = 0;
+  const deps: Record<string, unknown> = {
     planRepo: {
       findByDigest: vi.fn(async (_planDigest: string) => {
         if (over.findByDigestThrows) throw new Error('store down');
@@ -254,19 +334,81 @@ const makeDeps = (over: {
       listByKeyPrefix: vi.fn(async (_prefix: string) => {
         if (over.journalThrows) throw new Error('journal down');
         return (
-          over.journalResult ?? { outcome: 'listed', entries: over.entries ?? [] }
+          over.journalResult ?? { outcome: 'listed', entries: store }
         ) as unknown as CutoverJournalListResult;
       }),
+      append: live.noAppend
+        ? undefined
+        : vi.fn(async (entry: Record<string, unknown>) => {
+            if (live.appendThrows) throw new Error('journal write down');
+            const record = { ...entry, entryId: `entry-${(entryCounter += 1)}` };
+            const result =
+              live.appendResults !== undefined && live.appendResults.length > 0
+                ? live.appendResults.shift()
+                : { outcome: 'appended', entry: record };
+            // A refused append writes nothing (the adapter's own guarantee).
+            if ((result as { outcome?: string } | null)?.outcome === 'appended') {
+              appended.push(record);
+              store.push(record);
+            }
+            return result;
+          }),
     },
     computeDigest: over.computeDigest ?? computeDigest,
-    authorization: {
-      authorizeRelaunchApply: vi.fn(async (_request: unknown) => ({
-        outcome: 'authorized',
-        grantId: 'g',
-      }) as AuthorizeRelaunchApplyResult),
-    },
+    authorization: live.noAuthorization
+      ? undefined
+      : {
+          authorizeRelaunchApply: vi.fn(async (request: unknown) => {
+            if (live.authorizeThrows) throw new Error('authorization down');
+            if (live.authorize !== undefined) return live.authorize;
+            const grantId = (request as { grantId?: string } | null)?.grantId;
+            return { outcome: 'authorized', grantId } as AuthorizeRelaunchApplyResult;
+          }),
+        },
     clock: over.clock ?? (() => CLOCK_NOW),
+    runRepo: live.noRunRepo
+      ? undefined
+      : {
+          get: vi.fn(async (_runId: string) => {
+            if (live.runThrows) throw new Error('run store down');
+            return live.run !== undefined ? live.run : { runId: 'run-1', state: 'running' };
+          }),
+        },
+    runner: live.noRunner
+      ? undefined
+      : {
+          inspectWorktreeRun: vi.fn(async (ref: unknown) => {
+            if (live.inspectThrows) throw new Error('runner down');
+            if (live.inspectByAttempt !== undefined) {
+              const attemptId = (ref as { attemptId?: string } | null)?.attemptId;
+              const per = live.inspectByAttempt[attemptId ?? ''];
+              if (per !== undefined) return per;
+            }
+            return live.inspect !== undefined ? live.inspect : { state: 'idle' };
+          }),
+          abortWorktreeRun: vi.fn(async (_request: unknown) => {
+            if (live.abortThrows) throw new Error('abort down');
+            return live.abort !== undefined ? live.abort : { outcome: 'aborted', endedAtIso: CLOCK_NOW };
+          }),
+        },
+    processTreeTermination: live.noTerminate
+      ? undefined
+      : {
+          terminateWorktreeProcesses: vi.fn(async (_request: unknown) => {
+            if (live.terminateThrows) throw new Error('termination down');
+            return live.terminate !== undefined ? live.terminate : { outcome: 'terminated', killed: 2 };
+          }),
+        },
+    saveLaneEdits: live.noSave
+      ? undefined
+      : vi.fn(async (_request: unknown) => {
+          if (live.saveThrows) throw new Error('save down');
+          return live.save !== undefined ? live.save : { outcome: 'saved' };
+        }),
+    mintEntryId: live.noMint ? undefined : vi.fn(() => `minted-${(entryCounter += 1)}`),
   };
+  deps['appended'] = appended;
+  return deps as unknown as Deps;
 };
 
 const dryRunRequest = (planDigest: string, over: Record<string, unknown> = {}): unknown => ({
@@ -336,6 +478,21 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'untouched')).toBe(false);
     }
     expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+    // AR2b carry-over: a bad save-input field type or lane-id grammar refuses
+    // up front, even though no `save` intent exists to consume it.
+    const badField = async (over: Record<string, unknown>): Promise<void> => {
+      await refused({ planDigest: plan.planDigest, nowIso: NOW, saveInputs: [saveInput(over)] });
+    };
+    await badField({ laneId: 'bad/id' });
+    await badField({ laneId: '' });
+    await badField({ worktreePath: 7 });
+    await badField({ clonePath: null });
+    await badField({ baseCommit: [] });
+    await badField({ allowedPathPrefixes: ['ok', 7] });
+    await badField({ allowedPathPrefixes: new Array(3) }); // sparse
+    await badField({ policyProtectedPaths: 'src/' });
+    await badField({ recordedHost: ['not', 'an', 'object'] });
+    await badField({ worktreePath: 'x'.repeat(4097) }); // over-cap length
   });
 
   it('U2: never invokes a counting or throwing getter or a Proxy get trap on the request or saveInputs (reads === 0)', async () => {
@@ -740,24 +897,40 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
         outcome: 'refused',
         reason: 'grant-missing',
       });
-      expect(deps.authorization.authorizeRelaunchApply).not.toHaveBeenCalled();
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
     }
   });
 
-  it('U15: refuses the AR2a2 live apply with a grant as live-apply-not-implemented, with zero authorizeRelaunchApply calls on both the apply and the dry-run path', async () => {
+  it('U15: refuses an over-long grantId as invalid-request before the secret scan, and refuses a live lane whose adopt step is not completed as adopt-not-implemented (AR2c owns adopt)', async () => {
+    // Over-long grantId: 4097 characters, secret-shaped, so the length cap
+    // (O(1)) must refuse before `hasSecretShape` (O(length)) ever runs.
+    const longGrant = `sk-${'a'.repeat(4097)}`;
     const plan = defaultPlan();
-    const deps = makeDeps({ plan });
-    const useCase = new ApplyRelaunchUseCase(deps);
-    expect(await useCase.applyRelaunch(applyRequest(plan.planDigest))).toEqual({
-      outcome: 'refused',
-      reason: 'live-apply-not-implemented',
-    });
-    expect(await useCase.applyRelaunch(dryRunRequest(plan.planDigest))).toEqual({
-      outcome: 'dry-run',
-      planDigest: plan.planDigest,
-      lanes: expect.any(Array),
-    });
-    expect(deps.authorization.authorizeRelaunchApply).toHaveBeenCalledTimes(0);
+    expect(
+      await new ApplyRelaunchUseCase(makeDeps({ plan })).applyRelaunch(
+        applyRequest(plan.planDigest, { grantId: longGrant }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    // A live wave stops at adopt: the default idle lane's adopt is absent.
+    const liveP = buildPlan([conductedLaneWithRun(), idleLane(hex('adopt-gate plan'))]);
+    const digest = liveP.planDigest;
+    const deps = makeDeps({ plan: liveP, live: {} });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    // The grant was consumed by the authorized call, but no save intent was
+    // journaled for the lane before adopt refused? No — save ran first; the
+    // adopt gate is what stopped the wave. Assert exactly what happened.
+    expect(deps.saveLaneEdits).toHaveBeenCalledTimes(1);
+    expect(deps.appended!.map((entry) => `${entry.kind}:${entry.key}`)).toEqual([
+      `intent:relaunch/${digest}/lane-2/save`,
+    ]);
+    // The dry-run path still never calls authorization.
+    const dryDeps = makeDeps({ plan });
+    await new ApplyRelaunchUseCase(dryDeps).applyRelaunch(dryRunRequest(digest));
+    expect(dryDeps.authorization!.authorizeRelaunchApply).toHaveBeenCalledTimes(0);
   });
 
   it('U16: defaults to a dry run when apply is omitted or false, with exact absent step statuses', async () => {
@@ -948,7 +1121,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     });
   });
 
-  it('U19: a request Proxy whose getPrototypeOf or getOwnPropertyDescriptor trap throws is a typed invalid-request, never a rejection', async () => {
+  it('HV1: a request Proxy whose getPrototypeOf or getOwnPropertyDescriptor trap throws is a typed invalid-request, never a rejection', async () => {
     const plan = defaultPlan();
     const deps = makeDeps({ plan });
     const useCase = new ApplyRelaunchUseCase(deps);
@@ -965,7 +1138,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
   });
 
-  it('U20: a port envelope with a throwing getter or Proxy trap is plan-unreadable or journal-unreadable and the getter never runs', async () => {
+  it('HV2: a port envelope with a throwing getter or Proxy trap is plan-unreadable or journal-unreadable and the getter never runs', async () => {
     const plan = defaultPlan();
     const calls = { count: 0 };
     const throwingGetter = (target: object, key: string): object => {
@@ -1011,7 +1184,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     expect(calls.count).toBe(0);
   });
 
-  it('U21: a secret-shaped or over-long value under an unknown request key is refused like any other request string', async () => {
+  it('HV3: a secret-shaped or over-long value under an unknown request key is refused like any other request string', async () => {
     const plan = defaultPlan();
     const deps = makeDeps({ plan });
     const useCase = new ApplyRelaunchUseCase(deps);
@@ -1023,5 +1196,468 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       reason: 'invalid-request',
     });
     expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+  });
+
+  // ---- AR2b: the live apply (one wave of save, abort, redispatch) ----
+
+  const key = (digest: string, laneId: string, code: string): string =>
+    `relaunch/${digest}/${laneId}/${code}`;
+  const adoptKey = (digest: string, laneId: string, sub: string): string =>
+    `relaunch/${digest}/${laneId}/adopt/${sub}`;
+
+  /** A live plan: one conducted lane with a run, one idle lane in wave 1. */
+  const livePlan = (seed = 'live plan'): RelaunchPlanRecord =>
+    buildPlan([conductedLaneWithRun(), idleLane(hex(seed))]);
+
+  /** Save intent + completed result for a lane, with the matching input digest. */
+  const completedSave = (digest: string, laneId: string, input: Record<string, unknown>): unknown[] => [
+    intent(key(digest, laneId, 'save'), saveInputDigest(digest, input)),
+    result(key(digest, laneId, 'save'), 'completed'),
+  ];
+
+  /** All four adopt sub-steps completed for a lane. */
+  const completedAdopt = (digest: string, laneId: string): unknown[] =>
+    ADOPT_SUB_STEPS.flatMap((sub) => [
+      intent(adoptKey(digest, laneId, sub)),
+      result(adoptKey(digest, laneId, sub), 'completed'),
+    ]);
+
+  it('U19: only the validated clone is used after validation — mutating the store plan object during the digest call cannot change the executed wave', async () => {
+    const plan = livePlan('clone plan');
+    const digest = plan.planDigest;
+    const entries = [...completedSave(digest, 'lane-2', saveInput()), ...completedAdopt(digest, 'lane-2')];
+    const deps = makeDeps({
+      plan,
+      entries,
+      // The digest runs on the validated CLONE after `findByDigest` resolved;
+      // mutating the ORIGINAL here must not change what executes. An
+      // implementation that kept reading the original would see wave 7, find
+      // no lane at wave 1, and return `wave: null` without acting.
+      computeDigest: (text: string) => {
+        (plan.lanes[1] as { admissionWave: number }).admissionWave = 7;
+        return computeDigest(text);
+      },
+      live: {},
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput()] }),
+      ),
+    ).toMatchObject({ outcome: 'applied', wave: 1 });
+    // The wave executed: the redispatch intent for lane-2 was journaled.
+    expect(
+      deps.appended!.some((entry) => entry.key === key(digest, 'lane-2', 'redispatch') && entry.kind === 'intent'),
+    ).toBe(true);
+    expect(deps.authorization!.authorizeRelaunchApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('U20: a missing runRepo, missing runner, missing append, missing mintEntryId, or a saveInput missing for one non-conducted lane refuses stale-plan-state before authorizeRelaunchApply', async () => {
+    const plan = livePlan('preflight plan');
+    const digest = plan.planDigest;
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    for (const omit of ['noRunRepo', 'noRunner', 'noAppend', 'noMint', 'noSave', 'noTerminate'] as const) {
+      const deps = makeDeps({ plan, live: { [omit]: true } });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
+        outcome: 'refused',
+        reason: 'stale-plan-state',
+      });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+      expect(deps.appended).toEqual([]);
+    }
+    // A missing saveInput for the non-conducted lane names the lane.
+    const deps = makeDeps({ plan, live: {} });
+    expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest))).toEqual({
+      outcome: 'refused',
+      reason: 'stale-plan-state',
+      laneId: 'lane-2',
+    });
+    expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+  });
+
+  it('U21: a conducted runRepo.get throw, a throwing inspectWorktreeRun and an unknown worktree state refuse stale-plan-state before authorizeRelaunchApply', async () => {
+    const plan = livePlan('liveness plan');
+    const digest = plan.planDigest;
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    // The conducted run record cannot be read: the conducted lane is named.
+    const runThrows = makeDeps({ plan, live: { runThrows: true } });
+    expect(await new ApplyRelaunchUseCase(runThrows).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'stale-plan-state',
+      laneId: 'lane-1',
+    });
+    expect(runThrows.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    // The worktree inspection throws.
+    const inspectThrows = makeDeps({ plan, live: { inspectThrows: true } });
+    expect(await new ApplyRelaunchUseCase(inspectThrows).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'stale-plan-state',
+      laneId: 'lane-2',
+    });
+    expect(inspectThrows.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    // The worktree state is unknown.
+    const inspectUnknown = makeDeps({ plan, live: { inspect: { state: 'unknown', reason: 'cannot tell' } } });
+    expect(await new ApplyRelaunchUseCase(inspectUnknown).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'stale-plan-state',
+      laneId: 'lane-2',
+    });
+    expect(inspectUnknown.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+  });
+
+  it('U22: a plan that says idle with an unfinished save while the worktree runs refuses unexpected-running-lane before authorizeRelaunchApply', async () => {
+    const plan = livePlan('idle-says plan');
+    const digest = plan.planDigest;
+    const deps = makeDeps({ plan, live: { inspect: { state: 'running', sessionId: 's-1' } } });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'unexpected-running-lane', laneId: 'lane-2' });
+    expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    expect(deps.appended).toEqual([]);
+  });
+
+  it('U23: blocked, unknown, missing-port, mismatched-grantId and throwing authorization each refuse with the mapped reason and zero journal writes', async () => {
+    const plan = livePlan('grant plan');
+    const digest = plan.planDigest;
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    const expectRefusal = async (
+      live: LiveOver,
+      expected: { outcome: string; reason: string; laneId?: string },
+    ): Promise<void> => {
+      const deps = makeDeps({ plan, live });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual(expected);
+      expect(deps.appended).toEqual([]);
+      expect(deps.saveLaneEdits).not.toHaveBeenCalled();
+    };
+    await expectRefusal(
+      { authorize: { outcome: 'blocked', reason: 'grant-expired' } },
+      { outcome: 'refused', reason: 'grant-expired' },
+    );
+    await expectRefusal(
+      { authorize: { outcome: 'blocked', reason: 'grant-revoked' } },
+      { outcome: 'refused', reason: 'grant-revoked' },
+    );
+    await expectRefusal(
+      { authorize: { outcome: 'blocked', reason: 'grant-digest-mismatch' } },
+      { outcome: 'refused', reason: 'grant-digest-mismatch' },
+    );
+    await expectRefusal(
+      { authorize: { outcome: 'blocked', reason: 'not-a-known-code' } },
+      { outcome: 'refused', reason: 'authorization-unavailable' },
+    );
+    await expectRefusal(
+      { authorize: { outcome: 'unknown', reason: 'grant store down' } },
+      { outcome: 'refused', reason: 'authorization-unavailable' },
+    );
+    await expectRefusal(
+      { authorize: { outcome: 'authorized', grantId: 'another-grant' } },
+      { outcome: 'refused', reason: 'grant-id-mismatch' },
+    );
+    await expectRefusal(
+      { authorizeThrows: true },
+      { outcome: 'refused', reason: 'authorization-unavailable' },
+    );
+    await expectRefusal(
+      { noAuthorization: true },
+      { outcome: 'refused', reason: 'authorization-unavailable' },
+    );
+  });
+
+  it('U24: a save intent that cannot be journaled — duplicate-intent, store-read-only, store-unreadable or a throw — refuses journal-write-failed with no save attempted', async () => {
+    const plan = livePlan('journal plan');
+    const digest = plan.planDigest;
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    for (const refusal of ['duplicate-intent', 'store-read-only', 'store-unreadable']) {
+      const deps = makeDeps({ plan, live: { appendResults: [{ outcome: refusal }] } });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
+        outcome: 'refused',
+        reason: 'journal-write-failed',
+        laneId: 'lane-2',
+      });
+      expect(deps.saveLaneEdits).not.toHaveBeenCalled();
+      expect(deps.appended).toEqual([]);
+    }
+    const throwing = makeDeps({ plan, live: { appendThrows: true } });
+    expect(await new ApplyRelaunchUseCase(throwing).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'journal-write-failed',
+      laneId: 'lane-2',
+    });
+    expect(throwing.saveLaneEdits).not.toHaveBeenCalled();
+  });
+
+  it('U25: saveLaneEdits refusing, answering unknown or throwing refuses save-failed after the intent was journaled', async () => {
+    const plan = livePlan('save plan');
+    const digest = plan.planDigest;
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    for (const live of [{ save: { outcome: 'refused', reason: 'diff-check-findings' } }, { save: { outcome: 'unknown', reason: 'runner down' } }, { saveThrows: true }]) {
+      const deps = makeDeps({ plan, live });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
+        outcome: 'refused',
+        reason: 'save-failed',
+        laneId: 'lane-2',
+      });
+      // The intent was journaled first (I7); the save result never is.
+      expect(deps.appended!.map((entry) => entry.kind)).toEqual(['intent']);
+      expect(deps.appended![0]!['key']).toBe(key(digest, 'lane-2', 'save'));
+    }
+  });
+
+  it('U26: resuming a save in intent-only with a matching digest re-calls saveLaneEdits without appending a second intent, then stops at adopt', async () => {
+    const digest = livePlan('resume plan').planDigest;
+    const input = saveInput();
+    const entries = [intent(key(digest, 'lane-2', 'save'), saveInputDigest(digest, input))];
+    const deps = makeDeps({ plan: livePlan('resume plan'), entries, live: {} });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest, { saveInputs: [input] })),
+    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    expect(deps.saveLaneEdits).toHaveBeenCalledTimes(1);
+    // No second save intent was journaled (I7): the only appended entry is
+    // the later wave's — here none, because adopt refused first.
+    expect(deps.appended).toEqual([]);
+  });
+
+  it('U27: an abort confirmed aborted records the completed result and never terminates the process tree', async () => {
+    const seed = 'abort-ok plan';
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
+    const digest = plan.planDigest;
+    const deps = makeDeps({
+      plan,
+      entries: [...completedSave(digest, 'lane-2', saveInput())],
+      live: { abort: { outcome: 'aborted', endedAtIso: CLOCK_NOW } },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: [saveInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'adopt-not-implemented', laneId: 'lane-2' });
+    expect(deps.runner!.abortWorktreeRun).toHaveBeenCalledWith(
+      expect.objectContaining({ attemptId: 'attempt-1', gracePeriodSeconds: 30 }),
+    );
+    expect(deps.processTreeTermination!.terminateWorktreeProcesses).not.toHaveBeenCalled();
+    expect(deps.appended!.map((entry) => [entry.kind, entry.key, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', key(digest, 'lane-2', 'abort'), undefined, undefined],
+      ['result', key(digest, 'lane-2', 'abort'), 'completed', 'aborted'],
+    ]);
+  });
+
+  it('U28: an abort without a confirmed result terminates the process tree (I3); a confirmed termination records completed, a refused one records the failure and refuses abort-failed', async () => {
+    const seed = 'abort-terminate plan';
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
+    const digest = plan.planDigest;
+    const entries = [...completedSave(digest, 'lane-2', saveInput())];
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    // still-running, unknown, refused and a thrown abort all terminate.
+    for (const live of [
+      { abort: { outcome: 'still-running', reason: 'process alive' } },
+      { abort: { outcome: 'unknown', reason: 'no answer' } },
+      { abort: { outcome: 'refused', reason: 'busy' } },
+      { abortThrows: true },
+    ]) {
+      const deps = makeDeps({ plan, entries: [...entries], live });
+      expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
+        outcome: 'refused',
+        reason: 'adopt-not-implemented',
+        laneId: 'lane-2',
+      });
+      expect(deps.processTreeTermination!.terminateWorktreeProcesses).toHaveBeenCalledTimes(1);
+      expect(deps.appended!.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+        ['intent', undefined, undefined],
+        ['result', 'completed', 'terminated'],
+      ]);
+    }
+    // A refused termination records the failed result and refuses the lane.
+    const deps = makeDeps({
+      plan,
+      entries: [...entries],
+      live: { abort: { outcome: 'still-running', reason: 'process alive' }, terminate: { outcome: 'refused', reason: 'no host' } },
+    });
+    expect(await new ApplyRelaunchUseCase(deps).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'abort-failed',
+      laneId: 'lane-2',
+    });
+    expect(deps.appended!.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', undefined, undefined],
+      ['result', 'refused', 'terminate-failed'],
+    ]);
+  });
+
+  it('U29: an abort left intent-only reconciles read-only — an idle worktree records completed without re-calling abortWorktreeRun, a running or unknown one refuses abort-failed', async () => {
+    const seed = 'abort-reconcile plan';
+    const plan = buildPlan([conductedLaneWithRun(), runningLane(hex(seed))]);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', saveInput()),
+      intent(key(digest, 'lane-2', 'abort')),
+    ];
+    const request = (): unknown => applyRequest(digest, { saveInputs: [saveInput()] });
+    // Idle: reconciled without another abort call.
+    const idle = makeDeps({ plan, entries: [...entries], live: {} });
+    expect(await new ApplyRelaunchUseCase(idle).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'adopt-not-implemented',
+      laneId: 'lane-2',
+    });
+    expect(idle.runner!.abortWorktreeRun).not.toHaveBeenCalled();
+    expect(idle.appended!.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['result', 'completed', 'reconciled-idle'],
+    ]);
+    // Still running: no result is recorded; the lane refuses.
+    const running = makeDeps({ plan, entries: [...entries], live: { inspect: { state: 'running', sessionId: 's-1' } } });
+    expect(await new ApplyRelaunchUseCase(running).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'abort-failed',
+      laneId: 'lane-2',
+    });
+    expect(running.appended).toEqual([]);
+    // Unknown: the preflight refuses before the grant is ever spent.
+    const unknown = makeDeps({ plan, entries: [...entries], live: { inspect: { state: 'unknown', reason: 'down' } } });
+    expect(await new ApplyRelaunchUseCase(unknown).applyRelaunch(request())).toEqual({
+      outcome: 'refused',
+      reason: 'stale-plan-state',
+      laneId: 'lane-2',
+    });
+    expect(unknown.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    expect(unknown.appended).toEqual([]);
+  });
+
+  it('U30: the active-run cap refuses a redispatch intent before it is written, counting hand-offs carried over from earlier waves', async () => {
+    // lane-2 (wave 1) is already handed off with its worktree still running;
+    // lanes 3 and 4 sit in wave 2. With maxActiveRuns 2 the second fresh
+    // hand-off crosses the cap; with 3 both fit. The planner's own wave
+    // capacity keeps both plans valid, so the refusal can only come from the
+    // apply's live counter.
+    const lane = (id: string): FixtureLane => ({
+      ...idleLane('x', id, ['lane-2']),
+      hostName: `host-${id}`,
+      admissionWave: 2,
+    });
+    const setup = (maxActiveRuns: number): { plan: RelaunchPlanRecord; inputs: Record<string, unknown>[]; entries: unknown[] } => {
+      const plan = buildPlan(
+        [{ ...idleLane('x', 'lane-2', []), hostName: 'host-lane-2' }, lane('lane-3'), lane('lane-4')],
+        maxActiveRuns,
+      );
+      const inputs = [
+        saveInput(),
+        saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' }),
+        saveInput({ laneId: 'lane-4', attemptId: 'attempt-4' }),
+      ];
+      const entries = [
+        ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
+        ...completedAdopt(plan.planDigest, 'lane-2'),
+        intent(key(plan.planDigest, 'lane-2', 'redispatch')),
+        ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
+        ...completedAdopt(plan.planDigest, 'lane-3'),
+        ...completedSave(plan.planDigest, 'lane-4', inputs[2]!),
+        ...completedAdopt(plan.planDigest, 'lane-4'),
+      ];
+      return { plan, inputs, entries };
+    };
+    // Cap 2: lane-3 hands off (0 + 1 < 2), lane-4 then crosses (0 + 2 >= 2).
+    // lane-2's worktree still runs (its redispatch is intent-only), so the
+    // preflight counts one hand-off before the wave starts.
+    const capped = setup(2);
+    const deps = makeDeps({
+      plan: capped.plan,
+      entries: capped.entries,
+      live: { inspectByAttempt: { 'attempt-1': { state: 'running', sessionId: 's-2' } } },
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(capped.plan.planDigest, { saveInputs: capped.inputs }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'active-run-cap-reached', laneId: 'lane-4' });
+    expect(
+      deps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
+    ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
+    // Cap 3: both wave-2 lanes hand off within the same wave.
+    const roomier = setup(3);
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: {} });
+    expect(
+      await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
+        applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs }),
+      ),
+    ).toMatchObject({ outcome: 'applied', wave: 2 });
+    expect(
+      roomierDeps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
+    ).toEqual([
+      key(roomier.plan.planDigest, 'lane-3', 'redispatch'),
+      key(roomier.plan.planDigest, 'lane-4', 'redispatch'),
+    ]);
+  });
+
+  it('U31: one wave per invocation — the first call saves and hands off wave 1 only, journaled as intent before action, and never calls prepareFixAttempt', async () => {
+    const seed = 'waves plan';
+    const digest = hex(seed);
+    const lane2 = idleLane(digest, 'lane-2', ['lane-1']);
+    const lane3 = { ...idleLane(digest, 'lane-3', ['lane-2']), hostName: 'host-c', admissionWave: 2, dispatchEndpointKey: 'opencode:host-c:4321' };
+    const plan = buildPlan([conductedLaneWithRun(), lane2, lane3]);
+    const inputs = [saveInput(), saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' })];
+    const entries = [
+      ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
+      ...completedAdopt(plan.planDigest, 'lane-2'),
+      ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
+      ...completedAdopt(plan.planDigest, 'lane-3'),
+    ];
+    const deps = makeDeps({ plan, entries, live: {} });
+    const result = await new ApplyRelaunchUseCase(deps).applyRelaunch(
+      applyRequest(plan.planDigest, { saveInputs: inputs }),
+    );
+    expect(result).toMatchObject({ outcome: 'applied', wave: 1 });
+    // Only lane-2's redispatch intent was journaled; lane-3 (wave 2) waits.
+    expect(deps.appended!.map((entry) => [entry.kind, entry.key])).toEqual([
+      ['intent', key(plan.planDigest, 'lane-2', 'redispatch')],
+    ]);
+    // The grant was authorized for this digest with the trusted clock reading.
+    expect(deps.authorization!.authorizeRelaunchApply).toHaveBeenCalledWith({
+      planDigest: plan.planDigest,
+      grantId: 'grant-1',
+      nowIso: CLOCK_NOW,
+    });
+    // The wave summary re-derived from the journal shows lane-2 handed off.
+    const summary = (result as unknown as { lanes: { laneId: string; stepStatuses: { step: string; status: string }[] }[] }).lanes.find(
+      (entry) => entry.laneId === 'lane-2',
+    );
+    expect(summary?.stepStatuses.find((entry) => entry.step === 'redispatch')).toEqual({
+      step: 'redispatch',
+      status: 'intent-only',
+    });
+  });
+
+  it('U32: replaying with the same grantId authorizes cleanly and advances wave by wave, ending with wave null once every redispatch is intent-only', async () => {
+    const seed = 'replay waves plan';
+    const digest = hex(seed);
+    const lane2 = idleLane(digest, 'lane-2', ['lane-1']);
+    const lane3 = { ...idleLane(digest, 'lane-3', ['lane-2']), hostName: 'host-c', admissionWave: 2, dispatchEndpointKey: 'opencode:host-c:4321' };
+    const plan = buildPlan([conductedLaneWithRun(), lane2, lane3]);
+    const inputs = [saveInput(), saveInput({ laneId: 'lane-3', attemptId: 'attempt-3' })];
+    const entries = [
+      ...completedSave(plan.planDigest, 'lane-2', inputs[0]!),
+      ...completedAdopt(plan.planDigest, 'lane-2'),
+      ...completedSave(plan.planDigest, 'lane-3', inputs[1]!),
+      ...completedAdopt(plan.planDigest, 'lane-3'),
+    ];
+    const deps = makeDeps({ plan, entries, live: {} });
+    const useCase = new ApplyRelaunchUseCase(deps);
+    const request = (): unknown => applyRequest(plan.planDigest, { saveInputs: inputs });
+    expect(await useCase.applyRelaunch(request())).toMatchObject({ outcome: 'applied', wave: 1 });
+    expect(await useCase.applyRelaunch(request())).toMatchObject({ outcome: 'applied', wave: 2 });
+    expect(
+      deps.appended!.filter((entry) => entry.kind === 'intent').map((entry) => entry.key),
+    ).toEqual([key(plan.planDigest, 'lane-2', 'redispatch'), key(plan.planDigest, 'lane-3', 'redispatch')]);
+    // The third call finds no lane left to wave: applied with wave null.
+    const third = await useCase.applyRelaunch(request());
+    expect(third).toMatchObject({ outcome: 'applied', wave: null });
+    const lanes = (third as unknown as { lanes: { laneId: string; stepStatuses: { step: string; status: string }[] }[] }).lanes;
+    for (const laneId of ['lane-2', 'lane-3']) {
+      expect(
+        lanes.find((entry) => entry.laneId === laneId)?.stepStatuses.find((entry) => entry.step === 'redispatch'),
+      ).toEqual({ step: 'redispatch', status: 'intent-only' });
+    }
+    // The same grantId re-authorized on every call (a failed preflight never
+    // consumes it, and a replay re-authorizes cleanly).
+    expect(deps.authorization!.authorizeRelaunchApply).toHaveBeenCalledTimes(3);
   });
 });

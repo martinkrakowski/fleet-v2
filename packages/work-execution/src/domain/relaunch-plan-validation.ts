@@ -147,6 +147,53 @@ export type StoredRelaunchPlanValidation =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: 'invalid-plan' };
 
+/** One validated planned step, as plain values (AR2b). */
+export interface ValidatedStoredRelaunchStep {
+  readonly step: RelaunchStepCode;
+  readonly idempotencyKey: string;
+}
+
+/** One validated planned lane, as plain values (AR2b). */
+export interface ValidatedStoredRelaunchLane {
+  readonly laneId: string;
+  readonly hostName: string;
+  readonly projectId: string | null;
+  readonly population: RelaunchPlannedPopulation;
+  readonly runnerState: 'idle' | 'running';
+  readonly runId: string | null;
+  readonly attemptId: string | null;
+  readonly workOrderId: string | null;
+  readonly baseBranch: string;
+  readonly chainHead: boolean;
+  readonly dependsOnLaneIds: readonly string[];
+  readonly admissionWave: number;
+  readonly dispatchEndpointKey: string | null;
+  readonly staggerOffsetMs: number | null;
+  readonly steps: readonly ValidatedStoredRelaunchStep[];
+}
+
+/** The whole validated stored plan, as plain values (AR2b). */
+export interface ValidatedStoredRelaunchPlan {
+  readonly schemaVersion: 1;
+  readonly planDigest: string;
+  readonly requestDigest: string;
+  readonly createdAtIso: string;
+  readonly hostFilter: string | null;
+  readonly maxActiveRuns: number;
+  readonly dispatchStaggerMs: number;
+  readonly conductor: {
+    readonly halted: boolean;
+    readonly driverLease: 'absent' | 'lapsed' | 'live';
+    readonly runCount: number;
+  };
+  readonly lanes: readonly ValidatedStoredRelaunchLane[];
+}
+
+/** AR2b: validation with the validated `structuredClone` snapshot returned. */
+export type ParsedStoredRelaunchPlan =
+  | { readonly ok: true; readonly plan: ValidatedStoredRelaunchPlan }
+  | { readonly ok: false; readonly reason: 'invalid-plan' };
+
 export type RecordedHostValidation =
   | { readonly ok: true; readonly value: AttemptRunnerRecord | null }
   | { readonly ok: false; readonly reason: 'invalid-recorded-host' };
@@ -276,7 +323,7 @@ function preflightGraph(
 }
 
 /** The typed refusal for a failed preflight or clone. */
-const INVALID_PLAN: StoredRelaunchPlanValidation = { ok: false, reason: 'invalid-plan' };
+const INVALID_PARSED_PLAN: ParsedStoredRelaunchPlan = { ok: false, reason: 'invalid-plan' };
 const INVALID_RECORDED_HOST: RecordedHostValidation = { ok: false, reason: 'invalid-recorded-host' };
 
 /**
@@ -444,7 +491,19 @@ function isNullableSafeIntegerWithin(value: unknown): boolean {
  * of the stored record.
  */
 export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanValidation {
-  return withSnapshot(plan, INVALID_PLAN, (snapshot) => {
+  const parsed = parseValidatedStoredRelaunchPlan(plan);
+  return parsed.ok ? { ok: true } : INVALID_PARSED_PLAN;
+}
+
+/**
+ * AR2b: validate a stored relaunch plan exactly as `validateStoredRelaunchPlan`
+ * does and return the validated `structuredClone` snapshot itself, so the
+ * caller never reads the original graph again after an `await` (AR2a2
+ * carry-over). The returned `plan` is a plain, getter-free deep copy: mutating
+ * the input afterwards cannot change it.
+ */
+export function parseValidatedStoredRelaunchPlan(plan: unknown): ParsedStoredRelaunchPlan {
+  return withSnapshot(plan, INVALID_PARSED_PLAN, (snapshot) => {
     const record = readExactPlainRecord(snapshot, [
       'schemaVersion',
       'planDigest',
@@ -456,42 +515,42 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
       'conductor',
       'lanes',
     ]);
-    if (record === null) return INVALID_PLAN;
-    if (record['schemaVersion'] !== 1) return INVALID_PLAN;
+    if (record === null) return INVALID_PARSED_PLAN;
+    if (record['schemaVersion'] !== 1) return INVALID_PARSED_PLAN;
     const planDigest = record['planDigest'];
-    if (typeof planDigest !== 'string' || !HEX_64.test(planDigest)) return INVALID_PLAN;
+    if (typeof planDigest !== 'string' || !HEX_64.test(planDigest)) return INVALID_PARSED_PLAN;
     const requestDigest = record['requestDigest'];
-    if (typeof requestDigest !== 'string' || !HEX_64.test(requestDigest)) return INVALID_PLAN;
-    if (!isZonedIsoDateTime(record['createdAtIso'])) return INVALID_PLAN;
+    if (typeof requestDigest !== 'string' || !HEX_64.test(requestDigest)) return INVALID_PARSED_PLAN;
+    if (!isZonedIsoDateTime(record['createdAtIso'])) return INVALID_PARSED_PLAN;
     const hostFilter = record['hostFilter'];
     if (hostFilter !== null) {
-      if (!isCleanIdentifier(hostFilter)) return INVALID_PLAN;
+      if (!isCleanIdentifier(hostFilter)) return INVALID_PARSED_PLAN;
     }
-    if (!isSafeIntegerWithin(record['maxActiveRuns'], 1, MAX_PLAN_MAX_ACTIVE_RUNS)) return INVALID_PLAN;
-    if (!isSafeIntegerWithin(record['dispatchStaggerMs'], 0, MAX_PLAN_DISPATCH_STAGGER_MS)) return INVALID_PLAN;
+    if (!isSafeIntegerWithin(record['maxActiveRuns'], 1, MAX_PLAN_MAX_ACTIVE_RUNS)) return INVALID_PARSED_PLAN;
+    if (!isSafeIntegerWithin(record['dispatchStaggerMs'], 0, MAX_PLAN_DISPATCH_STAGGER_MS)) return INVALID_PARSED_PLAN;
     const conductorRecord = readExactPlainRecord(record['conductor'], [
       'halted',
       'driverLease',
       'runCount',
     ]);
-    if (conductorRecord === null) return INVALID_PLAN;
-    if (typeof conductorRecord['halted'] !== 'boolean') return INVALID_PLAN;
+    if (conductorRecord === null) return INVALID_PARSED_PLAN;
+    if (typeof conductorRecord['halted'] !== 'boolean') return INVALID_PARSED_PLAN;
     const driverLease = conductorRecord['driverLease'];
     if (driverLease !== 'absent' && driverLease !== 'lapsed' && driverLease !== 'live') {
-      return INVALID_PLAN;
+      return INVALID_PARSED_PLAN;
     }
-    if (!isSafeIntegerWithin(conductorRecord['runCount'], 0, Number.MAX_SAFE_INTEGER)) return INVALID_PLAN;
+    if (!isSafeIntegerWithin(conductorRecord['runCount'], 0, Number.MAX_SAFE_INTEGER)) return INVALID_PARSED_PLAN;
     const lanes = readBoundedDenseArray(record['lanes'], MAX_RELAUNCH_APPLY_LANES);
-    if (lanes === null) return INVALID_PLAN;
+    if (lanes === null) return INVALID_PARSED_PLAN;
     const snapshotLanes: SnapshotLane[] = [];
     const seenHostLane = new Set<string>();
     const laneIds = new Set<string>();
     for (const laneValue of lanes.array) {
       const lane = readSnapshotLane(laneValue, planDigest);
-      if (lane === null) return INVALID_PLAN;
-      if (seenHostLane.has(`${lane.hostName}\u0000${lane.laneId}`)) return INVALID_PLAN;
+      if (lane === null) return INVALID_PARSED_PLAN;
+      if (seenHostLane.has(`${lane.hostName}\u0000${lane.laneId}`)) return INVALID_PARSED_PLAN;
       seenHostLane.add(`${lane.hostName}\u0000${lane.laneId}`);
-      if (laneIds.has(lane.laneId)) return INVALID_PLAN;
+      if (laneIds.has(lane.laneId)) return INVALID_PARSED_PLAN;
       laneIds.add(lane.laneId);
       snapshotLanes.push(lane);
     }
@@ -507,7 +566,7 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
     }
     for (const [wave, count] of waveCounts) {
       const capacity = wave === 1 ? maxActiveRuns - conductedCount : maxActiveRuns;
-      if (count > capacity) return INVALID_PLAN;
+      if (count > capacity) return INVALID_PARSED_PLAN;
     }
     // Dependency graph: membership, wave ordering and acyclicity (Kahn's
     // algorithm), so only topologically schedulable plans pass. Wave ordering
@@ -520,13 +579,13 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
     for (const lane of snapshotLanes) {
       for (const dependency of lane.dependsOnLaneIds) {
         const dependencyLane = laneById.get(dependency);
-        if (dependencyLane === undefined) return INVALID_PLAN;
+        if (dependencyLane === undefined) return INVALID_PARSED_PLAN;
         if (
           lane.population !== 'conducted' &&
           dependencyLane.population !== 'conducted' &&
           dependencyLane.admissionWave >= lane.admissionWave
         ) {
-          return INVALID_PLAN;
+          return INVALID_PARSED_PLAN;
         }
       }
     }
@@ -554,7 +613,7 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
         if (remaining === 0) ready.push(dependent);
       }
     }
-    if (scheduled !== snapshotLanes.length) return INVALID_PLAN;
+    if (scheduled !== snapshotLanes.length) return INVALID_PARSED_PLAN;
     // Digest recomputation runs last, after every field set has validated.
     const digest = pureSha256Hex(
       canonicalPlanBodyJson({
@@ -586,8 +645,23 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
         })),
       }),
     );
-    if (digest !== planDigest) return INVALID_PLAN;
-    return { ok: true };
+    if (digest !== planDigest) return INVALID_PARSED_PLAN;
+    const validatedPlan: ValidatedStoredRelaunchPlan = {
+      schemaVersion: 1,
+      planDigest,
+      requestDigest,
+      createdAtIso: record['createdAtIso'] as string,
+      hostFilter: hostFilter as string | null,
+      maxActiveRuns: record['maxActiveRuns'] as number,
+      dispatchStaggerMs: record['dispatchStaggerMs'] as number,
+      conductor: {
+        halted: conductorRecord['halted'] as boolean,
+        driverLease: driverLease as 'absent' | 'lapsed' | 'live',
+        runCount: conductorRecord['runCount'] as number,
+      },
+      lanes: snapshotLanes,
+    };
+    return { ok: true, plan: validatedPlan };
   });
 }
 

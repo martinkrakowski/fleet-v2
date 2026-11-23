@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { SHADOW_IMPORT_ACTION_SCOPE } from '../../domain/coordination-records.js';
+import { SHADOW_IMPORT_ACTION_SCOPE, RELAUNCH_APPLY_DIGEST_PREFIX, relaunchApplyDigestPayload, RELAUNCH_APPLY_ACTION_SCOPE, RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS, RELAUNCH_APPLY_PROJECT_ID } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { DecisionAnswer, DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 import { ResolveActionAuthorizationUseCase } from './ResolveActionAuthorizationUseCase.use-case.js';
@@ -678,19 +678,13 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(calls).toBe(0);
   });
 
-  it('handles an own __proto__ key on a shadow resolve request as an ordinary field', async () => {
+  it('refuses an own __proto__ key on a shadow resolve request as invalid-request without polluting Object.prototype', async () => {
     const requestRepo = seededRepo();
     const hostile = JSON.parse(
       `{"projectId":"proj-1","actionScope":"${SHADOW_IMPORT_ACTION_SCOPE}","authorizationGrantId":"${GRANT_ID}","repository":{"owner":"octo","repo":"hello"},"__proto__":{"polluted":true}}`,
     ) as Record<string, unknown>;
     const result = await resolveRaw(useCase(requestRepo), hostile);
-    expect(result).toEqual({
-      outcome: 'authorized',
-      grantId: GRANT_ID,
-      requestId: REQUEST_ID,
-      expectedHeadSha: '',
-      policyRevision: 'pol-rev-1',
-    });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
@@ -1730,5 +1724,584 @@ describe('ResolveActionAuthorizationUseCase signed re-verification (KEY0c2)', ()
     }).execute(request);
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(getterCalls).toBe(0);
+  });
+});
+
+describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () => {
+  const CREATED_AT_ISO = '2026-11-01T00:00:00.000Z';
+  const GRANT_ID = 'grant-relaunch-1';
+  const PROPOSAL_DIGEST = 'a'.repeat(64);
+  const SEVEN_DAYS_MS = RELAUNCH_APPLY_GRANT_MAX_TTL_DAYS * 86_400_000;
+
+  function relaunchRecord(
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    const bound = {
+      projectId: overrides.projectId ?? RELAUNCH_APPLY_PROJECT_ID,
+      proposalDigest: overrides.proposalDigest ?? PROPOSAL_DIGEST,
+      createdAtIso: overrides.createdAtIso ?? CREATED_AT_ISO,
+    };
+    return {
+      id: `${RELAUNCH_APPLY_DIGEST_PREFIX}${createHash('sha256').update(relaunchApplyDigestPayload(bound)).digest('hex')}`,
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      expectedHeadSha: null,
+      proposalDigest: PROPOSAL_DIGEST,
+      policyRevision: 'pol-relaunch-1',
+      decisionRevision: 'dec-relaunch-1',
+      grantId: GRANT_ID,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: CREATED_AT_ISO,
+      updatedAtIso: CREATED_AT_ISO,
+      ...overrides,
+    };
+  }
+
+  function repositoryWith(...records: CoordinationRequestRecord[]): InMemoryCoordinationRequestRepository {
+    const repo = new InMemoryCoordinationRequestRepository();
+    for (const record of records) {
+      void repo.saveRequest(record);
+    }
+    return repo;
+  }
+
+  function signedDeps(requestRepo: CoordinationRequestRepositoryPort, record: CoordinationRequestRecord): {
+    requestRepo: CoordinationRequestRepositoryPort;
+    decisionTransport: DecisionTransportPort;
+  } {
+    const signer = createSignedDecisionFixture();
+    void signer.writeApprovedAnswer({
+      id: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: record.decisionRevision,
+      grantId: record.grantId,
+    });
+    return { requestRepo, ...signer.deps };
+  }
+
+  function clockAt(nowIso: string): {
+    shadowImportClock: { nowIso: () => string };
+    computeDigest: (payload: string) => string;
+  } {
+    return {
+      shadowImportClock: { nowIso: () => nowIso },
+      computeDigest: (payload) => createHash('sha256').update(payload).digest('hex'),
+    };
+  }
+
+  function relaunchRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      expectedHeadSha: '',
+      authorizationGrantId: GRANT_ID,
+      proposalDigest: PROPOSAL_DIGEST,
+      ...overrides,
+    };
+  }
+
+  async function resolve(
+    deps: ConstructorParameters<typeof ResolveActionAuthorizationUseCase>[0],
+    input: unknown,
+  ): Promise<ResolveActionAuthorizationResult> {
+    return new ResolveActionAuthorizationUseCase(deps).resolveActionAuthorization(input as never);
+  }
+
+  it('authorizes a signed, approved, digest-bound relaunch-apply grant', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      {
+        ...signedDeps(repositoryWith(record), record),
+        ...clockAt(CREATED_AT_ISO),
+      },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: record.id,
+      expectedHeadSha: '',
+      policyRevision: 'pol-relaunch-1',
+    });
+  });
+
+  it('refuses a relaunch grant whose createdAtIso is in the future of the trusted clock (grant-created-in-future)', async () => {
+    const record = relaunchRecord({ createdAtIso: '2099-01-01T00:00:00.000Z' });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-created-in-future' });
+  });
+
+  it('refuses a store-edited proposalDigest even when the request names the edited digest', async () => {
+    const original = relaunchRecord();
+    const edited = { ...original, proposalDigest: 'c'.repeat(64) };
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(edited), edited), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ proposalDigest: 'c'.repeat(64) }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-request-digest-mismatch' });
+  });
+
+  it('refuses a store-edited createdAtIso that would reset the expiry', async () => {
+    const original = relaunchRecord({ createdAtIso: '2026-10-01T00:00:00.000Z' });
+    const edited = { ...original, createdAtIso: CREATED_AT_ISO };
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(edited), edited), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-request-digest-mismatch' });
+  });
+
+  it('refuses a calendar-invalid trusted-clock instant (2026-02-30)', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt('2026-02-30T00:00:00.000Z') },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-now-iso' });
+  });
+
+  it('authorizes 1ms before the 7-day boundary and blocks with grant-expired at and after 7 days', async () => {
+    const record = relaunchRecord();
+    const createdAtMs = Date.parse(CREATED_AT_ISO);
+    const before = new Date(createdAtMs + SEVEN_DAYS_MS - 1).toISOString();
+    const at = new Date(createdAtMs + SEVEN_DAYS_MS).toISOString();
+    const after = new Date(createdAtMs + SEVEN_DAYS_MS + 1).toISOString();
+    for (const [nowIso, expected] of [
+      [before, 'authorized'],
+      [at, 'blocked'],
+      [after, 'blocked'],
+    ] as const) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(nowIso) },
+        relaunchRequest(),
+      );
+      if (expected === 'authorized') {
+        expect(result.outcome).toBe('authorized');
+      } else {
+        expect(result).toEqual({ outcome: 'blocked', reason: 'grant-expired' });
+      }
+    }
+  });
+
+  it('blocks relaunch-apply with grant-expired when the record carries an unparseable createdAtIso', async () => {
+    const record = relaunchRecord({ createdAtIso: 'not-a-timestamp' });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-expired' });
+  });
+
+  it('blocks relaunch-apply with grant-wrong-project when refreshed.projectId is not relaunch', async () => {
+    const record = relaunchRecord({ projectId: 'project-other' });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+  });
+
+  it('blocks relaunch-apply with grant-wrong-project when the resolve names another project', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ projectId: 'project-other' }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+  });
+
+  it('blocks relaunch-apply with grant-wrong-project when projectId is missing or unfilled', async () => {
+    const record = relaunchRecord();
+    for (const projectId of ['', '   ', 7, null]) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        relaunchRequest({ projectId }),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+    }
+  });
+
+  it('blocks relaunch-apply with grant-missing when grant record is absent', async () => {
+    const record = relaunchRecord();
+    const absent = await resolve(
+      {
+        ...signedDeps(repositoryWith(record), record),
+        ...clockAt(CREATED_AT_ISO),
+      },
+      relaunchRequest({ authorizationGrantId: 'grant-never-recorded' }),
+    );
+    expect(absent).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+  });
+
+  it('blocks relaunch-apply with grant-missing when authorizationGrantId is missing', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ authorizationGrantId: undefined }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+  });
+
+  it('blocks relaunch-apply with grant-revoked when record is cancelled', async () => {
+    const record = relaunchRecord({ state: 'cancelled' });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-revoked' });
+  });
+
+  it('blocks relaunch-apply with grant-not-approved when record is awaiting-decision or declined', async () => {
+    // Awaiting-decision: the transport has no answer (the refresh reads back
+    // awaiting), so the refreshed record stays awaiting and blocks.
+    const awaiting = relaunchRecord({ state: 'awaiting-decision' });
+    const signer = createSignedDecisionFixture();
+    const awaitingResult = await resolve(
+      {
+        requestRepo: repositoryWith(awaiting),
+        decisionTransport: explicitAnswerTransport(signer.ownerPublicKey, {}),
+        ...clockAt(CREATED_AT_ISO),
+      },
+      relaunchRequest(),
+    );
+    expect(awaitingResult).toEqual({ outcome: 'blocked', reason: 'grant-not-approved' });
+    const declined = relaunchRecord({ state: 'declined' });
+    const declinedResult = await resolve(
+      { ...signedDeps(repositoryWith(declined), declined), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(declinedResult).toEqual({ outcome: 'blocked', reason: 'grant-not-approved' });
+  });
+
+  it('blocks relaunch-apply with grant-wrong-scope when scope or expectedHeadSha mismatches', async () => {
+    for (const overrides of [
+      { actionScope: 'merge:import-shadow' },
+      { expectedHeadSha: '0123456789abcdef' },
+    ]) {
+      const record = relaunchRecord(overrides);
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        relaunchRequest(),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-scope' });
+    }
+  });
+
+  it('blocks relaunch-apply with grant-digest-mismatch when plan digest mismatches', async () => {
+    const record = relaunchRecord();
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ proposalDigest: 'b'.repeat(64) }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-digest-mismatch' });
+  });
+
+  it('blocks relaunch-apply with invalid-request when the proposal digest is malformed', async () => {
+    const record = relaunchRecord();
+    for (const proposalDigest of [undefined, '', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), 7]) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        relaunchRequest({ proposalDigest }),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+  });
+
+  it('authorizes a relaunch-apply request with extra own keys past the fixed fields, proving the resolve never enumerates the body', async () => {
+    const record = relaunchRecord();
+    const padded: Record<string, unknown> = relaunchRequest();
+    // Far past any fixed field count: the relaunch resolve reads only its four
+    // named fields with descriptor lookups, so bulk keys are inert — they are
+    // never enumerated, never copied, and can never make the resolve cost
+    // proportional to their count.
+    for (let i = 0; i < 4096; i += 1) {
+      padded[`filler-${i}`] = i;
+    }
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      padded,
+    );
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: record.id,
+      expectedHeadSha: '',
+      policyRevision: 'pol-relaunch-1',
+    });
+  });
+
+  it('refuses a relaunch projectId padded past the length bound as grant-wrong-project', async () => {
+    const record = relaunchRecord();
+    // Trims to exactly `relaunch`, so only the O(1) length bound — not the
+    // project comparison — can refuse it.
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ projectId: `${RELAUNCH_APPLY_PROJECT_ID}${' '.repeat(4096)}` }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+  });
+
+  it('refuses a relaunch grant id padded past the length bound as grant-missing', async () => {
+    const record = relaunchRecord();
+    // Trims to the exact recorded grant id, so only the O(1) length bound —
+    // not the grant lookup — can refuse it.
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest({ authorizationGrantId: `${GRANT_ID}${' '.repeat(4096)}` }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+  });
+
+  it('blocks relaunch-apply with clock-unavailable when clock is absent', async () => {
+    const record = relaunchRecord();
+    const deps = signedDeps(repositoryWith(record), record);
+    const result = await resolve(deps, relaunchRequest());
+    expect(result).toEqual({ outcome: 'blocked', reason: 'clock-unavailable' });
+  });
+
+  it('blocks relaunch-apply with invalid-now-iso when clock returns invalid timestamp', async () => {
+    const record = relaunchRecord();
+    for (const nowIso of ['not-a-timestamp', '', '0', '2026', '1', 7 as unknown as string]) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(nowIso) },
+        relaunchRequest(),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-now-iso' });
+    }
+  });
+
+  it('refuses an array-like plain relaunch request carrying length and an index as invalid-request', async () => {
+    const record = relaunchRecord();
+    for (const extra of [{ length: 1 }, { 0: 'x' }, { length: 1, 0: 'x' }]) {
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        relaunchRequest(extra),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+  });
+
+  it('blocks relaunch-apply with decision-signature-invalid when decisionTransport is absent or signature fails', async () => {
+    const record = relaunchRecord();
+    const withoutTransport = await resolve(
+      { requestRepo: repositoryWith(record), ...clockAt(CREATED_AT_ISO) },
+      relaunchRequest(),
+    );
+    expect(withoutTransport).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+    // An answer signed by a different key also blocks.
+    const signer = createSignedDecisionFixture();
+    const other = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer({
+      id: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: record.decisionRevision,
+      grantId: record.grantId,
+    });
+    const wrongKey = await resolve(
+      {
+        requestRepo: repositoryWith(record),
+        decisionTransport: explicitAnswerTransport(other.ownerPublicKey, {
+          [record.id]: signer.signApprovedAnswer(record),
+        }),
+        ...clockAt(CREATED_AT_ISO),
+      },
+      relaunchRequest(),
+    );
+    expect(wrongKey).toEqual({ outcome: 'blocked', reason: 'decision-signature-invalid' });
+  });
+
+  it('never echoes the grant id or the plan digest in a refusal reason', async () => {
+    const record = relaunchRecord();
+    const clock = clockAt(new Date(Date.parse(CREATED_AT_ISO) + SEVEN_DAYS_MS + 1).toISOString());
+    const refusals = await Promise.all([
+      resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clock },
+        relaunchRequest(),
+      ),
+      resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clock },
+        relaunchRequest({ proposalDigest: 'b'.repeat(64) }),
+      ),
+      resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clock },
+        relaunchRequest({ projectId: 'project-other' }),
+      ),
+    ]);
+    for (const result of refusals) {
+      expect(result.outcome).toBe('blocked');
+      if (result.outcome === 'blocked') {
+        expect(result.reason).not.toContain(GRANT_ID);
+        expect(result.reason).not.toContain(PROPOSAL_DIGEST);
+      }
+    }
+  });
+
+  it('refuses an accessor on projectId as invalid-request without running the getter', async () => {
+    const record = relaunchRecord();
+    let calls = 0;
+    const hostile = relaunchRequest();
+    Object.defineProperty(hostile, 'projectId', {
+      get() {
+        calls += 1;
+        throw new Error('hostile getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      hostile,
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses an own __proto__ key on a relaunch-apply resolve as invalid-request without polluting Object.prototype', async () => {
+    const record = relaunchRecord();
+    const hostile = JSON.parse(
+      `{"projectId":"${RELAUNCH_APPLY_PROJECT_ID}","actionScope":"${RELAUNCH_APPLY_ACTION_SCOPE}","authorizationGrantId":"${GRANT_ID}","proposalDigest":"${PROPOSAL_DIGEST}","__proto__":{"polluted":true}}`,
+    ) as Record<string, unknown>;
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      hostile,
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('refuses own constructor and prototype keys on a relaunch-apply resolve as invalid-request', async () => {
+    const record = relaunchRecord();
+    for (const polluting of ['constructor', 'prototype']) {
+      const hostile: Record<string, unknown> = relaunchRequest();
+      Object.defineProperty(hostile, polluting, { value: 'hostile', enumerable: true });
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        hostile,
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+  });
+
+  it('refuses a hostile Proxy relaunch-apply resolve as invalid-request without throwing', async () => {
+    const record = relaunchRecord();
+    const proxy = new Proxy(relaunchRequest(), {
+      get() {
+        throw new Error('hostile proxy');
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile proxy descriptor');
+      },
+    });
+    const result = await resolve(
+      { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+      proxy,
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+});
+
+describe('ResolveActionAuthorizationUseCase dependency receivers (AR3a)', () => {
+  const NOW_ISO = '2026-11-18T00:00:00.000Z';
+
+  // A valid computeDigest that depends on its receiver: it reads `this.salt`,
+  // so it only works when invoked as a method of the dependencies object.
+  class SaltedDeps {
+    readonly salt = 'receiver-salt:';
+    readonly shadowImportClock = { nowIso: (): string => NOW_ISO };
+    constructor(
+      readonly requestRepo: CoordinationRequestRepositoryPort,
+      readonly decisionTransport: DecisionTransportPort,
+    ) {}
+
+    computeDigest(payload: string): string {
+      return createHash('sha256').update(this.salt + payload).digest('hex');
+    }
+  }
+
+  const baseRecord = (overrides: Partial<CoordinationRequestRecord>): CoordinationRequestRecord => ({
+    id: 'placeholder',
+    projectId: 'proj-1',
+    kind: 'action-decision',
+    state: 'approved',
+    actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+    expectedHeadSha: null,
+    proposalDigest: 'sha256-proposal',
+    policyRevision: 'pol-rev-1',
+    decisionRevision: 'dec-rev-1',
+    grantId: 'grant-salted',
+    consumptions: [],
+    acknowledgements: [],
+    deliveryStatus: 'delivered',
+    deliveryGapReason: null,
+    revision: 1,
+    createdAtIso: NOW_ISO,
+    updatedAtIso: NOW_ISO,
+    ...overrides,
+  });
+
+  it('keeps the receiver of computeDigest for a shadow import grant', async () => {
+    const expiresAtIso = '2026-12-16T00:00:00Z';
+    const salted = (p: string): string => createHash('sha256').update(`receiver-salt:${p}`).digest('hex');
+    const record = baseRecord({
+      id: `shadow-import-${salted(
+        JSON.stringify({ scope: SHADOW_IMPORT_ACTION_SCOPE, owner: 'octo', repo: 'hello', expiresAtIso }),
+      )}`,
+      shadowImportGrant: { repository: { owner: 'octo', repo: 'hello' }, expiresAtIso },
+    });
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(record);
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase(
+      new SaltedDeps(requestRepo, signer.deps.decisionTransport),
+    ).resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      authorizationGrantId: 'grant-salted',
+      repository: { owner: 'octo', repo: 'hello' },
+    } as never);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-salted', requestId: record.id });
+  });
+
+  it('keeps the receiver of computeDigest for a relaunch-apply grant', async () => {
+    const proposalDigest = 'b'.repeat(64);
+    const createdAtIso = '2026-11-17T00:00:00.000Z';
+    const salted = (p: string): string => createHash('sha256').update(`receiver-salt:${p}`).digest('hex');
+    const record = baseRecord({
+      id: `${RELAUNCH_APPLY_DIGEST_PREFIX}${salted(
+        relaunchApplyDigestPayload({ projectId: RELAUNCH_APPLY_PROJECT_ID, proposalDigest, createdAtIso }),
+      )}`,
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      proposalDigest,
+      createdAtIso,
+      updatedAtIso: createdAtIso,
+    });
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(record);
+    const signer = createSignedDecisionFixture();
+    await signer.writeApprovedAnswer(record);
+    const result = await new ResolveActionAuthorizationUseCase(
+      new SaltedDeps(requestRepo, signer.deps.decisionTransport),
+    ).resolveActionAuthorization({
+      projectId: RELAUNCH_APPLY_PROJECT_ID,
+      actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+      expectedHeadSha: '',
+      authorizationGrantId: 'grant-salted',
+      proposalDigest,
+    } as never);
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-salted', requestId: record.id });
   });
 });

@@ -163,13 +163,8 @@ function branchNameOf(record: LaneRunRecord, latest: AttemptRecord): string | nu
 
 const LANE_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
-/** GU2: park reasons that never carry a failed-gate retry: a halt, an ambiguity or a stop takes the normal resume path. */
-const GATE_RETRY_EXCLUDED_PARK_REASONS: ReadonlySet<string> = new Set([
-  'halted',
-  'ambiguous',
-  'stop-unconfirmed',
-  'stop-refused',
-]);
+/** GU2: the only park reason a gate-failed park from gating carries (afterLaneRunFailure); every other reason takes the normal resume path. */
+const GATE_RETRY_PARK_REASON = 'blocker-after-round-2';
 
 /**
  * R4a: whether the PR's full validated 40-hex head SHA equals the attempt's
@@ -337,7 +332,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     // GU2: a run parked from `gating` whose gate already failed past the retry
     // cap stays parked: the resume is refused before any intent is appended.
-    if (record.parked !== null && record.parked.parkedFrom === 'gating') {
+    if (record.parked !== null && record.parked.parkedFrom === 'gating' && record.parked.reason === GATE_RETRY_PARK_REASON) {
       const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
       if (plan.kind === 'cap-reached') {
         return { outcome: 'refused', reason: 'gate-retry-cap-reached' };
@@ -422,7 +417,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (
       record.parked.parkedFrom === 'gating' &&
       facts.stopMode === null &&
-      !GATE_RETRY_EXCLUDED_PARK_REASONS.has(record.parked.reason)
+      record.parked.reason === GATE_RETRY_PARK_REASON
     ) {
       const plan = planGateFailedRetry(facts.entries, record.runId, record.round);
       if (plan.kind === 'cap-reached') {

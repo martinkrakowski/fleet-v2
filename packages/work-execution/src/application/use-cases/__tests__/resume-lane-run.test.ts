@@ -1121,6 +1121,26 @@ describe('ResumeLaneRunUseCase GU2 bounded gate retry', () => {
     expect((await fx.repo.get(RUN_ID))?.parked).toMatchObject({ parkedFrom: 'gating' });
   });
 
+  it.each(['cost-ceiling', 'step-refused', 'artifacts-unsealed', 'seat-plan-exhausted'] as const)(
+    'a %s park from gating after gate-failed mints no gate retry',
+    async (reason) => {
+      const fx = await seededGateFailedPark([], { reason, qualifier: reason === 'step-refused' ? 'gate' : null, parkedFrom: 'gating', questionId: null } as LaneRunParkRecord);
+      expect(await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW })).toMatchObject({
+        outcome: 'resume-recorded',
+      });
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW });
+      expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
+    },
+  );
+
+  it('a halted park from gating at the retry cap resumes normally instead of gate-retry-cap-reached', async () => {
+    const fx = await seededGateFailedPark([1, 2, 3], { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null });
+    expect(await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW })).toMatchObject({
+      outcome: 'resume-recorded',
+      to: 'gating',
+    });
+  });
+
   it('a halted park from gating after gate-failed takes the normal resume path and mints no gate retry', async () => {
     const fx = await seededGateFailedPark([], { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null });
     expect(

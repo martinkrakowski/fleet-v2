@@ -298,6 +298,28 @@ function isSecretShapedLine(line: string): boolean {
  * regardless of how much a failing command printed — never O(64 KiB) or an
  * unbounded line split.
  */
+/** The last `max` UTF-8 bytes of `text`, cut on a code-point boundary. */
+function lastUtf8Bytes(text: string, max: number): string {
+  if (text.length * 3 <= max || Buffer.byteLength(text, 'utf8') <= max) {
+    return text;
+  }
+  let bytes = 0;
+  let start = text.length;
+  while (start > 0) {
+    const low = text.charCodeAt(start - 1);
+    const pair = low >= 0xdc00 && low <= 0xdfff && start >= 2;
+    const width = pair ? 2 : 1;
+    const unit = text.slice(start - width, start);
+    const size = Buffer.byteLength(unit, 'utf8');
+    if (bytes + size > max) {
+      break;
+    }
+    bytes += size;
+    start -= width;
+  }
+  return text.slice(start);
+}
+
 export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
   // Retain at most the last 32 KiB + 1 of each stream: more than the largest
   // window any later step can need is never retained. O(1) slice per stream.
@@ -331,7 +353,7 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
     const headKeep = MAX_OUTPUT_TAIL_BYTES - joinNewline.length - b.length;
     rawWindow = a.slice(a.length - headKeep) + joinNewline + b;
   }
-  const stripped = rawWindow.replace(ANSI_PATTERN, '');
+  const stripped = lastUtf8Bytes(rawWindow.replace(ANSI_PATTERN, ''), MAX_OUTPUT_TAIL_BYTES);
   if (stripped.trim() === '') {
     return undefined;
   }

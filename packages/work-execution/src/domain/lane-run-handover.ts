@@ -233,21 +233,20 @@ function safeOwnValue(
  * anything, and running it would let untrusted code run) and a lying Proxy
  * trap cannot throw out of the read. Prototype-polluting own keys, a
  * non-string, an empty or over-long value refuse with `invalid-gate-predicate`;
- * a secret-shaped value refuses with `secret-shaped-input`. O(keys) per
- * predicate; a length check is O(1) and the secret-shape scan is bounded by
+ * a secret-shaped value refuses with `secret-shaped-input`. O(1) per
+ * predicate (no key enumeration); a length check is O(1) and the secret-shape scan is bounded by
  * the value's capped length.
  */
 function safeOutputTailOf(
   predicate: { readonly outputTail?: string },
 ): { ok: true; tail?: string } | { ok: false; reason: 'invalid-gate-predicate' | 'secret-shaped-input' } {
-  let ownKeys: readonly string[];
-  try {
-    ownKeys = Object.getOwnPropertyNames(predicate);
-  } catch {
-    return { ok: false, reason: 'invalid-gate-predicate' };
-  }
-  if (ownKeys.some((key) => key === '__proto__' || key === 'constructor' || key === 'prototype')) {
-    return { ok: false, reason: 'invalid-gate-predicate' };
+  // Never enumerate keys (a predicate may carry a huge number of them): probe
+  // only the three prototype-polluting names through their own descriptors.
+  for (const polluting of ['__proto__', 'constructor', 'prototype']) {
+    const probe = safeOwnValue(predicate, polluting);
+    if (probe.kind !== 'absent') {
+      return { ok: false, reason: 'invalid-gate-predicate' };
+    }
   }
   const read = safeOwnValue(predicate, 'outputTail');
   if (read.kind === 'refused') {
@@ -367,18 +366,22 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
           ) {
             return { ok: false, reason: 'invalid-gate-predicate' };
           }
+          if (name.length > 120 || !GATE_PREDICATE_NAME_PATTERN.test(name)) {
+            return { ok: false, reason: 'invalid-gate-predicate' };
+          }
           if (containsSecretShape(name)) {
             return { ok: false, reason: 'secret-shaped-input' };
           }
-          if (!GATE_PREDICATE_NAME_PATTERN.test(name)) {
-            return { ok: false, reason: 'invalid-gate-predicate' };
-          }
-          const tail = safeOutputTailOf(predicate as { readonly outputTail?: string });
-          if (!tail.ok) {
-            return { ok: false, reason: tail.reason };
-          }
-          if (tail.tail !== undefined) {
-            tails.push(tail.tail);
+          // The tail is rendered for failing predicates only; an unknown
+          // predicate's tail is ignored, never read.
+          if (verdict === 'fail') {
+            const tail = safeOutputTailOf(predicate as { readonly outputTail?: string });
+            if (!tail.ok) {
+              return { ok: false, reason: tail.reason };
+            }
+            if (tail.tail !== undefined) {
+              tails.push(tail.tail);
+            }
           }
           const exitText = exitCode === null ? 'none' : String(exitCode);
           rawLines.push({ text: `[gate] ${name} — ${verdict}, exit ${exitText}` });

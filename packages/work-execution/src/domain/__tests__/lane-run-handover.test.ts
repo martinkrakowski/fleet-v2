@@ -1,4 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+const scanner = vi.hoisted(() => ({ calls: 0 }));
+vi.mock('@fleet/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@fleet/shared')>();
+  return {
+    ...actual,
+    containsSecretShape: (text: string) => {
+      scanner.calls += 1;
+      return actual.containsSecretShape(text);
+    },
+  };
+});
 
 import { renderHandoverBrief, ORIGINAL_BRIEF_MARKER, originalBriefOf } from '../lane-run-handover.js';
 import type { HandoverFinding, RenderHandoverBriefInput } from '../lane-run-handover.js';
@@ -577,6 +589,53 @@ describe('renderHandoverBrief output tails (GD2)', () => {
     expect(section).toBeGreaterThan(fixesEnd);
     expect(result.text.slice(section)).toContain('error: build failed');
     expect(result.text.slice(section)).toContain('src/x.ts(3): boom');
+  });
+
+  it('GD2 never enumerates a predicate\'s keys', () => {
+    let ownKeysCalls = 0;
+    const target = { name: "yarn build", verdict: "fail" as const, exitCode: 1, outputTail: "boom" };
+    const proxy = new Proxy(target, {
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    const result = renderHandoverBrief(input({ source: 'gate', gatePredicates: [proxy] }));
+    expect(result.ok).toBe(true);
+    expect(ownKeysCalls).toBe(0);
+    const many: { name: string; verdict: 'fail'; exitCode: number; outputTail: string } & Record<string, unknown> = {
+      name: 'yarn build',
+      verdict: 'fail',
+      exitCode: 1,
+      outputTail: 'boom',
+    };
+    for (let i = 0; i < 200_000; i += 1) {
+      many[`k${i}`] = i;
+    }
+    expect(renderHandoverBrief(input({ source: 'gate', gatePredicates: [many] })).ok).toBe(true);
+  });
+
+  it('GD2 checks the name length before scanning it for secrets', () => {
+    scanner.calls = 0;
+    const result = renderHandoverBrief(
+      input({ source: 'gate', gatePredicates: [predicate({ name: 'a'.repeat(10_000_000) })] }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-gate-predicate' });
+    expect(scanner.calls).toBe(0);
+  });
+
+  it('GD2 ignores the tail of an unknown predicate', () => {
+    const result = renderHandoverBrief(
+      input({
+        source: 'gate',
+        gatePredicates: [predicate({ verdict: 'unknown', exitCode: null, outputTail: 'SECRETY-TAIL-TEXT' })],
+      }),
+    );
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(result.text).not.toContain('SECRETY-TAIL-TEXT');
+    expect(result.text).not.toContain('Failed gate output tail');
   });
 
   it('renders no tail section when no failing predicate carries an outputTail', () => {

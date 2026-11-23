@@ -966,6 +966,16 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     expect(results[2].kind === 'command' && results[2].outputTail).toBe('error: failed');
   });
 
+  it('GD2 bounds the tail in UTF-8 bytes on a code-point boundary', () => {
+    const tail = boundedRedactedOutputTail('\u{1F600}'.repeat(20000), undefined);
+    expect(tail).toBeDefined();
+    expect(Buffer.byteLength(tail as string, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    expect(tail).toBe('\u{1F600}'.repeat(8192));
+    const cjk = boundedRedactedOutputTail('\u4e2d'.repeat(20000), undefined) as string;
+    expect(Buffer.byteLength(cjk, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    expect(cjk).toBe('\u4e2d'.repeat(10922));
+  });
+
   it('bounds the scan of an enormous stream to its last 200 lines and 32 KiB', () => {
     // A stream far past the bound (several MiB, 100k+ lines): the tail must
     // still be exactly the last 200 lines capped to 32 KiB, produced by

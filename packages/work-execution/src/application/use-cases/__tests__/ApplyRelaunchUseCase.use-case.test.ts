@@ -2305,6 +2305,42 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     ).toEqual({ outcome: 'refused', reason: 'journal-write-failed', laneId: 'lane-2' });
   });
 
+  it('AR3b-4b: a refused handed-off append whose journal re-read is unreadable refuses journal-unreadable', async () => {
+    const { plan, inputs } = handoffPlan(2);
+    const digest = plan.planDigest;
+    const entries = [
+      ...completedSave(digest, 'lane-2', inputs[0]!),
+      ...completedAdopt(digest, 'lane-2'),
+      intent(key(digest, 'lane-2', 'redispatch')),
+      ...completedSave(digest, 'lane-3', inputs[1]!),
+    ];
+    const deps = makeDeps({
+      plan,
+      entries,
+      live: {
+        runs: [runRecord(RUN_A, 'wo-9', ['attempt-1'])],
+        runJournalFor: (runId: string) => (runId === RUN_A ? [conductEntry(RUN_A, 'merged')] : []),
+        adopt: lane3Adopted(),
+        appendResults: [{ outcome: 'refused', reason: 'store-read-only' }],
+      },
+    });
+    // The preflight read succeeds; the re-read after the refused append throws.
+    const list = deps.cutoverJournal.listByKeyPrefix as unknown as ReturnType<typeof vi.fn>;
+    const healthy = list.getMockImplementation() as (prefix: string) => Promise<unknown>;
+    let reads = 0;
+    list.mockImplementation(async (prefix: string) => {
+      reads += 1;
+      if (reads > 1) throw new Error('journal down');
+      return healthy(prefix);
+    });
+    expect(
+      await new ApplyRelaunchUseCase(deps).applyRelaunch(
+        applyRequest(digest, { saveInputs: inputs, adoptInputs: [adoptInput(), lane3AdoptInput()] }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'journal-unreadable' });
+    expect(reads).toBe(2);
+  });
+
   it('AR3b-5: a hostile runRepo.list answer — throw, null, non-array, array-like, hole, over-sized, getter element, polluting key, two runs on one work order — refuses stale-plan-state before the grant is spent', async () => {
     const { plan, inputs } = handoffPlan(3);
     const digest = plan.planDigest;

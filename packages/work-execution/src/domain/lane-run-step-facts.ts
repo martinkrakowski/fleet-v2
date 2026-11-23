@@ -317,43 +317,52 @@ interface GateRetryEntrySnapshot {
 }
 
 /**
- * A plain-data snapshot of one journal entry's planner fields, or null when the
- * entry is not a plain object or carries an accessor (getter) property among
- * them — a getter is never run; the entry is skipped instead. Cost: O(1) per
- * entry, five descriptor reads. A proxy that lies consistently in every trap is
- * an accepted residual.
+ * A plain-data snapshot of one journal entry's planner fields, or a refusal.
+ * `refused` marks an entry that is not a plain object or carries an accessor
+ * (getter) property among the read fields — a getter is never run; the entry
+ * is skipped instead. `polluted` marks an entry with a prototype-polluting own
+ * key, which refuses the whole planner input. Cost: O(1) per entry, six descriptor reads. A proxy that
+ * lies consistently in every trap is an accepted residual.
  */
-function snapshotGateRetryEntry(source: unknown): GateRetryEntrySnapshot | null {
+function snapshotGateRetryEntry(source: unknown): { readonly status: 'ok'; readonly snapshot: GateRetryEntrySnapshot } | { readonly status: 'refused' } | { readonly status: 'polluted' } {
   if (typeof source !== 'object' || source === null) {
-    return null;
+    return REFUSED_GATE_RETRY_ENTRY;
   }
   const proto = Object.getPrototypeOf(source);
   if (proto !== Object.prototype && proto !== null) {
-    return null;
+    return REFUSED_GATE_RETRY_ENTRY;
   }
-  // A prototype-polluting own key marks the entry hostile: it is skipped.
+  // A prototype-polluting own key marks the entry hostile: the planner must refuse it.
   if (Object.getOwnPropertyDescriptor(source, '__proto__') !== undefined) {
-    return null;
+    return { status: 'polluted' };
   }
   const read = (field: string): unknown => {
     const descriptor = Object.getOwnPropertyDescriptor(source, field);
     return descriptor === undefined || !('value' in descriptor) ? undefined : descriptor.value;
   };
   return {
-    kind: read('kind'),
-    key: read('key'),
-    runId: read('runId'),
-    outcome: read('outcome'),
-    reasonCode: read('reasonCode'),
+    status: 'ok',
+    snapshot: {
+      kind: read('kind'),
+      key: read('key'),
+      runId: read('runId'),
+      outcome: read('outcome'),
+      reasonCode: read('reasonCode'),
+    },
   };
 }
 
-/** The snapshot's final result for the key (non-ambiguous outcome), or null. O(N) per call over the snapshot. */
+const REFUSED_GATE_RETRY_ENTRY = { status: 'refused' } as const;
+
+/** The snapshot's final result for the key in the given run (non-ambiguous outcome), or null. O(N) per call over the snapshots. */
 function finalSnapshotResultOf(
-  snapshots: readonly (GateRetryEntrySnapshot | null)[], key: string,
+  snapshots: readonly (GateRetryEntrySnapshot | null)[], runId: string, key: string,
 ): GateRetryEntrySnapshot | null {
   for (const snapshot of snapshots) {
-    if (snapshot !== null && snapshot.kind === 'result' && snapshot.key === key && snapshot.outcome !== 'ambiguous') {
+    if (
+      snapshot !== null && snapshot.kind === 'result' && snapshot.runId === runId &&
+      snapshot.key === key && snapshot.outcome !== 'ambiguous'
+    ) {
       return snapshot;
     }
   }
@@ -408,7 +417,20 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
     }
     const snapshots: (GateRetryEntrySnapshot | null)[] = new Array(entries.length);
     for (let index = 0; index < entries.length; index += 1) {
-      snapshots[index] = snapshotGateRetryEntry(entries[index]);
+      // Read each slot through its own property descriptor so a getter (an
+      // accessor at an index) is never invoked; an accessor slot is refused
+      // like any non-plain entry. A prototype-polluting own key on any entry
+      // refuses the whole input rather than being silently skipped.
+      const slot = Object.getOwnPropertyDescriptor(entries, index);
+      if (slot === undefined || !('value' in slot)) {
+        snapshots[index] = null;
+        continue;
+      }
+      const snapshotted = snapshotGateRetryEntry(slot.value);
+      if (snapshotted.status === 'polluted') {
+        return GATE_RETRY_NONE;
+      }
+      snapshots[index] = snapshotted.status === 'ok' ? snapshotted.snapshot : null;
     }
 
     // The round's gate intents, in journal order, with their parsed key parts.
@@ -443,7 +465,7 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
 
     // Only a settled `gate-failed` may be retried; a pending intent, a pass, a
     // congestion, an unknown or an abandonment never mints a retry.
-    const final = finalSnapshotResultOf(snapshots, highest.key);
+    const final = finalSnapshotResultOf(snapshots, runId, highest.key);
     if (final === null || final.outcome === 'ambiguous' || final.reasonCode !== 'gate-failed') {
       return GATE_RETRY_NONE;
     }
@@ -464,7 +486,7 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
       if (predecessorKey === undefined) {
         continue;
       }
-      const predecessorFinal = finalSnapshotResultOf(snapshots, predecessorKey);
+      const predecessorFinal = finalSnapshotResultOf(snapshots, runId, predecessorKey);
       if (predecessorFinal !== null && predecessorFinal.outcome !== 'ambiguous' && predecessorFinal.reasonCode === 'gate-failed') {
         failedRetries += 1;
       }

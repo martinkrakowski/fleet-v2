@@ -687,6 +687,46 @@ describe('planGateFailedRetry', () => {
     expect(planGateFailedRetry(entries, RUN_ID, 0)).toEqual({ kind: 'none' });
   });
 
+  it('ignores a final result whose key matches but whose runId belongs to another run', () => {
+    // A result for the target key stamped with another run's id must never be
+    // read as this run's gate failure: the runId participates in the lookup.
+    const base = gateKeyOf(0, 0, HEAD, null);
+    const foreign = { ...result(base, 'completed', 'gate-failed'), runId: OTHER_RUN_ID };
+    expect(planGateFailedRetry([intent(base), foreign], RUN_ID, 0)).toEqual({ kind: 'none' });
+    // The same entries wholly under their own run still plan the retry, so the
+    // refusal above comes from the runId mismatch, not from the entries.
+    const foreignBase = { ...intent(base), runId: OTHER_RUN_ID };
+    const foreignResult = { ...result(base, 'completed', 'gate-failed'), runId: OTHER_RUN_ID };
+    // The key embeds the run id, so the foreign pair needs its own key.
+    const foreignKey = foreignBase.key === null ? null : foreignBase.key.replace(RUN_ID, OTHER_RUN_ID);
+    expect(planGateFailedRetry([{ ...foreignBase, key: foreignKey }, { ...foreignResult, key: foreignKey }], OTHER_RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 1 });
+  });
+
+  it('refuses a getter installed at an array index without running it', () => {
+    let getterRan = false;
+    const lying = intent(gateKeyOf(0, 0, HEAD, null));
+    const entries: unknown[] = [];
+    entries.length = 1;
+    Object.defineProperty(entries, 0, {
+      enumerable: true,
+      get: () => {
+        getterRan = true;
+        return lying;
+      },
+    });
+    // A plain gate-failed entry alone would mint; the accessor slot must not
+    // be read (no getter ever runs) and must not contribute a mintable entry.
+    const plan = planGateFailedRetry(entries, RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'none' });
+    expect(getterRan).toBe(false);
+  });
+
+  it('refuses the whole input when any entry carries a prototype-polluting own key, even with a valid gate-failed entry present', () => {
+    const polluting = JSON.parse('{"__proto__": {}, "kind": "intent"}') as object;
+    const plan = planGateFailedRetry([...failedEntries(), polluting], RUN_ID, 0);
+    expect(plan).toEqual({ kind: 'none' });
+  });
+
   it('refuses hostile inputs without throwing or running getters', () => {
     const entry = intent(gateKeyOf(0, 0, HEAD, null));
     const throwing: Record<string, unknown> = { kind: 'intent' };

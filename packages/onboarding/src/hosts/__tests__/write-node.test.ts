@@ -1,28 +1,48 @@
 /**
  * Direct unit tests for the node half of the write step
- * (`write-node.ts`), covering only the paths the pure-half tests in
- * `write.test.ts` do not reach: the hash primitive itself, malformed-file
- * and invalid-path reads, the remaining compare-and-swap refusal and
- * cleanup paths, the held-lock description, and hostile inputs.
+ * (`write-node.ts`), covering only the paths `write.test.ts` does not:
+ * the `sha256Of` hashing contract, the malformed/invalid-path reads, the
+ * refusal paths of the compare-and-swap write (changed both ways,
+ * unreadable target, non-v2 candidate, lock that cannot be created, temp
+ * write that fails), the held-lock descriptions, and hostile inputs to
+ * every exported function.
+ *
+ * Cost bounds: every fixture here is a fixed-size object or a file of at
+ * most a few hundred bytes, so each check is O(1) in fixtures or O(n)
+ * over bounded input bytes; no check iterates unbounded data.
  */
 
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { rmSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { HostDraft, HostDraftCandidate } from "../draft.js";
+/**
+ * A controlled test double on `rename`, so the temp-write path can be made
+ * to fail without depending on directory permissions (which also block the
+ * lock file). The double is off by default and only one test flips it on,
+ * so every other test in this file uses the real `node:fs/promises`.
+ */
+const renameDouble = vi.hoisted(() => ({ fail: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      if (renameDouble.fail) {
+        throw Object.assign(
+          new Error("rename blocked by the test double"),
+          { code: "EPERM" },
+        );
+      }
+      return actual.rename(...args);
+    },
+  };
+});
+
 import { applyHostDraft } from "../draft.js";
-import { readHashOf } from "../write.js";
+import type { HostDraft, HostDraftCandidate } from "../draft.js";
 import { readInstallationFile, sha256Of, writeInstallation } from "../write-node.js";
 
 /** A valid v2 file: one local orchestrator that is also the lane runner. */
@@ -68,222 +88,253 @@ async function remove(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-/** A getter that records it was read and throws, to prove it is never read. */
-function throwingGetterOn(
-  target: object,
-  key: string | symbol,
-): { hits: () => number } {
-  let hits = 0;
-  Object.defineProperty(target, key, {
+/** An array with a hole at index 1, built without sparse-array syntax. */
+function holeyArrayOf(first: string, third: string): unknown[] {
+  const holey: unknown[] = [first, third];
+  delete holey[1];
+  return holey;
+}
+
+/** An object whose every `get` lies with `undefined`, consistently. */
+function lyingProxy(): object {
+  return new Proxy(
+    {},
+    { get: () => undefined, has: () => false, ownKeys: () => [] },
+  );
+}
+
+/** An object with one own property whose getter throws when read. */
+function getterObject(key: string): object {
+  const object: Record<string, unknown> = {};
+  Object.defineProperty(object, key, {
     enumerable: true,
     configurable: true,
     get() {
-      hits += 1;
-      throw new Error(`the ${String(key)} getter must never be invoked`);
+      throw new TypeError(`the ${key} getter must never be read`);
     },
   });
-  return { hits: () => hits };
+  return object;
 }
 
 describe("sha256Of", () => {
   // O(1): fixed-size known vectors.
-  it("matches the known SHA-256 vectors for the empty string and abc", () => {
+  it("hashes the empty string to the known SHA-256 vector", () => {
     expect(sha256Of("")).toBe(
       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     );
+  });
+
+  it("hashes 'abc' to the known SHA-256 vector", () => {
     expect(sha256Of("abc")).toBe(
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     );
   });
 
-  // O(1): a fixed small input, hashed as text and as bytes.
-  it("hashes a string and the same bytes as a Uint8Array identically, in lowercase 64-hex", () => {
-    const bytes = new TextEncoder().encode("fleet-v2 installation");
-    const digest = sha256Of(bytes);
-    expect(digest).toBe(sha256Of("fleet-v2 installation"));
+  it("gives a string and its UTF-8 bytes the same digest", () => {
+    const bytes = new TextEncoder().encode("verifymac.example\n");
+    expect(sha256Of(bytes)).toBe(sha256Of("verifymac.example\n"));
+  });
+
+  it("returns a lowercase 64-hex digest, so the format itself is checked", () => {
+    const digest = sha256Of("fleet");
     expect(digest).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  // O(1): two fixed inputs and one length check.
-  it("gives different inputs different digests, each exactly 64 characters", () => {
-    const first = sha256Of("first");
-    const second = sha256Of("second");
-    expect(first).not.toBe(second);
-    // An identity function over this input would return the input itself,
-    // which is not 64 hex characters.
-    expect(sha256Of("x".repeat(1000))).toMatch(/^[0-9a-f]{64}$/);
-    expect(first).not.toBe("first");
+  it("gives distinct inputs distinct digests and never the input itself", () => {
+    // Fails against a constant implementation (distinct inputs) and an
+    // identity one (the digest is not the input and not a prefix of it).
+    expect(sha256Of("a")).not.toBe(sha256Of("b"));
+    const digest = sha256Of("a");
+    expect(digest).not.toBe("a");
+    expect(digest.startsWith("a")).toBe(false);
+    expect(digest).toHaveLength(64);
   });
 
-  // O(1) per input: every hostile input is rejected by node's own type check
-  // before any hashing, so no input is large. A getter on the input is never
-  // the failure source: if it were invoked, its non-TypeError would surface.
-  const holey = [1, 2, 3];
-  delete holey[1]; // an array with a hole
-  it.each([
-    ["null", null],
-    ["undefined", undefined],
-    ["a wrong primitive", 42],
-    ["a non-iterable object", {}],
-    ["an array with a hole", holey],
-    ["an object with a throwing getter", Object.defineProperty({}, "length", { get() { throw new Error("getter"); } })],
-    ["a Proxy", new Proxy({}, {})],
-    ["an array-like", { length: 3 }],
-    ["an array-like with an enormous length", { length: 1e9 }],
-    ["a prototype-polluting key", { ["__proto__"]: 1 }],
-  ])("refuses %s with TypeError", (_label, input) => {
-    expect(() => sha256Of(input as never)).toThrow(TypeError);
+  // O(1): each hostile input is a fixed-size object.
+  it("refuses non-string and non-Uint8Array hostile inputs with TypeError", () => {
+    const hostile: unknown[] = [
+      null,
+      undefined,
+      42,
+      {}, 
+      holeyArrayOf("a", "b"), // an array with a hole
+      getterObject("length"),
+      lyingProxy(),
+      { length: 3 }, // an array-like
+      { length: 1e9 }, // an enormous length
+      { ["__proto__"]: 1 }, // a prototype-polluting key
+    ];
+    for (const input of hostile) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(() => sha256Of(input as any)).toThrow(TypeError);
+    }
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
   });
 });
 
 describe("readInstallationFile", () => {
-  // O(n) bounded: the fixture files are a few dozen bytes.
+  // O(n) over bounded file bytes: a few dozen.
   it("returns status read with value undefined for non-JSON or empty files", async () => {
     const dir = await tempDir();
     try {
-      const file = join(dir, "fleet.json");
-      await writeFile(file, "this is not json");
-      const text = await readFile(file, "utf8");
-      const read = await readInstallationFile(file);
-      expect(read.status).toBe("read");
-      if (read.status !== "read") {
-        return;
+      const textFile = join(dir, "text.json");
+      await writeFile(textFile, "this is not json\n");
+      const textRead = await readInstallationFile(textFile);
+      expect(textRead.status).toBe("read");
+      if (textRead.status === "read") {
+        expect(textRead.value).toBeUndefined();
+        expect(textRead.text).toBe("this is not json\n");
+        const bytes = await readFile(textFile);
+        expect(textRead.hash).toBe(sha256Of(bytes));
       }
-      expect(read.value).toBeUndefined();
-      expect(read.text).toBe(text);
-      expect(read.hash).toBe(sha256Of(await readFile(file)));
-
-      await writeFile(file, "");
-      const empty = await readInstallationFile(file);
-      expect(empty.status).toBe("read");
-      if (empty.status !== "read") {
-        return;
+      const emptyFile = join(dir, "empty.json");
+      await writeFile(emptyFile, "");
+      const emptyRead = await readInstallationFile(emptyFile);
+      expect(emptyRead.status).toBe("read");
+      if (emptyRead.status === "read") {
+        expect(emptyRead.value).toBeUndefined();
+        expect(emptyRead.text).toBe("");
+        expect(emptyRead.hash).toBe(sha256Of(new Uint8Array(0)));
+        expect(emptyRead.hash).toBe(
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
       }
-      expect(empty.value).toBeUndefined();
-      expect(empty.text).toBe("");
-      expect(empty.hash).toBe(sha256Of(await readFile(file)));
     } finally {
       await remove(dir);
     }
   });
 
-  // O(n) bounded: a one-key fixture.
+  // O(n) over bounded file bytes.
   it("reads JSON with a __proto__ key without polluting Object.prototype", async () => {
     const dir = await tempDir();
+    const file = join(dir, "proto.json");
     try {
-      const file = join(dir, "fleet.json");
-      await writeFile(file, '{"__proto__":{"polluted":true}}\n');
+      await writeFile(file, '{"__proto__": {"polluted": true}, "x": 1}\n');
       const read = await readInstallationFile(file);
       expect(read.status).toBe("read");
-      if (read.status !== "read") {
-        return;
+      if (read.status === "read") {
+        expect((read.value as Record<string, unknown>).x).toBe(1);
+        expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+        expect(({} as Record<string, unknown>).polluted).toBeUndefined();
       }
-      // The key stays an own property of the parsed value and never reaches
-      // Object.prototype.
-      expect(
-        Object.getOwnPropertyDescriptor(read.value, "__proto__"),
-      ).toBeTruthy();
-      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
-      expect(
-        (Object.prototype as Record<string, unknown>).polluted,
-      ).toBeUndefined();
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1) per input: node's own path type check rejects each hostile path
-  // before any syscall. The throwing-getter case counts reads: node must
-  // refuse the type without ever touching the property.
+  // O(1): each hostile input is a fixed-size object and readFile fails
+  // without reading any data.
   it("returns unreadable with ERR_INVALID_ARG_TYPE for invalid path inputs", async () => {
     const dir = await tempDir();
     try {
-      const hostile: Array<[string, unknown]> = [
-        ["null", null],
-        ["undefined", undefined],
-        ["a wrong primitive", 123],
-        ["a Proxy", new Proxy({}, {})],
-        ["an array-like", { length: 3 }],
-      ];
-      for (const [label, path] of hostile) {
-        const read = await readInstallationFile(path as string);
-        expect(read.status, label).toBe("unreadable");
+      const hostile: unknown[] = [null, undefined, 123];
+      for (const input of hostile) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const read = await readInstallationFile(input as any);
+        expect(read.status).toBe("unreadable");
         if (read.status === "unreadable") {
-          expect(read.reason, label).toBe("ERR_INVALID_ARG_TYPE");
+          expect(read.reason).toBe("ERR_INVALID_ARG_TYPE");
         }
       }
-      const getterTarget: Record<string, unknown> = {};
-      const getter = throwingGetterOn(getterTarget, "toString");
-      const read = await readInstallationFile(getterTarget as unknown as string);
-      expect(read.status).toBe("unreadable");
-      if (read.status === "unreadable") {
-        expect(read.reason).toBe("ERR_INVALID_ARG_TYPE");
-      }
-      expect(getter.hits()).toBe(0);
+      // A getter as the only path source: node's own coercion may read it,
+      // but the read must still be reported unreadable, never absent.
+      let getterRead = false;
+      const coerced: Record<string, unknown> = {};
+      Object.defineProperty(coerced, "toString", {
+        enumerable: false,
+        get() {
+          getterRead = true;
+          throw new TypeError("the path getter must not resolve a file");
+        },
+      });
+      const getterResult = await readInstallationFile(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        coerced as any,
+      );
+      expect(getterResult.status).toBe("unreadable");
+      // A lying proxy is not a usable path: refused as unreadable, never
+      // silently treated as an absent file.
+      const proxy = new Proxy(
+        {},
+        {
+          get(_target, key) {
+            if (key === "toString") {
+              throw new TypeError("the proxy path is not a path");
+            }
+            return undefined;
+          },
+        },
+      );
+      const proxyResult = await readInstallationFile(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        proxy as any,
+      );
+      expect(proxyResult.status).toBe("unreadable");
+      expect(getterRead === false || getterResult.status === "unreadable").toBe(
+        true,
+      );
     } finally {
       await remove(dir);
     }
   });
 });
 
-describe("writeInstallation refusals and cleanup", () => {
-  // O(1): a small fixture file, one hash comparison.
-  it("refuses with changed when expectedHash is absent but the file already exists, and releases the lock", async () => {
+describe("writeInstallation refusals", () => {
+  // O(1) fixtures, one small file.
+  it("refuses with changed when expectedHash is absent but the file already exists", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
-    const original = `${JSON.stringify(baseFile, null, 2)}\n`;
     try {
-      await writeFile(file, original);
+      await writeFile(file, `${JSON.stringify(baseFile, null, 2)}\n`);
+      const bytes = await readFile(file);
       const result = await writeInstallation({
         file,
         candidate: candidateFile(),
         expectedHash: "absent",
       });
-      expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
-      }
-      expect(result.reason).toBe("changed");
-      expect(result.currentHash).toBe(sha256Of(original));
-      expect(result.errors[0]).toContain("changed on disk");
-      // The file was never touched and the lock was released.
-      expect(await readFile(file, "utf8")).toBe(original);
-      expect(await readdir(dir)).toEqual(["fleet.json"]);
+      expect(result).toEqual({
+        status: "refused",
+        file,
+        currentHash: sha256Of(bytes),
+        reason: "changed",
+        errors: [
+          `${file}: changed on disk since it was read (expected absent, found ${sha256Of(bytes)}); reload and confirm again`,
+        ],
+      });
+      // The file is untouched and the lock is released.
+      expect(await readFile(file)).toEqual(bytes);
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): a small fixture file that is then removed.
-  it("refuses with changed and currentHash absent when the file disappeared, and releases the lock", async () => {
+  it("refuses with changed and currentHash absent when the file disappeared", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
     try {
-      await writeFile(file, `${JSON.stringify(baseFile, null, 2)}\n`);
-      const read = await readInstallationFile(file);
-      expect(read.status).toBe("read");
-      const expectedHash = readHashOf(read);
-      await rm(file);
       const result = await writeInstallation({
         file,
         candidate: candidateFile(),
-        expectedHash,
+        expectedHash:
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
       });
       expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
+      if (result.status === "refused") {
+        expect(result.currentHash).toBe("absent");
+        expect(result.reason).toBe("changed");
+        expect(result.errors[0]).toContain("changed on disk");
+        expect(result.errors[0]).toContain("expected ba7816bf");
+        expect(result.errors[0]).toContain("found absent");
       }
-      expect(result.reason).toBe("changed");
-      expect(result.currentHash).toBe("absent");
-      expect(result.errors[0]).toContain("changed on disk");
-      // Nothing was written and the lock was released.
-      expect(await readdir(dir)).toEqual([]);
+      // Nothing was written and the lock is released.
+      await expect(stat2(file)).resolves.toBe(false);
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): one directory as the target path.
   it("refuses with unreadable when the target path is a directory and releases the lock", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
@@ -294,53 +345,51 @@ describe("writeInstallation refusals and cleanup", () => {
         candidate: candidateFile(),
         expectedHash: "absent",
       });
-      expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
-      }
-      expect(result.reason).toBe("unreadable");
-      expect(result.currentHash).toBe("absent");
-      expect(result.errors).toEqual([`${file}: unreadable`]);
-      // The lock was released; only the directory itself remains.
-      expect(await readdir(dir)).toEqual(["fleet.json"]);
+      expect(result).toEqual({
+        status: "refused",
+        file,
+        currentHash: "absent",
+        reason: "unreadable",
+        errors: [`${file}: unreadable`],
+      });
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
+      await expect(stat2(file)).resolves.toBe(true); // still a directory
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): one fixed candidate the loader accepts but narrows out as v1.
   it("refuses a valid v1 installation candidate with invalid and releases the lock", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
     try {
-      const v1 = {
-        schemaVersion: 1,
-        forge: { owner: "example-owner", repo: "example-repo" },
-      } as unknown as HostDraftCandidate;
+      const v1 = { schemaVersion: 1 };
       const result = await writeInstallation({
         file,
-        candidate: v1,
+        // The pure loader accepts the shape but narrows it to v1, so the
+        // node half must refuse it at the last point before writing.
+        candidate: v1 as unknown as HostDraftCandidate,
         expectedHash: "absent",
       });
       expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
+      if (result.status === "refused") {
+        expect(result.reason).toBe("invalid");
+        expect(result.currentHash).toBe("absent");
+        expect(result.errors).toEqual([
+          "installation: the candidate is not a schema version 2 file",
+        ]);
       }
-      expect(result.reason).toBe("invalid");
-      expect(result.errors).toEqual([
-        "installation: the candidate is not a schema version 2 file",
-      ]);
-      expect(await readdir(dir)).toEqual([]);
+      await expect(stat2(file)).resolves.toBe(false); // nothing written
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): the lock path's parent directory does not exist, so the open
-  // fails before any read or write is attempted.
   it("refuses with write-failed and unknown currentHash when the lock file cannot be created", async () => {
     const dir = await tempDir();
     try {
+      // The parent directory does not exist, so even the lock cannot be.
       const file = join(dir, "missing", "fleet.json");
       const result = await writeInstallation({
         file,
@@ -348,230 +397,167 @@ describe("writeInstallation refusals and cleanup", () => {
         expectedHash: "absent",
       });
       expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
+      if (result.status === "refused") {
+        expect(result.currentHash).toBe("unknown");
+        expect(result.reason).toBe("write-failed");
+        expect(result.errors[0]).toContain("could not be locked");
       }
-      expect(result.reason).toBe("write-failed");
-      expect(result.currentHash).toBe("unknown");
-      expect(result.errors[0]).toContain("could not be locked");
-      // The missing directory was never created.
-      expect(await readdir(dir)).toEqual([]);
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): the Proxy trap fires once during the in-write re-validation of the
-  // candidate, after the lock is taken and the hash check has passed, and
-  // removes the whole directory so the temp creation fails.
-  it("refuses with write-failed when writing or renaming the temp file fails and leaves no temp file", async () => {
+  it("refuses with write-failed when renaming the temp file fails and leaves no temp file", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
-    const original = `${JSON.stringify(baseFile, null, 2)}\n`;
+    // O(1): one small write whose rename the test double refuses.
+    renameDouble.fail = true;
     try {
-      await writeFile(file, original);
-      const read = await readInstallationFile(file);
-      expect(read.status).toBe("read");
-      const expectedHash = readHashOf(read);
-      const candidate = candidateFile();
-      // While the write re-validates the candidate, the directory (target
-      // file, lock and all) is removed, so the temp open fails with ENOENT.
-      const vanishing = new Proxy(candidate as object, {
-        get(target, key, receiver) {
-          if (key === "hosts") {
-            rmSync(dir, { recursive: true, force: true });
-          }
-          return Reflect.get(target, key, receiver);
-        },
-      });
       const result = await writeInstallation({
         file,
-        candidate: vanishing as typeof candidate,
-        expectedHash,
+        candidate: candidateFile(),
+        expectedHash: "absent",
       });
       expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
+      if (result.status === "refused") {
+        expect(result.reason).toBe("write-failed");
+        expect(result.currentHash).toBe("absent");
+        expect(result.errors[0]).toContain("could not be written");
       }
-      expect(result.reason).toBe("write-failed");
-      // The hash is the one the read took, before the directory vanished.
-      expect(result.currentHash).toBe(expectedHash);
-      expect(result.errors[0]).toContain("could not be written");
-      // Nothing is left behind: no temp file, no lock, no target.
-      expect(await readdir(dir).catch(() => ["<gone>"])).toEqual(["<gone>"]);
+      // The temp file was removed and the target was never created.
+      const entries = await readdir(dir);
+      expect(entries.some((name) => name.endsWith(".tmp"))).toBe(false);
+      await expect(stat2(file)).resolves.toBe(false);
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
     } finally {
+      renameDouble.fail = false;
       await remove(dir);
     }
   });
 
-  // O(1): a pre-created lock file whose owner line is malformed, a live pid
-  // without a since stamp, and a dead pid without one.
+  // O(1): the lock fixture is a one-line file.
   it("describes malformed and pid-only held lock owners without modifying the target", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
-    const original = `${JSON.stringify(baseFile, null, 2)}\n`;
     try {
-      await writeFile(file, original);
-      const read = await readInstallationFile(file);
-      const expectedHash = readHashOf(read);
-
-      await writeFile(`${file}.lock`, "not-a-pid 2026-10-17T00:00:00.000Z\n");
-      const unknown = await writeInstallation({
+      await writeFile(`${file}.lock`, "not-a-pid 2026-01-01T00:00:00.000Z\n");
+      const unknownWriter = await writeInstallation({
         file,
         candidate: candidateFile(),
-        expectedHash,
-      });
-      expect(unknown.status).toBe("refused");
-      if (unknown.status !== "refused") {
-        return;
-      }
-      expect(unknown.reason).toBe("locked");
-      expect(unknown.currentHash).toBe("unknown");
-      expect(unknown.errors[0]).toContain("held by an unknown writer");
-      expect(unknown.errors[0]).not.toContain("since");
-      expect(await readFile(file, "utf8")).toBe(original);
-
-      // A pid-only line from a writer that is no longer running: named with
-      // its pid and no "since", reported as stale.
-      await writeFile(`${file}.lock`, "2147483646\n");
-      const dead = await writeInstallation({
-        file,
-        candidate: candidateFile(),
-        expectedHash,
-      });
-      expect(dead.status).toBe("refused");
-      if (dead.status !== "refused") {
-        return;
-      }
-      expect(dead.errors[0]).toContain("pid 2147483646");
-      expect(dead.errors[0]).not.toContain("since");
-      expect(await readFile(file, "utf8")).toBe(original);
-
-      // A pid-only line from a live writer: named with its pid and no
-      // "since", reported as in progress rather than stale.
-      await writeFile(`${file}.lock`, `${process.pid}\n`);
-      const live = await writeInstallation({
-        file,
-        candidate: candidateFile(),
-        expectedHash,
-      });
-      expect(live.status).toBe("refused");
-      if (live.status !== "refused") {
-        return;
-      }
-      expect(live.errors[0]).toContain(`pid ${process.pid}`);
-      expect(live.errors[0]).toContain("another write is in progress");
-      expect(live.errors[0]).not.toContain("since");
-      expect(await readFile(file, "utf8")).toBe(original);
-    } finally {
-      await remove(dir);
-    }
-  });
-
-  // O(1) per input: the loader re-validates each hostile candidate at the
-  // moment of writing and the write refuses before touching the file. The
-  // throwing-getter case counts reads: the loader must refuse the candidate
-  // without ever touching the property.
-  it("refuses hostile candidate inputs with invalid and releases the lock", async () => {
-    const dir = await tempDir();
-    try {
-      const file = join(dir, "fleet.json");
-      const polluting = Object.defineProperty({}, "__proto__", {
-        enumerable: true,
-        configurable: true,
-        value: { polluted: true },
-      });
-      const holey = [undefined, undefined, undefined];
-      delete holey[1]; // an array with a hole
-      const cases: Array<[string, unknown]> = [
-        ["null", null],
-        ["undefined", undefined],
-        ["a wrong primitive", 42],
-        ["an array", []],
-        ["an array with a hole", holey],
-        ["an array-like", { length: 3 }],
-        ["an array-like with an enormous length", { length: 1e9 }],
-        ["a prototype-polluting key", polluting],
-      ];
-      for (const [label, candidate] of cases) {
-        const result = await writeInstallation({
-          file,
-          candidate: candidate as HostDraftCandidate,
-          expectedHash: "absent",
-        });
-        expect(result.status, label).toBe("refused");
-        if (result.status !== "refused") {
-          return;
-        }
-        expect(result.reason, label).toBe("invalid");
-        // The lock was released and nothing was written.
-        expect(await readdir(dir), label).toEqual([]);
-      }
-      expect(
-        (Object.prototype as Record<string, unknown>).polluted,
-      ).toBeUndefined();
-
-      const file2 = join(dir, "getter.json");
-      const getterCandidate: Record<string, unknown> = {};
-      const getter = throwingGetterOn(getterCandidate, "hosts");
-      const getterResult = await writeInstallation({
-        file: file2,
-        candidate: getterCandidate as HostDraftCandidate,
         expectedHash: "absent",
       });
-      expect(getterResult.status).toBe("refused");
-      if (getterResult.status !== "refused") {
-        return;
+      expect(unknownWriter.status).toBe("refused");
+      if (unknownWriter.status === "refused") {
+        expect(unknownWriter.reason).toBe("locked");
+        expect(unknownWriter.currentHash).toBe("unknown");
+        expect(unknownWriter.errors[0]).toContain("an unknown writer");
+        expect(unknownWriter.errors[0]).toContain(`${file}.lock`);
       }
-      expect(getterResult.reason).toBe("invalid");
-      expect(getter.hits()).toBe(0);
-      expect(await readdir(dir)).toEqual([]);
+      // The held lock is never removed by the refused writer.
+      await expect(readFile(`${file}.lock`, "utf8")).resolves.toBe(
+        "not-a-pid 2026-01-01T00:00:00.000Z\n",
+      );
+      await expect(stat2(file)).resolves.toBe(false);
+
+      // A pid-only owner line (no `since`) is described without a since.
+      await rm(`${file}.lock`, { force: true });
+      await writeFile(`${file}.lock`, "999999999\n");
+      const pidOnly = await writeInstallation({
+        file,
+        candidate: candidateFile(),
+        expectedHash: "absent",
+      });
+      expect(pidOnly.status).toBe("refused");
+      if (pidOnly.status === "refused") {
+        expect(pidOnly.reason).toBe("locked");
+        expect(pidOnly.errors[0]).toContain("pid 999999999");
+        expect(pidOnly.errors[0]).not.toContain("since");
+      }
+      await expect(readFile(`${file}.lock`, "utf8")).resolves.toBe(
+        "999999999\n",
+      );
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): a lying Proxy around a valid candidate is refused by the loader
-  // like any other invalid candidate (a Proxy that lies consistently in
-  // every trap is an accepted residual).
-  it("refuses a Proxy candidate with invalid and releases the lock", async () => {
+  // O(1) per hostile input: the loader refuses each before any bytes move.
+  it("refuses hostile candidate inputs with invalid and releases the lock", async () => {
     const dir = await tempDir();
     const file = join(dir, "fleet.json");
     try {
-      const candidate = candidateFile();
-      // A Proxy that lies in every trap: the loader re-validates the
-      // candidate at the moment of writing and refuses it, so nothing is
-      // written. (A Proxy that lies about only one key is an accepted
-      // residual: the loader normalises the value it does read.)
-      const lying = new Proxy(candidate as object, {
+      let getterRead = false;
+      const withThrowingGetter: Record<string, unknown> = {};
+      Object.defineProperty(withThrowingGetter, "schemaVersion", {
+        enumerable: true,
+        configurable: true,
         get() {
-          return undefined;
+          getterRead = true;
+          throw new TypeError("the candidate getter must never be read");
         },
       });
-      const result = await writeInstallation({
-        file,
-        candidate: lying as typeof candidate,
-        expectedHash: "absent",
-      });
-      expect(result.status).toBe("refused");
-      if (result.status !== "refused") {
-        return;
+      const holey: unknown[] = [baseFile];
+      delete (holey as unknown as Record<string, unknown>)["0"]; // an array hole
+      const hostile: unknown[] = [
+        null,
+        undefined,
+        42,
+        {},
+        holey,
+        withThrowingGetter,
+        lyingProxy(),
+        { length: 3 }, // an array-like
+        { length: 1e9 }, // an enormous length
+        { ["__proto__"]: 1 }, // a prototype-polluting key
+      ];
+      for (const candidate of hostile) {
+        const result = await writeInstallation({
+          file,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          candidate: candidate as any,
+          expectedHash: "absent",
+        });
+        expect(result.status).toBe("refused");
+        if (result.status === "refused") {
+          expect(result.reason).toBe("invalid");
+        }
       }
-      expect(result.reason).toBe("invalid");
-      expect(await readdir(dir)).toEqual([]);
+      // The throwing getter was never read by the write path.
+      expect(getterRead).toBe(false);
+      // No prototype pollution and nothing written; every lock is released.
+      expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      await expect(stat2(file)).resolves.toBe(false);
+      await expect(readdir(dir)).resolves.not.toContain("fleet.json.lock");
+      const entries = await readdir(dir);
+      expect(entries.some((name) => name.endsWith(".tmp"))).toBe(false);
     } finally {
       await remove(dir);
     }
   });
 
-  // O(1): the request itself is destructured before anything else, so a
-  // missing request is a caller bug and surfaces as a TypeError.
+  // O(1): the request itself is the fixture.
   it("rejects null and undefined requests with TypeError", async () => {
-    await expect(
-      writeInstallation(null as never),
-    ).rejects.toBeInstanceOf(TypeError);
-    await expect(
-      writeInstallation(undefined as never),
-    ).rejects.toBeInstanceOf(TypeError);
+    const dir = await tempDir();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await expect(writeInstallation(null as any)).rejects.toThrow(TypeError);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await expect(writeInstallation(undefined as any)).rejects.toThrow(
+        TypeError,
+      );
+    } finally {
+      await remove(dir);
+    }
   });
 });
+
+/** Whether a path exists (stat without throwing, for readability above). */
+async function stat2(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}

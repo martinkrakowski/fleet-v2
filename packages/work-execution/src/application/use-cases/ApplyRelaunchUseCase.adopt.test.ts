@@ -909,6 +909,31 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     }
   });
 
+  it('validates clean-commit commitsSinceBase ids and rejects an empty list at parse time', async () => {
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('since plan'))]);
+    const clean = (commitsSinceBase: unknown): Record<string, unknown> =>
+      adoptInput({
+        source: { kind: 'clean-commit', commitOid: COMMIT, branchName: 'fleet/x', commitOnBranch: true, dirtyCount: 0, commitsSinceBase },
+      });
+    for (const bad of [[], ['not-a-commit'], ['a'.repeat(40), 'XYZ']]) {
+      const deps = makeDeps({ plan });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(
+          applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [clean(bad)] }),
+        ),
+      ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+      expect(deps.appended).toEqual([]);
+    }
+    const deps = makeDeps({ plan });
+    const out = (await new ApplyRelaunchUseCase(deps).applyRelaunch(
+      applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [clean(['a'.repeat(40), 'b'.repeat(40)])] }),
+    )) as { reason?: string };
+    expect(out.reason).not.toBe('invalid-request');
+    expect(deps.planRepo.findByDigest).toHaveBeenCalled();
+  });
+
   it('refuses adopt-failed when an adopted result is missing fields or carries mismatched ids', async () => {
     // Fix-round item 2: an `own` outcome of 'adopted' is only trusted when
     // every required result field is present and each id matches the input;

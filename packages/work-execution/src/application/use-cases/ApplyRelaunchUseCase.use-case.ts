@@ -40,6 +40,7 @@ import {
   verifySaveIntentDigest,
   type RelaunchApplyStepStatus,
 } from '../../domain/relaunch-apply.js';
+import { COMMIT as ADOPT_COMMIT } from './AdoptLaneUseCase.use-case.js';
 import { relaunchStepStatus } from '../../domain/relaunch-step-ledger.js';
 import { parseValidatedStoredRelaunchPlan } from '../../domain/relaunch-plan-validation.js';
 import type {
@@ -333,7 +334,6 @@ function containsPollutingKey(value: unknown, depth: number, budget: { nodes: nu
  */
 const ADOPT_NESTED_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ADOPT_ATTEMPT_ID = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
-const ADOPT_COMMIT = /^[0-9a-f]{40,64}$/;
 const MAX_ADOPT_NESTED_ID = 128;
 const MAX_ADOPT_REF = 256;
 const MAX_ADOPT_OWNED_PATHS = 256;
@@ -395,7 +395,12 @@ function isAdoptNestedSource(value: unknown): boolean {
     const dirty = record['dirtyCount'];
     if (!(dirty === 'unknown' || (typeof dirty === 'number' && Number.isSafeInteger(dirty) && dirty >= 0))) return false;
     const since = record['commitsSinceBase'];
-    return since === undefined || adoptNestedStringList(since, MAX_ADOPT_COMMITS_SINCE_BASE, 64);
+    return (
+      since === undefined ||
+      (adoptNestedStringList(since, MAX_ADOPT_COMMITS_SINCE_BASE, 64) &&
+        (since as string[]).length > 0 &&
+        (since as string[]).every((item) => ADOPT_COMMIT.test(item)))
+    );
   }
   return false;
 }

@@ -51,7 +51,8 @@ const MAX_COMMITS_SINCE_BASE = 512;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ATTEMPT_ID = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
 const PLAN_DIGEST = /^[0-9a-f]{64}$/;
-const COMMIT = /^[0-9a-f]{40,64}$/;
+/** A git object id; shared with the relaunch apply parse so the two cannot drift. */
+export const COMMIT = /^[0-9a-f]{40,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 const NONE = Symbol('none');

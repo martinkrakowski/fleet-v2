@@ -266,7 +266,7 @@ type HardeningDeps = ApplyRelaunchDependencies;
 
 /** How the fixture journals the `adopt/work-order` completed result. */
 type WorkOrderDigest =
-  | /** No result entry at all. */ undefined
+  | /** A completed result entry that journals no `digest` member at all. */ undefined
   | /** A result entry with this digest (null = explicit null). */ string
   | null
   | /** A result entry whose digest is an own accessor (a counting getter). */ { getter: true };
@@ -284,7 +284,23 @@ const makeDeps = (fixture: Fixture): { deps: HardeningDeps; getterReads: { count
   const getterReads = { count: 0 };
   let adoptEntries: unknown[];
   if (fixture.workOrder === undefined) {
-    adoptEntries = [];
+    // The adopt itself completed — every sub-step has its completed result —
+    // but the work-order result journaled no digest member at all. This is the
+    // AR3c1 fail-closed case: a completed adopt with no usable recorded digest.
+    adoptEntries = [
+      intent(workOrderKey),
+      {
+        key: workOrderKey,
+        kind: 'result',
+        entryId: 'entry-2',
+        recordedAtIso: CLOCK_NOW,
+        outcome: 'completed',
+      },
+      ...(['brief', 'attempt', 'run'] as const).flatMap((sub) => [
+        intent(`relaunch/${plan.planDigest}/lane-2/adopt/${sub}`),
+        result(`relaunch/${plan.planDigest}/lane-2/adopt/${sub}`, 'completed'),
+      ]),
+    ];
   } else if (typeof fixture.workOrder === 'object' && fixture.workOrder !== null && 'getter' in fixture.workOrder) {
     const entry: Record<string, unknown> = {
       key: workOrderKey,
@@ -377,11 +393,34 @@ const applyRequest = (planDigest: string, over: Record<string, unknown> = {}): u
 describe('ApplyRelaunchUseCase adopt-digest preflight hardening (AR3c1)', () => {
   const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('hardening plan'))]);
 
-  it('never reaches the grant for a completed-adopt participant whose work-order sub-step has no completed result', async () => {
-    // The work-order sub-step was never completed, so the adopt derivation
-    // itself is inconsistent; the lane is refused (out-of-order) before the
-    // grant is spent either way.
-    const { deps } = makeDeps({ plan, workOrder: undefined });
+  it('refuses stale-plan-state for a completed adopt whose work-order result journals no digest, before the grant', async () => {
+    // AR3c1: the adopt step derives `completed` (every sub-step has a
+    // completed result), but the work-order result carries no digest member,
+    // so there is nothing the resent input can be checked against. The lane
+    // fails closed in preflight — with or without a resent adopt input —
+    // instead of counting as an idle lane.
+    for (const adoptInputs of [[adoptInput()], []]) {
+      const { deps } = makeDeps({ plan, workOrder: undefined });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(plan.planDigest, { adoptInputs })),
+      ).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses out-of-order before the grant for a lane whose adopt step has no journal entries at all', async () => {
+    // With no adopt entries the adopt step derives `absent` while the
+    // redispatch intent has already begun; the lane progress derivation
+    // refuses that ordering before the grant is spent.
+    const { deps } = makeDeps({
+      plan,
+      workOrder: null,
+      entries: [
+        intent(`relaunch/${plan.planDigest}/lane-2/save`, saveInputDigest(plan.planDigest, saveInput())),
+        result(`relaunch/${plan.planDigest}/lane-2/save`, 'completed'),
+        intent(`relaunch/${plan.planDigest}/lane-2/redispatch`),
+      ],
+    });
     const out = await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(plan.planDigest));
     expect(out).toEqual({ outcome: 'refused', reason: 'out-of-order', laneId: 'lane-2' });
     expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();

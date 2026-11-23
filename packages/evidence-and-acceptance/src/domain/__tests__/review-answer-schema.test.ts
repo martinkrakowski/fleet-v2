@@ -419,8 +419,9 @@ describe('extractSingleTrailingJsonFence: glued closing fence (RV1)', () => {
   it('closes a glued fence on the live PASS reply and validates its object', () => {
     const stripped = '```json\n{"verdict":"PASS","findings":[]}```';
     const extracted = extractSingleTrailingJsonFence(stripped);
+    expect(extracted.kind).toBe('single');
     if (extracted.kind !== 'single') {
-      return;
+      throw new Error('expected single trailing json fence');
     }
     expect(extracted).toEqual({
       kind: 'single',

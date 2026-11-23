@@ -24,7 +24,13 @@
  *   isStrictDescendant returns unknown or throws" failed.
  */
 
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+
+import { WorkspaceAdapter } from '../src/infrastructure/adapters/WorkspaceAdapter.adapter.js';
 
 import type {
   ActionJournalEntryRecord,
@@ -377,6 +383,54 @@ describe('DispatchAttemptUseCase adopts a clean strict-descendant head (SN2)', (
     await adoptExpectation(setup, result);
     expect(forCalls).toEqual([OPENCODE_RUNNER_RECORD]);
     expect(diff.calls).toHaveLength(1);
+  });
+
+  it('refuses adoption when the range holds a merge commit with an unrelated parent (real git)', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'sn2-adopt-'));
+    try {
+      const env = { ...process.env, GIT_AUTHOR_NAME: 'x', GIT_AUTHOR_EMAIL: 'x@example.invalid', GIT_COMMITTER_NAME: 'x', GIT_COMMITTER_EMAIL: 'x@example.invalid' };
+      const git = (...args: string[]): string =>
+        execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', env }).trim();
+      git('init', '-q', '-b', 'main');
+      git('commit', '-q', '--allow-empty', '-m', 'a');
+      const ancestor = git('rev-parse', 'HEAD');
+      git('checkout', '-q', '--orphan', 'other');
+      git('commit', '-q', '--allow-empty', '-m', 'unrelated');
+      git('checkout', '-q', 'main');
+      git('merge', '-q', '--allow-unrelated-histories', '--no-ff', '-m', 'merge', 'other');
+      const merged = git('rev-parse', 'HEAD');
+      const real = new WorkspaceAdapter({
+        executor: {
+          async run(argv) {
+            try {
+              const stdout = execFileSync(argv[0]!, argv.slice(1), { encoding: 'utf8' });
+              return { exitCode: 0, signal: null, stdout, stderr: '' };
+            } catch (error) {
+              const status = (error as { status?: number }).status ?? null;
+              return { exitCode: status, signal: null, stdout: '', stderr: '' };
+            }
+          },
+        },
+      });
+      const workspace = makeWorkspace({
+        checkedOutCommit: DESCENDANT,
+        descendantAnswer: (request) =>
+          real.isStrictDescendant({
+            ...request,
+            worktreePath: repo,
+            ancestorCommit: ancestor,
+            descendantCommit: merged,
+            recordedHost: null,
+          }),
+      });
+      const setup = makeSetup({ workspace, laneDiffCheck: makeDiffCheck({ outcome: 'clean' }).port });
+      expect(headMismatch(await setup.useCase.dispatchAttempt(dispatchRequest()))).toBe(HEAD_MISMATCH_BASE);
+      expect(workspace.descendantCalls).toHaveLength(1);
+      expect(setup.startCalls).toEqual([]);
+      expect(setup.journal.entries.some((entry) => entry.detail.includes('strict-descendant'))).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   it('refuses adoption when isStrictDescendant returns unknown or throws', async () => {

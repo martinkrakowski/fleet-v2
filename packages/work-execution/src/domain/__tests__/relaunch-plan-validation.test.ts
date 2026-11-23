@@ -480,14 +480,18 @@ describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => 
   });
 
   it('V5 accepts the planner\'s kind:host:port endpoint keys and refuses anything else', () => {
-    for (const value of ['opencode:lane-host:4321', 'agy:host-b:0', 'unknown:local:0']) {
+    for (const value of ['opencode:lane-host:4321', 'agy:host-b:0', 'opencode:host:99999', `opencode:host:${Number.MAX_SAFE_INTEGER}`]) {
       expect(validateStoredRelaunchPlan(redigested((p) => { lane2Of(p)['dispatchEndpointKey'] = value; }))).toEqual({ ok: true });
     }
     for (const value of [
       'opencode:lane-host',
       'ep-key-1',
       'other:host:1',
-      'opencode:host:99999',
+      'unknown:local:0',
+      'opencode:host:00',
+      'opencode:host:01',
+      'opencode:host:-1',
+      `opencode:host:${Number.MAX_SAFE_INTEGER + 1}`,
       'opencode:host:12a',
       'opencode:a:b:1',
       'opencode::1',
@@ -521,19 +525,35 @@ describe('validateStoredRelaunchPlan (V5: malformed lane fields refuse)', () => 
     expect(validateStoredRelaunchPlan(withExtra(0, 1, 2))).toEqual({ ok: true });
   });
 
-  it('V5 refuses a dependency cycle that cannot be topologically scheduled', () => {
+  it('V5 refuses a dependency cycle among lanes in the same wave (the Kahn pass, not the wave rule)', () => {
     const plan = redigested((p) => {
       const lanes = p['lanes'] as Record<string, unknown>[];
-      lanes[0]['population'] = 'unrecorded';
-      lanes[0]['runnerState'] = 'idle';
-      lanes[0]['admissionWave'] = 2;
-      lanes[0]['dispatchEndpointKey'] = 'ep-key-0';
-      lanes[0]['staggerOffsetMs'] = 0;
+      // Two conducted lanes depend on each other: the wave-order rule does not
+      // apply to conducted lanes, so only the acyclicity pass can refuse this.
       lanes[0]['dependsOnLaneIds'] = ['lane-2'];
-      lanes[1]['admissionWave'] = 1;
+      lanes[1]['population'] = 'conducted';
+      lanes[1]['runnerState'] = 'running';
+      lanes[1]['admissionWave'] = 0;
+      lanes[1]['dispatchEndpointKey'] = null;
+      lanes[1]['staggerOffsetMs'] = null;
       lanes[1]['dependsOnLaneIds'] = ['lane-1'];
     });
     expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: false, reason: 'invalid-plan' });
+  });
+
+  it('V5 accepts a conducted lane with dependencies, as the planner emits them', () => {
+    const plan = redigested((p) => {
+      const lanes = p['lanes'] as Record<string, unknown>[];
+      lanes[0]['dependsOnLaneIds'] = ['lane-3'];
+      lanes.push({
+        ...lanes[0],
+        laneId: 'lane-3',
+        hostName: 'host-c',
+        dependsOnLaneIds: [],
+        chainHead: false,
+      });
+    });
+    expect(validateStoredRelaunchPlan(plan)).toEqual({ ok: true });
   });
 
   it('V5 refuses a dependency on a lane admitted in the same wave', () => {

@@ -126,12 +126,17 @@ const IDENTIFIER_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 /**
  * The grammar of a dispatch endpoint key, exactly as the planner builds it
  * (`dispatchEndpointKey` in `dispatch-stagger.ts`): `kind:host:port`, with the
- * kind a runner kind or `unknown`, a host part in the identifier grammar (a
- * host name is capped at 128 by the adapter) and a decimal port. The colons
- * are the key's own separators, not free text.
+ * kind a runner kind (`opencode` or `agy`; `assignStaggers` always passes a
+ * non-null endpoint, so the `unknown:local:0` key of a null endpoint is never
+ * emitted), a host part in the identifier grammar (a host name is capped at
+ * 128 by the adapter) and a canonical decimal port (no leading zeros). The
+ * producer takes `remotePort` from a runner record, whose reader accepts any
+ * safe integer, so the port bound is `Number.MAX_SAFE_INTEGER`, not 65535:
+ * the validator accepts exactly what the planner can emit. The colons are the
+ * key's own separators, not free text.
  */
-const ENDPOINT_KEY_PATTERN = /^(opencode|agy|unknown):[A-Za-z0-9._-]{1,128}:([0-9]{1,5})$/;
-const MAX_ENDPOINT_PORT = 65535;
+const ENDPOINT_KEY_PATTERN = /^(opencode|agy):[A-Za-z0-9._-]{1,128}:(0|[1-9][0-9]{0,15})$/;
+const MAX_ENDPOINT_PORT = Number.MAX_SAFE_INTEGER;
 /** The scheduling caps of the plan contract: at most 64 concurrent runs. */
 const MAX_PLAN_MAX_ACTIVE_RUNS = 64;
 /** The scheduling caps of the plan contract: at most 10 minutes of stagger. */
@@ -504,15 +509,25 @@ export function validateStoredRelaunchPlan(plan: unknown): StoredRelaunchPlanVal
       const capacity = wave === 1 ? maxActiveRuns - conductedCount : maxActiveRuns;
       if (count > capacity) return INVALID_PLAN;
     }
-    // Dependency graph: membership, wave ordering (a lane admits strictly
-    // after every lane it depends on) and acyclicity (Kahn's algorithm), so
-    // only topologically schedulable plans pass.
+    // Dependency graph: membership, wave ordering and acyclicity (Kahn's
+    // algorithm), so only topologically schedulable plans pass. Wave ordering
+    // follows the planner (`assignWaves`): a conducted lane is always wave 0
+    // whatever it depends on (`deriveDependencies` has no population filter),
+    // and a dependency on a conducted lane is satisfied by wave 1 or later;
+    // only between two non-conducted lanes does a lane admit strictly after
+    // the lane it depends on.
     const laneById = new Map(snapshotLanes.map((lane) => [lane.laneId, lane]));
     for (const lane of snapshotLanes) {
       for (const dependency of lane.dependsOnLaneIds) {
         const dependencyLane = laneById.get(dependency);
         if (dependencyLane === undefined) return INVALID_PLAN;
-        if (dependencyLane.admissionWave >= lane.admissionWave) return INVALID_PLAN;
+        if (
+          lane.population !== 'conducted' &&
+          dependencyLane.population !== 'conducted' &&
+          dependencyLane.admissionWave >= lane.admissionWave
+        ) {
+          return INVALID_PLAN;
+        }
       }
     }
     const indegree = new Map<string, number>(snapshotLanes.map((lane) => [lane.laneId, 0]));

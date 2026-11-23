@@ -947,4 +947,81 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ],
     });
   });
+
+  it('U19: a request Proxy whose getPrototypeOf or getOwnPropertyDescriptor trap throws is a typed invalid-request, never a rejection', async () => {
+    const plan = defaultPlan();
+    const deps = makeDeps({ plan });
+    const useCase = new ApplyRelaunchUseCase(deps);
+    const target = { planDigest: plan.planDigest, nowIso: NOW };
+    const boom = (): never => {
+      throw new Error('trap must not escape');
+    };
+    for (const traps of [{ getPrototypeOf: boom }, { getOwnPropertyDescriptor: boom }, { ownKeys: boom }]) {
+      await expect(useCase.applyRelaunch(new Proxy(target, traps))).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+  });
+
+  it('U20: a port envelope with a throwing getter or Proxy trap is plan-unreadable or journal-unreadable and the getter never runs', async () => {
+    const plan = defaultPlan();
+    const calls = { count: 0 };
+    const throwingGetter = (target: object, key: string): object => {
+      Object.defineProperty(target, key, {
+        enumerable: true,
+        configurable: true,
+        get(): never {
+          calls.count += 1;
+          throw new Error('getter must never run');
+        },
+      });
+      return target;
+    };
+    const planEnvelope = throwingGetter({ plan }, 'outcome');
+    expect(
+      await new ApplyRelaunchUseCase(makeDeps({ findResult: planEnvelope })).applyRelaunch(dryRunRequest(plan.planDigest)),
+    ).toEqual({ outcome: 'refused', reason: 'plan-unreadable' });
+    const entriesEnvelope = throwingGetter({ outcome: 'listed' }, 'entries');
+    expect(
+      await new ApplyRelaunchUseCase(makeDeps({ plan, journalResult: entriesEnvelope })).applyRelaunch(
+        dryRunRequest(plan.planDigest),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'journal-unreadable' });
+    const outcomeEnvelope = throwingGetter({ entries: [] }, 'outcome');
+    expect(
+      await new ApplyRelaunchUseCase(makeDeps({ plan, journalResult: outcomeEnvelope })).applyRelaunch(
+        dryRunRequest(plan.planDigest),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'journal-unreadable' });
+    const trapped = new Proxy(
+      { outcome: 'listed', entries: [] },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('trap must not escape');
+        },
+      },
+    );
+    expect(
+      await new ApplyRelaunchUseCase(makeDeps({ plan, journalResult: trapped })).applyRelaunch(
+        dryRunRequest(plan.planDigest),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'journal-unreadable' });
+    expect(calls.count).toBe(0);
+  });
+
+  it('U21: a secret-shaped or over-long value under an unknown request key is refused like any other request string', async () => {
+    const plan = defaultPlan();
+    const deps = makeDeps({ plan });
+    const useCase = new ApplyRelaunchUseCase(deps);
+    expect(
+      await useCase.applyRelaunch(dryRunRequest(plan.planDigest, { note: `sk-${'a'.repeat(20)}` })),
+    ).toEqual({ outcome: 'refused', reason: 'secret-detected' });
+    expect(await useCase.applyRelaunch(dryRunRequest(plan.planDigest, { note: 'x'.repeat(4097) }))).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+  });
 });

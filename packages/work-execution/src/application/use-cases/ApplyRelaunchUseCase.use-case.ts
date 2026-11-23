@@ -231,6 +231,277 @@ function deriveLane(
   return { stepStatuses, nextAction: relaunchApplyLaneProgress(stepStatuses) };
 }
 
+type Step<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly result: ApplyRelaunchResult };
+
+const refusal = (reason: Extract<ApplyRelaunchResult, { outcome: 'refused' }>['reason']): ApplyRelaunchResult => ({
+  outcome: 'refused',
+  reason,
+});
+const fail = <T>(reason: Extract<ApplyRelaunchResult, { outcome: 'refused' }>['reason']): Step<T> => ({
+  ok: false,
+  result: refusal(reason),
+});
+const pass = <T>(value: T): Step<T> => ({ ok: true, value });
+
+/**
+ * An untrusted envelope's named own fields, read through their own data
+ * descriptors inside a try/catch. `null` when the value is not an object, an
+ * inspection throws (a Proxy trap) or any named field is an accessor: no
+ * getter ever runs.
+ */
+function readEnvelope(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object') return null;
+  try {
+    const out: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined) continue;
+      if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) return null;
+      out[key] = descriptor.value;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+interface ParsedRequest {
+  readonly planDigest: string;
+  readonly apply: boolean;
+  readonly grantId: string | null;
+  readonly deadlineMs: number | null;
+  readonly saveInputs: Map<string, ApplyRelaunchSaveInput>;
+}
+
+function readPlanDigest(request: unknown): Step<string> {
+  const value = own(request, 'planDigest');
+  if (value === BAD || value === ABSENT || typeof value !== 'string') return fail('invalid-request');
+  if (!PLAN_DIGEST.test(value)) return fail('invalid-plan-digest');
+  return pass(value);
+}
+
+function readApply(request: unknown): Step<boolean> {
+  const value = own(request, 'apply');
+  if (value === BAD) return fail('invalid-request');
+  const apply = value === ABSENT ? false : value;
+  return typeof apply === 'boolean' ? pass(apply) : fail('invalid-request');
+}
+
+function readGrantId(request: unknown): Step<string | null> {
+  const value = own(request, 'grantId');
+  if (value === BAD) return fail('invalid-request');
+  const grantId = value === ABSENT || value === null ? null : value;
+  if (grantId === null) return pass(null);
+  if (typeof grantId !== 'string') return fail('invalid-request');
+  return hasSecretShape(grantId) ? fail('secret-detected') : pass(grantId);
+}
+
+function readDeadlineMs(request: unknown): Step<number | null> {
+  const nowValue = own(request, 'nowIso');
+  if (nowValue === ABSENT || nowValue === BAD) return fail('invalid-request');
+  if (!isZonedIsoDateTime(nowValue)) return fail('invalid-clock');
+  const deadlineValue = own(request, 'deadlineIso');
+  if (deadlineValue === BAD) return fail('invalid-request');
+  if (deadlineValue === ABSENT || deadlineValue === null) return pass(null);
+  if (!isZonedIsoDateTime(deadlineValue)) return fail('invalid-clock');
+  return pass(Date.parse(deadlineValue));
+}
+
+function readSaveInputsField(request: unknown): Step<Map<string, ApplyRelaunchSaveInput>> {
+  const value = own(request, 'saveInputs');
+  if (value === BAD) return fail('invalid-request');
+  if (value === ABSENT) return pass(new Map<string, ApplyRelaunchSaveInput>());
+  const inputs = readSaveInputs(value);
+  if (inputs === 'secret-detected') return fail('secret-detected');
+  return inputs === null ? fail('invalid-request') : pass(inputs);
+}
+
+const KNOWN_REQUEST_KEYS: readonly string[] = ['planDigest', 'apply', 'grantId', 'nowIso', 'deadlineIso', 'saveInputs'];
+
+/** Every other own value of the request gets the same secret scan and length cap. */
+function scanUnknownRequestKeys(request: unknown): ApplyRelaunchResult | null {
+  const snapshot = snapshotPlainDataRecord(request);
+  if (snapshot === null) return refusal('invalid-request');
+  const budget = { nodes: MAX_SCAN_NODES };
+  for (const key of Object.keys(snapshot)) {
+    if (KNOWN_REQUEST_KEYS.includes(key)) continue;
+    const found = scanForSecret(snapshot[key], 1, budget);
+    if (found === true) return refusal('secret-detected');
+    if (found === null) return refusal('invalid-request');
+  }
+  return null;
+}
+
+function parseRequestFields(request: unknown): Step<ParsedRequest> {
+  const planDigest = readPlanDigest(request);
+  if (!planDigest.ok) return planDigest;
+  const apply = readApply(request);
+  if (!apply.ok) return apply;
+  const grantId = readGrantId(request);
+  if (!grantId.ok) return grantId;
+  const deadlineMs = readDeadlineMs(request);
+  if (!deadlineMs.ok) return deadlineMs;
+  const saveInputs = readSaveInputsField(request);
+  if (!saveInputs.ok) return saveInputs;
+  const unknownKeys = scanUnknownRequestKeys(request);
+  if (unknownKeys !== null) return { ok: false, result: unknownKeys };
+  return pass({
+    planDigest: planDigest.value,
+    apply: apply.value,
+    grantId: grantId.value,
+    deadlineMs: deadlineMs.value,
+    saveInputs: saveInputs.value,
+  });
+}
+
+/** The whole parse is guarded: a throwing Proxy trap is an invalid request, never a rejection. */
+function parseRequest(request: unknown): Step<ParsedRequest> {
+  try {
+    return parseRequestFields(request);
+  } catch {
+    return fail('invalid-request');
+  }
+}
+
+/** The trusted clock: a throwing or malformed reading, or a passed deadline, is an exhausted budget. */
+function withinBudget(deps: ApplyRelaunchDependencies, deadlineMs: number | null): boolean {
+  try {
+    const nowText: unknown = deps.clock !== undefined ? deps.clock() : new Date().toISOString();
+    if (typeof nowText !== 'string') return false;
+    if (!isZonedIsoDateTime(nowText) || Number.isNaN(Date.parse(nowText))) return false;
+    return deadlineMs === null || Date.parse(nowText) < deadlineMs;
+  } catch {
+    return false;
+  }
+}
+
+function planFromEnvelope(found: unknown): Step<unknown> {
+  const record = readEnvelope(found, ['outcome', 'reason', 'plan']);
+  if (record === null) return fail('plan-unreadable');
+  if (record['outcome'] === 'found') return pass(record['plan']);
+  if (record['outcome'] === 'absent') return fail('plan-not-found');
+  if (record['outcome'] === 'unreadable' && record['reason'] === 'unknown-version') {
+    return fail('plan-unknown-version');
+  }
+  if (record['outcome'] === 'refused' && record['reason'] === 'invalid-digest') return fail('invalid-plan-digest');
+  return fail('plan-unreadable');
+}
+
+async function loadVerifiedPlan(
+  deps: ApplyRelaunchDependencies,
+  planDigest: string,
+): Promise<Step<RelaunchPlanRecord>> {
+  let found: unknown;
+  try {
+    found = await deps.planRepo.findByDigest(planDigest);
+  } catch {
+    return fail('plan-unreadable');
+  }
+  const planStep = planFromEnvelope(found);
+  if (!planStep.ok) return planStep;
+  if (!validateStoredRelaunchPlan(planStep.value).ok) return fail('invalid-plan');
+  const storedPlan = planStep.value as RelaunchPlanRecord;
+  let computedDigest: unknown;
+  try {
+    computedDigest = deps.computeDigest(canonicalRelaunchPlanBodyJson(storedPlan));
+  } catch {
+    return fail('plan-unreadable');
+  }
+  if (computedDigest !== storedPlan.planDigest || computedDigest !== planDigest) {
+    return fail('plan-digest-mismatch');
+  }
+  return pass(storedPlan);
+}
+
+async function loadJournalSnapshot(
+  deps: ApplyRelaunchDependencies,
+  planDigest: string,
+): Promise<Step<SnapshotEntry[]>> {
+  let listing: unknown;
+  try {
+    listing = await deps.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/`);
+  } catch {
+    return fail('journal-unreadable');
+  }
+  const envelope = readEnvelope(listing, ['outcome', 'entries']);
+  if (envelope === null || envelope['outcome'] !== 'listed') return fail('journal-unreadable');
+  const dense = readBoundedDenseArray(envelope['entries'], MAX_RELAUNCH_APPLY_ENTRIES);
+  if (dense === null) return fail('journal-unreadable');
+  const snapshot: SnapshotEntry[] = [];
+  for (const item of dense.array) {
+    const entry = snapshotJournalEntry(item);
+    if (entry === null) return fail('journal-unreadable');
+    snapshot.push(entry);
+  }
+  return pass(snapshot);
+}
+
+type PlanLane = RelaunchPlanRecord['lanes'][number];
+
+/** A lane's save intent must still match the re-supplied save input; a refusal otherwise. */
+function verifyLaneSaveInput(
+  deps: ApplyRelaunchDependencies,
+  planDigest: string,
+  lane: PlanLane,
+  snapshot: readonly SnapshotEntry[],
+  saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>,
+): ApplyRelaunchResult | null {
+  for (const step of lane.steps) {
+    if (step.step !== 'save') continue;
+    const intent = snapshot.find((entry) => entry.key === step.idempotencyKey && entry.kind === 'intent');
+    const saveInput = saveInputs.get(lane.laneId);
+    if (intent === undefined || saveInput === undefined) continue;
+    const canonicalJson = canonicalSaveInputJson(planDigest, saveInput);
+    if (canonicalJson === null) return refusal('invalid-request');
+    let currentDigest: unknown;
+    try {
+      currentDigest = deps.computeDigest(canonicalJson);
+    } catch {
+      return refusal('journal-unreadable');
+    }
+    if (verifySaveIntentDigest(intent.digest, currentDigest) === 'mismatch') {
+      return { outcome: 'refused', reason: 'save-input-digest-mismatch', laneId: lane.laneId };
+    }
+  }
+  return null;
+}
+
+function stoppedRefusal(nextAction: LaneDerivation['nextAction'], laneId: string): ApplyRelaunchResult | null {
+  if (nextAction.kind !== 'stopped') return null;
+  if (nextAction.reason === 'out-of-order') return { outcome: 'refused', reason: 'out-of-order', laneId };
+  if (nextAction.reason === 'inconsistent' || nextAction.reason === 'invalid-steps') {
+    return { outcome: 'refused', reason: 'step-inconsistent', laneId };
+  }
+  return null;
+}
+
+function deriveLaneSummaries(
+  deps: ApplyRelaunchDependencies,
+  planDigest: string,
+  storedPlan: RelaunchPlanRecord,
+  snapshot: readonly SnapshotEntry[],
+  saveInputs: ReadonlyMap<string, ApplyRelaunchSaveInput>,
+): Step<ApplyRelaunchLaneSummary[]> {
+  const lanes: ApplyRelaunchLaneSummary[] = [];
+  for (const lane of storedPlan.lanes) {
+    const saveRefusal = verifyLaneSaveInput(deps, planDigest, lane, snapshot, saveInputs);
+    if (saveRefusal !== null) return { ok: false, result: saveRefusal };
+    const derivation = deriveLane(snapshot, planDigest, lane);
+    if (derivation === null) return { ok: false, result: { outcome: 'refused', reason: 'step-inconsistent', laneId: lane.laneId } };
+    const stopped = stoppedRefusal(derivation.nextAction, lane.laneId);
+    if (stopped !== null) return { ok: false, result: stopped };
+    lanes.push({
+      laneId: lane.laneId,
+      population: lane.population,
+      stepStatuses: derivation.stepStatuses,
+      nextAction: derivation.nextAction,
+    });
+  }
+  return pass(lanes);
+}
+
 export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
   constructor(private readonly deps?: ApplyRelaunchDependencies) {}
 
@@ -244,186 +515,26 @@ export class ApplyRelaunchUseCase implements ApplyRelaunchPort {
     }
     const deps = this.deps;
 
-    // ---- Step 2: defensive request parsing (no outbound call yet). ----
-    if (own(request, 'planDigest') === BAD) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    const planDigestValue = own(request, 'planDigest');
-    if (planDigestValue === ABSENT || typeof planDigestValue !== 'string') {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if (!PLAN_DIGEST.test(planDigestValue)) {
-      return { outcome: 'refused', reason: 'invalid-plan-digest' };
-    }
-    const planDigest = planDigestValue;
+    const parsed = parseRequest(request);
+    if (!parsed.ok) return parsed.result;
+    const { planDigest, apply, grantId, deadlineMs, saveInputs } = parsed.value;
 
-    const applyValue = own(request, 'apply');
-    if (applyValue === BAD) return { outcome: 'refused', reason: 'invalid-request' };
-    const apply = applyValue === ABSENT ? false : applyValue;
-    if (typeof apply !== 'boolean') return { outcome: 'refused', reason: 'invalid-request' };
+    if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
 
-    const grantValue = own(request, 'grantId');
-    if (grantValue === BAD) return { outcome: 'refused', reason: 'invalid-request' };
-    const grantId = grantValue === ABSENT || grantValue === null ? null : grantValue;
-    if (grantId !== null && typeof grantId !== 'string') {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if (grantId !== null && hasSecretShape(grantId)) {
-      return { outcome: 'refused', reason: 'secret-detected' };
-    }
+    const planStep = await loadVerifiedPlan(deps, planDigest);
+    if (!planStep.ok) return planStep.result;
 
-    const nowValue = own(request, 'nowIso');
-    if (nowValue === ABSENT || nowValue === BAD) return { outcome: 'refused', reason: 'invalid-request' };
-    if (!isZonedIsoDateTime(nowValue)) return { outcome: 'refused', reason: 'invalid-clock' };
-
-    const deadlineValue = own(request, 'deadlineIso');
-    if (deadlineValue === BAD) return { outcome: 'refused', reason: 'invalid-request' };
-    const deadlineIso =
-      deadlineValue === ABSENT || deadlineValue === null ? null : deadlineValue;
-    if (deadlineIso !== null && !isZonedIsoDateTime(deadlineIso)) {
-      return { outcome: 'refused', reason: 'invalid-clock' };
-    }
-    const deadlineMs = deadlineIso === null ? null : Date.parse(deadlineIso);
-
-    const saveInputsValue = own(request, 'saveInputs');
-    if (saveInputsValue === BAD) return { outcome: 'refused', reason: 'invalid-request' };
-    const saveInputs =
-      saveInputsValue === ABSENT ? new Map<string, ApplyRelaunchSaveInput>() : readSaveInputs(saveInputsValue);
-    if (saveInputs === 'secret-detected') return { outcome: 'refused', reason: 'secret-detected' };
-    if (saveInputs === null) return { outcome: 'refused', reason: 'invalid-request' };
-
-    // ---- Trusted clock & deadline, before any outbound call. ----
-    const readNow = (): string | null => {
-      try {
-        const nowText = deps.clock !== undefined ? deps.clock() : new Date().toISOString();
-        if (typeof nowText !== 'string') return null;
-        if (!isZonedIsoDateTime(nowText) || Number.isNaN(Date.parse(nowText))) return null;
-        return nowText;
-      } catch {
-        return null;
-      }
-    };
-    const budgetExhausted = (): ApplyRelaunchResult => ({ outcome: 'refused', reason: 'budget-exhausted' });
-    const isExpired = (nowText: string): boolean =>
-      deadlineMs !== null && Date.parse(nowText) >= deadlineMs;
-
-    const nowText = readNow();
-    if (nowText === null || isExpired(nowText)) return budgetExhausted();
-
-    // ---- Step 3: load, validate and digest-verify the stored plan. ----
-    let found: unknown;
-    try {
-      found = await deps.planRepo.findByDigest(planDigest);
-    } catch {
-      return { outcome: 'refused', reason: 'plan-unreadable' };
-    }
-    if (found === null || typeof found !== 'object') {
-      return { outcome: 'refused', reason: 'plan-unreadable' };
-    }
-    const record = found as {
-      outcome?: unknown;
-      reason?: unknown;
-      plan?: unknown;
-    };
-    let plan: unknown;
-    if (record.outcome === 'found') {
-      plan = record.plan;
-    } else if (record.outcome === 'absent') {
-      return { outcome: 'refused', reason: 'plan-not-found' };
-    } else if (record.outcome === 'unreadable' && record.reason === 'unknown-version') {
-      return { outcome: 'refused', reason: 'plan-unknown-version' };
-    } else if (record.outcome === 'refused' && record.reason === 'invalid-digest') {
-      return { outcome: 'refused', reason: 'invalid-plan-digest' };
-    } else {
-      return { outcome: 'refused', reason: 'plan-unreadable' };
-    }
-    const validation = validateStoredRelaunchPlan(plan);
-    if (!validation.ok) {
-      return { outcome: 'refused', reason: 'invalid-plan' };
-    }
-    const storedPlan = plan as RelaunchPlanRecord;
-
-    let computedDigest: unknown;
-    try {
-      computedDigest = deps.computeDigest(canonicalRelaunchPlanBodyJson(storedPlan));
-    } catch {
-      return { outcome: 'refused', reason: 'plan-unreadable' };
-    }
-    if (computedDigest !== storedPlan.planDigest || computedDigest !== planDigest) {
-      return { outcome: 'refused', reason: 'plan-digest-mismatch' };
-    }
-
-    // ---- Step 4: apply-path refusal (authorization is never called here). ----
+    // Authorization is never called here: AR2b owns the live apply.
     if (apply) {
-      if (typeof grantId !== 'string' || grantId.trim() === '') {
-        return { outcome: 'refused', reason: 'grant-missing' };
-      }
-      return { outcome: 'refused', reason: 'live-apply-not-implemented' };
+      return refusal(typeof grantId !== 'string' || grantId.trim() === '' ? 'grant-missing' : 'live-apply-not-implemented');
     }
 
-    // ---- Step 5: journal read, snapshot and replay derivation. ----
-    const nowBeforeJournal = readNow();
-    if (nowBeforeJournal === null || isExpired(nowBeforeJournal)) return budgetExhausted();
+    if (!withinBudget(deps, deadlineMs)) return refusal('budget-exhausted');
+    const snapshotStep = await loadJournalSnapshot(deps, planDigest);
+    if (!snapshotStep.ok) return snapshotStep.result;
 
-    let listing: unknown;
-    try {
-      listing = await deps.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/`);
-    } catch {
-      return { outcome: 'refused', reason: 'journal-unreadable' };
-    }
-    if (listing === null || typeof listing !== 'object' || (listing as { outcome?: unknown }).outcome !== 'listed') {
-      return { outcome: 'refused', reason: 'journal-unreadable' };
-    }
-    const denseEntries = readBoundedDenseArray((listing as { entries?: unknown }).entries, MAX_RELAUNCH_APPLY_ENTRIES);
-    if (denseEntries === null) return { outcome: 'refused', reason: 'journal-unreadable' };
-    const snapshot: SnapshotEntry[] = [];
-    for (const item of denseEntries.array) {
-      const entry = snapshotJournalEntry(item);
-      if (entry === null) return { outcome: 'refused', reason: 'journal-unreadable' };
-      snapshot.push(entry);
-    }
-
-    const lanes: ApplyRelaunchLaneSummary[] = [];
-    for (const lane of storedPlan.lanes) {
-      for (const step of lane.steps) {
-        if (step.step !== 'save') continue;
-        const intent = snapshot.find((entry) => entry.key === step.idempotencyKey && entry.kind === 'intent');
-        if (intent === undefined) continue;
-        const saveInput = saveInputs.get(lane.laneId);
-        if (saveInput === undefined) continue;
-        const canonicalJson = canonicalSaveInputJson(planDigest, saveInput);
-        if (canonicalJson === null) return { outcome: 'refused', reason: 'invalid-request' };
-        let currentDigest: unknown;
-        try {
-          currentDigest = deps.computeDigest(canonicalJson);
-        } catch {
-          return { outcome: 'refused', reason: 'journal-unreadable' };
-        }
-        if (verifySaveIntentDigest(intent.digest, currentDigest) === 'mismatch') {
-          return { outcome: 'refused', reason: 'save-input-digest-mismatch', laneId: lane.laneId };
-        }
-      }
-      const derivation = deriveLane(snapshot, planDigest, lane);
-      if (derivation === null) {
-        return { outcome: 'refused', reason: 'step-inconsistent', laneId: lane.laneId };
-      }
-      const nextAction = derivation.nextAction;
-      if (nextAction.kind === 'stopped') {
-        if (nextAction.reason === 'out-of-order') {
-          return { outcome: 'refused', reason: 'out-of-order', laneId: lane.laneId };
-        }
-        if (nextAction.reason === 'inconsistent' || nextAction.reason === 'invalid-steps') {
-          return { outcome: 'refused', reason: 'step-inconsistent', laneId: lane.laneId };
-        }
-      }
-      lanes.push({
-        laneId: lane.laneId,
-        population: lane.population,
-        stepStatuses: derivation.stepStatuses,
-        nextAction,
-      });
-    }
-
-    return { outcome: 'dry-run', planDigest, lanes };
+    const lanes = deriveLaneSummaries(deps, planDigest, planStep.value, snapshotStep.value, saveInputs);
+    if (!lanes.ok) return lanes.result;
+    return { outcome: 'dry-run', planDigest, lanes: lanes.value };
   }
 }

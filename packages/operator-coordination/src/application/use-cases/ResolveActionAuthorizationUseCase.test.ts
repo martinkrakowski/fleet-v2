@@ -678,19 +678,13 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(calls).toBe(0);
   });
 
-  it('handles an own __proto__ key on a shadow resolve request as an ordinary field', async () => {
+  it('refuses an own __proto__ key on a shadow resolve request as invalid-request without polluting Object.prototype', async () => {
     const requestRepo = seededRepo();
     const hostile = JSON.parse(
       `{"projectId":"proj-1","actionScope":"${SHADOW_IMPORT_ACTION_SCOPE}","authorizationGrantId":"${GRANT_ID}","repository":{"owner":"octo","repo":"hello"},"__proto__":{"polluted":true}}`,
     ) as Record<string, unknown>;
     const result = await resolveRaw(useCase(requestRepo), hostile);
-    expect(result).toEqual({
-      outcome: 'authorized',
-      grantId: GRANT_ID,
-      requestId: REQUEST_ID,
-      expectedHeadSha: '',
-      policyRevision: 'pol-rev-1',
-    });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
@@ -1976,19 +1970,27 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     }
   });
 
-  it('refuses a relaunch-apply request with more own keys than the snapshot bound as invalid-request', async () => {
+  it('authorizes a relaunch-apply request with extra own keys past the fixed fields, proving the resolve never enumerates the body', async () => {
     const record = relaunchRecord();
-    const hostile: Record<string, unknown> = relaunchRequest();
-    // Far past the snapshot's own-key cap: hostile bulk whose only possible
-    // effect is to make the snapshot cost proportional to its size.
-    for (let i = 0; i < 64; i += 1) {
-      hostile[`filler-${i}`] = i;
+    const padded: Record<string, unknown> = relaunchRequest();
+    // Far past any fixed field count: the relaunch resolve reads only its four
+    // named fields with descriptor lookups, so bulk keys are inert — they are
+    // never enumerated, never copied, and can never make the resolve cost
+    // proportional to their count.
+    for (let i = 0; i < 4096; i += 1) {
+      padded[`filler-${i}`] = i;
     }
     const result = await resolve(
       { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
-      hostile,
+      padded,
     );
-    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: REQUEST_ID,
+      expectedHeadSha: '',
+      policyRevision: 'pol-relaunch-1',
+    });
   });
 
   it('refuses a relaunch projectId padded past the length bound as grant-wrong-project', async () => {
@@ -2107,7 +2109,7 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     expect(calls).toBe(0);
   });
 
-  it('handles an own __proto__ key on a relaunch-apply resolve as an ordinary field', async () => {
+  it('refuses an own __proto__ key on a relaunch-apply resolve as invalid-request without polluting Object.prototype', async () => {
     const record = relaunchRecord();
     const hostile = JSON.parse(
       `{"projectId":"${RELAUNCH_APPLY_PROJECT_ID}","actionScope":"${RELAUNCH_APPLY_ACTION_SCOPE}","authorizationGrantId":"${GRANT_ID}","proposalDigest":"${PROPOSAL_DIGEST}","__proto__":{"polluted":true}}`,
@@ -2116,8 +2118,21 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
       { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
       hostile,
     );
-    expect(result.outcome).toBe('authorized');
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('refuses own constructor and prototype keys on a relaunch-apply resolve as invalid-request', async () => {
+    const record = relaunchRecord();
+    for (const polluting of ['constructor', 'prototype']) {
+      const hostile: Record<string, unknown> = relaunchRequest();
+      Object.defineProperty(hostile, polluting, { value: 'hostile', enumerable: true });
+      const result = await resolve(
+        { ...signedDeps(repositoryWith(record), record), ...clockAt(CREATED_AT_ISO) },
+        hostile,
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
   });
 
   it('refuses a hostile Proxy relaunch-apply resolve as invalid-request without throwing', async () => {

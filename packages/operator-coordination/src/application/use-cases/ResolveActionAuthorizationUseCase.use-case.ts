@@ -82,6 +82,28 @@ const MAX_RELAUNCH_PROJECT_ID_LENGTH = 64;
 const MAX_RELAUNCH_GRANT_ID_LENGTH = 256;
 
 /**
+ * Prototype-polluting own keys. A request body carrying any of these as an own
+ * property (as `JSON.parse('{"__proto__":{...}}')` produces) is refused with a
+ * typed `invalid-request` result — never copied onto any snapshot object, so
+ * `Object.prototype` can never be reached, let alone mutated.
+ */
+const PROTOTYPE_POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
+
+/**
+ * The fixed field names the relaunch-apply resolve reads. The relaunch path
+ * never enumerates the request: each field is read by name with exactly one
+ * `Object.getOwnPropertyDescriptor` call — O(1) per field, four fields, so the
+ * whole read is O(1) regardless of how many other own keys the request body
+ * carries, and no key list is ever materialized.
+ */
+const RELAUNCH_REQUEST_FIELDS: readonly string[] = [
+  'actionScope',
+  'projectId',
+  'authorizationGrantId',
+  'proposalDigest',
+];
+
+/**
  * Enormous-input bound for the descriptor-safe request snapshot: at most this
  * many own keys are ever copied. Every legitimate request carries a fixed
  * handful of fields, so a body carrying more own keys than this is hostile
@@ -137,22 +159,30 @@ function snapshotRepository(value: unknown): unknown {
  */
 function readRequestSnapshot(
   input: object,
+  preRead?: { readonly key: string; readonly descriptor: PropertyDescriptor | undefined },
 ): {
   snapshot: Record<string, unknown> | null;
   accessorField: string | null;
   keyBoundExceeded: boolean;
+  pollutingKey: string | null;
 } {
   if (Array.isArray(input)) {
-    return { snapshot: null, accessorField: null, keyBoundExceeded: false };
+    return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
   }
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) {
-    return { snapshot: null, accessorField: null, keyBoundExceeded: false };
+    return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
   }
-  // The snapshot is built on a null prototype: an own `__proto__` key on the
-  // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
-  // as an ordinary data property instead of mutating the snapshot's
-  // prototype, so the snapshot reads exactly like main reads any other body.
+  // Prototype-polluting own keys are refused outright: a request body that
+  // carries `__proto__` (or `constructor`/`prototype`) as an own property is
+  // hostile bulk, and the hostile-input rules require it to be refused with a
+  // typed result — copying it onto a null-prototype snapshot would leave the
+  // key readable on the snapshot and one spread away from pollution.
+  for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
+    if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
+      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: polluting };
+    }
+  }
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   let accessorField: string | null = null;
   // Enormous-input bound: a legitimate request carries a fixed handful of own
@@ -163,24 +193,81 @@ function readRequestSnapshot(
   let ownKeyCount = 0;
   for (const key of Reflect.ownKeys(input)) {
     if (typeof key !== 'string') {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: false };
+      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
     }
     if (ownKeyCount >= MAX_SNAPSHOT_OWN_KEYS) {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: true };
+      return { snapshot: null, accessorField: null, keyBoundExceeded: true, pollutingKey: null };
     }
     ownKeyCount += 1;
     // EXACTLY ONE descriptor read per snapshotted field: both the accessor
-    // refusal and the copied value derive from this single descriptor.
-    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    // refusal and the copied value derive from this single descriptor. A
+    // field whose descriptor was already read once by the O(1) routing read
+    // above is reused here, never consulted a second time.
+    const descriptor =
+      preRead !== undefined && key === preRead.key
+        ? preRead.descriptor
+        : Object.getOwnPropertyDescriptor(input, key);
     if (descriptor === undefined || !descriptor.enumerable) {
-      return { snapshot: null, accessorField: null, keyBoundExceeded: false };
+      return { snapshot: null, accessorField: null, keyBoundExceeded: false, pollutingKey: null };
     }
     if (accessorField === null && (descriptor.get !== undefined || descriptor.set !== undefined)) {
       accessorField = key;
     }
     out[key] = descriptor.value;
   }
-  return { snapshot: out, accessorField, keyBoundExceeded: false };
+  return { snapshot: out, accessorField, keyBoundExceeded: false, pollutingKey: null };
+}
+
+/**
+ * AR3a fix round 2: reads the relaunch-apply request's fixed fields WITHOUT
+ * enumerating the body. Cost bound: O(1) — a fixed handful of named
+ * `Object.getOwnPropertyDescriptor` calls (four request fields plus the
+ * prototype-polluting key names), each of which is a single hash lookup; no
+ * key list is ever materialized and no per-key loop ever runs, so the read
+ * cost never scales with the number of own keys the body carries. Extra own
+ * keys beyond the fixed fields are simply never read: nothing copies them,
+ * nothing spreads the request, so hostile bulk is inert by construction
+ * rather than counted.
+ *
+ * An own accessor (getter or setter) on any relaunch field, or a
+ * non-enumerable own field, is refused with null — the same typed
+ * `invalid-request` refusal the descriptor-safe snapshot gives the other
+ * paths. A prototype-polluting own key (`__proto__`, `constructor`,
+ * `prototype`) is refused with null too, so a relaunch-apply request that
+ * carries one can never authorize. A trap that throws propagates; the caller
+ * turns it into the same typed refusal.
+ */
+function readRelaunchRequestFields(
+  input: object,
+): {
+  actionScope: unknown;
+  projectId: unknown;
+  authorizationGrantId: unknown;
+  proposalDigest: unknown;
+} | null {
+  for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
+    if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
+      return null;
+    }
+  }
+  const fields: Record<string, unknown> = {};
+  for (const field of RELAUNCH_REQUEST_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, field);
+    if (descriptor === undefined) {
+      fields[field] = undefined;
+      continue;
+    }
+    if (!descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    fields[field] = descriptor.value;
+  }
+  return fields as {
+    actionScope: unknown;
+    projectId: unknown;
+    authorizationGrantId: unknown;
+    proposalDigest: unknown;
+  };
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -205,6 +292,43 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (typeof input !== 'object' || input === null) {
       return blocked('invalid-request');
     }
+    // AR3a fix round 2: the relaunch-apply route is decided and resolved with
+    // O(1) named descriptor reads alone — the request body is never
+    // enumerated here, so no key list is ever materialized and no per-key
+    // work can scale with the body's size. A throwing trap on any descriptor
+    // read is a hostile Proxy and a typed refusal, never an exception.
+    // The single `actionScope` descriptor read below is REUSED by the
+    // snapshot on the non-relaunch paths, so every snapshotted field keeps
+    // its exactly-once descriptor consultation.
+    let scopeDescriptor: PropertyDescriptor | undefined;
+    try {
+      if (!Array.isArray(input)) {
+        const prototype = Object.getPrototypeOf(input);
+        if (prototype === Object.prototype || prototype === null) {
+          scopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+          if (
+            scopeDescriptor !== undefined &&
+            (!scopeDescriptor.enumerable ||
+              scopeDescriptor.get !== undefined ||
+              scopeDescriptor.set !== undefined)
+          ) {
+            return blocked('invalid-request');
+          }
+          const scopeValue = scopeDescriptor === undefined ? undefined : scopeDescriptor.value;
+          if (typeof scopeValue === 'string' && isRelaunchApplyActionScope(scopeValue.trim())) {
+            const relaunchFields = readRelaunchRequestFields(input);
+            if (relaunchFields === null) {
+              return blocked('invalid-request');
+            }
+            return this.resolveRelaunchApply(
+              relaunchFields as unknown as ResolveActionAuthorizationRequest,
+            );
+          }
+        }
+      }
+    } catch {
+      return blocked('invalid-request');
+    }
     // Standing shadow import grant (owner decision 2026-11-18): the resolve
     // is head-free — the grant is bound by its digest-bound request id, its
     // exact repository and its capped expiry, never by a commit. Its clock is
@@ -221,9 +345,19 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     let snapshot: Record<string, unknown> | null = null;
     let accessorField: string | null = null;
     let keyBoundExceeded = false;
+    let pollutingKey: string | null = null;
     try {
-      ({ snapshot, accessorField, keyBoundExceeded } = readRequestSnapshot(input));
+      ({ snapshot, accessorField, keyBoundExceeded, pollutingKey } = readRequestSnapshot(input, {
+        key: 'actionScope',
+        descriptor: scopeDescriptor,
+      }));
     } catch {
+      return blocked('invalid-request');
+    }
+    // AR3a fix round 2: a request body carrying a prototype-polluting own key
+    // is refused with the typed `invalid-request` answer on every path — the
+    // key is never copied onto any snapshot object.
+    if (pollutingKey !== null) {
       return blocked('invalid-request');
     }
     // Enormous-input refusal: a body carrying more own keys than the snapshot

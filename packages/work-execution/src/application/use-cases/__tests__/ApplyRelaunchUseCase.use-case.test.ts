@@ -231,39 +231,46 @@ const saveInputDigest = (planDigest: string, input: Record<string, unknown>): st
 };
 
 /** A valid adopt input for the held lane; every cross-check matches the fixtures. */
-const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
-  laneId: 'lane-2',
-  projectId: 'proj-1',
-  planRef: { projectId: 'proj-1', planId: 'plan-1', laneId: 'lane-2' },
-  baseBranch: 'chain/relaunch-2',
-  workOrder: {
-    workOrderId: 'wo-9',
-    taskId: 'task-1',
-    repository: 'repo-1',
-    baseCommit: 'b'.repeat(64),
-    ownedPaths: ['src/a.ts'],
-    policyRevision: 'policy-1',
-  },
-  brief: {
-    briefId: 'brief-1',
-    briefText: 'do the thing',
-    expectedBriefDigest: 'a'.repeat(64),
-    prosePath: 'brief/prose.md',
-    manifestPath: 'brief/manifest.json',
-    reviewerModel: 'reviewer-1',
-    acceptanceSpec: { commands: [{ argv: ['yarn', 'test'] }] },
-  },
-  attempt: { attemptId: 'attempt-1', endedAtIso: CLOCK_NOW, sessionId: null },
-  run: {
-    runId: 'run-9',
-    tier: 2,
-    seatPlanRef: 'e'.repeat(64),
-    runPolicyRevision: 'policy-1',
-    branchName: 'fleet/run-9',
-  },
-  source: { kind: 'save-ref', saveRef: 'refs/fleet/saved/lane-2', commitOid: 'c'.repeat(64), treeDigest: 'd'.repeat(64) },
-  ...over,
-});
+const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown> => {
+  const base = {
+    laneId: 'lane-2',
+    projectId: 'proj-1',
+    baseBranch: 'chain/relaunch-2',
+    workOrder: {
+      workOrderId: 'wo-9',
+      taskId: 'task-1',
+      repository: 'repo-1',
+      baseCommit: 'b'.repeat(64),
+      ownedPaths: ['src/a.ts'],
+      policyRevision: 'policy-1',
+    },
+    brief: {
+      briefId: 'brief-1',
+      briefText: 'do the thing',
+      expectedBriefDigest: 'a'.repeat(64),
+      prosePath: 'brief/prose.md',
+      manifestPath: 'brief/manifest.json',
+      reviewerModel: 'reviewer-1',
+      acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['yarn', 'test'] }] },
+    },
+    attempt: { attemptId: 'attempt-1', endedAtIso: CLOCK_NOW, sessionId: null },
+    run: {
+      runId: `run-7${'A'.repeat(25)}`,
+      tier: 2,
+      seatPlanRef: 'e'.repeat(64),
+      runPolicyRevision: 'policy-1',
+      branchName: `fleet/run-7${'A'.repeat(25)}`,
+    },
+    source: { kind: 'save-ref', saveRef: 'refs/fleet/saved/lane-2', commitOid: 'c'.repeat(64), treeDigest: 'd'.repeat(64) },
+    ...over,
+  };
+  // The planRef mirrors the (possibly overridden) lane and project ids, as
+  // the port's own grammar requires planRef.laneId and planRef.projectId to
+  // match the request's.
+  const laneId = typeof base['laneId'] === 'string' ? base['laneId'] : 'lane-2';
+  const projectId = typeof base['projectId'] === 'string' ? base['projectId'] : 'proj-1';
+  return { ...base, planRef: { projectId, planId: 'plan-1', laneId } };
+};
 
 /** An own accessor on `key` that counts its invocations and never fires. */
 const getterOn = (target: object, key: string, calls: { count: number }): object => {
@@ -278,6 +285,19 @@ const getterOn = (target: object, key: string, calls: { count: number }): object
   });
   return target;
 };
+
+/** The full `adopted` result for the lane-4 adopt input, matching its ids (fix-round item 2 hardening). */
+const lane4Adopted = (): Record<string, unknown> => ({
+  outcome: 'adopted',
+  reused: false,
+  workOrderId: 'wo-9',
+  briefDigest: 'a'.repeat(64),
+  attemptId: 'attempt-4',
+  runId: `run-7${'C'.repeat(25)}`,
+  commitOid: 'c'.repeat(64),
+  enteredState: 'collecting',
+  provenance: 'adopted',
+});
 
 interface Deps {
   planRepo: { findByDigest: (planDigest: string) => Promise<FindRelaunchPlanResult> };
@@ -1637,7 +1657,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const lane4AdoptInput = adoptInput({
       laneId: 'lane-4',
       attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-4' },
-      run: { ...(adoptInput()['run'] as object), runId: 'run-11' },
+      run: { ...(adoptInput()['run'] as object), runId: `run-7${'C'.repeat(25)}` },
     });
     // Cap 2: lane-2's pending hand-off and lane-3's completed adopt are
     // counted (0 conducted + 2 >= 2), so lane-4's absent adopt refuses before
@@ -1659,7 +1679,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
     // Cap 3: lane-4's adopt fits and both wave-2 lanes hand off.
     const roomier = setup(3);
-    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { adopt: { outcome: 'adopted', reused: false } } });
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { adopt: lane4Adopted() } });
     expect(
       await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
         applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs, adoptInputs: [lane4AdoptInput] }),
@@ -2005,7 +2025,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     const lane4AdoptInput = adoptInput({
       laneId: 'lane-4',
       attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-4' },
-      run: { ...(adoptInput()['run'] as object), runId: 'run-11' },
+      run: { ...(adoptInput()['run'] as object), runId: `run-7${'C'.repeat(25)}` },
     });
     // Cap 2: the pending hand-off on lane-2 (idle worktree) and lane-3's
     // completed adopt both count (0 + 2 >= 2), so lane-4's absent adopt
@@ -2022,7 +2042,7 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
     ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
     // Cap 3: lane-4's adopt fits and both wave-2 lanes hand off.
     const roomier = setup(3);
-    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { inspect: { state: 'idle' }, adopt: { outcome: 'adopted', reused: false } } });
+    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { inspect: { state: 'idle' }, adopt: lane4Adopted() } });
     expect(
       await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
         applyRequest(roomier.plan.planDigest, { saveInputs: roomier.inputs, adoptInputs: [lane4AdoptInput] }),

@@ -202,44 +202,56 @@ const SAVE_REF = 'refs/fleet/saved/lane-2';
 const COMMIT = 'c'.repeat(64);
 const TREE = 'd'.repeat(64);
 
+/** Fix-round item 2 hardening: run ids in the `LANE_RUN_ID_PATTERN` grammar. */
+const RUN_9 = `run-7${'A'.repeat(25)}`;
+const RUN_10 = `run-7${'B'.repeat(25)}`;
+const RUN_11 = `run-7${'C'.repeat(25)}`;
+
 /** A completed save result that carries the ref, commit id and tree digest. */
 const savedResult = (key: string): Record<string, unknown> =>
   result(key, 'completed', { saveRef: SAVE_REF, commitId: COMMIT, digest: TREE });
 
 /** A valid adopt input for the held lane; every cross-check matches the fixtures. */
-const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
-  laneId: 'lane-2',
-  projectId: 'proj-1',
-  planRef: { projectId: 'proj-1', planId: 'plan-1', laneId: 'lane-2' },
-  baseBranch: 'chain/relaunch-2',
-  workOrder: {
-    workOrderId: 'wo-9',
-    taskId: 'task-1',
-    repository: 'repo-1',
-    baseCommit: 'b'.repeat(64),
-    ownedPaths: ['src/a.ts'],
-    policyRevision: 'policy-1',
-  },
-  brief: {
-    briefId: 'brief-1',
-    briefText: 'do the thing',
-    expectedBriefDigest: 'a'.repeat(64),
-    prosePath: 'brief/prose.md',
-    manifestPath: 'brief/manifest.json',
-    reviewerModel: 'reviewer-1',
-    acceptanceSpec: { commands: [{ argv: ['yarn', 'test'] }] },
-  },
-  attempt: { attemptId: 'attempt-1', endedAtIso: CLOCK_NOW, sessionId: null },
-  run: {
-    runId: 'run-9',
-    tier: 2,
-    seatPlanRef: 'e'.repeat(64),
-    runPolicyRevision: 'policy-1',
-    branchName: 'fleet/run-9',
-  },
-  source: { kind: 'save-ref', saveRef: SAVE_REF, commitOid: COMMIT, treeDigest: TREE },
-  ...over,
-});
+const adoptInput = (over: Record<string, unknown> = {}): Record<string, unknown> => {
+  const base = {
+    laneId: 'lane-2',
+    projectId: 'proj-1',
+    baseBranch: 'chain/relaunch-2',
+    workOrder: {
+      workOrderId: 'wo-9',
+      taskId: 'task-1',
+      repository: 'repo-1',
+      baseCommit: 'b'.repeat(64),
+      ownedPaths: ['src/a.ts'],
+      policyRevision: 'policy-1',
+    },
+    brief: {
+      briefId: 'brief-1',
+      briefText: 'do the thing',
+      expectedBriefDigest: 'a'.repeat(64),
+      prosePath: 'brief/prose.md',
+      manifestPath: 'brief/manifest.json',
+      reviewerModel: 'reviewer-1',
+      acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['yarn', 'test'] }] },
+    },
+    attempt: { attemptId: 'attempt-1', endedAtIso: CLOCK_NOW, sessionId: null },
+    run: {
+      runId: RUN_9,
+      tier: 2,
+      seatPlanRef: 'e'.repeat(64),
+      runPolicyRevision: 'policy-1',
+      branchName: `fleet/${RUN_9}`,
+    },
+    source: { kind: 'save-ref', saveRef: SAVE_REF, commitOid: COMMIT, treeDigest: TREE },
+    ...over,
+  };
+  // The planRef mirrors the (possibly overridden) lane and project ids, as
+  // the port's own grammar requires planRef.laneId and planRef.projectId to
+  // match the request's.
+  const laneId = typeof base['laneId'] === 'string' ? base['laneId'] : 'lane-2';
+  const projectId = typeof base['projectId'] === 'string' ? base['projectId'] : 'proj-1';
+  return { ...base, planRef: { projectId, planId: 'plan-1', laneId } };
+};
 
 const adopted = (): Record<string, unknown> => ({
   outcome: 'adopted',
@@ -247,11 +259,33 @@ const adopted = (): Record<string, unknown> => ({
   workOrderId: 'wo-9',
   briefDigest: 'a'.repeat(64),
   attemptId: 'attempt-1',
-  runId: 'run-9',
+  runId: RUN_9,
   commitOid: COMMIT,
   enteredState: 'collecting',
   provenance: 'adopted',
 });
+
+/** An adopted result whose ids match whatever request the port received. */
+const adoptedFor = (request: unknown): Record<string, unknown> => {
+  const req = (request ?? {}) as {
+    workOrder?: { workOrderId?: string };
+    brief?: { expectedBriefDigest?: string };
+    attempt?: { attemptId?: string };
+    run?: { runId?: string };
+    source?: { commitOid?: string };
+  };
+  return {
+    outcome: 'adopted',
+    reused: false,
+    workOrderId: req.workOrder?.workOrderId ?? 'wo-9',
+    briefDigest: req.brief?.expectedBriefDigest ?? 'a'.repeat(64),
+    attemptId: req.attempt?.attemptId ?? 'attempt-1',
+    runId: req.run?.runId ?? RUN_9,
+    commitOid: req.source?.commitOid ?? COMMIT,
+    enteredState: 'collecting',
+    provenance: 'adopted',
+  };
+};
 
 interface Deps {
   planRepo: { findByDigest: (planDigest: string) => Promise<FindRelaunchPlanResult> };
@@ -397,7 +431,12 @@ const makeDeps = (over: {
       ? undefined
       : vi.fn(async (request: unknown) => {
           if (live.adoptThrows) throw new Error('adopt down');
-          const answer = live.adopt !== undefined ? live.adopt : { outcome: 'refused', reason: 'invalid-request' };
+          const answer =
+            typeof live.adopt === 'function'
+              ? await (live.adopt as (request: unknown) => unknown)(request)
+              : live.adopt !== undefined
+                ? live.adopt
+                : { outcome: 'refused', reason: 'invalid-request' };
           if (
             plainOutcome(answer) === 'adopted' &&
             typeof (request as { planDigest?: string } | null)?.planDigest === 'string' &&
@@ -649,14 +688,13 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
   it('refuses stale-plan-state for each adoptInput cross-check mismatch before authorization', async () => {
     const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('cross-check plan'))]);
     const mismatch = (over: Record<string, unknown>): Record<string, unknown> => {
-      const input = adoptInput();
       if ('workOrderId' in over || 'baseCommit' in over || 'ownedPaths' in over || 'policyRevision' in over) {
-        return { ...input, workOrder: { ...(input['workOrder'] as object), ...over } };
+        return adoptInput({ workOrder: { ...(adoptInput()['workOrder'] as object), ...over } });
       }
       if ('attemptId' in over) {
-        return { ...input, attempt: { ...(input['attempt'] as object), ...over } };
+        return adoptInput({ attempt: { ...(adoptInput()['attempt'] as object), ...over } });
       }
-      return { ...input, ...over };
+      return adoptInput(over);
     };
     for (const bad of [
       mismatch({ baseBranch: 'chain/other' }),
@@ -714,12 +752,12 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     const lane3Input = adoptInput({
       laneId: 'lane-3',
       attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-3' },
-      run: { ...(adoptInput()['run'] as object), runId: 'run-10' },
+      run: { ...(adoptInput()['run'] as object), runId: RUN_10 },
     });
     const lane4Input = adoptInput({
       laneId: 'lane-4',
       attempt: { ...(adoptInput()['attempt'] as object), attemptId: 'attempt-4' },
-      run: { ...(adoptInput()['run'] as object), runId: 'run-11' },
+      run: { ...(adoptInput()['run'] as object), runId: RUN_11 },
     });
     const setup = (maxActiveRuns: number): { plan: RelaunchPlanRecord; entries: unknown[] } => {
       const plan = buildPlan([lane2, lane3, lane4], maxActiveRuns);
@@ -754,7 +792,13 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     ).toEqual([key(capped.plan.planDigest, 'lane-3', 'redispatch')]);
     // Cap 3: lane-4's adopt fits and both wave-2 lanes hand off.
     const roomier = setup(3);
-    const roomierDeps = makeDeps({ plan: roomier.plan, entries: roomier.entries, live: { adopt: adopted() } });
+    // Fix-round item 2 hardening: the port's answer must carry the ids of
+    // the request it adopted, so the mock derives them per request.
+    const roomierDeps = makeDeps({
+      plan: roomier.plan,
+      entries: roomier.entries,
+      live: { adopt: (request: unknown) => adoptedFor(request) },
+    });
     expect(
       await new ApplyRelaunchUseCase(roomierDeps).applyRelaunch(
         applyRequest(roomier.plan.planDigest, {
@@ -832,6 +876,59 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       ),
     ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
     expect(getterCalls.count).toBe(0);
+  });
+
+  it('refuses invalid-request before authorization when a nested adoptInput field is malformed', async () => {
+    // Fix-round item 1: the nested fields are validated at parse, so a
+    // `run.tier` outside {1, 2}, a run id outside the lane-run grammar or an
+    // acceptance spec the domain value object refuses can no longer pass
+    // preflight, consume the grant and save/abort the lane before
+    // `AdoptLane` rejects it.
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('nested plan'))]);
+    for (const bad of [
+      adoptInput({ run: { ...(adoptInput()['run'] as object), tier: 999 } }),
+      adoptInput({ run: { ...(adoptInput()['run'] as object), runId: 'run-9' } }),
+      adoptInput({
+        brief: {
+          ...(adoptInput()['brief'] as object),
+          acceptanceSpec: { commands: [{ argv: ['yarn', 'test'] }] },
+        },
+      }),
+      // A planRef whose laneId does not match the input's own lane id.
+      { ...adoptInput(), planRef: { projectId: 'proj-1', planId: 'plan-1', laneId: 'lane-9' } },
+    ]) {
+      const deps = makeDeps({ plan });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(
+          applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [bad] }),
+        ),
+      ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(deps.planRepo.findByDigest).not.toHaveBeenCalled();
+      expect(deps.authorization!.authorizeRelaunchApply).not.toHaveBeenCalled();
+      expect(deps.appended).toEqual([]);
+    }
+  });
+
+  it('refuses adopt-failed when an adopted result is missing fields or carries mismatched ids', async () => {
+    // Fix-round item 2: an `own` outcome of 'adopted' is only trusted when
+    // every required result field is present and each id matches the input;
+    // otherwise the wave must not journal the redispatch intent.
+    const plan = buildPlan([conductedLaneWithRun(), heldLane(hex('adopted-shape plan'))]);
+    for (const answer of [
+      { outcome: 'adopted', reused: false, workOrderId: 'wo-9', briefDigest: 'a'.repeat(64), attemptId: 'attempt-1', commitOid: COMMIT, enteredState: 'collecting', provenance: 'adopted' }, // no runId
+      { ...adopted(), attemptId: 'attempt-2' }, // a mismatched attempt id
+      { ...adopted(), commitOid: 'a'.repeat(64) }, // a commit the source does not carry
+      { ...adopted(), enteredState: 'running' },
+      { ...adopted(), reused: 'no' },
+    ]) {
+      const deps = makeDeps({ plan, live: { adopt: answer } });
+      expect(
+        await new ApplyRelaunchUseCase(deps).applyRelaunch(
+          applyRequest(plan.planDigest, { saveInputs: [saveInput()], adoptInputs: [adoptInput()] }),
+        ),
+      ).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+      expect(deps.appended!.every((entry) => entry.key !== key(plan.planDigest, 'lane-2', 'redispatch'))).toBe(true);
+    }
   });
 
   it('refuses adopt-failed without calling adoptLane when adopt status is refused', async () => {
@@ -931,7 +1028,11 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
     const brief = {
       ...(adoptInput()['brief'] as object),
       briefText: 'x'.repeat(262_144),
-      acceptanceSpec: { commands: [{ argv: ['yarn', 'turbo', 'run', 'test', '--', '--filter=...'] }] },
+      acceptanceSpec: {
+        commitRequired: true,
+        diffCheck: true,
+        commands: [{ argv: ['yarn', 'turbo', 'run', 'test', '--', '--filter=...'] }],
+      },
     };
     const input = adoptInput({ brief });
     const deps = makeDeps({
@@ -966,7 +1067,7 @@ describe('ApplyRelaunchUseCase adopt (AR2c)', () => {
       workOrder: expect.objectContaining({ workOrderId: 'wo-9', baseCommit: 'b'.repeat(64) }),
       brief: expect.objectContaining({ briefText: 'x'.repeat(262_144) }),
       attempt: expect.objectContaining({ attemptId: 'attempt-1' }),
-      run: expect.objectContaining({ runId: 'run-9' }),
+      run: expect.objectContaining({ runId: RUN_9 }),
       source: { kind: 'save-ref', saveRef: SAVE_REF, commitOid: COMMIT, treeDigest: TREE },
       nowIso: CLOCK_NOW,
       deadlineIso: DEADLINE,

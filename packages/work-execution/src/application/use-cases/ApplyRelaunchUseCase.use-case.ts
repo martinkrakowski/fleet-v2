@@ -18,7 +18,12 @@
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
+import { parseBaseBranch } from '../../domain/base-branch.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { parseWorkOrderRisk } from '../../domain/execution-records.js';
+import { SHA256_HEX_PATTERN } from '../../domain/lane-plan-records.js';
+import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
+import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import {
   readBoundedDenseArray,
   readPlainRecordWithOptionalKeys,
@@ -308,6 +313,171 @@ function containsPollutingKey(value: unknown, depth: number, budget: { nodes: nu
   return false;
 }
 
+/**
+ * Fix-round item 1: the nested grammars of one adopt input, checked on the
+ * cloned plain snapshot before the input is stored or handed to preflight.
+ * They mirror the exact checks `AdoptLaneUseCase.readAdoptLaneRequest`
+ * enforces, so an input the port would refuse — a `run.tier` outside
+ * `{1, 2}`, an unknown `acceptanceSpec`, a malformed work order, attempt,
+ * brief or source — can no longer pass preflight, consume the owner grant
+ * and save/abort the lane before `adoptLane` rejects it.
+ *
+ * Every read below is a plain property read of a `structuredClone` result:
+ * the clone carries data properties only (accessors and symbol keys are
+ * dropped), and the `__proto__`/`constructor`/`prototype` sweep already
+ * refused any polluting key, so no getter ever runs and no key can be
+ * confused with the prototype chain. Cost: O(size of the clone), which the
+ * preceding secret and polluting-key sweeps already bound to at most
+ * `MAX_ADOPT_SCAN_NODES` nodes at most `MAX_ADOPT_SCAN_DEPTH` deep, with
+ * strings capped at `MAX_BRIEF_TEXT_LENGTH`.
+ */
+const ADOPT_NESTED_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ADOPT_ATTEMPT_ID = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
+const ADOPT_COMMIT = /^[0-9a-f]{40,64}$/;
+const MAX_ADOPT_NESTED_ID = 128;
+const MAX_ADOPT_REF = 256;
+const MAX_ADOPT_OWNED_PATHS = 256;
+const MAX_ADOPT_PREREQUISITE_IDS = 64;
+const MAX_ADOPT_COMMITS_SINCE_BASE = 512;
+
+/** A non-empty bounded string; the trim refuses whitespace-only values as `AdoptLaneUseCase` does. */
+function adoptNestedText(value: unknown, max: number): boolean {
+  return typeof value === 'string' && value.trim() !== '' && value.length <= max;
+}
+
+function adoptNestedId(value: unknown): boolean {
+  return typeof value === 'string' && ADOPT_NESTED_ID.test(value);
+}
+
+/** A dense, bounded list of non-empty bounded strings. */
+function adoptNestedStringList(value: unknown, max: number, itemMax: number): boolean {
+  if (!Array.isArray(value) || value.length > max) return false;
+  return value.every((item) => adoptNestedText(item, itemMax));
+}
+
+function adoptNestedRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+/** The optional `attempt.runner` record, exactly as `AdoptLaneUseCase.readRunner` reads it. */
+function isAdoptNestedRunner(value: unknown): boolean {
+  const record = adoptNestedRecord(value);
+  if (record === null) return false;
+  const kind = record['kind'];
+  const port = record['remotePort'];
+  if ((kind !== 'opencode' && kind !== 'agy') || !(port === null || (typeof port === 'number' && Number.isSafeInteger(port)))) {
+    return false;
+  }
+  for (const key of ['host', 'agent', 'model', 'variant'] as const) {
+    const field = record[key];
+    if (!(field === null || adoptNestedText(field, MAX_ADOPT_NESTED_ID))) return false;
+  }
+  return true;
+}
+
+/** The optional `source`, exactly as `AdoptLaneUseCase.readSource` reads it. */
+function isAdoptNestedSource(value: unknown): boolean {
+  const record = adoptNestedRecord(value);
+  if (record === null) return false;
+  if (typeof record['commitOid'] !== 'string' || !ADOPT_COMMIT.test(record['commitOid'])) return false;
+  if (record['kind'] === 'save-ref') {
+    return (
+      adoptNestedText(record['saveRef'], MAX_ADOPT_REF) &&
+      typeof record['treeDigest'] === 'string' &&
+      ADOPT_COMMIT.test(record['treeDigest'])
+    );
+  }
+  if (record['kind'] === 'clean-commit') {
+    if (!adoptNestedText(record['branchName'], MAX_ADOPT_REF)) return false;
+    const onBranch = record['commitOnBranch'];
+    if (!(typeof onBranch === 'boolean' || onBranch === 'unknown')) return false;
+    const dirty = record['dirtyCount'];
+    if (!(dirty === 'unknown' || (typeof dirty === 'number' && Number.isSafeInteger(dirty) && dirty >= 0))) return false;
+    const since = record['commitsSinceBase'];
+    return since === undefined || adoptNestedStringList(since, MAX_ADOPT_COMMITS_SINCE_BASE, 64);
+  }
+  return false;
+}
+
+/** One nested field group of the cloned adopt input, or `null` when malformed. */
+function isAdoptInputShape(snapshot: unknown, laneId: string): boolean {
+  const record = adoptNestedRecord(snapshot);
+  if (record === null) return false;
+  if (!adoptNestedId(record['projectId'])) return false;
+  const planRef = adoptNestedRecord(record['planRef']);
+  if (planRef === null || !adoptNestedId(planRef['planId']) || planRef['projectId'] !== record['projectId'] || planRef['laneId'] !== laneId) {
+    return false;
+  }
+  if (parseBaseBranch(record['baseBranch']) === undefined) return false;
+  const workOrder = adoptNestedRecord(record['workOrder']);
+  if (
+    workOrder === null || !adoptNestedId(workOrder['workOrderId']) || !adoptNestedId(workOrder['taskId']) ||
+    !adoptNestedText(workOrder['repository'], MAX_ADOPT_REF) ||
+    typeof workOrder['baseCommit'] !== 'string' || !ADOPT_COMMIT.test(workOrder['baseCommit']) ||
+    !adoptNestedStringList(workOrder['ownedPaths'], MAX_ADOPT_OWNED_PATHS, MAX_ADOPT_REF) ||
+    (workOrder['ownedPaths'] as string[]).length === 0 ||
+    !adoptNestedText(workOrder['policyRevision'], MAX_ADOPT_NESTED_ID)
+  ) {
+    return false;
+  }
+  if (workOrder['risk'] !== undefined && parseWorkOrderRisk(workOrder['risk']) === undefined) return false;
+  if (
+    workOrder['prerequisiteWorkOrderIds'] !== undefined &&
+    !adoptNestedStringList(workOrder['prerequisiteWorkOrderIds'], MAX_ADOPT_PREREQUISITE_IDS, MAX_ADOPT_NESTED_ID)
+  ) {
+    return false;
+  }
+  const brief = adoptNestedRecord(record['brief']);
+  if (
+    brief === null || !adoptNestedId(brief['briefId']) || !adoptNestedText(brief['briefText'], MAX_BRIEF_TEXT_LENGTH) ||
+    typeof brief['expectedBriefDigest'] !== 'string' || !SHA256_HEX_PATTERN.test(brief['expectedBriefDigest']) ||
+    !adoptNestedText(brief['prosePath'], MAX_ADOPT_REF) || !adoptNestedText(brief['manifestPath'], MAX_ADOPT_REF) ||
+    !adoptNestedText(brief['reviewerModel'], MAX_ADOPT_NESTED_ID)
+  ) {
+    return false;
+  }
+  // The acceptance spec is validated in full by the domain value object, the
+  // same check `AdoptLaneUseCase` runs before it journals any adopt step:
+  // bounded to MAX_GATE_COMMANDS commands of bounded argv, so the cost is O(1).
+  if (AcceptanceSpec.create(brief['acceptanceSpec']).success !== true) return false;
+  const attempt = adoptNestedRecord(record['attempt']);
+  if (
+    attempt === null || typeof attempt['attemptId'] !== 'string' || !ADOPT_ATTEMPT_ID.test(attempt['attemptId']) ||
+    !isZonedIsoDateTime(attempt['endedAtIso']) ||
+    !(attempt['sessionId'] === undefined || attempt['sessionId'] === null || adoptNestedText(attempt['sessionId'], MAX_ADOPT_NESTED_ID))
+  ) {
+    return false;
+  }
+  if (attempt['runner'] !== undefined && !isAdoptNestedRunner(attempt['runner'])) return false;
+  const run = adoptNestedRecord(record['run']);
+  if (
+    run === null || typeof run['runId'] !== 'string' || !LANE_RUN_ID_PATTERN.test(run['runId']) ||
+    (run['tier'] !== 1 && run['tier'] !== 2) ||
+    typeof run['seatPlanRef'] !== 'string' || !SHA256_HEX_PATTERN.test(run['seatPlanRef']) ||
+    !adoptNestedText(run['runPolicyRevision'], MAX_ADOPT_NESTED_ID) ||
+    !(run['branchName'] === undefined || adoptNestedText(run['branchName'], MAX_ADOPT_REF))
+  ) {
+    return false;
+  }
+  if (record['source'] !== undefined && !isAdoptNestedSource(record['source'])) return false;
+  return true;
+}
+
+/** The required result fields of an `adopted` port answer, read through `own`; `null` when any is malformed. */
+function readAdoptedResult(result: unknown): Record<string, unknown> | null {
+  const reused = own(result, 'reused');
+  if (typeof reused !== 'boolean') return null;
+  const fields: Record<string, unknown> = { reused };
+  for (const key of ['workOrderId', 'briefDigest', 'attemptId', 'runId', 'commitOid'] as const) {
+    const value = own(result, key);
+    if (typeof value !== 'string') return null;
+    fields[key] = value;
+  }
+  if (own(result, 'enteredState') !== 'collecting' || own(result, 'provenance') !== 'adopted') return null;
+  return fields;
+}
+
 function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> | 'secret-detected' | null {
   const dense = readBoundedDenseArray(value, MAX_RELAUNCH_APPLY_LANES);
   if (dense === null) return null;
@@ -340,6 +510,11 @@ function readAdoptInputs(value: unknown): Map<string, ApplyRelaunchAdoptInput> |
     } catch {
       return null;
     }
+    // Fix-round item 1: the nested fields are validated on the cloned plain
+    // snapshot, so a `run.tier` outside `{1, 2}` or a malformed work order,
+    // brief, attempt or source is refused at parse, before preflight can
+    // consume the grant or the wave can save/abort the lane.
+    if (!isAdoptInputShape(snapshot, laneId)) return null;
     map.set(laneId, snapshot as ApplyRelaunchAdoptInput);
   }
   return map;
@@ -1343,13 +1518,31 @@ async function adoptAndRedispatchLane(
       // trap; the exception must not escape, so a throwing read fails closed
       // as `adopt-failed`.
       let outcome: unknown;
+      let adoptedFields: Record<string, unknown> | null = null;
       try {
         outcome = own(adoptResult, 'outcome');
+        // Fix-round item 2: an `adopted` outcome is trusted only once every
+        // required result field is present as an own data property; the ids
+        // are then matched against the input below, outside the try.
+        if (outcome === 'adopted') adoptedFields = readAdoptedResult(adoptResult);
       } catch {
         return refusedLane('adopt-failed', lane.laneId);
       }
       if (outcome === 'budget-exhausted') return refusal('budget-exhausted');
       if (outcome === 'adopted') {
+        if (
+          adoptedFields === null ||
+          adoptedFields['workOrderId'] !== adoptInput.workOrder.workOrderId ||
+          adoptedFields['attemptId'] !== adoptInput.attempt.attemptId ||
+          adoptedFields['runId'] !== adoptInput.run.runId ||
+          adoptedFields['briefDigest'] !== adoptInput.brief.expectedBriefDigest ||
+          adoptedFields['commitOid'] !== source.commitOid
+        ) {
+          // A port answer claiming `adopted` without the full result or with
+          // ids that do not match the input must not journal redispatch or
+          // hand the lane to the conductor.
+          return refusedLane('adopt-failed', lane.laneId);
+        }
         // An `absent` adopt occupies a run from this wave on; a `partial`
         // resume was already counted by the preflight.
         if (adoptStatus === 'absent') ctx.counts.handedOffNotIdle += 1;

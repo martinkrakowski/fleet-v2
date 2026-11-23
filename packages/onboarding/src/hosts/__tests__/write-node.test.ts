@@ -227,7 +227,7 @@ describe("readInstallationFile", () => {
   it("returns unreadable with ERR_INVALID_ARG_TYPE for invalid path inputs", async () => {
     const dir = await tempDir();
     try {
-      const hostile: unknown[] = [null, undefined, 123];
+      const hostile: unknown[] = [null, undefined, 123, { length: 3 }];
       for (const input of hostile) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const read = await readInstallationFile(input as any);
@@ -270,9 +270,11 @@ describe("readInstallationFile", () => {
         proxy as any,
       );
       expect(proxyResult.status).toBe("unreadable");
-      expect(getterRead === false || getterResult.status === "unreadable").toBe(
-        true,
-      );
+      // The path getter stays unread: node refuses a non-string, non-Buffer,
+      // non-URL path by type before any coercion, so the getter must never
+      // have run (a getter that ran would resolve a path, which is what this
+      // guard exists to refuse).
+      expect(getterRead).toBe(false);
     } finally {
       await remove(dir);
     }

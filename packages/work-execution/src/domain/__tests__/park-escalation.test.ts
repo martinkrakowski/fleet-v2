@@ -37,13 +37,14 @@ describe('decideParkEscalation', () => {
   });
 
   it('exposes the closed mode and stay-reason sets and the history cap', () => {
-    expect(PARK_ESCALATION_MODES).toEqual(['commit-pending']);
+    expect(PARK_ESCALATION_MODES).toEqual(['commit-pending', 'recollect']);
     expect(PARK_ESCALATION_STAY_REASONS).toEqual([
       'malformed-parked-record',
       'malformed-history',
       'history-too-long',
       'missing-dirty-worktree-fact',
       'malformed-dirty-worktree-fact',
+      'malformed-head-fact',
       'worktree-clean',
       'park-reason-not-escalatable',
       'already-escalated',
@@ -309,5 +310,101 @@ describe('decideParkEscalation', () => {
         getPrototypeOf() { throw new Error('boom'); },
       }), [], DIRTY),
     ).toEqual({ kind: 'stay-parked', reason: 'malformed-parked-record' });
+  });
+
+  it('escalates recollect when headAdvanced is true, winning over a dirty or absent worktree fact', () => {
+    expect(decideParkEscalation(PARKED_FIX, [], DIRTY, { headAdvanced: true })).toEqual({ kind: 'escalate', mode: 'recollect' });
+    // A dirty worktree loses to the advanced head; a missing dirty fact too.
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 3 }, { headAdvanced: true })).toEqual({ kind: 'escalate', mode: 'recollect' });
+    expect(decideParkEscalation(PARKED_FIX, [], undefined, { headAdvanced: true })).toEqual({ kind: 'escalate', mode: 'recollect' });
+    expect(decideParkEscalation(PARKED_FIX, [], null, { headAdvanced: true })).toEqual({ kind: 'escalate', mode: 'recollect' });
+  });
+
+  it('returns worktree-clean when headAdvanced is false and trackedFilesChanged is zero', () => {
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0 }, { headAdvanced: false })).toEqual({
+      kind: 'stay-parked',
+      reason: 'worktree-clean',
+    });
+  });
+
+  it('behaves identically for three-argument calls as before the head fact existed', () => {
+    expect(decideParkEscalation(PARKED_FIX, [historyEntry()], DIRTY)).toEqual({ kind: 'escalate', mode: 'commit-pending' });
+    expect(decideParkEscalation(PARKED_FIX, [])).toEqual({ kind: 'stay-parked', reason: 'missing-dirty-worktree-fact' });
+    expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'commit-pending' }], DIRTY)).toEqual({
+      kind: 'stay-parked',
+      reason: 'already-escalated',
+    });
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0 })).toEqual({ kind: 'stay-parked', reason: 'worktree-clean' });
+  });
+
+  it('enforces once-per-run per mode so recollect and commit-pending do not block each other', () => {
+    // A recollect marker blocks a second recollect...
+    expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'recollect' }], DIRTY, { headAdvanced: true })).toEqual({
+      kind: 'stay-parked',
+      reason: 'already-escalated',
+    });
+    expect(decideParkEscalation(PARKED_FIX, [{ mode: 'recollect' }], DIRTY, { headAdvanced: true })).toEqual({
+      kind: 'stay-parked',
+      reason: 'already-escalated',
+    });
+    // ...but not a commit-pending escalation on the unadvanced head.
+    expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'recollect' }], DIRTY, { headAdvanced: false })).toEqual({
+      kind: 'escalate',
+      mode: 'commit-pending',
+    });
+    // A commit-pending marker blocks a second commit-pending...
+    expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'commit-pending' }], DIRTY, { headAdvanced: false })).toEqual({
+      kind: 'stay-parked',
+      reason: 'already-escalated',
+    });
+    // ...but not a recollect escalation on the advanced head.
+    expect(decideParkEscalation(PARKED_FIX, [{ reasonCode: 'park-escalated', detail: 'commit-pending' }], DIRTY, { headAdvanced: true })).toEqual({
+      kind: 'escalate',
+      mode: 'recollect',
+    });
+  });
+
+  it('returns malformed-head-fact for wrong primitive types, wrong keys, getters, proto keys, and hostile Proxies', () => {
+    const malformed = { kind: 'stay-parked', reason: 'malformed-head-fact' };
+    // missing key, extra key, wrong primitives, null value, array, non-plain
+    for (const headFact of [
+      {},
+      { headAdvanced: true, extra: 1 },
+      { headAdvanced: 'true' },
+      { headAdvanced: 1 },
+      { headAdvanced: null },
+      [],
+      [true],
+      7,
+      'head',
+      true,
+      Object.create(null),
+    ]) {
+      expect(decideParkEscalation(PARKED_FIX, [], DIRTY, headFact)).toEqual(malformed);
+    }
+
+    // A throwing enumerable getter is never invoked: the copied value is undefined, refused as malformed.
+    const throwing: Record<string, unknown> = {};
+    Object.defineProperty(throwing, 'headAdvanced', { enumerable: true, get() { throw new Error('boom'); } });
+    expect(decideParkEscalation(PARKED_FIX, [], DIRTY, throwing)).toEqual(malformed);
+
+    // A prototype-polluting own `__proto__` key is refused and Object.prototype stays unpolluted.
+    const parsed = JSON.parse('{"__proto__": {"polluted": true}, "headAdvanced": true}') as Record<string, unknown>;
+    expect(decideParkEscalation(PARKED_FIX, [], DIRTY, parsed)).toEqual(malformed);
+    const defined: Record<string, unknown> = {};
+    Object.defineProperty(defined, '__proto__', { enumerable: true, value: { polluted: true } });
+    Object.defineProperty(defined, 'headAdvanced', { enumerable: true, value: true });
+    expect(decideParkEscalation(PARKED_FIX, [], DIRTY, defined)).toEqual(malformed);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+    // A Proxy with a non-plain prototype is refused via the shared reader's one unavoidable trap.
+    const traps: string[] = [];
+    expect(
+      decideParkEscalation(PARKED_FIX, [], DIRTY, new Proxy({ headAdvanced: true }, {
+        getPrototypeOf() { traps.push('getPrototypeOf'); return Array.prototype; },
+        get(t, k) { traps.push('get'); return Reflect.get(t, k); },
+      })),
+    ).toEqual(malformed);
+    expect(traps).toEqual(['getPrototypeOf']);
   });
 });

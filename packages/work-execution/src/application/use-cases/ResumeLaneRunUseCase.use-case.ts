@@ -33,7 +33,7 @@ import {
   planGateFailedRetry,
 } from '../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../domain/lane-run-step-facts.js';
-import { checkLaneRunResume } from '../../domain/lane-run-transitions.js';
+import { checkLaneRunResume, checkParkEscalation } from '../../domain/lane-run-transitions.js';
 import type { RunStopMode } from '../../domain/lane-run-transitions.js';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
@@ -49,6 +49,8 @@ import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.o
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ForgeReadPort, PullRequestSnapshot } from '../ports/out/ForgeReadPort.out-port.js';
+import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
 
 export interface ResumeLaneRunDependencies {
   readonly runRepo: Pick<LaneRunRepositoryPort, 'get' | 'save'>;
@@ -59,6 +61,13 @@ export interface ResumeLaneRunDependencies {
   readonly forgeRead?: ForgeReadPort;
   /** R4a: the attempt records the branch fallback and the lane head read from. */
   readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById'>;
+  /**
+   * CE1/CE3: the worktree reader the `fix-no-progress` escalation re-reads the
+   * dirty-worktree and head facts from. Absent (or an attempt without a
+   * recorded host) reads no fact, and the escalation refuses without
+   * escalating (fail closed: a park is never left on a guess).
+   */
+  readonly worktreeInspect?: Pick<WorkspacePort, 'inspectWorktree'>;
 }
 
 interface ResumeFacts {
@@ -327,7 +336,13 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       expectedRevision: expected,
     });
     if (!check.ok) {
-      return { outcome: 'refused', reason: check.reason };
+      // CE1/CE3: a `fix-no-progress` park is not owner-resumable, but the
+      // conductor re-decides it at apply time from fresh worktree facts
+      // (`checkParkEscalation`). The resume intent is still recorded, so the
+      // driver can apply that decision; every other refusal is final here.
+      if (check.reason !== 'fix-no-progress') {
+        return { outcome: 'refused', reason: check.reason };
+      }
     }
 
     // GU2: a run parked from `gating` whose gate already failed past the retry
@@ -347,7 +362,14 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     const appended = await this.deps.runJournal.append(this.resumeIntentEntry(snapshot, key, expected));
     if (appended.outcome === 'appended') {
-      return { outcome: 'resume-recorded', runId, to: check.to, key };
+      // A `fix-no-progress` park's target is decided at apply time by the
+      // escalation check, so `to` is still unknown here and reads null.
+      return {
+        outcome: 'resume-recorded',
+        runId,
+        to: check.ok ? check.to : null,
+        key,
+      };
     }
     if (appended.reason === 'duplicate-key') {
       return { outcome: 'already-requested', runId, key };
@@ -572,6 +594,11 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       expectedRevision: first.expectedRevision ?? record.revision,
     });
     if (!check.ok) {
+      // CE1/CE3: a `fix-no-progress` park is decided here, at apply time,
+      // from the fresh worktree facts; every other refusal is final.
+      if (check.reason === 'fix-no-progress') {
+        return this.escalateParkedFixRound(record, pending, facts, snapshot);
+      }
       await this.appendResult(runId, first.key as string, 'refused', check.reason, nowIso);
       return { outcome: 'refused', key: first.key, reason: check.reason };
     }
@@ -617,6 +644,153 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     await this.refuseRemainingPendingResumes(runId, pending, nowIso);
     return { outcome: 'resumed', to: check.to, key: firstKey };
+  }
+
+  /**
+   * CE1/CE3: the apply-time decision for a `fix-no-progress` park. The worktree
+   * facts are re-read from the latest attempt's worktree through the
+   * `worktreeInspect` port, and `checkParkEscalation` — which follows
+   * `checkLaneRunResume`'s exact check order — decides: a dirty worktree
+   * escalates `commit-pending` into `fixing`, an advanced head escalates
+   * `recollect` into `collecting`, anything else refuses with its typed stay
+   * reason and the run stays parked. The escalation follows the same write
+   * order as a resume (conduct, save, then result), so a crash between the
+   * writes is repaired the same way. `pending[0]` is the winning resume intent
+   * `conductAndSaveResume` was called with.
+   */
+  private async escalateParkedFixRound(
+    record: LaneRunRecord,
+    pending: readonly LaneRunJournalEntryRecord[],
+    facts: ResumeFacts,
+    snapshot: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
+    const { runId, lease, nowIso } = snapshot;
+    const { holderId, fence } = lease;
+    const first = pending[0];
+    const firstKey = first.key as string;
+    const worktreeFacts = await this.worktreeEscalationFacts(record);
+    const check = checkParkEscalation({
+      record,
+      state: facts.state,
+      stopMode: facts.stopMode,
+      expectedRevision: first.expectedRevision ?? record.revision,
+      history: facts.entries,
+      dirtyWorktree: worktreeFacts.dirtyWorktree,
+      headFact: worktreeFacts.headFact,
+    });
+    if (!check.ok) {
+      // The journal's reasonCode union is fixed: the refusal stays
+      // `fix-no-progress` and the typed stay reason travels in the detail.
+      const appended = await this.appendResult(runId, firstKey, 'refused', 'fix-no-progress', nowIso, check.reason);
+      if (!appended) {
+        return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+      }
+      return { outcome: 'refused', key: firstKey, reason: check.reason };
+    }
+    if (!(await this.abandonAmbiguousPendingIntent(runId, facts.pendingIntent, nowIso))) {
+      return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+    }
+    const conduct = await this.deps.runJournal.append(
+      laneRunConductEntry(this.deps.newUlid(), runId, check.to, nowIso),
+    );
+    if (conduct.outcome !== 'appended') {
+      return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+    }
+    const saved = await this.deps.runRepo.save(
+      { ...record, parked: null, revision: record.revision + 1 },
+      { holderId, fence, nowIso },
+    );
+    if (saved.outcome !== 'saved') {
+      // The conduct stays; K4-4a's park-exit repair completes the exit.
+      return { outcome: 'refused', key: firstKey, reason: 'save-refused' };
+    }
+    const appended = await this.appendResult(runId, firstKey, 'completed', 'park-escalated', nowIso, check.journalDetail);
+    if (!appended) {
+      return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+    }
+    await this.refuseRemainingPendingResumes(runId, pending, nowIso);
+    return { outcome: 'resumed', to: check.to, key: firstKey };
+  }
+
+  /**
+   * CE1/CE3: the escalation facts of the run's latest attempt, read through
+   * the `worktreeInspect` port under the attempt's recorded host (Q2a-2: a
+   * missing host is never read through the local executor). `dirtyWorktree`
+   * counts the inspected uncommitted and untracked paths; `headAdvanced`
+   * compares the inspected `HEAD` with the attempt's collected head, never
+   * counting a worktree reset back to the attempt's base as an advance.
+   * Fail closed: an unwired port or repo, no attempt, a throwing read, a
+   * non-object answer or a non-array path list yields no fact at all, and the
+   * escalation then refuses (a missing fact never escalates).
+   */
+  private async worktreeEscalationFacts(record: LaneRunRecord): Promise<{
+    readonly dirtyWorktree?: { readonly trackedFilesChanged: number };
+    readonly headFact?: { readonly headAdvanced: boolean };
+  }> {
+    const port = this.deps.worktreeInspect;
+    const attemptRepo = this.deps.attemptRepo;
+    if (port?.inspectWorktree === undefined || attemptRepo === undefined) {
+      return {};
+    }
+    const latestId = record.attemptIds[record.attemptIds.length - 1];
+    if (latestId === undefined) {
+      return {};
+    }
+    let attempt: AttemptRecord | null;
+    try {
+      attempt = await attemptRepo.findAttemptById(latestId);
+    } catch {
+      return {};
+    }
+    if (attempt === null) {
+      return {};
+    }
+    const recordedHost = conductedRunnerOf(attempt);
+    if (recordedHost === null) {
+      return {};
+    }
+    let inspection: unknown;
+    try {
+      inspection = await port.inspectWorktree({
+        worktreePath: attempt.worktreePath,
+        baseCommit: attempt.baseCommit,
+        expectedArtifactPaths: [],
+        recordedHost,
+      });
+    } catch {
+      return {};
+    }
+    if (typeof inspection !== 'object' || inspection === null) {
+      return {};
+    }
+    // The inspection result is externally shaped: a Proxy or a throwing
+    // getter on any read property must fail closed (no fact at all, so the
+    // escalation refuses), never escape this use case.
+    try {
+      const read = inspection as {
+        checkedOutCommit?: unknown;
+        uncommittedPaths?: unknown;
+        untrackedPaths?: unknown;
+      };
+      const facts: {
+        dirtyWorktree?: { readonly trackedFilesChanged: number };
+        headFact?: { readonly headAdvanced: boolean };
+      } = {};
+      if (Array.isArray(read.uncommittedPaths) && Array.isArray(read.untrackedPaths)) {
+        facts.dirtyWorktree = {
+          trackedFilesChanged: read.uncommittedPaths.length + read.untrackedPaths.length,
+        };
+      }
+      const collectedHead = attempt.artifacts?.headCommit;
+      if (typeof collectedHead === 'string' && typeof read.checkedOutCommit === 'string') {
+        facts.headFact = {
+          headAdvanced: read.checkedOutCommit !== collectedHead && read.checkedOutCommit !== attempt.baseCommit,
+        };
+      }
+      return facts;
+    } catch {
+      return {};
+    }
   }
 
   /**

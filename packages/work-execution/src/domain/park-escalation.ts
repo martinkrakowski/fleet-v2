@@ -13,8 +13,8 @@ import { PARK_FINDINGS_MAX_COUNT } from './park-findings-view.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from './plain-record-reads.js';
 import { isPlainRecordObject } from './record-schema-version.js';
 
-/** The escalation modes of the first slice; later slices add more (CE3). */
-export const PARK_ESCALATION_MODES = ['commit-pending'] as const;
+/** The escalation modes: a fix round of a pending commit, or a re-collect of an advanced head. */
+export const PARK_ESCALATION_MODES = ['commit-pending', 'recollect'] as const;
 export type ParkEscalationMode = (typeof PARK_ESCALATION_MODES)[number];
 
 /** Cost bound on the history scan: a longer history is refused, never scanned. */
@@ -25,6 +25,11 @@ export interface DirtyWorktreeFact {
   readonly trackedFilesChanged: number;
 }
 
+/** The observed fact that the worktree's HEAD has moved since the collect. */
+export interface HeadFact {
+  readonly headAdvanced: boolean;
+}
+
 /** Why the run stays parked instead of escalating. */
 export const PARK_ESCALATION_STAY_REASONS = [
   'malformed-parked-record',
@@ -32,6 +37,7 @@ export const PARK_ESCALATION_STAY_REASONS = [
   'history-too-long',
   'missing-dirty-worktree-fact',
   'malformed-dirty-worktree-fact',
+  'malformed-head-fact',
   'worktree-clean',
   'park-reason-not-escalatable',
   'already-escalated',
@@ -45,6 +51,7 @@ export type ParkEscalationDecision =
 const STAY_MALFORMED_PARKED: ParkEscalationDecision = { kind: 'stay-parked', reason: 'malformed-parked-record' };
 const STAY_MALFORMED_HISTORY: ParkEscalationDecision = { kind: 'stay-parked', reason: 'malformed-history' };
 const STAY_MALFORMED_DIRTY: ParkEscalationDecision = { kind: 'stay-parked', reason: 'malformed-dirty-worktree-fact' };
+const STAY_MALFORMED_HEAD: ParkEscalationDecision = { kind: 'stay-parked', reason: 'malformed-head-fact' };
 
 /**
  * Reads findings[i] only through its own property descriptor: a hole or an
@@ -80,13 +87,24 @@ function validateFindingsShape(findings: unknown): boolean {
 }
 
 /**
- * The pure park-escalation decision (CE1). Checks in this order: the parked
- * record's shape and `reason`, then the run's journal history (an earlier
- * `commit-pending` escalation is final — once per run), then the observed
- * dirty-worktree fact. `fix-no-progress` is the only escalatable park reason.
+ * Whether the history already carries the escalation marker of `mode`, either
+ * as the `park-escalated` result's detail (the journal shape) or as a direct
+ * `mode` key (the fact shape). Fixed-key reads on already-validated snapshots.
+ */
+function hasEscalatedMode(snapshots: readonly Record<string, unknown>[], mode: ParkEscalationMode): boolean {
+  return snapshots.some((snapshot) => (snapshot.reasonCode === 'park-escalated' && snapshot.detail === mode) || snapshot.mode === mode);
+}
+
+/**
+ * The pure park-escalation decision (CE1/CE3). Checks in this order: the parked
+ * record's shape and `reason`, then the run's journal history (each escalation
+ * mode is final — once per run per mode), then the observed facts: an advanced
+ * head escalates with mode `recollect` regardless of the worktree state;
+ * otherwise the dirty-worktree fact decides a `commit-pending` fix round.
+ * `fix-no-progress` is the only escalatable park reason.
  * Total: any throw (a hostile Proxy trap) reads as `malformed-parked-record`.
  */
-export function decideParkEscalation(parked: unknown, history: unknown, dirtyWorktree?: unknown): ParkEscalationDecision {
+export function decideParkEscalation(parked: unknown, history: unknown, dirtyWorktree?: unknown, headFact?: unknown): ParkEscalationDecision {
   try {
     const parkedRecord = readPlainRecordWithOptionalKeys(
       parked,
@@ -134,7 +152,19 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
       }
       snapshots.push(snapshot);
     }
-    if (snapshots.some((snapshot) => (snapshot.reasonCode === 'park-escalated' && snapshot.detail === 'commit-pending') || snapshot.mode === 'commit-pending')) {
+    if (headFact !== undefined && headFact !== null) {
+      const head = readExactPlainRecord(headFact, ['headAdvanced']);
+      if (head === null || typeof head.headAdvanced !== 'boolean') {
+        return STAY_MALFORMED_HEAD;
+      }
+      if (head.headAdvanced === true) {
+        if (hasEscalatedMode(snapshots, 'recollect')) {
+          return { kind: 'stay-parked', reason: 'already-escalated' };
+        }
+        return { kind: 'escalate', mode: 'recollect' };
+      }
+    }
+    if (hasEscalatedMode(snapshots, 'commit-pending')) {
       return { kind: 'stay-parked', reason: 'already-escalated' };
     }
     if (dirtyWorktree === undefined || dirtyWorktree === null) {

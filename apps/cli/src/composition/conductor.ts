@@ -428,6 +428,10 @@ export function composeConductor(input: ComposeConductorInput) {
       newUlid: conductorNewUlid,
       forgeRead,
       attemptRepo: attemptRepository,
+      // CE1/CE3: the worktree facts the fix-no-progress escalation re-reads at
+      // apply time (dirty worktree, advanced head) come from the same
+      // workspace port the advance pass inspects through.
+      worktreeInspect: workspace,
     }),
     // EX-2b: the operator-opt-in worktree reap, built beside the lane-run
     // stores it scans and the execution stores it journals to. C2': the

@@ -778,4 +778,93 @@ describe('park escalation (CE1)', () => {
       }),
     ).toEqual({ ok: false, reason: 'history-too-long' });
   });
+
+  it('escalates recollect via headFact and enters collecting, and the guard allows parked -> collecting only for recollect', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [],
+        dirtyWorktree: DIRTY, headFact: { headAdvanced: true },
+      }),
+    ).toEqual({ ok: true, to: 'collecting', mode: 'recollect', journalReasonCode: 'park-escalated', journalDetail: 'recollect' });
+    // The head fact wins over the dirty worktree even when the worktree is dirty.
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [],
+        dirtyWorktree: { trackedFilesChanged: 3 }, headFact: { headAdvanced: true },
+      }),
+    ).toEqual({ ok: true, to: 'collecting', mode: 'recollect', journalReasonCode: 'park-escalated', journalDetail: 'recollect' });
+    // The recollect guard: parked -> collecting is open only for 'recollect'.
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, 'recollect')).toBe(true);
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, undefined)).toBe(false);
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, false)).toBe(false);
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, true)).toBe(false);
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, 'commit-pending')).toBe(false);
+    // The recollect mode does not open the fixing entry from parked.
+    expect(canEnterLaneRunState('parked', 'fixing', null, false, undefined, 'recollect')).toBe(false);
+    // The recollect exception opens nothing else and nothing from a non-parked state.
+    expect(canEnterLaneRunState('parked', 'gating', null, false, undefined, 'recollect')).toBe(false);
+  });
+
+  it('keeps true meaning commit-pending for the fixing entry while commit-pending cannot enter collecting', () => {
+    expect(canEnterLaneRunState('parked', 'fixing', null, false, undefined, true)).toBe(true);
+    expect(canEnterLaneRunState('parked', 'fixing', null, false, undefined, 'commit-pending')).toBe(true);
+    expect(canEnterLaneRunState('parked', 'collecting', null, false, undefined, 'commit-pending')).toBe(false);
+  });
+
+  it('propagates malformed-head-fact from checkParkEscalation', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    for (const headFact of [{}, { headAdvanced: 1 }, { headAdvanced: true, extra: 1 }, [], 7]) {
+      expect(
+        checkParkEscalation({
+          record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [],
+          dirtyWorktree: DIRTY, headFact,
+        }),
+      ).toEqual({ ok: false, reason: 'malformed-head-fact' });
+    }
+    // An absent head fact keeps the CE1 behaviour.
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision, history: [], dirtyWorktree: DIRTY,
+      }),
+    ).toEqual({ ok: true, to: 'fixing', mode: 'commit-pending', journalReasonCode: 'park-escalated', journalDetail: 'commit-pending' });
+  });
+
+  it('refuses recollect escalation with stop-pending, stale-revision, and one-way-door just like commit-pending', () => {
+    const rec = record({ parked: PARKED_FIX_NO_PROGRESS, parkCount: 1 });
+    const headFact = { headAdvanced: true };
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'stopped', stopMode: null, expectedRevision: rec.revision, history: [], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'run-stopped' });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision + 1, history: [], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'stale-revision' });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: 'graceful', expectedRevision: rec.revision, history: [], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'stop-pending' });
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'running', stopMode: null, expectedRevision: rec.revision, history: [], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'not-parked' });
+    const oneway = record({ parked: PARKED_ONE_WAY, parkCount: 1 });
+    expect(
+      checkParkEscalation({
+        record: oneway, state: 'parked', stopMode: null, expectedRevision: oneway.revision, history: [], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'one-way-door' });
+    // A recollect marker in the history refuses the second escalation.
+    expect(
+      checkParkEscalation({
+        record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision,
+        history: [{ reasonCode: 'park-escalated', detail: 'recollect' }], headFact,
+      }),
+    ).toEqual({ ok: false, reason: 'already-escalated' });
+  });
 });

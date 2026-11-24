@@ -12,12 +12,14 @@ import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { laneRunConductEntry, laneRunGateFact, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
+
 import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { AttemptRecord } from '../../../domain/execution-records.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
@@ -1150,5 +1152,310 @@ describe('ResumeLaneRunUseCase GU2 bounded gate retry', () => {
       await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
     ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
     expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
+  });
+});
+
+describe('ResumeLaneRunUseCase CE1/CE3 park escalation', () => {
+  const ENTRY_6 = '01JB0000000000000000000006';
+  const ENTRY_7 = '01JB0000000000000000000007';
+  const ENTRY_8 = '01JB0000000000000000000008';
+  const HEAD_COLLECTED = 'a'.repeat(40);
+  const HEAD_ADVANCED = 'b'.repeat(40);
+  const HEAD_BASE = 'c'.repeat(40);
+
+  const FIX_PARK: LaneRunParkRecord = {
+    reason: 'fix-no-progress',
+    qualifier: null,
+    parkedFrom: 'fixing',
+    questionId: null,
+  };
+
+  function fixAttemptRecord(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+    return {
+      id: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      kind: 'fix',
+      fixNumber: 1,
+      priorAttemptId: null,
+      worktreePath: '/wt/example',
+      baseCommit: HEAD_BASE,
+      state: 'collected',
+      outcome: null,
+      briefDigest: null,
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+      artifacts: {
+        headCommit: HEAD_COLLECTED,
+        commitsSinceBase: [HEAD_COLLECTED],
+        collectedArtifactPaths: [],
+        notes: 'present',
+      },
+      runner: {
+        kind: 'agy',
+        remotePort: null,
+        host: null,
+        hostName: 'lane-host',
+        agent: null,
+        model: null,
+        variant: null,
+      },
+      ...overrides,
+    };
+  }
+
+  interface EscalationFixture extends Fixture {
+    inspection: {
+      uncommittedPaths: string[];
+      untrackedPaths: string[];
+      checkedOutCommit: string;
+      worktreePath: string;
+      matchesBaseCommit: boolean;
+      residueFromEarlierAttempts: string[];
+      missingExpectedArtifacts: string[];
+    };
+  }
+
+  /** A full `WorktreeInspection` fixture; the test only varies its paths and head. */
+  function inspectionOf(inspection: { uncommittedPaths: string[]; untrackedPaths: string[]; checkedOutCommit: string }) {
+    return {
+      worktreePath: '/wt/example',
+      matchesBaseCommit: false,
+      residueFromEarlierAttempts: [],
+      missingExpectedArtifacts: [],
+      ...inspection,
+    };
+  }
+
+  /** A run parked `fix-no-progress` (parkedFrom `fixing`) whose latest attempt carries a collected head. */
+  async function seededFixPark(): Promise<EscalationFixture> {
+    const fx = await seededParked(FIX_PARK);
+    const attempt = fixAttemptRecord();
+    const inspection = inspectionOf({ uncommittedPaths: [], untrackedPaths: [], checkedOutCommit: HEAD_COLLECTED });
+    const worktreeInspect = {
+      inspectWorktree: async () => inspection,
+    };
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => attempt },
+      worktreeInspect,
+    });
+    return { ...fx, resume, inspection };
+  }
+
+  it('records a resume intent for a fix-no-progress park with to null: the target is decided at apply time', async () => {
+    const fx = await seededFixPark();
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toEqual({ outcome: 'resume-recorded', runId: RUN_ID, to: null, key: RESUME_CLI_KEY });
+  });
+
+  it('a dirty worktree escalates commit-pending: the run enters fixing, the park is cleared, the result names the mode', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.uncommittedPaths = ['/wt/example/src/changed.ts'];
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'fixing', key: RESUME_CLI_KEY });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    expect(entries[entries.length - 2]).toMatchObject({ kind: 'conduct', state: 'fixing' });
+    expect(entries[entries.length - 1]).toMatchObject({
+      kind: 'result',
+      key: RESUME_CLI_KEY,
+      outcome: 'completed',
+      reasonCode: 'park-escalated',
+      detail: 'commit-pending',
+    });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    expect(record?.revision).toBe(3);
+  });
+
+  it('an advanced head escalates recollect: the run enters collecting even though the worktree is clean', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.checkedOutCommit = HEAD_ADVANCED;
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'collecting', key: RESUME_CLI_KEY });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    expect(entries[entries.length - 2]).toMatchObject({ kind: 'conduct', state: 'collecting' });
+    expect(entries[entries.length - 1]).toMatchObject({
+      kind: 'result',
+      key: RESUME_CLI_KEY,
+      outcome: 'completed',
+      reasonCode: 'park-escalated',
+      detail: 'recollect',
+    });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+  });
+
+  it('a worktree reset back to the attempt base is not an advanced head: a clean tree stays parked as worktree-clean', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.checkedOutCommit = HEAD_BASE;
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'worktree-clean' });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    expect(entries[entries.length - 1]).toMatchObject({
+      kind: 'result',
+      key: RESUME_CLI_KEY,
+      outcome: 'refused',
+      reasonCode: 'fix-no-progress',
+      detail: 'worktree-clean',
+    });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+    expect(record?.revision).toBe(2);
+  });
+
+  it('an unreadable worktree reads no fact and refuses without escalating (missing-dirty-worktree-fact)', async () => {
+    const fx = await seededFixPark();
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => fixAttemptRecord() },
+      worktreeInspect: {
+        inspectWorktree: async () => {
+          throw new Error('unreadable');
+        },
+      },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'missing-dirty-worktree-fact' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
+  it('a throwing getter on the inspection result reads no fact and refuses without escalating (fail closed, no escape)', async () => {
+    const fx = await seededFixPark();
+    const hostile = new Proxy(inspectionOf({ uncommittedPaths: [], untrackedPaths: [], checkedOutCommit: HEAD_ADVANCED }), {
+      get(target, prop) {
+        if (prop === 'uncommittedPaths') {
+          throw new Error('hostile getter');
+        }
+        return Reflect.get(target, prop);
+      },
+    });
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => fixAttemptRecord() },
+      worktreeInspect: {
+        inspectWorktree: async () => hostile,
+      },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'missing-dirty-worktree-fact' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
+  it('an unwired worktreeInspect port refuses without escalating; a hostless attempt is never read', async () => {
+    const unwired = await seededFixPark();
+    const noPort = new ResumeLaneRunUseCase({
+      runRepo: unwired.repo,
+      runJournal: unwired.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => fixAttemptRecord() },
+    });
+    await noPort.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await noPort.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'missing-dirty-worktree-fact' });
+
+    const hostless = await seededFixPark();
+    const legacyAttempt = fixAttemptRecord({ runner: null });
+    let reads = 0;
+    const noHost = new ResumeLaneRunUseCase({
+      runRepo: hostless.repo,
+      runJournal: hostless.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => legacyAttempt },
+      worktreeInspect: {
+        inspectWorktree: async () => {
+          reads += 1;
+          return hostless.inspection;
+        },
+      },
+    });
+    await noHost.requestResume({ runId: RUN_ID, via: 'web', entryId: ENTRY_2, nowIso: NOW });
+    expect(
+      await noHost.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_WEB_KEY, reason: 'missing-dirty-worktree-fact' });
+    expect(reads).toBe(0);
+  });
+
+  it('a stop recorded after the resume request still wins before the escalation is decided', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.uncommittedPaths = ['/wt/example/src/changed.ts'];
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await fx.journal.append({
+        ...laneRunIntentEntry(ENTRY_2, RUN_ID, `${RUN_ID}/stop@cli`, null, LATER),
+        mode: 'graceful',
+        expectedRevision: 2,
+      }),
+    ).toMatchObject({ outcome: 'appended' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stop-pending' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
+  it('an already-escalated park refuses the second escalation with its typed stay reason', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.uncommittedPaths = ['/wt/example/src/changed.ts'];
+    const collectKey = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'collect',
+      seatIndex: 0,
+      head12: null,
+      retry: null,
+      attemptOrdinal: 1,
+    });
+    expect(collectKey.ok).toBe(true);
+    if (!collectKey.ok) {
+      throw new Error('fixture key must build');
+    }
+    expect(
+      await fx.journal.append(
+        laneRunIntentEntry(ENTRY_7, RUN_ID, collectKey.key, null, NOW),
+      ),
+    ).toMatchObject({ outcome: 'appended' });
+    expect(
+      await fx.journal.append(
+        laneRunResultEntry(ENTRY_6, RUN_ID, collectKey.key, 'completed', 'park-escalated', NOW, 'commit-pending'),
+      ),
+    ).toMatchObject({ outcome: 'appended' });
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_8, nowIso: NOW });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'already-escalated' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
   });
 });

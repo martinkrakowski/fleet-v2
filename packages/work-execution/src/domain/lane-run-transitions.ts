@@ -112,7 +112,9 @@ export const LANE_RUN_REVIEWS_IN_FLIGHT = {
  * `open-pr` park whose spent key the resume adopted leaves by itself; the `opening-pr` parkedFrom exit
  * would decide `open-pr` again on its spent key). Otherwise the table, except that `ready → collecting`
  * needs `provenance === 'adopted'` (CO28; `resolveLaneRunProvenance(record)`), and that a
- * `parked → fixing` entry allowed by `checkParkEscalation` is `escalatedPark` (CE1). Unknown strings → false.
+ * `parked → fixing` entry allowed by `checkParkEscalation` is `escalatedPark`
+ * (CE1, `true` meaning `commit-pending`), as is its `parked → collecting` entry
+ * for the `recollect` mode (CE3). Unknown strings → false.
  */
 export function canEnterLaneRunState(
   from: string,
@@ -120,7 +122,7 @@ export function canEnterLaneRunState(
   parkedFrom?: string | null,
   settledOpenPrPark?: boolean,
   provenance?: unknown,
-  escalatedPark?: boolean,
+  escalatedPark?: boolean | ParkEscalationMode,
 ): boolean {
   if (!(LANE_RUN_STATES as readonly string[]).includes(from)) {
     return false;
@@ -157,7 +159,12 @@ export function canEnterLaneRunState(
     }
     // CE1: an escalated `fix-no-progress` park re-enters `fixing` (the fix
     // round of the `commit-pending` escalation) without its parkedFrom.
-    if (to === 'fixing' && escalatedPark === true) {
+    // CE3: a `recollect` escalation re-enters `collecting` instead; `true`
+    // keeps meaning `commit-pending` for existing callers.
+    if (to === 'fixing' && (escalatedPark === true || escalatedPark === 'commit-pending')) {
+      return true;
+    }
+    if (to === 'collecting' && escalatedPark === 'recollect') {
       return true;
     }
     return parkedFrom !== null && parkedFrom !== undefined && to === parkedFrom;
@@ -554,7 +561,7 @@ export type ParkEscalationTransitionRefusal =
 export type ParkEscalationTransitionCheck =
   | {
       readonly ok: true;
-      readonly to: 'fixing';
+      readonly to: 'fixing' | 'collecting';
       readonly mode: ParkEscalationMode;
       readonly journalReasonCode: 'park-escalated';
       readonly journalDetail: ParkEscalationMode;
@@ -568,8 +575,8 @@ export type ParkEscalationTransitionCheck =
  * → stale-revision; stopMode not null → stop-pending; state !== 'parked' or
  * record.parked === null → not-parked; parked.reason `stop-unconfirmed` or
  * `stop-refused` → stop-pending; `one-way-door` → one-way-door — and then
- * defers to `decideParkEscalation` for the park shape, the once-per-run
- * history rule and the dirty-worktree fact. Total: any throw reads as
+ * defers to `decideParkEscalation` for the park shape, the once-per-run-per-mode
+ * history rule, the head fact and the dirty-worktree fact. Total: any throw reads as
  * `malformed-input`; every refusal is a typed value, nothing throws.
  */
 export function checkParkEscalation(input: {
@@ -579,23 +586,25 @@ export function checkParkEscalation(input: {
   readonly expectedRevision: number;
   readonly history: readonly unknown[];
   readonly dirtyWorktree?: unknown;
+  readonly headFact?: unknown;
 }): ParkEscalationTransitionCheck {
   try {
     const snapshot = readPlainRecordWithOptionalKeys(
       input,
       ['record', 'state', 'stopMode', 'expectedRevision', 'history'],
-      ['dirtyWorktree'],
+      ['dirtyWorktree', 'headFact'],
     );
     if (snapshot === null) {
       return { ok: false, reason: 'malformed-input' };
     }
-    const { record, state, stopMode, expectedRevision, history, dirtyWorktree } = snapshot as {
+    const { record, state, stopMode, expectedRevision, history, dirtyWorktree, headFact } = snapshot as {
       record: unknown;
       state: unknown;
       stopMode: unknown;
       expectedRevision: unknown;
       history: unknown;
       dirtyWorktree?: unknown;
+      headFact?: unknown;
     };
     if (!isPlainRecordObject(record)) {
       return { ok: false, reason: 'malformed-input' };
@@ -627,11 +636,12 @@ export function checkParkEscalation(input: {
     if (parkedReason === 'one-way-door') {
       return { ok: false, reason: 'one-way-door' };
     }
-    const decision = decideParkEscalation(parked, history, dirtyWorktree);
+    const decision = decideParkEscalation(parked, history, dirtyWorktree, headFact);
     if (decision.kind === 'stay-parked') {
       return { ok: false, reason: decision.reason };
     }
-    return { ok: true, to: 'fixing', mode: decision.mode, journalReasonCode: 'park-escalated', journalDetail: decision.mode };
+    const to = decision.mode === 'recollect' ? 'collecting' : 'fixing';
+    return { ok: true, to, mode: decision.mode, journalReasonCode: 'park-escalated', journalDetail: decision.mode };
   } catch {
     return { ok: false, reason: 'malformed-input' };
   }

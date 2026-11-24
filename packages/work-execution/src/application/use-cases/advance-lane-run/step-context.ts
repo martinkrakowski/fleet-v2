@@ -17,6 +17,7 @@ import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
+import type { ParkEscalationMode } from '../../../domain/park-escalation.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { workOrderHoldFacts } from '../work-order-hold-facts.js';
 
@@ -69,13 +70,14 @@ export async function performEnter(ctx: AdvanceStepContext,
   from: LaneRunStateValue,
   to: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
+  escalatedPark?: boolean | ParkEscalationMode,
 ): Promise<AdvanceLaneRunResult> {
   const settledOpenPr =
     record.parked !== null &&
     record.parked.reason === 'ambiguous' &&
     record.parked.qualifier === 'open-pr' &&
     record.prNumber !== null;
-  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr, resolveLaneRunProvenance(record))) {
+  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr, resolveLaneRunProvenance(record), escalatedPark)) {
     return { outcome: 'refused', reason: 'illegal-transition' };
   }
   if (to === 'merged' || to === 'stopped') {

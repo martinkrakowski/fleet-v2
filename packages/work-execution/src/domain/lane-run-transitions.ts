@@ -18,7 +18,7 @@ import type {
   LaneRunTier,
   RunStopRefusalKind,
 } from './lane-run-records.js';
-import { RUN_STOP_REFUSAL_KINDS } from './lane-run-records.js';
+import { LANE_RUN_MAX_ROUND, RUN_STOP_REFUSAL_KINDS } from './lane-run-records.js';
 import { LANE_RUN_STATES, LANE_RUN_TERMINAL_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { ImplementerSeatRole } from './value-objects/SeatPlan.vo.js';
@@ -549,6 +549,7 @@ export type ParkEscalationTransitionRefusal =
   | 'not-parked'
   | 'stop-pending'
   | 'one-way-door'
+  | 'round-limit-reached'
   | ParkEscalationStayReason;
 
 export type ParkEscalationTransitionCheck =
@@ -569,8 +570,12 @@ export type ParkEscalationTransitionCheck =
  * record.parked === null → not-parked; parked.reason `stop-unconfirmed` or
  * `stop-refused` → stop-pending; `one-way-door` → one-way-door — and then
  * defers to `decideParkEscalation` for the park shape, the once-per-run
- * history rule and the dirty-worktree fact. Total: any throw reads as
- * `malformed-input`; every refusal is a typed value, nothing throws.
+ * history rule and the dirty-worktree fact. A `fix-no-progress` park whose
+ * `round` is at `LANE_RUN_MAX_ROUND` is `round-limit-reached` before that
+ * decision: conducting to `fixing` would re-park `blocker-after-round-2` and
+ * spend the once-per-run marker. The round is read through its own descriptor.
+ * Total: any throw reads as `malformed-input`; every refusal is a typed value,
+ * nothing throws.
  */
 export function checkParkEscalation(input: {
   readonly record: LaneRunRecord;
@@ -626,6 +631,17 @@ export function checkParkEscalation(input: {
     }
     if (parkedReason === 'one-way-door') {
       return { ok: false, reason: 'one-way-door' };
+    }
+    // Only `fix-no-progress` escalates, so the round cap is checked only then,
+    // after the resume-order refusals and before the park decision.
+    if (parkedReason === 'fix-no-progress') {
+      const round = Object.getOwnPropertyDescriptor(record, 'round')?.value;
+      if (typeof round !== 'number' || !Number.isSafeInteger(round) || round < 0) {
+        return { ok: false, reason: 'malformed-input' };
+      }
+      if (round >= LANE_RUN_MAX_ROUND) {
+        return { ok: false, reason: 'round-limit-reached' };
+      }
     }
     const decision = decideParkEscalation(parked, history, dirtyWorktree);
     if (decision.kind === 'stay-parked') {

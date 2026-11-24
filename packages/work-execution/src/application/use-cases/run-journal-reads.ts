@@ -39,6 +39,8 @@ import type {
 } from '../../domain/lane-run-records.js';
 import { LANE_RUN_STOP_KEY_MODES, parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from '../../domain/lane-run-keys.js';
+import { PARK_ESCALATION_MODES } from '../../domain/park-escalation.js';
+import type { ParkEscalationMode } from '../../domain/park-escalation.js';
 import { LANE_RUN_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
@@ -225,7 +227,7 @@ export interface LaneRunJournalWireEntry {
   readonly runId: string | null;
   readonly recordedAtIso: string;
   readonly isWouldAct: boolean;
-  readonly mode: LaneRunStopKeyMode | null;
+  readonly mode: LaneRunStopKeyMode | ParkEscalationMode | null;
   readonly expectedRevision: number | null;
   readonly mintedId: string | null;
   readonly outcome: LaneRunJournalOutcome | null;
@@ -434,9 +436,28 @@ function validateJournalEntryIdentity(entry: LaneRunJournalEntryRecord): void {
   failIf(typeof entry.recordedAtIso !== 'string', 'bad-timestamp');
 }
 
+/**
+ * A stop mode is accepted on any entry the journal already stored. The
+ * escalation marker is only `commit-pending` on a conduct into `fixing`;
+ * any other mode is `bad-mode` so a projection never treats it as success.
+ */
+function journalModeAccepted(entry: LaneRunJournalEntryRecord): boolean {
+  if (entry.mode === null) {
+    return true;
+  }
+  if ((LANE_RUN_STOP_KEY_MODES as readonly string[]).includes(entry.mode)) {
+    return true;
+  }
+  return (
+    entry.kind === 'conduct' &&
+    entry.state === 'fixing' &&
+    (PARK_ESCALATION_MODES as readonly string[]).includes(entry.mode)
+  );
+}
+
 /** Fail closed on an unknown enum, a wrong-typed text slot or a secret-shaped reason or detail. */
 function validateJournalEntryFacts(entry: LaneRunJournalEntryRecord): void {
-  failIf(entry.mode !== null && !LANE_RUN_STOP_KEY_MODES.includes(entry.mode as LaneRunStopKeyMode), 'bad-mode');
+  failIf(!journalModeAccepted(entry), 'bad-mode');
   failIf(entry.expectedRevision !== null && !Number.isSafeInteger(entry.expectedRevision), 'bad-revision');
   failIf(
     entry.outcome !== null && !LANE_RUN_JOURNAL_OUTCOMES.includes(entry.outcome as LaneRunJournalOutcome),

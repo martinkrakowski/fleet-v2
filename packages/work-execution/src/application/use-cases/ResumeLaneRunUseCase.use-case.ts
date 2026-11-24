@@ -203,6 +203,20 @@ function escalationRefusalCode(reason: ParkEscalationTransitionRefusal): { code:
   return { code: 'fix-no-progress', detail: reason };
 }
 
+/**
+ * The once-per-run escalation marker: a conduct into `fixing` whose mode is
+ * `commit-pending`. It is written on that conduct, before the unpark save, so
+ * a crash after the conduct still leaves the marker in the journal.
+ */
+function escalationConductMarkerPresent(entries: readonly LaneRunJournalEntryRecord[]): boolean {
+  for (const entry of entries) {
+    if (entry.kind === 'conduct' && entry.state === 'fixing' && entry.mode === 'commit-pending') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** GU2: the only park reason a gate-failed park from gating carries (afterLaneRunFailure); every other reason takes the normal resume path. */
 const GATE_RETRY_PARK_REASON = 'blocker-after-round-2';
 
@@ -567,15 +581,26 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     const resumeDetail = await this.prepareResumeDetail(record, record.parked, nowIso);
 
-    if (facts.state === record.parked.parkedFrom) {
+    // A crash after the escalation conduct (state `fixing`, record still
+    // parked from `collecting`) is an exit only when the conduct carries the
+    // marker. The same shape without the marker is not a crash repair.
+    const escalatedCrashExit =
+      record.parked.reason === 'fix-no-progress' &&
+      facts.state === 'fixing' &&
+      escalationConductMarkerPresent(facts.entries);
+    if (facts.state === record.parked.parkedFrom || escalatedCrashExit) {
       return this.finishConductedResumeExit(
         record,
-        record.parked.parkedFrom,
+        escalatedCrashExit ? 'fixing' : record.parked.parkedFrom,
         pending,
         facts,
         resumeDetail,
         snapshot,
       );
+    }
+    if (record.parked.reason === 'fix-no-progress' && facts.state === 'fixing') {
+      await this.appendResult(runId, firstPendingKey, 'refused', 'fix-no-progress', nowIso);
+      return { outcome: 'refused', key: firstPendingKey, reason: 'fix-no-progress' };
     }
 
     // GU2: a bounded operator-driven gate retry for a run parked from `gating`
@@ -683,9 +708,10 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
   /**
    * The conduct landed but the save did not (a crash, or a refused save): the
-   * journal already left the park for its parked-from state while the record
-   * is still parked. Finish that exit here, so the intent is settled as
-   * resumed and never refused as not-parked ahead of the repair.
+   * journal already left the park for its parked-from state, or for `fixing`
+   * when the conduct is the escalation marker, while the record is still
+   * parked. Finish that exit here, so the intent is settled and never refused
+   * as not-parked ahead of the repair. A stop recorded since still wins.
    */
   private async finishConductedResumeExit(
     record: LaneRunRecord,
@@ -805,7 +831,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
 
     const conduct = await this.deps.runJournal.append(
-      laneRunConductEntry(this.deps.newUlid(), runId, resumeTo, nowIso),
+      laneRunConductEntry(this.deps.newUlid(), runId, resumeTo, nowIso, escalationDetail),
     );
     if (conduct.outcome !== 'appended') {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
@@ -820,13 +846,14 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       },
     );
     if (saved.outcome !== 'saved') {
-      // The conduct stays; K4-4a's park-exit repair completes the exit.
+      // The conduct, including an escalation marker, stays. The next apply
+      // finishes that exit.
       return { outcome: 'refused', key: firstKey, reason: 'save-refused' };
     }
 
     if (escalationDetail !== null) {
-      // CE1 (this change): the escalation's own result codes the once-per-run
-      // history scan looks for: `park-escalated` with detail `commit-pending`.
+      // The once-per-run marker is already on the conduct entry. This result
+      // keeps `park-escalated` with detail `commit-pending`.
       if (!(await this.appendResult(runId, firstKey, 'completed', 'park-escalated', nowIso, escalationDetail))) {
         return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
       }

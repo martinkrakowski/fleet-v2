@@ -11,6 +11,7 @@ import {
   classifyUnreadableReviewAnswer,
   extractSingleTrailingJsonFence,
   isSafeRelativeFilePath,
+  scanUntrustedEchoBlocks,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
 import type { UnreadableReviewAnswerLabel } from '../../domain/review-answer-schema.js';
@@ -1026,13 +1027,6 @@ export const MAX_PARSED_FINDINGS = 1000;
 export const MAX_FINDING_LINE_LENGTH = 8192;
 
 /**
- * The untrusted-block markers the prompt wraps lane-written text in. An echoed
- * block (the reviewer repeating the diff or brief it was given) is data, so
- * neither its markers nor its body may ever contribute a finding.
- */
-const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"]*">>>$/;
-
-/**
  * Every line of `text` that is not inside an echoed `<<<UNTRUSTED ...>>>`
  * block (open marker to its matching close, or to EOF when it never closes)
  * or inside a fenced diff block. Linear over the line count; the scan never
@@ -1040,34 +1034,6 @@ const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"
  */
 export function stripUntrustedEchoBlocks(text: string): string {
   return scanUntrustedEchoBlocks(text).stripped;
-}
-
-/**
- * The stripped text plus whether an untrusted block was opened and never
- * closed. An unclosed block is a malformed answer: callers refuse it
- * (no verdict is read) rather than trusting whatever the strip left.
- */
-function scanUntrustedEchoBlocks(text: string): {
-  readonly stripped: string;
-  readonly unclosed: boolean;
-} {
-  const kept: string[] = [];
-  let openNonce: string | null = null;
-  for (const line of text.split(/\r?\n/)) {
-    if (openNonce !== null) {
-      if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
-        openNonce = null;
-      }
-      continue;
-    }
-    const openMatch = UNTRUSTED_OPEN_PATTERN.exec(line.trim());
-    if (openMatch !== null) {
-      openNonce = openMatch[1] ?? null;
-      continue;
-    }
-    kept.push(line);
-  }
-  return { stripped: kept.join('\n'), unclosed: openNonce !== null };
 }
 
 /**

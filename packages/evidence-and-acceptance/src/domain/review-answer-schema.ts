@@ -489,20 +489,20 @@ export const UNREADABLE_REVIEW_ANSWER_LABELS = [
 export type UnreadableReviewAnswerLabel = (typeof UNREADABLE_REVIEW_ANSWER_LABELS)[number];
 
 /**
- * The untrusted-block markers of OcmReviewTransport's `scanUntrustedEchoBlocks`
- * mirrored locally (contexts never import across; this file already mirrors
- * patterns the same way). An echoed `<<<UNTRUSTED ...>>>` block is data: its
- * body never contributes a fence.
+ * The untrusted-block marker the review prompt wraps lane-written text in. An
+ * echoed `<<<UNTRUSTED ...>>>` block is data: its body never contributes a
+ * fence or a finding.
  */
 const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"]*">>>$/;
 
 /**
  * Every line of `text` outside an echoed `<<<UNTRUSTED ...>>>` block, plus
- * whether a block was opened and never closed. Linear over the line count,
- * mirroring the adapter's scan exactly (open marker trimmed, close marker
- * `<<<END UNTRUSTED nonce=<same-nonce>>>`).
+ * whether a block was opened and never closed (an unclosed block is a
+ * malformed answer: callers refuse it). Linear over the line count (open
+ * marker trimmed, close marker `<<<END UNTRUSTED nonce=<same-nonce>>>`); the
+ * one shared scan of the domain classifier and the review transport adapter.
  */
-function scanUntrustedEchoBlocks(
+export function scanUntrustedEchoBlocks(
   text: string,
 ): { readonly stripped: string; readonly unclosed: boolean } {
   const kept: string[] = [];

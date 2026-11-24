@@ -432,6 +432,15 @@ describe('SandboxRunnerAdapter', () => {
     });
 
     it('refuses stopSession for an unknown session without calling driver.destroy', async () => {
+      // Control: the same stop on a started session terminates, so a constant `refused` fails this test.
+      const control = makeAdapter();
+      await expectStarted(control.adapter);
+      const clean = await control.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(clean.outcome).toBe('terminated');
       const { adapter, driver } = makeAdapter();
       const result = await adapter.stopSession({
         attemptId: ATTEMPT_ID,
@@ -775,6 +784,11 @@ describe('SandboxRunnerAdapter', () => {
     });
 
     it('reports unreachable with safe defaults for hostile inspect sessions without driver calls', async () => {
+      // Control: a clean session ref on a started session is reachable, so a constant `unreachable` fails this test.
+      const control = makeAdapter();
+      await expectStarted(control.adapter);
+      const cleanStatus = await control.adapter.inspectSession({ attemptId: ATTEMPT_ID, sessionId: SESSION_ID });
+      expect(cleanStatus.runnerReachable).toBe('reachable');
       const { adapter, driver } = makeAdapter();
       const seen = { read: false };
       const sessions: unknown[] = [

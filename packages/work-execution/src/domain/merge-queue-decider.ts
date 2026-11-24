@@ -64,6 +64,11 @@ export type MergeContextState = (typeof MERGE_CONTEXT_STATES)[number];
 export interface MergeContextFact {
   readonly state: MergeContextState;
   readonly creatorLogin?: string | null;
+  /**
+   * The deciding status's own creation time (the rollup node's `createdAt`).
+   * Absent or null is unobservable: only the shadow retro check reads it.
+   */
+  readonly createdAtIso?: string | null;
 }
 
 export type MergePrFact =
@@ -117,6 +122,12 @@ export interface MergeStepFacts {
   readonly lastForgeOutcome?: MergeLastForgeOutcomeFact | null;
   /** The base branch the forge read the pull request against; absent means unobserved. */
   readonly observedBaseBranch?: unknown;
+  /**
+   * The merge-commit time the forge read observed; null or absent means the
+   * merge time was not observable on that read. Only the shadow retro
+   * check (EV2) reads it.
+   */
+  readonly mergedAtIso?: string | null;
 }
 
 export interface MergeRepoPolicy {
@@ -716,24 +727,63 @@ function classifyContext(
   return 'failed';
 }
 
+/**
+ * Own data value, or `undefined` when the key is absent. An accessor is
+ * refused and never invoked: `[[Get]]` is not used.
+ */
+function readOwnData(record: Record<string, unknown>, key: string): Read<unknown> {
+  const descriptor = Reflect.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    return { ok: false };
+  }
+  return { ok: true, value: descriptor.value };
+}
+
 /** Reads the own enumerable descriptor so a hostile getter never runs. */
 function readContextFact(container: Record<string, unknown>, name: string): Read<MergeContextFact> {
   const descriptor = Reflect.getOwnPropertyDescriptor(container, name);
   if (descriptor === undefined) {
     return { ok: true, value: { state: 'missing' } };
   }
-  if (!descriptor.enumerable || !isPlainObject(descriptor.value)) {
+  if (
+    descriptor.get !== undefined || descriptor.set !== undefined ||
+    !descriptor.enumerable || !isPlainObject(descriptor.value)
+  ) {
     return { ok: false };
   }
   const value = descriptor.value as Record<string, unknown>;
-  if (!isKnownStatus(value.state, MERGE_CONTEXT_STATES)) {
+  const state = readOwnData(value, 'state');
+  if (!state.ok || !isKnownStatus(state.value, MERGE_CONTEXT_STATES)) {
     return { ok: false };
   }
-  const creator = value.creatorLogin;
-  if (creator !== undefined && creator !== null && typeof creator !== 'string') {
+  const creator = readOwnData(value, 'creatorLogin');
+  if (!creator.ok) {
     return { ok: false };
   }
-  return { ok: true, value: { state: value.state as MergeContextState, creatorLogin: creator as string | null | undefined } };
+  if (creator.value !== undefined && creator.value !== null && typeof creator.value !== 'string') {
+    return { ok: false };
+  }
+  // The retro timestamp is optional; a present one must be a zoned instant.
+  // A garbage value, or a getter, fails closed here so no row can read it as
+  // observable. The merge state at merge time stays unobservable.
+  const created = readOwnData(value, 'createdAtIso');
+  if (!created.ok) {
+    return { ok: false };
+  }
+  if (created.value !== undefined && created.value !== null && !isZonedIsoDateTime(created.value)) {
+    return { ok: false };
+  }
+  return {
+    ok: true,
+    value: {
+      state: state.value as MergeContextState,
+      creatorLogin: creator.value as string | null | undefined,
+      createdAtIso: created.value as string | null | undefined,
+    },
+  };
 }
 
 interface ChecksOutcome {
@@ -1150,5 +1200,231 @@ export function decideMergeStep(
     return decideRows(record, validated.value, policy, nowIso);
   } catch {
     return FACTS_INCONSISTENT;
+  }
+}
+
+/**
+ * The facts keys the EV2 retro check reads: an own accessor on any of them
+ * (or on the nested `pr` / `unresolvedThreads` records) is refused before it
+ * could ever run.
+ */
+const RETRO_FACT_KEYS: readonly string[] = [
+  'pr', 'reReadHeadOid', 'contexts', 'unresolvedThreads', 'veto',
+  'mergedAtIso', 'observedBaseBranch',
+];
+
+/** The own keys read inside the nested `pr` record (never a getter run). */
+const RETRO_PR_KEYS: readonly string[] = ['status', 'headOid'];
+
+/** The own keys read inside the nested `unresolvedThreads` record. */
+const RETRO_THREADS_KEYS: readonly string[] = ['status', 'count'];
+
+/** True when the record's own descriptor for the key is an accessor (get or set). */
+function ownsAccessor(raw: Record<string, unknown>, key: string): boolean {
+  const descriptor = Reflect.getOwnPropertyDescriptor(raw, key);
+  return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
+}
+
+/**
+ * EV2: the shadow retro `would-merge` for a head the pass first sees as
+ * already merged. Re-evaluates the live path's decider predicates on the
+ * facts already gathered for that merged head, plus the facts the live path
+ * cannot have observed at all: the merge-commit time and each required
+ * context's own creation time, so the merge state at merge time stays
+ * unobservable and the retro verdict is an estimate, never a record of it.
+ * Fails closed: every hostile input reads as ineligible (`false`), and a
+ * getter is never invoked.
+ *
+ * Cost bound: O(|policy.requiredContexts|) where
+ * `requiredContexts.length <= 32` (enforced by `readRequiredContexts`);
+ * every other check is O(1) (the own-descriptor getter probes are constant
+ * reads, and the timestamp comparisons are two parses per required
+ * context, part of the same linear term).
+ */
+export function isMergedHeadRetroMergeEligible(
+  entry: unknown,
+  facts: unknown,
+  repoPolicy: MergeRepoPolicy | null,
+  nowIso: string,
+): boolean {
+  try {
+    const read = readMergeQueueEntryRecord(entry);
+    if (!read.ok || !isZonedIsoDateTime(nowIso)) {
+      return false;
+    }
+    // The policy is normalized only after its own readable keys are probed
+    // for accessors: a getter on any key `normalizeRepoPolicy` would read
+    // is refused before it could run. An own numeric `length` (array-like)
+    // and a prototype-polluting own key are refused the same way. Cost O(1)
+    // per probed key.
+    if (isPlainObject(repoPolicy)) {
+      const policyRecord = repoPolicy as unknown as Record<string, unknown>;
+      const policyLength = Reflect.getOwnPropertyDescriptor(policyRecord, 'length');
+      if (
+        policyLength !== undefined &&
+        (policyLength.get !== undefined || policyLength.set !== undefined || typeof policyLength.value === 'number')
+      ) {
+        return false;
+      }
+      for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
+        if (Reflect.getOwnPropertyDescriptor(policyRecord, key) !== undefined) {
+          return false;
+        }
+      }
+      for (const key of [
+        'policyRevision', 'shadow', 'unattended', 'updateBranch', 'requiredContexts',
+        'premergePosterLogin', 'updateGraceMinutes', 'macosProcedure', 'maxAttempts',
+        'checksGraceMinutes', 'veto',
+      ] as const) {
+        if (ownsAccessor(policyRecord, key)) {
+          return false;
+        }
+      }
+      // Nested fields the normalizer reads. A getter here would run inside
+      // it; refuse the accessor first. Still O(1).
+      const veto = policyRecord.veto;
+      if (isPlainObject(veto)) {
+        for (const key of ['mode', 'holdConfidence'] as const) {
+          if (ownsAccessor(veto, key)) {
+            return false;
+          }
+        }
+      }
+      const grace = policyRecord.checksGraceMinutes;
+      if (isPlainObject(grace)) {
+        for (const key of ['gate', 'premerge'] as const) {
+          if (ownsAccessor(grace, key)) {
+            return false;
+          }
+        }
+      }
+    }
+    // An accessor anywhere the raw facts touch (the keys the check reads,
+    // plus the nested `pr` / `unresolvedThreads` records that
+    // `validateFacts` itself would read) is refused BEFORE the facts are
+    // validated, so no getter is ever invoked. isPlainObject reads only the
+    // prototype, never a property.
+    if (isPlainObject(facts)) {
+      const rawRecord = facts as Record<string, unknown>;
+      for (const key of RETRO_FACT_KEYS) {
+        if (ownsAccessor(rawRecord, key)) {
+          return false;
+        }
+      }
+      const rawPr = rawRecord.pr;
+      if (isPlainObject(rawPr)) {
+        for (const key of RETRO_PR_KEYS) {
+          if (ownsAccessor(rawPr, key)) {
+            return false;
+          }
+        }
+      }
+      const rawThreads = rawRecord.unresolvedThreads;
+      if (isPlainObject(rawThreads)) {
+        for (const key of RETRO_THREADS_KEYS) {
+          if (ownsAccessor(rawThreads, key)) {
+            return false;
+          }
+        }
+      }
+    }
+    const validated = validateFacts(facts);
+    if (!validated.ok) {
+      return false;
+    }
+    const policy = normalizeRepoPolicy(repoPolicy);
+    if (policy === null) {
+      return false;
+    }
+    const record = read.record;
+    // The shadow retro is a shadow-only estimate; a live policy never acts.
+    if (policy.shadow !== true) {
+      return false;
+    }
+    // An array-like shape (own numeric `length`) and prototype-polluting
+    // own keys are refused before any nested value is read. Cost O(1).
+    const factRecord = validated.value as unknown as Record<string, unknown>;
+    const lengthDescriptor = Reflect.getOwnPropertyDescriptor(factRecord, 'length');
+    if (
+      lengthDescriptor !== undefined &&
+      (lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined || typeof lengthDescriptor.value === 'number')
+    ) {
+      return false;
+    }
+    for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
+      if (Reflect.getOwnPropertyDescriptor(factRecord, key) !== undefined) {
+        return false;
+      }
+    }
+    const pr = validated.value.pr;
+    // A parked entry is eligible only when its park reason was `checks` —
+    // the one park the retro re-enters through the live predicates.
+    if (record.state === 'parked' && record.reason !== 'checks') {
+      return false;
+    }
+    if (pr.status !== 'merged' || !isMergeHex40(pr.headOid) || pr.headOid !== record.headOid) {
+      return false;
+    }
+    const reRead = validated.value.reReadHeadOid;
+    if (reRead !== undefined && (!isMergeHex40(reRead) || reRead !== record.headOid)) {
+      return false;
+    }
+    // All `policy.requiredContexts` must be green and the premerge posted by
+    // `policy.premergePosterLogin` (classifyContext + readContextFact inside).
+    const checks = checksStep(record, validated.value, policy, nowIso, Date.parse(nowIso));
+    if (checks.decision !== null || checks.deferCarry) {
+      return false;
+    }
+    if (threadsStep(record, validated.value) !== null) {
+      return false;
+    }
+    const resolvedVeto = resolveVeto(record, validated.value);
+    if (resolvedVeto === VETO_UNREADABLE) {
+      return false;
+    }
+    const verdict = evaluateMergeVeto(resolvedVeto, {
+      mode: policy.vetoMode,
+      holdConfidence: policy.holdConfidence,
+    });
+    if (verdict === 'act-veto' || verdict === 'park-hold' || verdict === 'would-hold') {
+      return false;
+    }
+    // The base gate must already pass on the observed base.
+    if (observedBaseStep(record, validated.value) !== null) {
+      return false;
+    }
+    // A macOS procedure row exists on the live path; a retro head that owes
+    // one cannot be estimated from the facts gathered, so it refuses.
+    if (policy.macosProcedure !== null) {
+      return false;
+    }
+    // The merge state at merge time is unobservable. The retro estimate
+    // needs the merge-commit time and every required context's own
+    // creation time: a missing or unparsable timestamp refuses.
+    const mergedAt = validated.value.mergedAtIso;
+    if (typeof mergedAt !== 'string' || !isZonedIsoDateTime(mergedAt)) {
+      return false;
+    }
+    const mergedAtMs = Date.parse(mergedAt);
+    const contexts = validated.value.contexts;
+    if (!isPlainObject(contexts)) {
+      return false;
+    }
+    for (const name of policy.requiredContexts) {
+      const fact = readContextFact(contexts as Record<string, unknown>, name);
+      if (!fact.ok) {
+        return false;
+      }
+      const createdAt = fact.value.createdAtIso;
+      if (typeof createdAt !== 'string' || !isZonedIsoDateTime(createdAt)) {
+        return false;
+      }
+      if (Date.parse(createdAt) > mergedAtMs) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
   }
 }

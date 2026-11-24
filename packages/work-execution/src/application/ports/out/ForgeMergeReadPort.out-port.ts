@@ -46,6 +46,12 @@ export interface MergeContextSnapshot {
   /** `state === 'SUCCESS'` and, for `premerge`, the creator equals the poster. */
   readonly isGreen: boolean;
   readonly creatorLogin: string | null;
+  /**
+   * The deciding status's own creation time (the rollup node's `createdAt`)
+   * as the forge reported it; null when the node carried no parsable
+   * timestamp. EV2's shadow retro check reads it.
+   */
+  readonly createdAtIso?: string | null;
 }
 
 export type ReadForgeMergeResult =
@@ -56,6 +62,12 @@ export type ReadForgeMergeResult =
       readonly mergeState: ForgeMergeState;
       /** The base branch the forge reports for the pull request (`baseRefName`); absent when the reader did not observe it. */
       readonly baseRef?: string;
+      /**
+       * The merge-commit time the forge reported (`mergedAt`); null when the
+       * pull request carries none or it was not parsable. EV2's shadow
+       * retro check reads it.
+       */
+      readonly mergedAtIso?: string | null;
       readonly contexts: readonly MergeContextSnapshot[];
       readonly unresolvedThreads: number | 'unknown';
     }

@@ -16,6 +16,7 @@
 
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
 import { parseMergeStateStatus } from './ForgeReadAdapter.adapter.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type {
   ForgeMergeReadPort,
   ForgeMergeState,
@@ -56,6 +57,7 @@ const MERGE_READ_QUERY = `
         headRefOid
         mergeStateStatus
         baseRefName
+        mergedAt
         statusCheckRollup {
           contexts(first: ${PAGE_SIZE}, after: $contextsAfter) {
             pageInfo { hasNextPage endCursor }
@@ -65,10 +67,12 @@ const MERGE_READ_QUERY = `
                 name
                 status
                 conclusion
+                createdAt
               }
               ... on StatusContext {
                 context
                 state
+                createdAt
                 creator { login }
               }
             }
@@ -88,6 +92,8 @@ export interface MergeContextNode {
   readonly name: string;
   readonly state: string;
   readonly creatorLogin: string | null;
+  /** The node's own `createdAt` as a zoned ISO instant; null when absent or unparsable. */
+  readonly createdAtIso: string | null;
 }
 
 export type MergeContextsPageResult =
@@ -111,7 +117,7 @@ export type MergeThreadsPageResult =
   | { readonly kind: 'unknown'; readonly reason: string };
 
 export type MergePrMetaResult =
-  | { readonly kind: 'ok'; readonly prState: ForgePrState; readonly liveHeadSha: string; readonly mergeState: ForgeMergeState; readonly baseRef: string }
+  | { readonly kind: 'ok'; readonly prState: ForgePrState; readonly liveHeadSha: string; readonly mergeState: ForgeMergeState; readonly baseRef: string; readonly mergedAtIso: string | null }
   | { readonly kind: 'unreadable' }
   | { readonly kind: 'unknown'; readonly reason: string };
 
@@ -120,6 +126,7 @@ interface MergePrMetaPayload {
   readonly liveHeadSha: string;
   readonly mergeState: ForgeMergeState;
   readonly baseRef: string;
+  readonly mergedAtIso: string | null;
 }
 
 function isValidRepository(repository: { readonly owner?: unknown; readonly repo?: unknown }): boolean {
@@ -202,6 +209,19 @@ function extractCreatorLogin(creator: unknown): string | null | undefined {
   return typeof login === 'string' ? login : undefined;
 }
 
+/**
+ * The node's own creation time (`createdAt`): a zoned ISO instant, null when
+ * absent, and null again when unparsable — the EV2 retro check refuses an
+ * unparsable timestamp rather than the whole read, so null is the exact
+ * "unobservable" answer for every non-timestamp value.
+ */
+function parseCreatedAtIso(value: unknown): string | null {
+  if (typeof value !== 'string' || !isZonedIsoDateTime(value)) {
+    return null;
+  }
+  return value;
+}
+
 function normalizeContextNode(node: unknown): MergeContextNode | null {
   if (!isRecord(node)) {
     return null;
@@ -211,14 +231,17 @@ function normalizeContextNode(node: unknown): MergeContextNode | null {
   let name: unknown;
   let state: unknown;
   let creator: unknown;
+  let createdAtIso: string | null;
   if (typename === 'CheckRun') {
     name = record.name;
     state = typeof record.conclusion === 'string' ? record.conclusion : record.status;
     creator = record.creator;
+    createdAtIso = parseCreatedAtIso(record.createdAt);
   } else if (typename === 'StatusContext') {
     name = record.context;
     state = record.state;
     creator = record.creator;
+    createdAtIso = parseCreatedAtIso(record.createdAt);
   } else {
     return null;
   }
@@ -229,7 +252,7 @@ function normalizeContextNode(node: unknown): MergeContextNode | null {
   if (creatorLogin === undefined) {
     return null;
   }
-  return { name, state, creatorLogin };
+  return { name, state, creatorLogin, createdAtIso };
 }
 
 /** Pure parse of one page's contexts connection (`statusCheckRollup.contexts`). */
@@ -334,7 +357,10 @@ export function parseMergePrMeta(stdout: string): MergePrMetaResult {
     return { kind: 'unreadable' };
   }
   const mergeState = parseMergeStateStatus(pullRequest.mergeStateStatus);
-  return { kind: 'ok', prState, liveHeadSha: headRefOid, mergeState, baseRef };
+  // EV2: the merge-commit time; null when absent or unparsable (the retro
+  // check refuses an unobservable merge time rather than the whole read).
+  const mergedAtIso = parseCreatedAtIso(pullRequest.mergedAt);
+  return { kind: 'ok', prState, liveHeadSha: headRefOid, mergeState, baseRef, mergedAtIso };
 }
 
 function guardRequest(
@@ -376,6 +402,29 @@ function threadsPageSignature(page: MergeThreadsPageResult & { kind: 'page' }): 
 }
 
 /**
+ * The earlier of two creation instants. A missing instant keeps the other
+ * node's instant (the one time that was observable). Instants are compared
+ * with `Date.parse`, not text: a shorter fractional second or a numeric
+ * offset does not sort as text. The merge state at merge time stays
+ * unobservable either way; this only chooses which reported instant the
+ * retro check will compare with `mergedAt`.
+ */
+function earlierCreatedAt(left: string | null, right: string | null): string | null {
+  if (left === null) {
+    return right;
+  }
+  if (right === null) {
+    return left;
+  }
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+    return null;
+  }
+  return rightMs < leftMs ? right : left;
+}
+
+/**
  * Two producers can report one context name. The read fails safe: any node
  * that is not SUCCESS decides, and SUCCESS nodes by different creators lose
  * their creator, so the premerge creator check cannot pass on a mix.
@@ -393,7 +442,11 @@ function combineContextNodes(
   if (node.state !== 'SUCCESS') {
     return node;
   }
-  return existing.creatorLogin === node.creatorLogin ? existing : { ...existing, creatorLogin: null };
+  if (existing.creatorLogin !== node.creatorLogin) {
+    return { ...existing, creatorLogin: null };
+  }
+  // Same creator: the older creation instant is the deciding status's own.
+  return { ...existing, createdAtIso: earlierCreatedAt(existing.createdAtIso, node.createdAtIso) };
 }
 
 /**
@@ -447,12 +500,12 @@ function buildContextSnapshots(
   return requiredContexts.map((name) => {
     const node = contextsByName.get(name);
     if (node === undefined) {
-      return { name, state: 'missing', isGreen: false, creatorLogin: null };
+      return { name, state: 'missing', isGreen: false, creatorLogin: null, createdAtIso: null };
     }
     const isGreen =
       node.state === 'SUCCESS' &&
       (name !== 'premerge' || (node.creatorLogin !== null && node.creatorLogin === posterLogin));
-    return { name, state: node.state, isGreen, creatorLogin: node.creatorLogin };
+    return { name, state: node.state, isGreen, creatorLogin: node.creatorLogin, createdAtIso: node.createdAtIso };
   });
 }
 
@@ -553,6 +606,7 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
       liveHeadSha: meta.liveHeadSha,
       mergeState: meta.mergeState,
       baseRef: meta.baseRef,
+      mergedAtIso: meta.mergedAtIso,
       contexts: resolvedContexts,
       unresolvedThreads: threads.unknown ? 'unknown' : threads.unresolved,
     };

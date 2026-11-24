@@ -30,6 +30,7 @@ interface PageOverrides {
   headRefOid?: string;
   mergeStateStatus?: string | null;
   baseRefName?: unknown;
+  mergedAt?: unknown;
   contextsNodes?: unknown[];
   contextsHasNextPage?: boolean;
   contextsEndCursor?: string | null;
@@ -47,6 +48,7 @@ function page(overrides: PageOverrides = {}): string {
           headRefOid: overrides.headRefOid ?? VALID_SHA,
           mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
           baseRefName: 'baseRefName' in overrides ? overrides.baseRefName : 'main',
+          mergedAt: 'mergedAt' in overrides ? overrides.mergedAt : null,
           statusCheckRollup: {
             contexts: {
               pageInfo: {
@@ -69,21 +71,33 @@ function page(overrides: PageOverrides = {}): string {
   });
 }
 
-function checkRun(name: string, conclusion: string, login: string | null = null): Record<string, unknown> {
+function checkRun(
+  name: string,
+  conclusion: string,
+  login: string | null = null,
+  createdAt: unknown = null,
+): Record<string, unknown> {
   return {
     __typename: 'CheckRun',
     name,
     status: 'COMPLETED',
     conclusion,
+    createdAt,
     creator: login === null ? null : { login },
   };
 }
 
-function statusContext(context: string, state: string, login: string | null = null): Record<string, unknown> {
+function statusContext(
+  context: string,
+  state: string,
+  login: string | null = null,
+  createdAt: unknown = null,
+): Record<string, unknown> {
   return {
     __typename: 'StatusContext',
     context,
     state,
+    createdAt,
     creator: login === null ? null : { login },
   };
 }
@@ -170,9 +184,10 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'clean',
       baseRef: 'main',
+      mergedAtIso: null,
       contexts: [
-        { name: 'gate', state: 'SUCCESS', isGreen: true, creatorLogin: null },
-        { name: 'premerge', state: 'missing', isGreen: false, creatorLogin: null },
+        { name: 'gate', state: 'SUCCESS', isGreen: true, creatorLogin: null, createdAtIso: null },
+        { name: 'premerge', state: 'missing', isGreen: false, creatorLogin: null, createdAtIso: null },
       ],
       unresolvedThreads: 0,
     });
@@ -976,8 +991,8 @@ describe('pure GraphQL parsers', () => {
     expect(result).toEqual({
       kind: 'page',
       nodes: [
-        { name: 'gate', state: 'SUCCESS', creatorLogin: 'runner' },
-        { name: 'premerge', state: 'PENDING', creatorLogin: null },
+        { name: 'gate', state: 'SUCCESS', creatorLogin: 'runner', createdAtIso: null },
+        { name: 'premerge', state: 'PENDING', creatorLogin: null, createdAtIso: null },
       ],
       hasNextPage: false,
       endCursor: null,
@@ -1004,6 +1019,7 @@ describe('pure GraphQL parsers', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'blocked',
       baseRef: 'main',
+      mergedAtIso: null,
     });
   });
 
@@ -1019,6 +1035,37 @@ describe('pure GraphQL parsers', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'clean',
       baseRef: 'chain/example',
+      mergedAtIso: null,
+    });
+  });
+
+  // EV2: the merge-commit time and each node's own creation time are read
+  // as zoned instants; a missing or unparsable value is null (the retro
+  // check refuses an unobservable merge time).
+  it('parseMergePrMeta reads mergedAt as a zoned instant and null when absent or unparsable', () => {
+    const parsed = parseMergePrMeta(page({ mergedAt: '2026-11-01T11:00:00.000Z' }));
+    expect(parsed).toMatchObject({ kind: 'ok', mergedAtIso: '2026-11-01T11:00:00.000Z' });
+    const unparsable = parseMergePrMeta(page({ mergedAt: 'not-a-timestamp' }));
+    expect(unparsable.kind === 'ok' ? unparsable.mergedAtIso : null).toBeNull();
+  });
+
+  it('parseMergeContextsPage reads each node createdAt as a zoned instant and null when unparsable', () => {
+    const result = parseMergeContextsPage(
+      page({
+        contextsNodes: [
+          checkRun('gate', 'SUCCESS', null, '2026-11-01T10:30:00.000Z'),
+          statusContext('premerge', 'SUCCESS', null, 'garbage'),
+        ],
+      }),
+    );
+    expect(result).toEqual({
+      kind: 'page',
+      nodes: [
+        { name: 'gate', state: 'SUCCESS', creatorLogin: null, createdAtIso: '2026-11-01T10:30:00.000Z' },
+        { name: 'premerge', state: 'SUCCESS', creatorLogin: null, createdAtIso: null },
+      ],
+      hasNextPage: false,
+      endCursor: null,
     });
   });
 

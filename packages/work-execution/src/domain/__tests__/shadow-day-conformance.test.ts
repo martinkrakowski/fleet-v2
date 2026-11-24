@@ -1715,6 +1715,123 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
+  it('a real park ordinal beside a null-key park-escalated marker in either order conforms', () => {
+    // `parkEscalationOrdinal` returns null for a null key, so a null-key
+    // marker contributes no ordinal in any position; the single real
+    // ordinal is the only one in the set. Cost: `hasStrayOneWay` is
+    // O(journal.length) capped by SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
+    // and `parkEscalationOrdinal` is O(key.length) capped by
+    // LANE_RUN_KEY_MAX_LENGTH (null is refused in constant time).
+    const base = added();
+    const park = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const realMarker = resultEntry(park, 'park-escalated', at, 'completed');
+    const nullMarker: JournalEntry = {
+      kind: 'result',
+      key: null,
+      recordedAtIso: at,
+      outcome: null,
+      reasonCode: 'park-escalated',
+      state: null,
+    };
+    expect(nullMarker.key).not.toBe(realMarker.key);
+    for (const markers of [[realMarker, nullMarker], [nullMarker, realMarker]]) {
+      const run = extendJournal(base, markers);
+      const result = evaluate(onTop(run));
+      expect(result).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+      expectCodesOnly(result, base.run.runId, park, String(base.run.pullRequest), 'park-escalated');
+    }
+  });
+
+  it('a real park ordinal beside an unparseable or well-formed non-park key marker conforms', () => {
+    // An unparseable key parses to null, and a well-formed `open-pr` step
+    // key parses to a non-park step; neither contributes an ordinal, so
+    // the single real park ordinal stays the only one. Cost bounds as
+    // above: both keys are capped by LANE_RUN_KEY_MAX_LENGTH during parse.
+    const base = added();
+    const park = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const realMarker = resultEntry(park, 'park-escalated', at, 'completed');
+    const unparseableMarker = resultEntry('not-a-lane-run-key', 'park-escalated', at, 'reconciled');
+    const openPrKey = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
+    const openPrMarker = resultEntry(openPrKey, 'park-escalated', at, 'completed');
+    expect(unparseableMarker.key).not.toBe(park);
+    expect(openPrKey).not.toBe(park);
+    for (const other of [unparseableMarker, openPrMarker]) {
+      for (const markers of [[realMarker, other], [other, realMarker]]) {
+        const run = extendJournal(base, markers);
+        expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+      }
+    }
+  });
+
+  it('two real park ordinals with a null-key marker interleaved in every permutation yield fail/stray-one-way-action', () => {
+    // The null-key marker contributes no ordinal in any position, so all
+    // six permutations still hold the two distinct real ordinals and are
+    // stray. Cost: `hasStrayOneWay` walks the capped journal once per
+    // permutation; the key parses are capped by LANE_RUN_KEY_MAX_LENGTH.
+    const base = added();
+    const ordinalOne = resumeKey(base.run.runId, 1, 'web');
+    const ordinalTwo = oneWayKey(base.run.runId, 'park', null, null, 2);
+    expect(ordinalOne).not.toBe(ordinalTwo);
+    const firstMarker = resultEntry(ordinalOne, 'park-escalated', at, 'reconciled');
+    const secondMarker = resultEntry(ordinalTwo, 'park-escalated', at, 'completed');
+    const nullMarker: JournalEntry = {
+      kind: 'result',
+      key: null,
+      recordedAtIso: at,
+      outcome: null,
+      reasonCode: 'park-escalated',
+      state: null,
+    };
+    const entries = [firstMarker, nullMarker, secondMarker];
+    const permutations = [
+      [0, 1, 2],
+      [0, 2, 1],
+      [1, 0, 2],
+      [1, 2, 0],
+      [2, 0, 1],
+      [2, 1, 0],
+    ];
+    for (const order of permutations) {
+      const run = extendJournal(
+        base,
+        order.map((index) => entries[index]!),
+      );
+      const result = evaluate(onTop(run));
+      expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+      expectCodesOnly(result, base.run.runId, ordinalOne, ordinalTwo, String(base.run.pullRequest), 'park-escalated');
+    }
+    // Dropping either real marker (null one alone, or with the other)
+    // leaves at most one real ordinal and conforms again.
+    for (const dropped of [0, 2]) {
+      const one = entries.filter((_, index) => index !== dropped);
+      expect(evaluate(onTop(extendJournal(base, one)))).toEqual(
+        scored('pass', 'conducted-runs-conform', SIX_PASS),
+      );
+    }
+  });
+
+  it('a park-escalated key on a foreign runId contributes its ordinal today (current behaviour)', () => {
+    // Current behaviour: `parkEscalationOrdinal` parses the key without
+    // comparing `parsed.runId` with `run.runId`, so ordinal 1 on a foreign
+    // runId contributes ordinal 1. Alone it is the only ordinal (pass), and
+    // beside ordinal 1 on this run's own key the two share one ordinal
+    // value, so the set stays at size one and still passes. This pins the
+    // behaviour as it stands; a future runId check may tighten it.
+    const base = added();
+    const foreign = resumeKey(runIdFor(99), 1, 'web');
+    const own = oneWayKey(base.run.runId, 'park', null, null, 1);
+    expect(foreign).not.toBe(own);
+    const foreignMarker = resultEntry(foreign, 'park-escalated', at, 'reconciled');
+    const alone = extendJournal(base, [foreignMarker]);
+    const aloneResult = evaluate(onTop(alone));
+    expect(aloneResult).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    const paired = extendJournal(base, [foreignMarker, resultEntry(own, 'park-escalated', at, 'completed')]);
+    const pairedResult = evaluate(onTop(paired));
+    expect(pairedResult).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    expectCodesOnly(aloneResult, foreign, 'park-escalated');
+    expectCodesOnly(pairedResult, base.run.runId, foreign, own, String(base.run.pullRequest), 'park-escalated');
+  });
+
   it('rule 1 and rule 6 failing together on D yield fail/merged-head-unlinked', () => {
     const base = added();
     const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);

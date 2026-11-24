@@ -78,6 +78,18 @@ function shellResultLine(atIso: string, pr: number, headOid: string): string {
   return JSON.stringify({ at: atIso, kind: 'result', outcome: 'merged', pr, headOid, detail: '' });
 }
 
+/** A shell `head-moved` whose `from <40hex>` detail the facts extractor pairs. */
+function shellHeadMovedLine(atIso: string, pr: number, fromHeadOid: string, toHeadOid: string): string {
+  return JSON.stringify({
+    at: atIso,
+    kind: 'head-moved',
+    outcome: 'moved',
+    pr,
+    headOid: toHeadOid,
+    detail: `from ${fromHeadOid}`,
+  });
+}
+
 function mergeKeyFor(pr: number, headOid: string): string {
   const built = buildMergeKey({
     repoDigest: REPO_DIGEST,
@@ -2789,6 +2801,106 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded.S6).toBeUndefined();
     const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
     expect(reasons.get('S6')).toBe('receipts-unavailable');
+  });
+
+  it('records S6 pass/conducted-runs-conform when a conducted run merged head is reached through headMoves within 32 hops', async () => {
+    const pr = 8;
+    const mergeHead = conformanceHeadOid(pr);
+    const collectedHead = HEAD_B;
+    const fixture = conformingFixture();
+    // One hop, before the shell merge, from the run's collected head to the
+    // merged head. Without this move the heads differ and S6 fails.
+    fixture.shellLines.push(shellHeadMovedLine(`${DAY}T09:00:00Z`, pr, collectedHead, mergeHead));
+    const specs = conformanceRunSpecs().map((spec) => (spec.pr === pr ? { ...spec, headOid: collectedHead } : spec));
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: specs,
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S6).toEqual({
+      verdict: 'pass',
+      reason: 'conducted-runs-conform',
+      digest: expectedS6Digest(DAY, 'pass', 'conducted-runs-conform'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S6');
+  });
+
+  it('records S6 unevaluated/duplicate-run-conflict, never pass, when runs.list yields one runId with a conflicting tier', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const conducted = harness.deps.conducted;
+    if (conducted === undefined) {
+      throw new Error('conducted dependency missing');
+    }
+    const port = conducted.facts.runs as {
+      list: () => Promise<readonly { readonly runId: string; readonly tier: 1 | 2 }[]>;
+    };
+    const originalList = port.list.bind(port);
+    const echoed: { runId: string } = { runId: '' };
+    port.list = async () => {
+      const listed = await originalList();
+      const first = listed[0];
+      if (first === undefined) {
+        throw new Error('fixture run missing');
+      }
+      echoed.runId = first.runId;
+      return [...listed, { ...first, tier: first.tier === 1 ? 2 : 1 }];
+    };
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBeUndefined();
+    expect(result.recorded.S6).not.toBe('pass');
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S6')).toBe('duplicate-run-conflict');
+    expect(echoed.runId.length).toBeGreaterThan(0);
+    expect(JSON.stringify(result.unevaluated)).not.toContain(echoed.runId);
+  });
+
+  it('records S6 fail/merged-head-unlinked, never pass, when the merged head is more than 32 headMoves away', async () => {
+    const pr = 8;
+    const mergeHead = conformanceHeadOid(pr);
+    const hopCount = 33;
+    const chain: string[] = [];
+    for (let hop = 0; hop < hopCount; hop += 1) {
+      chain.push(oid(3000 + hop));
+    }
+    chain.push(mergeHead);
+    const fixture = conformingFixture();
+    for (let hop = 0; hop < hopCount; hop += 1) {
+      const from = chain[hop];
+      const to = chain[hop + 1];
+      if (from === undefined || to === undefined) {
+        throw new Error('fixture hop missing');
+      }
+      fixture.shellLines.push(shellHeadMovedLine(`${DAY}T09:00:00Z`, pr, from, to));
+    }
+    const collectedHead = chain[0];
+    if (collectedHead === undefined) {
+      throw new Error('fixture chain missing');
+    }
+    const specs = conformanceRunSpecs().map((spec) => (spec.pr === pr ? { ...spec, headOid: collectedHead } : spec));
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: specs,
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBe('fail');
+    expect(result.recorded.S6).not.toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S6).toEqual({
+      verdict: 'fail',
+      reason: 'merged-head-unlinked',
+      digest: expectedS6Digest(DAY, 'fail', 'merged-head-unlinked'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S6');
   });
 
   it('reports S7 unevaluated (chain-state-unreadable), never a pass, when either side is unreadable', async () => {

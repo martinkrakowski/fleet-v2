@@ -1642,6 +1642,26 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused')).toBe(true);
   });
 
+  it('j2) journals the closed rejection category (too-large, secret-shaped, invalid) as the prepare-refused detail', async () => {
+    const cases: readonly (readonly [string, string])[] = [
+      ['proseMarkdown must be at most 64 KiB', 'prepare-brief-rejected-too-large'],
+      ['proseMarkdown contains a secret-shaped value and was refused', 'prepare-brief-rejected-secret-shaped'],
+      ['proseMarkdown must be a non-empty string', 'prepare-brief-rejected-invalid'],
+    ];
+    for (const [reason, detail] of cases) {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await seedReviewFailure(harness, [blockerFinding()]);
+      harness.setBriefAnswer(async () => ({ outcome: 'rejected', reason }));
+
+      const result = await advance(harness);
+      expect(result).toMatchObject({ result: 'refused', reasonCode: 'prepare-refused', detail });
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(
+        entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'prepare-refused' && entry.detail === detail),
+      ).toBe(true);
+    }
+  });
+
   it('k) refuses prepare-refused when the prior manifest is unusable or incomplete', async () => {
     // A tampered manifest never matches the prior's recorded digest, so the
     // digest check refuses first; a missing manifest read refuses unreadable.

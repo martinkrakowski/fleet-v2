@@ -39,7 +39,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, refusedResult, saveOrRefuse } from './step-context.js';
 import { lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
-import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
+import { prepareBriefRejectionDetail, simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
 type ReviewKind = 'brief-check' | 'code-review' | 'pre-merge';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -1759,7 +1759,9 @@ async function fixDispatchStep(shared: FixPrepareWired, input: FixDispatchInput)
     briefResult = { outcome: 'rejected', reason: 'prepare-refused' };
   }
   if (briefResult.outcome !== 'prepared') {
-    return refusePrepared('prepare-brief-rejected');
+    // CB6: the journalled detail names the closed rejection category, so the
+    // journal never has to be parsed to learn why the brief was refused.
+    return refusePrepared(prepareBriefRejectionDetail(briefResult.reason));
   }
   const fixRequest: PrepareFixAttemptRequest = {
     ...briefFixRequest,

@@ -27,7 +27,7 @@
 
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { DEFAULT_BASE_BRANCH, parseBaseBranch, resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
+import { DEFAULT_BASE_BRANCH, parseBaseBranch } from '../../domain/base-branch.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
 import { isConductorHalted } from '../../domain/conductor-halt.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
@@ -44,7 +44,7 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { WorkOrderState } from '../../domain/value-objects/WorkOrderState.vo.js';
-import type { AttemptRecord, AttemptRunnerRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, CapacityReservationRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import type {
   AbandonStartRequest,
   AbandonStartResult,
@@ -211,6 +211,32 @@ function firstPassSeatOf(plan: SeatPlan): { readonly ok: true; readonly seatInde
   return selection.ok ? { ok: true, seatIndex: selection.seatIndex } : { ok: false };
 }
 
+/**
+ * The base branch a stored work order declares (RP1c): `main` when its own
+ * `baseBranch` is absent or `undefined` (an inherited value counts as absent),
+ * the parsed `main` or `chain/<name>` when it parses, and `null` for anything
+ * else: a wrong primitive, an over-long or mis-cased name, an own accessor
+ * (never invoked) or a read that throws. Never coerced to `main`. Cost: one
+ * own-descriptor read plus the length-bounded match in `parseBaseBranch`.
+ */
+function resolveDeclaredWorkOrderBaseBranch(workOrder: WorkOrderRecord): BaseBranchValue | null {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(workOrder, 'baseBranch');
+    if (descriptor === undefined) {
+      return DEFAULT_BASE_BRANCH;
+    }
+    if (!('value' in descriptor)) {
+      return null;
+    }
+    if (descriptor.value === undefined) {
+      return DEFAULT_BASE_BRANCH;
+    }
+    return parseBaseBranch(descriptor.value) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export class StartLaneRunUseCase implements StartLaneRunPort {
   constructor(private readonly deps?: StartLaneRunDependencies) {}
 
@@ -271,6 +297,13 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     const profile = await deps.profileRead.readProjectProfile(request.brief.projectId);
     if (profile === null || profile.status === 'retired') {
       return { outcome: 'refused', reason: 'project-not-active' };
+    }
+    // RP1c: a present stored base branch must be `main` or `chain/<name>`; any
+    // other value is refused here, before the capacity reserve, the worktree or
+    // the brief, and is never coerced to `main`. An absent one is `main`.
+    const baseBranch = resolveDeclaredWorkOrderBaseBranch(workOrder);
+    if (baseBranch === null) {
+      return { outcome: 'refused', reason: 'unsupported-base-branch' };
     }
     if (request.brief.seatPlan === undefined) {
       return { outcome: 'refused', reason: 'no-seat-plan' };
@@ -411,10 +444,9 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       attempt,
       clone.path,
       recordedHost,
-      // RP1: a work order may carry a profile base (e.g. `staging`); the
-      // workspace port still declares declared branches only until RP1b, so
-      // an undeclared value reads as `main`, as an unparsable value always has.
-      parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? DEFAULT_BASE_BRANCH,
+      // RP1c: the run's base branch was resolved and checked above; an
+      // unsupported stored value never reaches the workspace port.
+      baseBranch,
     );
     if (baseTip.outcome === 'refused') {
       return baseTip.result;
@@ -518,7 +550,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
         branchName: branchForRun(request.runId),
-        baseBranch: parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? DEFAULT_BASE_BRANCH,
+        baseBranch,
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };

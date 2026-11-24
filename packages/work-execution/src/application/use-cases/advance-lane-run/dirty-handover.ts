@@ -39,6 +39,16 @@ export function lastDispatchLeftDirtyWorktree(
 }
 
 /**
+ * True for an accessor descriptor. `getOwnPropertyDescriptor` builds its result
+ * with OWN `get`/`set` keys for an accessor and own `value`/`writable` keys for
+ * data, so own-key presence decides it; reading `descriptor.get` directly would
+ * run a getter planted on `Object.prototype` under the name `get` or `set`.
+ */
+function isAccessorDescriptor(descriptor: PropertyDescriptor): boolean {
+  return Object.hasOwn(descriptor, 'get') || Object.hasOwn(descriptor, 'set');
+}
+
+/**
  * Read one own property through its descriptor, so a getter is never invoked
  * and a missing or accessor property reads as absent. Never throws on a
  * well-formed object; a hostile object is the caller's refusal, not an error.
@@ -50,7 +60,7 @@ function ownValue(source: object, key: string): { readonly present: boolean; rea
   } catch {
     return { present: false, value: undefined };
   }
-  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+  if (descriptor === undefined || isAccessorDescriptor(descriptor)) {
     return { present: false, value: undefined };
   }
   return { present: true, value: descriptor.value };
@@ -92,7 +102,8 @@ function isPlainGetterFreeRecord(value: unknown): value is Record<string, unknow
   } catch {
     return false;
   }
-  for (const key of keys) {
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
     if (typeof key === 'string' && POLLUTING_KEYS.includes(key)) {
       return false;
     }
@@ -104,7 +115,7 @@ function isPlainGetterFreeRecord(value: unknown): value is Record<string, unknow
     } catch {
       return false;
     }
-    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    if (descriptor === undefined || isAccessorDescriptor(descriptor)) {
       return false;
     }
   }
@@ -121,14 +132,17 @@ function isPlainGetterFreeRecord(value: unknown): value is Record<string, unknow
  * built-in prototypes, a constant independent of the journal.
  */
 function sharedPrototypesCarryAccessor(): boolean {
-  for (const proto of [Array.prototype, Object.prototype] as const) {
+  const protos: readonly object[] = [Array.prototype, Object.prototype];
+  for (let protoIndex = 0; protoIndex < protos.length; protoIndex += 1) {
+    const proto = protos[protoIndex];
     let keys: readonly (string | symbol)[];
     try {
       keys = Reflect.ownKeys(proto);
     } catch {
       return true;
     }
-    for (const key of keys) {
+    for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+      const key = keys[keyIndex];
       let descriptor: PropertyDescriptor | undefined;
       try {
         descriptor = Object.getOwnPropertyDescriptor(proto, key);
@@ -138,7 +152,7 @@ function sharedPrototypesCarryAccessor(): boolean {
       if (descriptor === undefined) {
         return true;
       }
-      const isAccessor = descriptor.get !== undefined || descriptor.set !== undefined;
+      const isAccessor = isAccessorDescriptor(descriptor);
       if (isAccessor && !(proto === Object.prototype && key === '__proto__')) {
         return true;
       }
@@ -204,7 +218,8 @@ export function lastStopLeftTimedOutSeat(
     // A Proxy whose getPrototypeOf or ownKeys trap throws is refused, never fatal.
     return false;
   }
-  for (const key of entryKeys) {
+  for (let keyIndex = 0; keyIndex < entryKeys.length; keyIndex += 1) {
+    const key = entryKeys[keyIndex];
     if (typeof key === 'string' && key !== 'length' && POLLUTING_KEYS.includes(key)) {
       return false;
     }
@@ -217,7 +232,7 @@ export function lastStopLeftTimedOutSeat(
     } catch {
       return false;
     }
-    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    if (descriptor === undefined || isAccessorDescriptor(descriptor)) {
       return false;
     }
   }

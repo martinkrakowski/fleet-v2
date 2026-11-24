@@ -438,7 +438,7 @@ describe('dirtyHandoverRequested after a stop-timeout (CB3)', () => {
     } as never;
   }
 
-  it('a fix attempt dispatches with the handover flag after a stop-timeout (allowUncommittedHandover: true, not refused worktree-uncommitted)', async () => {
+  it('dirtyHandoverRequested reads true for a fix attempt after a stop-timeout (the handover decision only; the dispatch wiring is not exercised here)', async () => {
     const stopTimeout = journalEntry({ key: STOP_KEY, outcome: 'completed', reasonCode: 'stop-timeout' });
     const result = await dirtyHandoverRequested(ctxOf([stopTimeout]), fixAttempt, record);
     expect(result).toBe(true);

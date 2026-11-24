@@ -222,7 +222,11 @@ async function seededEscalation(options: SeedOptions = {}): Promise<EscalationFi
         readPullRequest: async () => {
           throw new Error('forge unreadable');
         },
-      } as ForgeReadPort
+        listOpenPullRequestsByBase: async () => {
+          throw new Error('forge unreadable');
+        },
+        isConfigured: () => true,
+      }
     : undefined;
 
   const inspectCalls = { count: 0 };
@@ -950,7 +954,7 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
       },
     });
     expect(checkParkEscalation({
-      record: hostileRecord as LaneRunRecord,
+      record: hostileRecord as never,
       state: 'parked',
       stopMode: null,
       expectedRevision: 2,
@@ -967,7 +971,7 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
       },
     });
     expect(checkParkEscalation({
-      record: roundRecord as LaneRunRecord,
+      record: roundRecord as never,
       state: 'parked',
       stopMode: null,
       expectedRevision: 2,

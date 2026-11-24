@@ -45,6 +45,7 @@ describe('decideParkEscalation', () => {
       'missing-dirty-worktree-fact',
       'malformed-dirty-worktree-fact',
       'worktree-clean',
+      'head-advanced',
       'park-reason-not-escalatable',
       'already-escalated',
     ]);
@@ -314,6 +315,25 @@ describe('decideParkEscalation', () => {
     for (const fact of [{}, { trackedFilesChanged: 1, extra: 2 }, { other: 1 }, 7, 'fact', [], [1]]) {
       expect(decideParkEscalation(PARKED_FIX, [], fact)).toEqual(malformed);
     }
+    // The optional `headAdvanced` key must be a boolean when present. An own
+    // `headAdvanced: undefined` (explicit or copied from a getter) is a present
+    // key, never "absent": it must be refused as malformed.
+    for (const headAdvanced of ['true', 1, null, 0, undefined]) {
+      expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 1, headAdvanced })).toEqual(malformed);
+    }
+
+    // An enumerable getter on `headAdvanced` is never invoked: the shared
+    // reader copies its value as `undefined`, and the own-key presence test
+    // (`Object.hasOwn`) then refuses the copied `undefined` as malformed.
+    const getterHead: Record<string, unknown> = { trackedFilesChanged: 1 };
+    let getterRan = false;
+    Object.defineProperty(getterHead, 'headAdvanced', { enumerable: true, get() { getterRan = true; return true; } });
+    expect(decideParkEscalation(PARKED_FIX, [], getterHead)).toEqual(malformed);
+    expect(getterRan).toBe(false);
+
+    // Even on a clean worktree an own `undefined` headAdvanced is malformed,
+    // never read as absent (which would report worktree-clean).
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0, headAdvanced: undefined })).toEqual(malformed);
 
     // A throwing enumerable getter is never invoked: the copied value is undefined, refused as malformed.
     const throwing: Record<string, unknown> = {};
@@ -342,6 +362,27 @@ describe('decideParkEscalation', () => {
 
   it('returns worktree-clean when trackedFilesChanged is zero', () => {
     expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0 })).toEqual({ kind: 'stay-parked', reason: 'worktree-clean' });
+    // Absent headAdvanced stays unknown: the clean worktree is still worktree-clean.
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0, headAdvanced: false })).toEqual({
+      kind: 'stay-parked',
+      reason: 'worktree-clean',
+    });
+  });
+
+  it('returns head-advanced when the worktree is clean but the HEAD advanced past the recorded head commit', () => {
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 0, headAdvanced: true })).toEqual({
+      kind: 'stay-parked',
+      reason: 'head-advanced',
+    });
+    // A dirty worktree is still an escalation regardless of the head fact.
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 3, headAdvanced: true })).toEqual({
+      kind: 'escalate',
+      mode: 'commit-pending',
+    });
+    expect(decideParkEscalation(PARKED_FIX, [], { trackedFilesChanged: 3, headAdvanced: false })).toEqual({
+      kind: 'escalate',
+      mode: 'commit-pending',
+    });
   });
 
   it('refuses a hostile parked Proxy with a non-plain prototype via the one getPrototypeOf trap, without throwing', () => {

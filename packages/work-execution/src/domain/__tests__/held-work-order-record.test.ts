@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { validateHeldWorkOrderRecord, type HeldWorkOrderRecord } from '../held-work-order.js';
 
 const RECORD_KEYS = [
@@ -31,6 +31,19 @@ function makeValidRecord(overrides?: Partial<HeldWorkOrderRecord>): HeldWorkOrde
 }
 
 describe('validateHeldWorkOrderRecord', () => {
+  // Every refusal below must be a refusal of THIS validator, not of a stub that
+  // returns null for everything: before each test the valid intent and held
+  // records are required to be accepted, so an always-null validator fails
+  // every test in this file, and an identity validator fails every refusal.
+  beforeEach(() => {
+    expect(validateHeldWorkOrderRecord(makeValidRecord())).not.toBeNull();
+    expect(
+      validateHeldWorkOrderRecord(
+        makeValidRecord({ stage: 'held', blockerKind: 'active-work-order', blockerId: 'wo-99', briefRequestRef: null }),
+      ),
+    ).not.toBeNull();
+  });
+
   it('returns a fresh HeldWorkOrderRecord with exact fields for valid intent and held records', () => {
     const intent = makeValidRecord();
     const intentResult = validateHeldWorkOrderRecord(intent);
@@ -200,10 +213,11 @@ describe('validateHeldWorkOrderRecord', () => {
     // The accepted residual is a Proxy that lies consistently in every trap
     // it defines: `get` answers every read with the same wrong value, `has`
     // denies every key, `ownKeys` reports a wrong key set, the descriptor
-    // trap reports a wrong descriptor, and the prototype trap lies too.
-    // Every value is read through its own property descriptor after the
-    // `ownKeys` count is checked, so the `get` trap is never invoked and the
-    // `ownKeys` lie is caught by the exact-key-count refusal — proven by the
+    // trap reports a wrong descriptor, and the prototype trap answers a plain
+    // prototype so the plain-record gate passes and the `ownKeys` lie is the
+    // refusal reason. Every value is read through its own property descriptor
+    // after the exact-key-set check, so the `get` trap is never invoked and
+    // the `ownKeys` lie is caught by that exact-key-set refusal — proven by the
     // call counter staying at zero and the whole proxy being refused with
     // null instead of the lie leaking through any single honest trap.
     let getCalls = 0;
@@ -222,7 +236,7 @@ describe('validateHeldWorkOrderRecord', () => {
         return { enumerable: true, configurable: true, value: 'a descriptor lie' };
       },
       getPrototypeOf() {
-        return Array.prototype;
+        return Object.prototype;
       },
     });
     expect(validateHeldWorkOrderRecord(lyingEverywhere)).toBeNull();

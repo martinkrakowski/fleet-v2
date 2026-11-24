@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildLaneRunStepKey, head12Of, laneRunPremergeKey } from '../lane-run-keys.js';
+import { buildLaneRunStepKey, head12Of, laneRunPremergeKey, laneRunResumeKey } from '../lane-run-keys.js';
 import {
   SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
   SHADOW_CONFORMANCE_MAX_HOPS,
@@ -312,6 +312,13 @@ function oneWayKey(
     retry: null,
   });
   if (!built.ok) throw new Error('fixture one-way key refused');
+  return built.key;
+}
+
+/** Resume keys come from the builder. A crashed escalation settles its marker on this key. */
+function resumeKey(runId: string, parkOrdinal = 1): string {
+  const built = laneRunResumeKey(runId, parkOrdinal);
+  if (!built.ok) throw new Error('fixture resume key refused');
   return built.key;
 }
 
@@ -1504,10 +1511,128 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
 
   it('a park intent while the state is parked conforms', () => {
     // CE1w: the commit-pending escalation journals its one-way park intent
-    // from `parked`. That intent is in the park row, so it is not stray.
+    // from `parked`. CE1w2: it conforms only with a later `park-escalated`
+    // result. Any key and any outcome count; a crash settles on the resume key.
     const base = added();
     const key = oneWayKey(base.run.runId, 'park', null, null);
-    const run = extendJournal(base, [conductAt('parked', at), intentAt(key, at)]);
+    const marker = resultEntry(resumeKey(base.run.runId), 'park-escalated', at, 'reconciled');
+    const run = extendJournal(base, [conductAt('parked', at), intentAt(key, at), marker]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('one park-from-parked escalation with a later park-escalated result returns pass/conducted-runs-conform', () => {
+    // The park step key's seat index is the run's parkCount. The normal path
+    // conducts onward, then writes the marker on the park key.
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const run = extendJournal(base, [
+      conductAt('parked', at),
+      intentAt(key, at),
+      conductAt('fixing', at),
+      resultEntry(key, 'park-escalated', at, 'completed'),
+    ]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('a later park-escalated result with a null key and a null outcome returns pass/conducted-runs-conform', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const marker: JournalEntry = {
+      kind: 'result',
+      key: null,
+      recordedAtIso: at,
+      outcome: null,
+      reasonCode: 'park-escalated',
+      state: null,
+    };
+    const run = extendJournal(base, [conductAt('parked', at), intentAt(key, at), marker]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('a park-from-parked intent with no later park-escalated result returns fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const parked = conductAt('parked', at);
+    const intent = intentAt(key, at);
+    const resumed = resumeKey(base.run.runId);
+    const decoys: JournalEntry[] = [
+      resultEntry(resumed, 'resumed', at),
+      resultEntry(resumed, 'fix-no-progress', at),
+      resultEntry(resumed, '', at),
+      { kind: 'result', key: null, recordedAtIso: at, outcome: null, reasonCode: null, state: null },
+      { kind: 'conduct', key: null, recordedAtIso: at, outcome: 'completed', reasonCode: 'park-escalated', state: 'fixing' },
+      { kind: 'intent', key: resumed, recordedAtIso: at, outcome: null, reasonCode: 'park-escalated', state: null },
+    ];
+    const cases = [extendJournal(base, [parked, intent]), ...decoys.map((decoy) => extendJournal(base, [parked, intent, decoy]))];
+    for (const broken of cases) {
+      const result = evaluate(onTop(broken));
+      expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+      expectCodesOnly(result, base.run.runId, key, resumed, String(base.run.pullRequest), 'park-escalated');
+    }
+  });
+
+  it('a second park-from-parked intent with a distinct parkCount key returns fail/stray-one-way-action', () => {
+    const base = added();
+    const firstKey = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const secondKey = oneWayKey(base.run.runId, 'park', null, null, 2);
+    expect(firstKey).not.toBe(secondKey);
+    const firstMarker = resultEntry(firstKey, 'park-escalated', at, 'completed');
+    const secondMarker = resultEntry(resumeKey(base.run.runId, 2), 'park-escalated', at, 'reconciled');
+    const once = extendJournal(base, [
+      conductAt('parked', at),
+      intentAt(firstKey, at),
+      conductAt('fixing', at),
+      firstMarker,
+    ]);
+    expect(evaluate(onTop(once))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    const twice = extendJournal(base, [
+      conductAt('parked', at),
+      intentAt(firstKey, at),
+      conductAt('fixing', at),
+      firstMarker,
+      conductAt('parked', at),
+      intentAt(secondKey, at),
+      secondMarker,
+    ]);
+    const result = evaluate(onTop(twice));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, firstKey, secondKey, String(base.run.pullRequest));
+  });
+
+  it('a second park-from-parked intent with a repeated key returns fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const marker = resultEntry(resumeKey(base.run.runId, 1), 'park-escalated', at, 'reconciled');
+    const once = extendJournal(base, [conductAt('parked', at), intentAt(key, at), marker]);
+    expect(evaluate(onTop(once))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    const twice = extendJournal(base, [conductAt('parked', at), intentAt(key, at), intentAt(key, at), marker]);
+    const result = evaluate(onTop(twice));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest));
+  });
+
+  it('a park-escalated result placed before the park-from-parked intent returns fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const marker = resultEntry(resumeKey(base.run.runId), 'park-escalated', at, 'completed');
+    const broken = extendJournal(base, [marker, conductAt('parked', at), intentAt(key, at)]);
+    const result = evaluate(onTop(broken));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest), 'park-escalated');
+  });
+
+  it('a repeated park key issued before parked does not make the one parked escalation stray', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const marker = resultEntry(resumeKey(base.run.runId), 'park-escalated', at, 'reconciled');
+    const run = extendJournal(base, [
+      conductAt('running', at),
+      intentAt(key, at),
+      intentAt(key, at),
+      conductAt('parked', at),
+      intentAt(key, at),
+      marker,
+    ]);
     expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 

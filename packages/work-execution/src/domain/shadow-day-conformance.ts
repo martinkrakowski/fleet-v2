@@ -68,8 +68,10 @@ const READY_FAMILY_STATES: readonly LaneRunStateValue[] = Object.freeze([
 /**
  * States from which a `park` step may be issued: every `LANE_RUN_STATES`
  * value except the terminals `merged` and `stopped`. `parked` is included so
- * a `fix-no-progress` escalation can journal its one-way `park` intent
- * (CE1w); without it that intent is `stray-one-way-action`. Cost: constant.
+ * the one commit-pending escalation can journal its `park` intent (CE1w).
+ * Rule 6 still requires a later `park-escalated` result and at most one such
+ * intent per run. Without `parked` in this row that intent is
+ * `stray-one-way-action`. Cost: constant.
  */
 const PARK_ISSUE_STATES: readonly LaneRunStateValue[] = Object.freeze(
   LANE_RUN_STATES.filter((state) => state !== 'merged' && state !== 'stopped'),
@@ -239,6 +241,13 @@ const MIN_DAY_YEAR = 2000;
 const MAX_DAY_YEAR = 9999;
 const MAX_JOURNAL_KEY_LENGTH = 256;
 const MAX_JOURNAL_TOKEN_LENGTH = 64;
+
+/**
+ * Result `reasonCode` that records a park-from-parked escalation (CE1).
+ * Only a `fix-no-progress` park produces it. The result's key and outcome
+ * are not part of the check: a crashed escalation settles on the resume key.
+ */
+const PARK_ESCALATED_REASON_CODE = 'park-escalated';
 
 const INPUT_KEYS: readonly string[] = ['day', 'runs', 'merges', 'headMoves', 'headMovesIncompleteFor'];
 const RUN_KEYS: readonly string[] = ['runId', 'tier', 'pullRequest', 'headOid', 'reviewReceipts', 'journal'];
@@ -686,18 +695,27 @@ function enqueueUnseen(
   return false;
 }
 
+/** Per-run record of the single accepted park-from-parked escalation. */
+interface ParkedEscalation {
+  escalatedFromParked: boolean;
+}
+
 /**
  * Rule 6. Walk the journal in append order. The state is `ready` before any
  * conduct entry, then each conduct entry's `state`. An intent whose key
  * parses as a one-way step is stray when that step is not `park` and the
  * key was already issued, or when the current state is outside
- * `SHADOW_ONE_WAY_STEP_STATES` for the step (`park` included). `park` is
- * dropped from the duplicate check: its key is `<run>/r<round>/park/<seat>`
- * with no ordinal, so two legitimate parks in one round share a key. A
- * `park` intent is also issued from `parked` for the commit-pending
- * escalation (CE1w), which is why that state is in the park row. An
- * unparseable key is ignored. Cost: linear in the journal, capped by
- * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ * `SHADOW_ONE_WAY_STEP_STATES` for the step. A `park` intent issued while
+ * the state is not `parked` skips the duplicate check: its key is
+ * `<run>/r<round>/park/<seat>` with no ordinal, so two legitimate parks in
+ * one round share a key. A `park` intent issued from `parked` is the
+ * commit-pending escalation (CE1w). Its seat index is the run's `parkCount`,
+ * so the key is unique per park and `repeatedKey` applies. That intent is
+ * accepted only once per run, and only when a later `result` has
+ * `reasonCode` `park-escalated` (any key, any outcome). A marker earlier in
+ * the journal does not count. A second park-from-parked intent is stray
+ * even with a distinct key. An unparseable key is ignored. Cost: linear in
+ * the journal, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
 function ruleOneWayDiscipline(
   run: ShadowConformanceRun,
@@ -708,22 +726,70 @@ function ruleOneWayDiscipline(
   return null;
 }
 
-/** Cost: linear in `journal`, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`. */
+/**
+ * True when the journal issues a stray one-way intent.
+ * `escalatedFromParked` starts false and records the one accepted
+ * park-from-parked escalation. Later-marker flags are one backward pass,
+ * so the walk stays linear in the capped journal. Cost: linear in
+ * `journal`, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ */
 function hasStrayOneWay(journal: readonly ShadowConformanceJournalEntry[]): boolean {
   const seen = new Set<string>();
+  const escalation: ParkedEscalation = { escalatedFromParked: false };
+  const later = parkEscalatedLater(journal);
   let state: string | null = 'ready';
+  let index = 0;
   for (const entry of journal) {
-    if (strayIntent(entry, state, seen)) return true;
+    if (strayIntent(entry, state, seen, escalation, later[index] === true)) return true;
     if (entry.kind === 'conduct') state = entry.state;
+    index += 1;
   }
   return false;
 }
 
-/** Cost: constant aside from the key parse, which is linear in the capped key. */
-function strayIntent(entry: ShadowConformanceJournalEntry, state: string | null, seen: Set<string>): boolean {
+/**
+ * `later[i]` is true when a `result` after index `i` has `reasonCode`
+ * `park-escalated`. The entry's key and outcome are ignored. Cost: linear
+ * in `journal`, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ */
+function parkEscalatedLater(journal: readonly ShadowConformanceJournalEntry[]): readonly boolean[] {
+  const later: boolean[] = [];
+  let seenEscalation = false;
+  for (let index = journal.length - 1; index >= 0; index -= 1) {
+    later[index] = seenEscalation;
+    const entry = journal[index];
+    if (entry !== undefined && entry.kind === 'result' && entry.reasonCode === PARK_ESCALATED_REASON_CODE) {
+      seenEscalation = true;
+    }
+  }
+  return later;
+}
+
+/**
+ * True when `entry` is a stray one-way intent. `park` from a state other
+ * than `parked` does not call `repeatedKey`. `park` from `parked` does, then
+ * requires `hasLaterParkEscalation`, then the still-unused
+ * `escalation.escalatedFromParked` slot. Accepting one sets that flag, then
+ * checks `stateAllows`. Cost: constant aside from the key parse, which is
+ * linear in the capped key.
+ */
+function strayIntent(
+  entry: ShadowConformanceJournalEntry,
+  state: string | null,
+  seen: Set<string>,
+  escalation: ParkedEscalation,
+  hasLaterParkEscalation: boolean,
+): boolean {
   if (entry.kind !== 'intent') return false;
   const step = oneWayStep(entry.key);
   if (step === null) return false;
+  if (step === 'park' && state === 'parked') {
+    if (repeatedKey(entry.key, seen)) return true;
+    if (!hasLaterParkEscalation) return true;
+    if (escalation.escalatedFromParked) return true;
+    escalation.escalatedFromParked = true;
+    return !stateAllows(step, state);
+  }
   if (step !== 'park' && repeatedKey(entry.key, seen)) return true;
   return !stateAllows(step, state);
 }

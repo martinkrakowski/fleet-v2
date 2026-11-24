@@ -462,6 +462,37 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
     expect(invocations).toBe(0);
   });
 
+  it('refuses a symbol-keyed iterator on requiredContexts and polluting keys in nested records without iterating', () => {
+    const entry = makeEntry();
+    const policy = makePolicy();
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(entry, makeFacts(), policy, NOW)).toBe(true);
+    let yielded = 0;
+    const endless = [...(policy.requiredContexts as readonly string[])];
+    Reflect.defineProperty(endless, Symbol.iterator, {
+      value: function* (): Generator<string> {
+        // Bounded so a regression FAILS (yielded > 0, then throws) instead of hanging.
+        for (;;) {
+          yielded += 1;
+          if (yielded > 1_000) {
+            throw new Error('endless iterator was consumed');
+          }
+          yield 'gate';
+        }
+      },
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    expect(isMergedHeadRetroMergeEligible(entry, makeFacts(), { ...policy, requiredContexts: endless }, NOW)).toBe(false);
+    expect(yielded).toBe(0);
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      const pr: Record<string, unknown> = { status: 'merged', headOid: HEAD };
+      Reflect.defineProperty(pr, key, { value: {}, enumerable: true, writable: true, configurable: true });
+      expect(isMergedHeadRetroMergeEligible(entry, makeFacts({ pr }), policy, NOW)).toBe(false);
+    }
+  });
+
   it('refuses a throwing Proxy, an accessor-lying Proxy, and an enormous length', () => {
     // Control: the unmodified eligible input passes, so a constant `false` fails this test.
     expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);

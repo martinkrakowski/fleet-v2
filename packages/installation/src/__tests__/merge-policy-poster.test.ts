@@ -241,8 +241,8 @@ describe('parseInstallation premergePosterLogin', () => {
     }
   });
 
-  it('refuses a leading or trailing hyphen in premergePosterLogin', () => {
-    for (const value of ['-octo', 'octo-', '-']) {
+  it('refuses a leading, trailing, or consecutive hyphen in premergePosterLogin', () => {
+    for (const value of ['-octo', 'octo-', '-', 'octo--cat', 'a--b', 'o--']) {
       const parsed = parsePolicy({
         repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: value } },
       });

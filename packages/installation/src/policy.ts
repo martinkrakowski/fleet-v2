@@ -785,10 +785,13 @@ const MERGE_REPOSITORY_KEY_PATTERN = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 
 /**
  * EV1a: a GitHub login is 1-39 characters of `A-Za-z0-9-` with no leading or
- * trailing hyphen. The pattern cannot backtrack: the leading and trailing
- * classes are disjoint from the middle quantifier's.
+ * trailing hyphen and no consecutive hyphens. The pattern is built as runs of
+ * alphanumerics joined by single hyphens, so a hyphen always separates two
+ * alphanumeric characters. Backtracking is bounded: the segments' classes are
+ * disjoint (`[A-Za-z0-9]` never matches the literal `-`), and `isValidGithubLogin`
+ * enforces the 39-character bound with an O(1) length check before the regex runs.
  */
-const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/;
 
 /**
  * EV1a: whether `value` is a valid GitHub login. The length check runs first

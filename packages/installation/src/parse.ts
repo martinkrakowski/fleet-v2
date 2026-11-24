@@ -2872,7 +2872,7 @@ function readMergePremergePosterLogin(
   // `containsSecretShape`.
   if (!isValidGithubLogin(value)) {
     errors.push(
-      `${path}.premergePosterLogin: must be a valid GitHub login (1-39 characters of A-Z, a-z, 0-9, or -, with no leading or trailing hyphen)`,
+      `${path}.premergePosterLogin: must be a valid GitHub login (1-39 characters of A-Z, a-z, 0-9, or -, with no leading, trailing, or consecutive hyphen)`,
     );
     return undefined;
   }

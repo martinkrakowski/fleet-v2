@@ -497,7 +497,10 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     expect(result.entries.map((row) => row.entryId)).toEqual([live.entryId]);
   });
 
-  it('entry with invalid headOid is not excluded', async () => {
+  it('an entry with an invalid headOid is dropped by record validation and does not disturb the exclusion of others', async () => {
+    // An invalid headOid never reaches the pass (queue-record validation drops
+    // it before selection), so the exclusion cannot see it; this pins that the
+    // valid matched entry is still excluded and the live one still read.
     const invalid = makeEntry({ pullRequest: 9, headOid: 'not-a-commit' });
     const matched = makeEntry({ pullRequest: 1 });
     const live = makeEntry({ pullRequest: 2 });

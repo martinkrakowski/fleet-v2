@@ -875,7 +875,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (!trustedNow.ok) {
       return trustedNow.block;
     }
-    const loaded = await this.loadApprovedHeadFreeGrant(grantId);
+    const loaded = await this.loadApprovedRelaunchGrant(grantId, request.proposalDigest ?? '');
     if (!loaded.ok) {
       return loaded.block;
     }
@@ -954,6 +954,58 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     } catch {
       return { ok: false, block: blocked('grant-wrong-scope') };
     }
+  }
+
+  /**
+   * AR3c2: the relaunch-apply load, with the recorded-answer fallback the
+   * standing-grant load lacks. `coordination sign-decision` writes the signed
+   * decision file `grant-<requestId>` without rewriting the stored request, so
+   * `findRequestByGrantId` misses a freshly approved relaunch-apply grant and
+   * the direct load reports `grant-missing`. When it does, the stored
+   * `relaunch` project requests that are still `awaiting-decision`, carry the
+   * relaunch-apply scope and name the requested plan digest are refreshed once
+   * from their verified answer (which persists the approval and its grant id);
+   * one that refreshes to `approved` under exactly the requested grant id
+   * continues through the same checks as the direct load. Cost bound: one
+   * store listing bounded by the stored `relaunch` project requests, one
+   * refresh per awaiting candidate — bounded by what the operator recorded,
+   * never by input size.
+   */
+  private async loadApprovedRelaunchGrant(
+    grantId: string,
+    proposalDigest: string,
+  ): Promise<
+    | { readonly ok: true; readonly refreshed: CoordinationRequestRecord; readonly candidate: CoordinationRequest }
+    | { readonly ok: false; readonly block: ResolveActionAuthorizationResult }
+  > {
+    const direct = await this.loadApprovedHeadFreeGrant(grantId);
+    if (direct.ok || direct.block.outcome !== 'blocked' || direct.block.reason !== 'grant-missing') {
+      return direct;
+    }
+    const candidates = await (this.deps?.requestRepo.listRequests(RELAUNCH_APPLY_PROJECT_ID) ?? []);
+    for (const record of candidates) {
+      if (
+        record.state !== 'awaiting-decision' ||
+        record.actionScope !== RELAUNCH_APPLY_ACTION_SCOPE ||
+        record.proposalDigest !== proposalDigest
+      ) {
+        continue;
+      }
+      const refreshedResult = await this.refreshFromVerifiedAnswer(record);
+      if (refreshedResult.refusalReason !== undefined) {
+        // A pinned owner-key refusal blocks before any grant state is checked.
+        return { ok: false, block: blocked(refreshedResult.refusalReason) };
+      }
+      const refreshed = refreshedResult.record;
+      if (refreshed.state === 'approved' && refreshed.grantId === grantId && refreshed.decisionRevision !== null) {
+        try {
+          return { ok: true, refreshed, candidate: CoordinationRequest.fromRecord(refreshed) };
+        } catch {
+          return { ok: false, block: blocked('grant-wrong-scope') };
+        }
+      }
+    }
+    return { ok: false, block: blocked('grant-missing') };
   }
 
   /**

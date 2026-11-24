@@ -722,11 +722,17 @@ rollback window. Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
-The relaunch group reports what a relaunch would find, read-only: relaunch
-inventory lists, per lane host, the registered clones' worktrees, the runner's
-state per worktree directory, the conductor's status and each lane's
-population (conducted, attempt-recorded, unrecorded). It writes nothing,
-journals nothing and mutates no worktree.
+The relaunch group reports what a relaunch would find and, under an owner
+grant, applies it. relaunch inventory lists, per lane host, the registered
+clones' worktrees, the runner's state per worktree directory, the conductor's
+status and each lane's population (conducted, attempt-recorded, unrecorded).
+relaunch plan orders the relaunch of those lanes and stores one immutable plan
+by digest. relaunch request-grant derives the digest-bound relaunch:apply
+owner grant coordinates (request id, grant id and the exact request, sign and
+resolve commands) from a plan digest. relaunch apply is dry-run by default:
+it reports what the stored plan would do and mutates nothing; --apply
+--grant <id> applies one wave, with --save-inputs and --adopt-inputs as JSON
+arrays of per-lane facts and --now / --deadline as ISO instants.
 
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
 
@@ -752,6 +758,9 @@ Commands:
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]
+  relaunch plan [--host <name>] [--max-active-runs <n>] [--dispatch-stagger-ms <ms>] [--deadline <iso>] [--now <iso>]
+  relaunch request-grant --plan-digest <64 hex> --policy-revision <revision> [--now <iso>]
+  relaunch apply --plan-digest <64 hex> [--apply --grant <id>] [--save-inputs <json>] [--adopt-inputs <json>] [--now <iso>] [--deadline <iso>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   merge import --repository owner/repo --legacy-state-dir <path> [--apply --grant <id> --project <id>] (no --authority)
   cutover shadow report --repository owner/repo --legacy-state-dir <path>

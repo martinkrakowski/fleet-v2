@@ -362,6 +362,6 @@ export const relaunchCommands: Readonly<Record<string, CommandHandler>> = {
       ...(supplied(p, 'deadline') ? { deadlineIso: p.deadline as string } : {}),
     });
   },
-'request-grant': requestGrant,
+  'request-grant': requestGrant,
   apply: applyRelaunchCommand,
 };

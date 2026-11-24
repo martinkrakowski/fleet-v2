@@ -1108,7 +1108,11 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
       reasonCode: { enumerable: true, value: 'review-failed' },
       detail: { enumerable: true, value: null },
     });
-    // A throwing `getPrototypeOf` trap is refused the same way.
+    // A throwing `getPrototypeOf` trap is now inert: every field the walk
+    // reads was proved to be an own data property, so reads never consult the
+    // prototype chain. The entry's own consistent data is honored and the
+    // walk proceeds past it (the refusal then comes from the later review
+    // step, not from a throw).
     const opaqueProto = new Proxy(Object.prototype, {
       getPrototypeOf() {
         throw new Error('hostile prototype trap');
@@ -1126,8 +1130,77 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     const first = await seededFixingHarness();
     expect(refusedDetailOf(await prepareDirect(first, () => [inherited]))).toBe('prepare-no-failure-source');
     const second = await seededFixingHarness();
-    expect(refusedDetailOf(await prepareDirect(second, () => [opaque]))).toBe('prepare-no-failure-source');
+    expect(refusedDetailOf(await prepareDirect(second, () => [opaque]))).toBe('prepare-no-review-request');
     expect(inheritedGetterCalls).toBe(0);
+  });
+
+  it('refuses prepare-no-failure-source and never throws on a revoked Proxy entry', async () => {
+    // `Array.isArray` on a revoked Proxy throws TypeError: the entry shape
+    // check must catch that throw and skip the entry — for both a revoked
+    // plain-object proxy and a revoked array proxy — instead of letting the
+    // hostile-input throw escape the walk.
+    const objectRevocation = Proxy.revocable({ kind: 'result' }, {});
+    const arrayRevocation = Proxy.revocable([], {});
+    objectRevocation.revoke();
+    arrayRevocation.revoke();
+
+    const first = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(first, () => [objectRevocation.proxy]))).toBe(
+      'prepare-no-failure-source',
+    );
+    const second = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(second, () => [arrayRevocation.proxy]))).toBe(
+      'prepare-no-failure-source',
+    );
+  });
+
+  it('refuses prepare-no-failure-source when an entry supplies its fields through inherited data properties', async () => {
+    // An entry shaped with `Object.create(proto)`: `kind`, `key`, `outcome`,
+    // `runId`, `reasonCode` and `detail` are plain data fields ON THE
+    // PROTOTYPE, not accessors. The walk reads only own data properties, so
+    // the entry is refused instead of being classified as a review source it
+    // never recorded on itself.
+    const proto = {
+      kind: 'result',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      outcome: 'completed',
+      runId: RUN_ID,
+      reasonCode: 'review-failed',
+      detail: null,
+    };
+    const inheritedData = Object.create(proto);
+    // Sanity: the fields really are inherited, not own — the assertion below
+    // is about the prototype path, so it must not silently hold for another
+    // reason.
+    for (const field of ['kind', 'key', 'outcome', 'runId', 'reasonCode', 'detail'] as const) {
+      expect(Object.hasOwn(inheritedData, field)).toBe(false);
+    }
+    const harness = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(harness, () => [inheritedData]))).toBe('prepare-no-failure-source');
+  });
+
+  it('refuses prepare-no-failure-source when only some walk fields are inherited from the prototype', async () => {
+    // A partial prototype supply: `kind`, `outcome` and `detail` are own data
+    // fields, but `key`, `runId` and `reasonCode` come from the prototype and
+    // would classify the entry as a gate failure source. No inherited field
+    // may be read, so the entry is refused.
+    const proto = {
+      key: gateKey(HEAD12_A),
+      runId: RUN_ID,
+      reasonCode: 'gate-failed',
+    };
+    const partiallyInherited = Object.assign(Object.create(proto), {
+      kind: 'result',
+      outcome: 'completed',
+      detail: null,
+    });
+    for (const field of ['key', 'runId', 'reasonCode'] as const) {
+      expect(Object.hasOwn(partiallyInherited, field)).toBe(false);
+    }
+    const harness = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(harness, () => [partiallyInherited]))).toBe(
+      'prepare-no-failure-source',
+    );
   });
 
   it('refuses prepare-gate-journal-unreadable when the execution journal read throws', async () => {

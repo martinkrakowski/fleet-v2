@@ -990,33 +990,34 @@ const FIXING_WALK_ENTRY_FIELDS = ['kind', 'key', 'outcome', 'runId', 'reasonCode
 const FIXING_WALK_MAX_ENTRIES = 10_000;
 
 /**
- * True when any field the walk reads is an accessor — its own descriptor, or
- * an inherited one anywhere on the prototype chain. The walk never runs a
- * getter — hostile input may throw or lie — so the whole entry is skipped
- * before any field is read. Every trap-reachable operation (the descriptor
- * lookup and the prototype hop) is guarded: a throwing `Proxy` trap means
- * hostile input, and the entry is refused, never a throw to the caller. Cost:
- * O(fields × prototype depth) descriptor lookups per entry, all O(1) each.
+ * True when any field the walk reads is not a plain OWN data property. The
+ * walk never runs a getter — hostile input may throw or lie — so an accessor
+ * on any read field refuses the whole entry before any field is read. A field
+ * with no own descriptor is refused too: an entry shaped with
+ * `Object.create(proto)` could otherwise supply `kind`, `key`, `outcome`,
+ * `runId` or `reasonCode` through inherited data fields and pass as a failure
+ * source it never recorded. When every read field is an own data property the
+ * reads below never touch the prototype chain, so inherited accessors are
+ * unreachable. Every trap-reachable operation (the descriptor lookup) is
+ * guarded: a throwing `Proxy` trap means hostile input, and the entry is
+ * refused, never a throw to the caller. Cost: O(fields) own descriptor
+ * lookups per entry, each O(1); no prototype walk is needed.
  */
-function hasAccessorWalkField(entry: object): boolean {
-  let current: object | null = entry;
-  while (current !== null) {
-    for (const field of FIXING_WALK_ENTRY_FIELDS) {
-      let descriptor: PropertyDescriptor | undefined;
-      try {
-        descriptor = Object.getOwnPropertyDescriptor(current, field);
-      } catch {
-        // A throwing trap is hostile input, not a readable shape.
-        return true;
-      }
-      if (descriptor !== undefined && typeof descriptor.get === 'function') {
-        return true;
-      }
-    }
+function hasMissingOrAccessorWalkField(entry: object): boolean {
+  for (const field of FIXING_WALK_ENTRY_FIELDS) {
+    let descriptor: PropertyDescriptor | undefined;
     try {
-      current = Object.getPrototypeOf(current);
+      descriptor = Object.getOwnPropertyDescriptor(entry, field);
     } catch {
-      // An unreadable prototype is hostile input.
+      // A throwing trap is hostile input, not a readable shape.
+      return true;
+    }
+    // No own descriptor: the field would be inherited, so the entry is
+    // refused — the walk reads only what this entry itself carries.
+    if (descriptor === undefined) {
+      return true;
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
       return true;
     }
   }
@@ -1068,10 +1069,18 @@ function fixingFailureSourceOf(
     } catch {
       continue;
     }
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    // `Array.isArray` on a revoked Proxy throws TypeError, so it runs inside
+    // the try: hostile input skips the entry, never escapes to the caller.
+    let entryIsArray: boolean;
+    try {
+      entryIsArray = Array.isArray(entry);
+    } catch {
       continue;
     }
-    if (hasAccessorWalkField(entry)) {
+    if (entry === null || typeof entry !== 'object' || entryIsArray) {
+      continue;
+    }
+    if (hasMissingOrAccessorWalkField(entry)) {
       continue;
     }
     const record = entry as LaneRunJournalEntryRecord;

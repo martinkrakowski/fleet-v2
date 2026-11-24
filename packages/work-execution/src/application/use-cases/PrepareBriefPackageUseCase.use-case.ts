@@ -117,7 +117,7 @@ const PR_NOTE_MAX_LENGTH = 4000;
  * 64 KiB carrying no secret shape. Returns a fixed reason or null; never
  * echoes a value.
  */
-const PROSE_MARKDOWN_MAX_BYTES = 64 * 1024;
+export const PROSE_MARKDOWN_MAX_BYTES = 64 * 1024;
 
 function proseMarkdownError(value: unknown): string | null {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -130,6 +130,26 @@ function proseMarkdownError(value: unknown): string | null {
     return 'proseMarkdown contains a secret-shaped value and was refused';
   }
   return null;
+}
+
+/**
+ * CB6: maps a prepare-brief refusal reason to a closed detail token by exact
+ * equality against `proseMarkdownError`'s fixed strings — never by scanning
+ * free text. Anything unknown (including non-string values, null, undefined
+ * and `'prepare-refused'`) falls back to the generic token; this function
+ * never throws and never echoes a value.
+ */
+export function prepareBriefRejectionDetail(reason: unknown): string {
+  switch (reason) {
+    case 'proseMarkdown must be at most 64 KiB':
+      return 'prepare-brief-rejected-too-large';
+    case 'proseMarkdown contains a secret-shaped value and was refused':
+      return 'prepare-brief-rejected-secret-shaped';
+    case 'proseMarkdown must be a non-empty string':
+      return 'prepare-brief-rejected-invalid';
+    default:
+      return 'prepare-brief-rejected';
+  }
 }
 /** The runner agent pattern (KF-7): alphanumeric start, then letters, digits, dot, underscore, hyphen. */
 const AGENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;

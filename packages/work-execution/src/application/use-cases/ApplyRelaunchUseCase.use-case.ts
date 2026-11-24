@@ -1914,9 +1914,10 @@ const POLLUTING_ATTEMPT_KEYS = new Set(['__proto__', 'constructor', 'prototype']
  * symbol or polluting key, an accessor, or a trap that throws.
  */
 function plainDataCopy(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const plain: Record<string, unknown> = {};
   try {
+    // Inside the try: `Array.isArray` throws on a revoked Proxy.
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
     const proto: unknown = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) return null;
     const keys = Reflect.ownKeys(value);

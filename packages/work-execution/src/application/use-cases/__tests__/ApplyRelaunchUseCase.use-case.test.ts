@@ -3063,12 +3063,15 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
         throw new Error('proxy trap');
       },
     });
+    const { proxy: revokedProxy, revoke } = Proxy.revocable(runningAttemptRecord(), {});
+    revoke();
     const cases: Record<string, () => unknown> = {
       undefined: () => undefined,
       primitive: () => 7,
       'accessor-bearing': () => withGetter,
       'polluting-key': () => polluting,
       'throwing-proxy': () => throwingProxy,
+      'revoked-proxy': () => revokedProxy,
       'bad-revision': () => runningAttemptRecord({ revision: 1.5 }),
       'wrong-id': () => runningAttemptRecord({ id: 'attempt-2' }),
     };

@@ -1090,83 +1090,116 @@ function fixingFailureSourceOf(
   if (length === null) {
     return null;
   }
-  // CB9: heads whose gate already passed LATER on the walk, keyed
-  // `round:head12`. A Set of composed strings only — no entry value ever
-  // becomes an object key, so there is no prototype-pollution path.
-  const passedGateHeads = new Set<string>();
-  // CB9: the round of the gate failure a later pass superseded, when one was
-  // skipped; a source found after it must carry the same round.
-  let supersededRound: number | null = null;
+  // CB9: walk state. `passedGateHeads` holds `round:head12` keys of gate
+  // passes met LATER on the walk (composed strings only, so no entry value
+  // ever becomes an object key); `supersededRound` is the round of the most
+  // recent gate failure a later pass superseded.
+  const walk: FixingWalkState = { passedGateHeads: new Set<string>(), supersededRound: null };
   for (let index = length - 1; index >= 0; index -= 1) {
-    // A sparse journal array has a hole: it is skipped, never read as an
-    // entry. A throwing `hasOwnProperty`/index `Proxy` trap is hostile input
-    // and skips the entry too — the walk never throws to its caller.
-    const entry = readWalkSlot(entries, index);
-    if (entry === null) {
+    const step = fixingWalkStep(entries, index, runId, walk);
+    if (step.kind === 'continue') {
       continue;
     }
-    const record = snapshotWalkEntry(entry);
-    if (record === null) {
-      continue;
-    }
-    // The descriptor scan above proved the read fields carry no accessor, but
-    // a Proxy may still lie between its descriptor trap and its `get` trap;
-    // such a throw is hostile input and skips the entry, never escapes.
-    let parsed: ReturnType<typeof parseLaneRunKey>;
-    try {
-      parsed = parseLaneRunKey(record.key);
-    } catch {
-      continue;
-    }
-    // CB9: a later final gate pass on the same `(round, head12)` supersedes
-    // an earlier gate failure on that head — the retried gate recovered it,
-    // so the failure is not what sent the run fixing. An ambiguous or
-    // non-result gate entry never counts as a pass (unknown is never success).
-    // Field reads may still throw on a Proxy whose traps lie inconsistently;
-    // such a throw is hostile input and skips the entry, never escapes.
-    try {
-      if (
-        parsed !== null &&
-        parsed.kind === 'step' &&
-        parsed.step === 'gate' &&
-        parsed.head12 !== null &&
-        record.kind === 'result' &&
-        record.outcome !== 'ambiguous' &&
-        record.runId === runId
-      ) {
-        if (record.reasonCode === 'gate-passed') {
-          passedGateHeads.add(parsed.round + ':' + parsed.head12);
-          continue;
-        }
-        if (record.reasonCode === 'gate-failed' && passedGateHeads.has(parsed.round + ':' + parsed.head12)) {
-          // Walking backward, the FIRST superseded failure met is the most
-          // recent one: keep its round as the bound. An older superseded
-          // failure must never widen the bound to an earlier round.
-          if (supersededRound === null) {
-            supersededRound = parsed.round;
-          }
-          continue;
-        }
-      }
-      const verdict = fixingSourceOfEntry(record, parsed, runId);
-      if (verdict.kind === 'skip') {
-        continue;
-      }
-      if (verdict.kind === 'stop') {
-        return null;
-      }
-      // CB9 (bounded walk): after a superseded gate failure, only a source in
-      // the superseded round may take over the fix trigger; a failure from any
-      // other round is not what this fix round answers.
-      if (supersededRound !== null && (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound)) {
-        return null;
-      }
-      return verdict.source;
-    } catch {
-      continue;
-    }
+    return step.source;
   }
   return null;
+}
+
+interface FixingWalkState {
+  readonly passedGateHeads: Set<string>;
+  supersededRound: number | null;
+}
+
+type FixingWalkStepResult = { readonly kind: 'continue' } | { readonly kind: 'done'; readonly source: FixingSource | null };
+
+const WALK_CONTINUE: FixingWalkStepResult = { kind: 'continue' };
+
+/**
+ * One backward step of the fix-source walk. A hole, an accessor slot, a
+ * hostile entry or a throwing trap continues the walk; it never throws.
+ */
+function fixingWalkStep(entries: unknown, index: number, runId: string, walk: FixingWalkState): FixingWalkStepResult {
+  const entry = readWalkSlot(entries, index);
+  if (entry === null) {
+    return WALK_CONTINUE;
+  }
+  const record = snapshotWalkEntry(entry);
+  if (record === null) {
+    return WALK_CONTINUE;
+  }
+  try {
+    const parsed = parseLaneRunKey(record.key);
+    if (noteGateSupersession(record, parsed, runId, walk)) {
+      return WALK_CONTINUE;
+    }
+    const verdict = fixingSourceOfEntry(record, parsed, runId);
+    if (verdict.kind === 'skip') {
+      return WALK_CONTINUE;
+    }
+    if (verdict.kind === 'stop') {
+      return { kind: 'done', source: null };
+    }
+    return { kind: 'done', source: boundedFixingSource(verdict.source, parsed, walk.supersededRound) };
+  } catch {
+    return WALK_CONTINUE;
+  }
+}
+
+/**
+ * CB9: records a final gate pass, or skips a gate failure that a LATER pass
+ * on the same `(round, head12)` superseded (the retried gate recovered it).
+ * An ambiguous or non-result gate entry never counts as a pass. Walking
+ * backward, the FIRST superseded failure met is the most recent: its round
+ * is kept as the bound, and an older one never widens it. Returns true when
+ * the entry was consumed here.
+ */
+function noteGateSupersession(
+  record: LaneRunJournalEntryRecord,
+  parsed: ReturnType<typeof parseLaneRunKey>,
+  runId: string,
+  walk: FixingWalkState,
+): boolean {
+  if (
+    parsed === null ||
+    parsed.kind !== 'step' ||
+    parsed.step !== 'gate' ||
+    parsed.head12 === null ||
+    record.kind !== 'result' ||
+    record.outcome === 'ambiguous' ||
+    record.runId !== runId
+  ) {
+    return false;
+  }
+  const headKey = parsed.round + ':' + parsed.head12;
+  if (record.reasonCode === 'gate-passed') {
+    walk.passedGateHeads.add(headKey);
+    return true;
+  }
+  if (record.reasonCode === 'gate-failed' && walk.passedGateHeads.has(headKey)) {
+    if (walk.supersededRound === null) {
+      walk.supersededRound = parsed.round;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * CB9 (bounded walk): after a superseded gate failure, only a source in the
+ * superseded round may take over the fix trigger.
+ */
+function boundedFixingSource(
+  source: FixingSource,
+  parsed: ReturnType<typeof parseLaneRunKey>,
+  supersededRound: number | null,
+): FixingSource | null {
+  if (supersededRound === null) {
+    return source;
+  }
+  if (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound) {
+    return null;
+  }
+  return source;
 }
 
 /** Receipt findings map one-to-one onto the renderer's typed findings. */

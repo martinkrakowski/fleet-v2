@@ -1240,6 +1240,13 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     expect(getCalls).toBe(0);
   });
 
+  it('refuses prepare-no-failure-source for null, undefined and wrong-primitive entries and for an undefined listing', async () => {
+    for (const listing of [[null], [undefined], [42], ['review-failed'], [true], undefined, null, 7]) {
+      const harness = await seededFixingHarness();
+      expect(refusedDetailOf(await prepareDirect(harness, () => listing))).toBe('prepare-no-failure-source');
+    }
+  });
+
   it('refuses prepare-no-failure-source when an entry supplies its fields through inherited data properties', async () => {
     // An entry shaped with `Object.create(proto)`: `kind`, `key`, `outcome`,
     // `runId`, `reasonCode` and `detail` are plain data fields ON THE

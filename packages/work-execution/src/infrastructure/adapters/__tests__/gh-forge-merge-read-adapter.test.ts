@@ -748,6 +748,46 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'premerge', isGreen: false }] });
   });
 
+  it('keeps the LATEST createdAt when one creator reports a context SUCCESS twice, in either order', async () => {
+    const early = '2026-11-01T10:00:00.000Z';
+    const late = '2026-11-01T12:00:00.000Z';
+    for (const nodes of [
+      [checkRun('gate', 'SUCCESS', 'runner', early), checkRun('gate', 'SUCCESS', 'runner', late)],
+      [checkRun('gate', 'SUCCESS', 'runner', late), checkRun('gate', 'SUCCESS', 'runner', early)],
+    ]) {
+      const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ contextsNodes: nodes }), stderr: '' });
+      const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+      expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'gate', isGreen: true, createdAtIso: late }] });
+    }
+  });
+
+  it('reports a null createdAt when either duplicate SUCCESS lacks a parseable createdAt', async () => {
+    const at = '2026-11-01T10:00:00.000Z';
+    for (const nodes of [
+      [checkRun('gate', 'SUCCESS', 'runner', at), checkRun('gate', 'SUCCESS', 'runner', null)],
+      [checkRun('gate', 'SUCCESS', 'runner', null), checkRun('gate', 'SUCCESS', 'runner', at)],
+      [checkRun('gate', 'SUCCESS', 'runner', at), checkRun('gate', 'SUCCESS', 'runner', 'not-a-time')],
+    ]) {
+      const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ contextsNodes: nodes }), stderr: '' });
+      const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+      expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'gate', createdAtIso: null }] });
+    }
+  });
+
+  it('keeps the LATEST createdAt and drops the creator when two creators report a context SUCCESS', async () => {
+    const early = '2026-11-01T10:00:00.000Z';
+    const late = '2026-11-01T12:00:00.000Z';
+    const stdout = page({
+      contextsNodes: [statusContext('gate', 'SUCCESS', 'a', early), statusContext('gate', 'SUCCESS', 'b', late)],
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      contexts: [{ name: 'gate', creatorLogin: null, createdAtIso: late }],
+    });
+  });
+
   it('fails as unknown when a finished contexts connection changes in a replay', async () => {
     const responses = [
       page({

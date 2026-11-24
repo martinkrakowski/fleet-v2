@@ -402,26 +402,25 @@ function threadsPageSignature(page: MergeThreadsPageResult & { kind: 'page' }): 
 }
 
 /**
- * The earlier of two creation instants. A missing instant keeps the other
- * node's instant (the one time that was observable). Instants are compared
- * with `Date.parse`, not text: a shorter fractional second or a numeric
- * offset does not sort as text. The merge state at merge time stays
- * unobservable either way; this only chooses which reported instant the
- * retro check will compare with `mergedAt`.
+ * The later of two creation instants, failing closed. Several SUCCESS nodes
+ * for one context (a rerun, or a second producer) leave the deciding status
+ * unknowable after the fact, so the retro check must compare `mergedAt` with
+ * the LATEST reported instant: a rerun created after the merge then refuses
+ * the retro row. A missing or unparseable instant on either node yields
+ * `null`, which the retro check refuses. Instants are compared with
+ * `Date.parse`, not text (a shorter fractional second or a numeric offset
+ * does not sort as text). The merge state at merge time stays unobservable.
  */
-function earlierCreatedAt(left: string | null, right: string | null): string | null {
-  if (left === null) {
-    return right;
-  }
-  if (right === null) {
-    return left;
+function laterCreatedAt(left: string | null, right: string | null): string | null {
+  if (left === null || right === null) {
+    return null;
   }
   const leftMs = Date.parse(left);
   const rightMs = Date.parse(right);
   if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
     return null;
   }
-  return rightMs < leftMs ? right : left;
+  return rightMs > leftMs ? right : left;
 }
 
 /**
@@ -442,11 +441,12 @@ function combineContextNodes(
   if (node.state !== 'SUCCESS') {
     return node;
   }
+  const createdAtIso = laterCreatedAt(existing.createdAtIso, node.createdAtIso);
   if (existing.creatorLogin !== node.creatorLogin) {
-    return { ...existing, creatorLogin: null };
+    return { ...existing, creatorLogin: null, createdAtIso };
   }
-  // Same creator: the older creation instant is the deciding status's own.
-  return { ...existing, createdAtIso: earlierCreatedAt(existing.createdAtIso, node.createdAtIso) };
+  // Same creator: which SUCCESS decided is unknowable, so keep the latest instant (fail closed).
+  return { ...existing, createdAtIso };
 }
 
 /**

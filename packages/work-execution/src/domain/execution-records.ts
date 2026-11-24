@@ -483,11 +483,23 @@ export function readJournalPullRequestRef(
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return { kind: 'invalid' };
   }
-  const prototype = Object.getPrototypeOf(value);
+  // A Proxy may sabotage any of these meta-operations with a throwing trap;
+  // each failure is an `invalid` read, never an escaping throw.
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    return { kind: 'invalid' };
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     return { kind: 'invalid' };
   }
-  const keys = Reflect.ownKeys(value);
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return { kind: 'invalid' };
+  }
   if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.size) {
     return { kind: 'invalid' };
   }
@@ -497,7 +509,12 @@ export function readJournalPullRequestRef(
     if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.has(key)) {
       return { kind: 'invalid' };
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return { kind: 'invalid' };
+    }
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
       return { kind: 'invalid' };
     }

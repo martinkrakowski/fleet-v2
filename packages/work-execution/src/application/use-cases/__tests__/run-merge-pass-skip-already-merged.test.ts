@@ -940,4 +940,115 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     expect(mergedClosed.forge.calls).toBe(1);
     expect(second.entries.map((row) => row.entryId)).toEqual([closedMerged.entryId]);
   });
+
+  it('a would-already-merged dry-run under a foreign repoDigest on the entry own head does not exclude the H1 entry', async () => {
+    // Asserts: an own-head12 would-already-merged key is ignored when its
+    // repoDigest is foreign — the entry is forge-read exactly once and stays
+    // in the report. Cost bound: O(1) journal records, one entry, one pass.
+    const entry = makeEntry({ pullRequest: 1, repoDigest: DIGEST });
+    const harness = makeHarness({
+      records: [entry],
+      list: () => [dryRun(alreadyMergedKey(1, HEAD12, OTHER_DIGEST), 'would-already-merged')],
+    });
+
+    const result = await harness.useCase.runMergePass(harness.request);
+
+    expect(result.outcome).toBe('completed');
+    expect(harness.forge.calls).toBe(1);
+    expect(result.entries.map((row) => row.entryId)).toEqual([entry.entryId]);
+  });
+
+  it('an attempt-suffixed /a1 key is not an exact 5-segment key and excludes nothing, while the paired foreign-head pair still leaves the entry live', async () => {
+    // Asserts: `merge/<digest>/1/<head12>/would-already-merged/a1` and its
+    // would-supersede twin carry an extra key segment, so shadowSkipHit
+    // rejects them; the paired foreign-head would-already-merged alone cannot
+    // exclude without a valid would-supersede on the entry own head. Both
+    // scenarios forge-read the entry exactly once and report it.
+    // Cost bound: O(1) journal records, one entry, one pass each.
+    const entry = makeEntry({ pullRequest: 1 });
+    const suffixed = makeHarness({
+      records: [entry],
+      list: () => [
+        dryRun(`merge/${DIGEST}/1/${HEAD12}/would-already-merged/a1`, 'would-already-merged'),
+        dryRun(`merge/${DIGEST}/1/${HEAD12}/would-supersede/a1`, 'would-supersede'),
+      ],
+    });
+
+    const suffixedResult = await suffixed.useCase.runMergePass(suffixed.request);
+
+    expect(suffixedResult.outcome).toBe('completed');
+    expect(suffixed.forge.calls).toBe(1);
+    expect(suffixedResult.entries.map((row) => row.entryId)).toEqual([entry.entryId]);
+
+    const foreignHead = makeEntry({ pullRequest: 1 });
+    const paired = makeHarness({
+      records: [foreignHead],
+      list: () => [
+        dryRun(`merge/${DIGEST}/1/${HEAD12}/would-supersede/a1`, 'would-supersede'),
+        dryRun(alreadyMergedKey(1, OTHER_HEAD12), 'would-already-merged'),
+      ],
+    });
+
+    const pairedResult = await paired.useCase.runMergePass(paired.request);
+
+    expect(pairedResult.outcome).toBe('completed');
+    expect(paired.forge.calls).toBe(1);
+    expect(pairedResult.entries.map((row) => row.entryId)).toEqual([foreignHead.entryId]);
+  });
+
+  it('a pass over more than MAX_ENTRIES_PER_PASS candidates with the real queue head shadow-skipped forges exactly 100 non-head entries and pins no queue head', async () => {
+    // Asserts: with 102 queue records where the real queue head (pullRequest 1,
+    // ordered[0]) is excluded by an own-head would-already-merged, the pass
+    // forges exactly MAX_ENTRIES_PER_PASS (100) entries; the excluded head
+    // costs no forge read and is absent from the report. The chosen nowIso
+    // makes the rotation offset 1 (step = 100: 100*100 mod 101 = 1), so with
+    // passHead null the 100 live entries are pullRequest 3..102 — pullRequest 2
+    // is rotated past too. If passHead had wrongly been pinned the window would
+    // be 99 and offset computed differently, which these counts would expose.
+    // Cost bound: O(N) over 102 queue records (under MAX_QUEUE_RECORDS = 5000)
+    // and 100 selected entries (MAX_ENTRIES_PER_PASS), one prefix listing.
+    const records = Array.from({ length: 102 }, (_, index) =>
+      makeEntry({ pullRequest: index + 1, repoDigest: DIGEST }));
+    const excludedHead = records[0];
+    const harness = makeHarness({
+      records,
+      nowIso: () => '1970-01-01T01:40:00.000Z',
+      list: () => [dryRun(alreadyMergedKey(1, HEAD12), 'would-already-merged')],
+    });
+
+    const result = await harness.useCase.runMergePass(harness.request);
+
+    expect(result.outcome).toBe('completed');
+    expect(harness.forge.calls).toBe(100);
+    expect(result.entries).toHaveLength(100);
+    expect(result.entries.some((row) => row.entryId === excludedHead.entryId)).toBe(false);
+    expect(result.entries.every((row) => row.head12 === HEAD12)).toBe(true);
+    const reported = new Set(result.entries.map((row) => row.entryId));
+    expect(reported.has(records[1].entryId)).toBe(false);
+  });
+
+  it('a local would-already-merged under H2 without a local would-supersede plus a foreign would-supersede on H1 leaves the H1 entry live while the settled sibling is skipped', async () => {
+    // Asserts: for pullRequest 1, a journaled would-already-merged under
+    // OTHER_HEAD12 starts the cross-head rule, but the would-supersede on the
+    // entry own head carries a foreign repoDigest, so it does not complete the
+    // pair and the entry stays live (forge-read once). The settled sibling
+    // (pullRequest 2) has both rows locally and is skipped.
+    // Cost bound: O(1) journal records, two entries, one pass.
+    const live = makeEntry({ pullRequest: 1, repoDigest: DIGEST });
+    const settled = makeEntry({ pullRequest: 2, repoDigest: DIGEST });
+    const harness = makeHarness({
+      records: [live, settled],
+      list: () => [
+        dryRun(alreadyMergedKey(1, OTHER_HEAD12, DIGEST), 'would-already-merged'),
+        dryRun(supersedeKey(1, HEAD12, OTHER_DIGEST), 'would-supersede'),
+        ...crossHeadRows(2),
+      ],
+    });
+
+    const result = await harness.useCase.runMergePass(harness.request);
+
+    expect(result.outcome).toBe('completed');
+    expect(harness.forge.calls).toBe(1);
+    expect(result.entries.map((row) => row.entryId)).toEqual([live.entryId]);
+  });
 });

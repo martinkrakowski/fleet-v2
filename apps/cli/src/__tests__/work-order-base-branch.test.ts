@@ -393,6 +393,64 @@ describe('work-order register --base-branch (CB1)', () => {
     expect(await inspectOrder(runtime, 'wo-base-branch-10')).toEqual(before);
     expect((await inspectOrder(runtime, 'wo-base-branch-11')).outcome).toBe('not-found');
   });
+
+  it('rerun of a stopped work order with no stored baseBranch registers the successor on main when the profile defaultBranch is chain/example', async () => {
+    // An absent stored base means main. Leaving it off the registration
+    // request would store the active profile default (chain/example) instead.
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-base-branch-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await registerProfile(runtime);
+
+    const edited = await cli(runtime, [
+      'projects',
+      'edit',
+      'example-project',
+      '--default-branch',
+      'chain/example',
+      '--yes',
+    ]);
+    expect(edited.code).toBe(0);
+    const shown = await cli(runtime, ['projects', 'show', 'example-project']);
+    expect(shown.code).toBe(0);
+    expect(shown.out).toContain('defaultBranch: chain/example');
+
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-base-branch-12',
+      projectId: 'example-project',
+      taskId: 'task-1',
+      laneId: 'lane-12',
+      repository: 'https://example.com/example.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/example-twelve/**'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'stopped',
+      revision: 1,
+      createdAtIso: '2026-11-20T08:00:00.000Z',
+      updatedAtIso: '2026-11-20T08:00:00.000Z',
+    });
+    const before = await inspectOrder(runtime, 'wo-base-branch-12');
+    expect(before.outcome).toBe('found');
+    expect(before.workOrder as Record<string, unknown>).not.toHaveProperty('baseBranch');
+    expect((before.workOrder as Record<string, unknown>).state).toBe('stopped');
+
+    const rerun = await cli(runtime, [
+      'work-order',
+      'rerun',
+      '--from',
+      'wo-base-branch-12',
+      '--work-order-id',
+      'wo-base-branch-13',
+      '--yes',
+    ]);
+    expect(rerun.code).toBe(0);
+    expect(JSON.parse(rerun.out).outcome).toBe('registered');
+
+    const successor = await inspectOrder(runtime, 'wo-base-branch-13');
+    expect(successor.outcome).toBe('found');
+    expect((successor.workOrder as Record<string, unknown>).baseBranch).toBe('main');
+  });
 });
 
 describe('work-order register --pull-request-title (CP1A1)', () => {

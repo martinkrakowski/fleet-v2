@@ -151,9 +151,9 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       // `staging`, a wrong primitive or an accessor, which is never invoked) is
       // refused and nothing is registered. A throwing own-descriptor trap is
       // that same typed refusal, not a generic error. An absent, inherited or
-      // `undefined` base is left out of the request, so the registration falls
-      // back to the profile default. Cost: one own-descriptor read (caught)
-      // and a bounded match.
+      // `undefined` base means `main` and is passed explicitly, so registration
+      // does not apply the active profile's default. Cost: one own-descriptor
+      // read (caught) and a bounded match.
       const unsupportedStoredBase = {
         outcome: 'refused' as const,
         reason: 'unsupported-base-branch' as const,
@@ -182,7 +182,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         ownedPaths: source.ownedPaths,
         policyRevision: source.policyRevision,
         risk: resolveWorkOrderRisk(source),
-        ...(parsedBase === undefined ? {} : { baseBranch: parsedBase }),
+        baseBranch: parsedBase ?? 'main',
         baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
         prerequisiteWorkOrderIds: [],
         supersedesWorkOrderId: from,

@@ -417,6 +417,47 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
     expect(invoked).toBe(false);
   });
 
+  it('refuses a benign getter on any own facts key or nested element without invoking it', () => {
+    const entry = makeEntry();
+    const policy = makePolicy();
+    // Control: the same facts with plain data properties are eligible, so each
+    // refusal below is caused by the accessor alone.
+    expect(isMergedHeadRetroMergeEligible(entry, makeFacts(), policy, NOW)).toBe(true);
+    let invocations = 0;
+    // Every own key of the facts, including ones the check itself never reads
+    // (such as `halted`): a getter returning the same plain value is refused.
+    for (const key of Reflect.ownKeys(makeFacts())) {
+      const facts = { ...makeFacts() } as Record<PropertyKey, unknown>;
+      const value = facts[key];
+      Reflect.defineProperty(facts, key, {
+        get: () => {
+          invocations += 1;
+          return value;
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      expect(isMergedHeadRetroMergeEligible(entry, facts, policy, NOW)).toBe(false);
+    }
+    // A getter two levels down, on `contexts.premerge.state`, returning the
+    // same plain value.
+    const premerge = { state: 'success', creatorLogin: POSTER, createdAtIso: CREATED_AT };
+    Reflect.defineProperty(premerge, 'state', {
+      get: () => {
+        invocations += 1;
+        return 'success';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const contexts = {
+      gate: { state: 'success', creatorLogin: null, createdAtIso: CREATED_AT },
+      premerge,
+    };
+    expect(isMergedHeadRetroMergeEligible(entry, makeFacts({ contexts }), policy, NOW)).toBe(false);
+    expect(invocations).toBe(0);
+  });
+
   it('refuses a throwing Proxy, an accessor-lying Proxy, and an enormous length', () => {
     const entry = makeEntry();
     const policy = makePolicy();

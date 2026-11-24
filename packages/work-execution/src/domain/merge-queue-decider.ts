@@ -1203,21 +1203,45 @@ export function decideMergeStep(
   }
 }
 
+/** Bounds of the retro preflight accessor walk; past either bound the walk fails closed. */
+const RETRO_ACCESSOR_SCAN_MAX_DEPTH = 6;
+const RETRO_ACCESSOR_SCAN_MAX_KEYS = 4096;
+
 /**
- * The facts keys the EV2 retro check reads: an own accessor on any of them
- * (or on the nested `pr` / `unresolvedThreads` records) is refused before it
- * could ever run.
+ * True when any own property, at any depth up to the bound, of `raw` (plain
+ * objects and arrays only) is an accessor, or when the walk exceeds its depth
+ * or key budget. Reads own descriptors only, so no getter is ever invoked.
+ * Cost bound: O(RETRO_ACCESSOR_SCAN_MAX_KEYS).
  */
-const RETRO_FACT_KEYS: readonly string[] = [
-  'pr', 'reReadHeadOid', 'contexts', 'unresolvedThreads', 'veto',
-  'mergedAtIso', 'observedBaseBranch',
-];
-
-/** The own keys read inside the nested `pr` record (never a getter run). */
-const RETRO_PR_KEYS: readonly string[] = ['status', 'headOid'];
-
-/** The own keys read inside the nested `unresolvedThreads` record. */
-const RETRO_THREADS_KEYS: readonly string[] = ['status', 'count'];
+function hasAccessorDeep(raw: unknown): boolean {
+  let budget = RETRO_ACCESSOR_SCAN_MAX_KEYS;
+  const walk = (value: unknown, depth: number): boolean => {
+    if (value === null || typeof value !== 'object') {
+      return false;
+    }
+    if (depth > RETRO_ACCESSOR_SCAN_MAX_DEPTH) {
+      return true;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      budget -= 1;
+      if (budget < 0) {
+        return true;
+      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined) {
+        continue;
+      }
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return true;
+      }
+      if (walk(descriptor.value, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return walk(raw, 0);
+}
 
 /** True when the record's own descriptor for the key is an accessor (get or set). */
 function ownsAccessor(raw: Record<string, unknown>, key: string): boolean {
@@ -1299,34 +1323,13 @@ export function isMergedHeadRetroMergeEligible(
         }
       }
     }
-    // An accessor anywhere the raw facts touch (the keys the check reads,
-    // plus the nested `pr` / `unresolvedThreads` records that
-    // `validateFacts` itself would read) is refused BEFORE the facts are
-    // validated, so no getter is ever invoked. isPlainObject reads only the
-    // prototype, never a property.
-    if (isPlainObject(facts)) {
-      const rawRecord = facts as Record<string, unknown>;
-      for (const key of RETRO_FACT_KEYS) {
-        if (ownsAccessor(rawRecord, key)) {
-          return false;
-        }
-      }
-      const rawPr = rawRecord.pr;
-      if (isPlainObject(rawPr)) {
-        for (const key of RETRO_PR_KEYS) {
-          if (ownsAccessor(rawPr, key)) {
-            return false;
-          }
-        }
-      }
-      const rawThreads = rawRecord.unresolvedThreads;
-      if (isPlainObject(rawThreads)) {
-        for (const key of RETRO_THREADS_KEYS) {
-          if (ownsAccessor(rawThreads, key)) {
-            return false;
-          }
-        }
-      }
+    // An accessor ANYWHERE in the raw facts (every own key, at every depth
+    // `validateFacts` could read) is refused BEFORE the facts are validated,
+    // so no getter is ever invoked. The walk reads own descriptors only and
+    // is bounded (RETRO_ACCESSOR_SCAN_MAX_DEPTH / _MAX_KEYS); past either
+    // bound it fails closed.
+    if (hasAccessorDeep(facts)) {
+      return false;
     }
     const validated = validateFacts(facts);
     if (!validated.ok) {

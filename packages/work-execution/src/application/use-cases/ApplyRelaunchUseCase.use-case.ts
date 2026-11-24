@@ -21,7 +21,7 @@ import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { readLaneRunRecord } from '../../domain/entities/LaneRun.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { parseWorkOrderRisk, type AttemptRecord } from '../../domain/execution-records.js';
+import { parseWorkOrderRisk, type AttemptRecord, type CollectedAttemptArtifacts } from '../../domain/execution-records.js';
 import { SHA256_HEX_PATTERN } from '../../domain/lane-plan-records.js';
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
@@ -1907,13 +1907,13 @@ async function saveAndAbortLane(
 const MAX_ATTEMPT_OWN_KEYS = 32;
 const POLLUTING_ATTEMPT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-/** An optional own data property: absent reads as undefined, anything unreadable stays hostile (BAD). */
-function optionalOwn(value: unknown, key: string): unknown {
-  const read = own(value, key);
-  return read === ABSENT ? undefined : read;
-}
-
-function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRecord | null {
+/**
+ * The own data properties of a plain object, copied through their descriptors
+ * so no getter ever runs, or `null` when the value is not one: a non-object,
+ * an array, a non-plain prototype, more than `MAX_ATTEMPT_OWN_KEYS` keys, a
+ * symbol or polluting key, an accessor, or a trap that throws.
+ */
+function plainDataCopy(value: unknown): Record<string, unknown> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const plain: Record<string, unknown> = {};
   try {
@@ -1924,12 +1924,7 @@ function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRec
     for (const key of keys) {
       if (typeof key !== 'string' || POLLUTING_ATTEMPT_KEYS.has(key)) return null;
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (
-        descriptor === undefined ||
-        descriptor.get !== undefined ||
-        descriptor.set !== undefined ||
-        !('value' in descriptor)
-      ) {
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
         return null;
       }
       plain[key] = descriptor.value;
@@ -1937,70 +1932,65 @@ function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRec
   } catch {
     return null;
   }
-  const id = own(value, 'id');
-  if (id !== attemptId) return null;
-  const readString = (key: string): string | null => {
-    const read = own(value, key);
-    return typeof read === 'string' && read !== '' ? read : null;
-  };
-  const workOrderId = readString('workOrderId');
-  const worktreePath = readString('worktreePath');
-  const baseCommit = readString('baseCommit');
-  const createdAtIso = readString('createdAtIso');
-  const updatedAtIso = readString('updatedAtIso');
-  const kind = own(value, 'kind');
-  const fixNumber = own(value, 'fixNumber');
-  const state = own(value, 'state');
-  const outcome = own(value, 'outcome');
-  const briefDigest = own(value, 'briefDigest');
-  const briefPackagePath = optionalOwn(value, 'briefPackagePath');
-  const priorAttemptId = optionalOwn(value, 'priorAttemptId');
-  const revision = optionalOwn(value, 'revision');
-  const sessionId = optionalOwn(value, 'sessionId');
-  const artifacts = own(value, 'artifacts');
-  if (
-    workOrderId === null ||
-    worktreePath === null ||
-    baseCommit === null ||
-    createdAtIso === null ||
-    updatedAtIso === null ||
-    kind !== 'initial' ||
-    fixNumber !== 0 ||
-    (state !== 'running' && state !== 'ended') ||
-    (outcome !== null && typeof outcome !== 'string') ||
-    (briefDigest !== null && typeof briefDigest !== 'string') ||
-    (briefPackagePath !== undefined && briefPackagePath !== null && typeof briefPackagePath !== 'string') ||
-    (priorAttemptId !== undefined && priorAttemptId !== null && typeof priorAttemptId !== 'string') ||
-    (sessionId !== undefined && sessionId !== null && typeof sessionId !== 'string')
-  ) {
-    return null;
-  }
-  if (revision !== undefined && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) {
-    return null;
-  }
-  // The artifacts are read for the replay's `headCommit` check; they must be
-  // a plain record with a string `headCommit` own data property.
-  if (artifacts === null || artifacts === undefined) return null;
-  const headCommit = own(artifacts, 'headCommit');
-  if (typeof headCommit !== 'string' || headCommit === '') return null;
+  return plain;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
+function isStringOrAbsent(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+function isRevisionOrAbsent(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
+}
+
+/** The identity and shape fields every stored attempt record this apply may touch must carry. */
+function attemptFieldsValid(plain: Record<string, unknown>): boolean {
+  return (
+    isNonEmptyString(plain['workOrderId']) &&
+    isNonEmptyString(plain['worktreePath']) &&
+    isNonEmptyString(plain['baseCommit']) &&
+    isNonEmptyString(plain['createdAtIso']) &&
+    isNonEmptyString(plain['updatedAtIso']) &&
+    plain['kind'] === 'initial' &&
+    plain['fixNumber'] === 0 &&
+    (plain['state'] === 'running' || plain['state'] === 'ended') &&
+    (plain['outcome'] === null || typeof plain['outcome'] === 'string') &&
+    (plain['briefDigest'] === null || typeof plain['briefDigest'] === 'string') &&
+    isStringOrAbsent(plain['briefPackagePath']) &&
+    isStringOrAbsent(plain['priorAttemptId']) &&
+    isStringOrAbsent(plain['sessionId']) &&
+    isRevisionOrAbsent(plain['revision'])
+  );
+}
+
+/**
+ * The collected artifacts of the record: only an `ended` record is read for
+ * its `headCommit` (the replay check), and it must carry one; a `running`
+ * record's artifacts may be `null` and are never read.
+ */
+function snapshotArtifacts(plain: Record<string, unknown>): CollectedAttemptArtifacts | null | undefined {
+  if (plain['state'] !== 'ended') return null;
+  const artifacts = plainDataCopy(plain['artifacts']);
+  const headCommit = artifacts?.['headCommit'];
+  if (!isNonEmptyString(headCommit)) return undefined;
+  return { headCommit, commitsSinceBase: [headCommit], collectedArtifactPaths: [], notes: 'missing' };
+}
+
+function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRecord | null {
+  const plain = plainDataCopy(value);
+  if (plain === null || plain['id'] !== attemptId || !attemptFieldsValid(plain)) return null;
+  const artifacts = snapshotArtifacts(plain);
+  if (artifacts === undefined) return null;
   return {
     ...(plain as unknown as AttemptRecord),
-    id,
-    workOrderId,
-    kind: 'initial',
-    fixNumber: 0,
-    priorAttemptId: priorAttemptId === undefined ? null : priorAttemptId,
-    worktreePath,
-    baseCommit,
-    state: state as AttemptRecord['state'],
-    ...(revision === undefined ? {} : { revision }),
-    outcome: outcome as AttemptRecord['outcome'],
-    briefDigest,
-    briefPackagePath: briefPackagePath === undefined ? null : briefPackagePath,
-    sessionId: sessionId === undefined ? null : sessionId,
-    artifacts: { headCommit, commitsSinceBase: [headCommit], collectedArtifactPaths: [], notes: 'missing' },
-    createdAtIso,
-    updatedAtIso,
+    priorAttemptId: (plain['priorAttemptId'] ?? null) as string | null,
+    briefPackagePath: (plain['briefPackagePath'] ?? null) as string | null,
+    sessionId: (plain['sessionId'] ?? null) as string | null,
+    artifacts: artifacts ?? ((plain['artifacts'] ?? null) as CollectedAttemptArtifacts | null),
   };
 }
 

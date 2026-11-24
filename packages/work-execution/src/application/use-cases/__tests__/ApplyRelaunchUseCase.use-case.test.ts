@@ -2927,6 +2927,14 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     expect(record.dispatchRevision).toBe(3);
   });
 
+  it('AR3d-running-record-without-artifacts: a running attempt whose collected artifacts are null is transitioned and adopted, not refused', async () => {
+    const harness = await makeRealHarness({ record: { artifacts: null } });
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect([record.state, record.revision, record.artifacts?.headCommit]).toEqual(['ended', 1, COMMIT]);
+  });
+
   it('AR3d-happy-path-replay: re-applying a fully completed lane runs saveAttempt exactly once across both calls and stays applied', async () => {
     const harness = await makeRealHarness();
     const useCase = new ApplyRelaunchUseCase(harness.deps);

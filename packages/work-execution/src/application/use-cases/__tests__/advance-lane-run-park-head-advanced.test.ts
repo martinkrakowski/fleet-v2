@@ -119,7 +119,10 @@ describe('dirtyWorktreeFactOf headAdvanced (CE2)', () => {
     expect(await dirtyWorktreeFactOf(ctxOf(missing), attempt)).toEqual({ trackedFilesChanged: 0 });
     // Malformed values.
     for (const checkedOutCommit of [null, undefined, 7, 'main', HEAD.slice(0, 12), OTHER_HEAD.toUpperCase()]) {
-      expect(await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit })), attempt), String(checkedOutCommit)).toEqual({
+      expect(
+        await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit } as unknown as Partial<WorktreeInspection>)), attempt),
+        String(checkedOutCommit),
+      ).toEqual({
         trackedFilesChanged: 0,
       });
     }
@@ -164,9 +167,10 @@ describe('dirtyWorktreeFactOf headAdvanced (CE2)', () => {
     expect(await dirtyWorktreeFactOf(unwired, attemptFixture())).toBeUndefined();
     // A throwing inspection reads undefined, never a throw.
     const throwing = ctxOf(null);
-    (throwing.deps as { worktreeInspect: { inspectWorktree: () => Promise<never> } }).worktreeInspect.inspectWorktree = async () => {
-      throw new Error('boom');
-    };
+    (throwing.deps as unknown as { worktreeInspect: { inspectWorktree: () => Promise<never> } }).worktreeInspect.inspectWorktree =
+      async () => {
+        throw new Error('boom');
+      };
     expect(await dirtyWorktreeFactOf(throwing, attemptFixture())).toBeUndefined();
     // No latest attempt: undefined.
     expect(await dirtyWorktreeFactOf(ctxOf(dirty), null)).toBeUndefined();

@@ -64,7 +64,7 @@ describe("loadSdk", () => {
     // — the mocked module exposes a `then` getter that throws it: vitest
     // inspects that property outside its factory wrapper, so the import
     // rejects with `originalError` unchanged.
-    vi.doMock(MCP_SPECIFIER, (): unknown => ({
+    vi.doMock(MCP_SPECIFIER, (): Record<string, unknown> => ({
       get then(): never {
         throw originalError;
       },
@@ -90,7 +90,7 @@ describe("loadSdk", () => {
     vi.doMock(MCP_SPECIFIER, () => ({ McpServer: FakeMcpServer }));
     // The stdio.js dynamic import itself rejects with `originalError`, for the
     // same reason as in the mcp.js failure test above.
-    vi.doMock(STDIO_SPECIFIER, (): unknown => ({
+    vi.doMock(STDIO_SPECIFIER, (): Record<string, unknown> => ({
       get then(): never {
         throw originalError;
       },

@@ -1260,7 +1260,13 @@ describe('ExecutionRunnerAdapter', () => {
         stderr: '',
       },
     ]);
-    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      // CB2: the ended path now needs a confirming second exit-0 read after
+      // a pause; the injected instant sleep keeps the test fast.
+      sleep: async () => {},
+    });
     const started = await adapter.startSession(makeStartRequest({ modelAssignment: { model: 'glm-5' } }));
     const status = await adapter.inspectSession({
       attemptId: 'att-1',
@@ -1293,6 +1299,7 @@ describe('ExecutionRunnerAdapter', () => {
     const idle = new ExecutionRunnerAdapter({
       runSubprocess: scriptedRunner([{ exitCode: 0, stdout: 'runner idle', stderr: '' }]).runner,
       remotePort: 4166,
+      sleep: async () => {},
     });
     const idleStatus = await idle.inspectSession({
       attemptId: 'att-1',
@@ -1308,6 +1315,7 @@ describe('ExecutionRunnerAdapter', () => {
       runSubprocess: scriptedRunner([{ exitCode: 0, stdout: 'nothing running', stderr: '' }])
         .runner,
       remotePort: 4166,
+      sleep: async () => {},
     });
     const nothingStatus = await nothing.inspectSession({
       attemptId: 'att-1',
@@ -1488,7 +1496,11 @@ describe('ExecutionRunnerAdapter', () => {
         stderr: '',
       },
     ]);
-    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166 });
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      sleep: async () => {},
+    });
     const status = await adapter.inspectSession({
       attemptId: 'att-1',
       sessionId: 'ses_a',

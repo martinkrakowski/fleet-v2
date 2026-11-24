@@ -2210,6 +2210,157 @@ describe('ResolveActionAuthorizationUseCase relaunch-apply resolve (AR3a)', () =
     );
     expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
   });
+
+  // AR3c2: `sign-decision` writes the signed answer under `grant-<requestId>`
+  // without rewriting the stored request, so the stored record still reads
+  // `awaiting-decision` with `grantId: null` and `findRequestByGrantId`
+  // misses. The resolve must fall back to the stored relaunch-project
+  // requests, refresh the matching awaiting one from its verified answer and
+  // authorize only then.
+  describe('relaunch-apply grant resolution from the recorded answer (AR3c2)', () => {
+    /** An awaiting relaunch-apply record exactly as `request-decision` stores it. */
+    function awaitingRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
+      return relaunchRecord({
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantId: null,
+        revision: 0,
+        deliveryStatus: 'pending',
+        ...overrides,
+      });
+    }
+
+    it('blocks grant-missing when the request is awaiting-decision and no signed decision exists', async () => {
+      const record = awaitingRecord();
+      expect(record.grantId).toBeNull();
+      const signer = createSignedDecisionFixture();
+      const result = await resolve(
+        {
+          requestRepo: repositoryWith(record),
+          decisionTransport: explicitAnswerTransport(signer.ownerPublicKey, {}),
+          ...clockAt(CREATED_AT_ISO),
+        },
+        relaunchRequest(),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+    });
+
+    it('refreshes an awaiting-decision record from its signed answer and authorizes the grant it names', async () => {
+      const record = awaitingRecord();
+      const repo = repositoryWith(record);
+      const signer = createSignedDecisionFixture();
+      const expectedGrantId = `grant-${record.id}`;
+      await signer.writeApprovedAnswer({
+        id: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-relaunch-1',
+        grantId: expectedGrantId,
+      });
+      const result = await resolve(
+        {
+          requestRepo: repo,
+          decisionTransport: signer.deps.decisionTransport,
+          ...clockAt(CREATED_AT_ISO),
+        },
+        relaunchRequest({ authorizationGrantId: expectedGrantId }),
+      );
+      expect(result).toEqual({
+        outcome: 'authorized',
+        grantId: expectedGrantId,
+        requestId: record.id,
+        expectedHeadSha: '',
+        policyRevision: 'pol-relaunch-1',
+      });
+      // The refresh persisted the decision: the stored record is now approved
+      // under the signed grant, at the next revision.
+      const stored = await repo.findRequestById(record.id);
+      expect(stored).toMatchObject({
+        state: 'approved',
+        grantId: expectedGrantId,
+        decisionRevision: 'dec-relaunch-1',
+        revision: 1,
+      });
+    });
+
+    it('refuses a signed approval naming a different grant id than the resolve requests', async () => {
+      const record = awaitingRecord();
+      const signer = createSignedDecisionFixture();
+      await signer.writeApprovedAnswer({
+        id: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-relaunch-1',
+        grantId: `grant-${record.id}`,
+      });
+      const result = await resolve(
+        {
+          requestRepo: repositoryWith(record),
+          decisionTransport: signer.deps.decisionTransport,
+          ...clockAt(CREATED_AT_ISO),
+        },
+        relaunchRequest({ authorizationGrantId: 'grant-some-other-grant' }),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+    });
+
+    it('refuses a signed answer whose recorded grant id was tampered after signing', async () => {
+      const record = awaitingRecord();
+      const signer = createSignedDecisionFixture();
+      const answer = signer.signApprovedAnswer({
+        id: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-relaunch-1',
+        grantId: `grant-${record.id}`,
+      });
+      // A store-side edit of the grant id breaks the signature: the answer can
+      // never verify to an approval, so the record stays awaiting and the
+      // resolve refuses.
+      const tampered = { ...answer, grantId: 'grant-tampered' };
+      const result = await resolve(
+        {
+          requestRepo: repositoryWith(record),
+          decisionTransport: explicitAnswerTransport(signer.ownerPublicKey, { [record.id]: tampered }),
+          ...clockAt(CREATED_AT_ISO),
+        },
+        relaunchRequest({ authorizationGrantId: 'grant-tampered' }),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+      expect(await repositoryWith(record).findRequestById(record.id)).toMatchObject({ state: 'awaiting-decision' });
+    });
+
+    it('never consults requests of another project or scope in the recorded-answer fallback', async () => {
+      // A non-relaunch awaiting record that happens to share the plan digest
+      // must never be refreshed into an authorization for the relaunch scope.
+      const foreign = awaitingRecord({
+        projectId: 'project-other',
+        actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+        expectedHeadSha: null,
+      });
+      const signer = createSignedDecisionFixture();
+      await signer.writeApprovedAnswer({
+        id: foreign.id,
+        projectId: foreign.projectId,
+        actionScope: foreign.actionScope,
+        expectedHeadSha: foreign.expectedHeadSha,
+        decisionRevision: 'dec-relaunch-1',
+        grantId: GRANT_ID,
+      });
+      const result = await resolve(
+        {
+          requestRepo: repositoryWith(foreign),
+          decisionTransport: signer.deps.decisionTransport,
+          ...clockAt(CREATED_AT_ISO),
+        },
+        relaunchRequest(),
+      );
+      expect(result).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+    });
+  });
 });
 
 describe('ResolveActionAuthorizationUseCase dependency receivers (AR3a)', () => {

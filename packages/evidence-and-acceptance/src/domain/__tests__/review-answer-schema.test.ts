@@ -635,6 +635,25 @@ describe('classifyUnreadableReviewAnswer', () => {
     ).toBe('bad-findings');
   });
 
+  it('returns extra-keys when a later finding carries an unexpected key after a non-record entry', () => {
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[null,{"severity":"nit","file":"a.ts","line":1,"summary":"s","extra":1}]}\n```',
+      ),
+    ).toBe('extra-keys');
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[1,"x",{"severity":"nit","file":"a.ts","line":1,"summary":"s","extra":1}]}\n```',
+      ),
+    ).toBe('extra-keys');
+    // No entry carries an extra key: the non-record entry stays bad-findings.
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[{"severity":"nit","file":"a.ts","line":1,"summary":"s"},null]}\n```',
+      ),
+    ).toBe('bad-findings');
+  });
+
   it('returns truncated for unclosed fences or truncated JSON', () => {
     expect(classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":[]}')).toBe(
       'truncated',

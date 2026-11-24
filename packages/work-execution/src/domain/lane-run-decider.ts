@@ -48,6 +48,17 @@ import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
  */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([
   'empty', 'unparseable-verdict', 'no-findings-on-fail',
+  // CB7: the closed per-label set, mirrored from UNREADABLE_REVIEW_ANSWER_LABELS.
+  'unparseable-verdict-empty',
+  'unparseable-verdict-no-json',
+  'unparseable-verdict-no-fence',
+  'unparseable-verdict-multiple-fences',
+  'unparseable-verdict-duplicate-keys',
+  'unparseable-verdict-extra-keys',
+  'unparseable-verdict-bad-verdict-word',
+  'unparseable-verdict-bad-findings',
+  'unparseable-verdict-truncated',
+  'unparseable-verdict-other',
 ]);
 
 const REVIEW_DETAIL_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;

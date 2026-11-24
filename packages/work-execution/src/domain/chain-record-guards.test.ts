@@ -1,3 +1,26 @@
+/**
+ * Break-and-restore proof (fix round 1, run-01M873DWC7J9FWM4A3PGJZ2VPQ): each
+ * guard in `chain-records.ts` was temporarily broken, the suite was run and
+ * observed failing, and the guard was restored immediately (zero production
+ * changes in the diff). Proven per guard:
+ * - `isChainCommitSha`: hex-pattern check dropped (uppercase hex accepted) —
+ *   "refuses wrong lengths, uppercase, non-hex, abbreviated and
+ *   newline-suffixed strings" failed (expected false, received true).
+ * - `isChainActionKey`: secret-shape refusal dropped (`return true`) —
+ *   "refuses the secret-shaped key from chain-records.test.ts" failed.
+ * - `parseChainRepository`: `Object.freeze` removed from the result —
+ *   "returns a frozen owner/repo pair and drops extra own keys" failed
+ *   (`Object.isFrozen(result)` no longer true).
+ * - `isChainReasonCode`: pattern check dropped (uppercase accepted) —
+ *   "refuses empty, uppercase, leading digit or dash, over-64, underscore and
+ *   space" failed.
+ * - `chainReviewRequestIdOf`: sha cut changed from 12 to 13 characters —
+ *   "pins the exact chain-review:id:<head12> output with a 12-character sha
+ *   cut" failed (exact pinned output mismatch).
+ * - `chainLinkBranchesOf`: absent-`linkBranches` result changed from `null` to
+ *   `[]` — "returns null when linkBranches is absent and the array when
+ *   landed" failed.
+ */
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -55,6 +78,17 @@ describe('isChainCommitSha', () => {
       expect(isChainCommitSha(bad)).toBe(false);
     }
   });
+
+  it('refuses getter-defined and Proxy shapes without running getters or throwing', () => {
+    const spy = vi.fn(() => SHA);
+    const getter = Object.defineProperty({}, 'toString', { get: spy, enumerable: true });
+    expect(isChainCommitSha(getter)).toBe(false);
+    const throwingProxy = new Proxy({}, { get() { throw new Error('boom'); } });
+    expect(isChainCommitSha(throwingProxy)).toBe(false);
+    const lyingProxy = new Proxy({}, { get: () => SHA, getOwnPropertyDescriptor: () => undefined });
+    expect(isChainCommitSha(lyingProxy)).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
+  });
 });
 
 describe('isChainActionKey', () => {
@@ -73,6 +107,17 @@ describe('isChainActionKey', () => {
     for (const bad of [...HOSTILE_INPUTS, [], {}]) {
       expect(isChainActionKey(bad)).toBe(false);
     }
+  });
+
+  it('refuses getter-defined and Proxy shapes without running getters or throwing', () => {
+    const spy = vi.fn(() => 'chain-start-1');
+    const getter = Object.defineProperty({}, 'toString', { get: spy, enumerable: true });
+    expect(isChainActionKey(getter)).toBe(false);
+    const throwingProxy = new Proxy({}, { get() { throw new Error('boom'); } });
+    expect(isChainActionKey(throwingProxy)).toBe(false);
+    const lyingProxy = new Proxy({}, { get: () => 'chain-start-1', getOwnPropertyDescriptor: () => undefined });
+    expect(isChainActionKey(lyingProxy)).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it('refuses the secret-shaped key from chain-records.test.ts (token ghp_ + 36 chars)', () => {
@@ -160,6 +205,17 @@ describe('isChainReasonCode', () => {
     for (const bad of [...HOSTILE_INPUTS, [], {}]) {
       expect(isChainReasonCode(bad)).toBe(false);
     }
+  });
+
+  it('refuses getter-defined and Proxy shapes without running getters or throwing', () => {
+    const spy = vi.fn(() => 'head-moved');
+    const getter = Object.defineProperty({}, 'toString', { get: spy, enumerable: true });
+    expect(isChainReasonCode(getter)).toBe(false);
+    const throwingProxy = new Proxy({}, { get() { throw new Error('boom'); } });
+    expect(isChainReasonCode(throwingProxy)).toBe(false);
+    const lyingProxy = new Proxy({}, { get: () => 'head-moved', getOwnPropertyDescriptor: () => undefined });
+    expect(isChainReasonCode(lyingProxy)).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 

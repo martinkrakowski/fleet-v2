@@ -39,11 +39,18 @@ export function trimString<T>(value: T): T {
 }
 
 export function trimStringArray<T>(value: T): T {
-  return (
-    Array.isArray(value)
-      ? value.map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : entry))
-      : value
-  ) as T;
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  // An array hole is untrusted input this trimmer cannot interpret, so it is
+  // refused with a named error instead of being silently carried through.
+  // The hole scan is O(n) over the array's own indices.
+  for (let index = 0; index < value.length; index += 1) {
+    if (!(index in value)) {
+      throw new TypeError(`trimStringArray refuses an array hole at index ${index}`);
+    }
+  }
+  return value.map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : entry)) as T;
 }
 
 export function findCredentialName(names: readonly string[]): string | null {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { findLiveRunForAttempt, MAX_LIVE_RUN_SCAN_RUNS, MAX_RUN_ATTEMPT_IDS } from '../cancel-prepared-run-active.js';
+import { findLiveRunForAttempt, MAX_LIVE_RUN_SCAN_RUNS, MAX_RUN_ATTEMPT_IDS, MAX_LIVE_RUN_JOURNAL_ENTRIES } from '../cancel-prepared-run-active.js';
 import { LANE_RUN_STATES, LANE_RUN_TERMINAL_STATES, type LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
@@ -252,5 +252,71 @@ describe('findLiveRunForAttempt', () => {
     getterAttemptIds.length = 1;
     await expectTypeRefusal(run(RUN_A, getterAttemptIds as unknown as string[]));
     expect(elementGetterInvoked).toBe(false);
+  });
+
+  it('refuses a sparse run list whose hole an inherited Array.prototype index would fill, instead of reading the inherited live run', async () => {
+    Object.defineProperty(Array.prototype, 0, {
+      configurable: true,
+      writable: true,
+      value: run(RUN_A, [ATTEMPT_ID]),
+    });
+    try {
+      const sparse: unknown[] = [];
+      sparse.length = 1;
+      await expect(
+        findLiveRunForAttempt(makeRepo(sparse), makeJournal(liveJournal('running')), ATTEMPT_ID),
+      ).rejects.toThrow(TypeError);
+    } finally {
+      delete (Array.prototype as unknown as Record<number, unknown>)[0];
+    }
+  });
+
+  it('refuses a port whose list or listForRun is an accessor, own or on the prototype, without running it', async () => {
+    let ran = 0;
+    const ownGetterRepo = {};
+    Object.defineProperty(ownGetterRepo, 'list', {
+      get() {
+        ran++;
+        return async () => [];
+      },
+    });
+    class ProtoGetterJournal {
+      get listForRun() {
+        ran++;
+        return async () => [];
+      }
+    }
+    await expect(
+      findLiveRunForAttempt(ownGetterRepo as Pick<LaneRunRepositoryPort, 'list'>, makeJournal(new Map()), ATTEMPT_ID),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      findLiveRunForAttempt(makeRepo([]), new ProtoGetterJournal() as unknown as Pick<LaneRunJournalPort, 'listForRun'>, ATTEMPT_ID),
+    ).rejects.toThrow(TypeError);
+    expect(ran).toBe(0);
+  });
+
+  it('refuses a journal entry with an accessor property, never treating the run as terminal and never running the accessor', async () => {
+    let ran = false;
+    const hostile = { kind: 'conduct', runId: RUN_A } as Record<string, unknown>;
+    Object.defineProperty(hostile, 'state', {
+      enumerable: true,
+      get() {
+        ran = true;
+        return 'merged';
+      },
+    });
+    const journal = makeJournal(new Map([[RUN_A, [hostile as unknown as LaneRunJournalEntryRecord]]]));
+    await expect(findLiveRunForAttempt(makeRepo([run(RUN_A, [ATTEMPT_ID])]), journal, ATTEMPT_ID)).rejects.toThrow(TypeError);
+    expect(ran).toBe(false);
+  });
+
+  it('refuses an oversized journal before scanning it and a non-object journal entry', async () => {
+    const huge = new Array(MAX_LIVE_RUN_JOURNAL_ENTRIES + 1);
+    await expect(
+      findLiveRunForAttempt(makeRepo([run(RUN_A, [ATTEMPT_ID])]), makeJournal(new Map([[RUN_A, huge as never]])), ATTEMPT_ID),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      findLiveRunForAttempt(makeRepo([run(RUN_A, [ATTEMPT_ID])]), makeJournal(new Map([[RUN_A, [null as never]]])), ATTEMPT_ID),
+    ).rejects.toThrow(TypeError);
   });
 });

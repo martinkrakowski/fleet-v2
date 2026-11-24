@@ -11,6 +11,12 @@ export const MAX_LIVE_RUN_SCAN_RUNS = 10_000;
 /** Cost bound: one run's `attemptIds` may not hold more ids than this. */
 export const MAX_RUN_ATTEMPT_IDS = 1_000;
 
+/** Cost bound: one run's journal may not hold more entries than this. */
+export const MAX_LIVE_RUN_JOURNAL_ENTRIES = 100_000;
+
+/** Cost bound: how many prototype links are walked looking for an accessor on a port. */
+const MAX_PROTOTYPE_DEPTH = 16;
+
 /** Keys that must never be accepted as an identifier or looked up dynamically. */
 const POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -42,15 +48,51 @@ function requirePlainArray(value: unknown, label: string, max: number): readonly
     throw new RangeError(`${label} length ${value.length} exceeds the bound ${max}`);
   }
   for (let index = 0; index < value.length; index++) {
-    if (!(index in value)) {
+    // Only an OWN data slot counts: a hole (even one an inherited `Array.prototype`
+    // index would fill) or an accessor is refused, and nothing is ever invoked.
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (descriptor === undefined) {
       throw new TypeError(`${label} has a hole at index ${index}`);
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (descriptor !== undefined && descriptor.get !== undefined) {
+    if (!('value' in descriptor)) {
       throw new TypeError(`${label} has a getter at index ${index}`);
     }
   }
   return value;
+}
+
+/**
+ * Reads a port's method without running a getter: walks the prototype chain
+ * (bounded) through descriptors and refuses an accessor or a missing function.
+ */
+function requireMethod(port: unknown, name: string, label: string): (...args: never[]) => unknown {
+  if (port === null || typeof port !== 'object') {
+    throw new TypeError(`${label} must be an object with a ${name} function`);
+  }
+  let current: object | null = port;
+  for (let depth = 0; current !== null && depth < MAX_PROTOTYPE_DEPTH; depth++) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor !== undefined) {
+      if (!('value' in descriptor) || typeof descriptor.value !== 'function') {
+        throw new TypeError(`${label} must have a plain ${name} function, not an accessor`);
+      }
+      return descriptor.value as (...args: never[]) => unknown;
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  throw new TypeError(`${label} must be an object with a ${name} function`);
+}
+
+/** A journal entry: an object whose own properties are all data properties (no accessor is ever run). */
+function requireJournalEntry(value: unknown): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('a journal entry must be a non-array object');
+  }
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+    if (!('value' in descriptor)) {
+      throw new TypeError('a journal entry must not carry accessor properties');
+    }
+  }
 }
 
 /** One run record: a plain object with own, getter-free, valid `runId` and `attemptIds`. */
@@ -86,17 +128,13 @@ export async function findLiveRunForAttempt(
   runJournal: Pick<LaneRunJournalPort, 'listForRun'>,
   attemptId: string,
 ): Promise<{ runId: string } | null> {
-  if (runRepo === null || typeof runRepo !== 'object' || typeof (runRepo as { list?: unknown }).list !== 'function') {
-    throw new TypeError('runRepo must be an object with a list function');
-  }
-  if (runJournal === null || typeof runJournal !== 'object' || typeof (runJournal as { listForRun?: unknown }).listForRun !== 'function') {
-    throw new TypeError('runJournal must be an object with a listForRun function');
-  }
+  const list = requireMethod(runRepo, 'list', 'runRepo') as () => Promise<unknown>;
+  const listForRun = requireMethod(runJournal, 'listForRun', 'runJournal') as (runId: string) => Promise<unknown>;
   requireIdentifier(attemptId, 'attemptId');
 
   // A rejected read propagates its exact error: a failed scan is never a clean null.
   const runs = requirePlainArray(
-    await runRepo.list(),
+    await list.call(runRepo),
     'runRepo.list() result',
     MAX_LIVE_RUN_SCAN_RUNS,
   );
@@ -106,10 +144,13 @@ export async function findLiveRunForAttempt(
       continue;
     }
     const entries = requirePlainArray(
-      await runJournal.listForRun(run.runId),
+      await listForRun.call(runJournal, run.runId),
       'runJournal.listForRun() result',
-      Number.MAX_SAFE_INTEGER,
+      MAX_LIVE_RUN_JOURNAL_ENTRIES,
     );
+    for (const journalEntry of entries) {
+      requireJournalEntry(journalEntry);
+    }
     const state: LaneRunStateValue = laneRunJournalState(entries as readonly LaneRunJournalEntryRecord[], run.runId);
     if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
       // Any non-terminal (or unknown) state is live: report the first such run.

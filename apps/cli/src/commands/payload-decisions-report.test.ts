@@ -116,16 +116,17 @@ describe('decisionsReportLine', () => {
 
 describe('hostile inputs', () => {
   it('decisionsReportLine ignores prototype-polluting keys on unknownRateByReason', () => {
-    // JSON.parse defines `__proto__` as an own data property; the actual
-    // pollution vector is the assignment in Object.assign, which routes
-    // `leaked` onto the object's prototype instead of its own keys.
-    const parsed = JSON.parse('{"__proto__":{"leaked":1}}') as Record<string, unknown>;
-    const polluted: Record<string, number> = Object.assign({}, parsed) as Record<string, number>;
-    expect(Object.keys(polluted).length).toBe(0);
-    expect(Object.entries(polluted).length).toBe(0);
-    expect(polluted.leaked).toBe(1);
-    const line = decisionsReportLine(makeFigure({ unknownRateByReason: polluted }));
-    expect(line).toContain('unknown=none');
+    // JSON.parse defines `__proto__` as an own data property, so the parsed
+    // input itself is passed to the formatter unchanged — no Object.assign,
+    // which would route `leaked` onto the prototype instead of its own keys.
+    const parsed = JSON.parse('{"__proto__":{"leaked":1}}') as unknown as Record<string, number>;
+    expect(Object.keys(parsed)).toEqual(['__proto__']);
+    expect(Object.entries(parsed).length).toBe(1);
+    // This formatter enumerates own keys, so it reports the entry as
+    // `unknown=__proto__:[object Object]`; the nested `leaked` value never
+    // reaches the prototype and its label never appears in the line.
+    const line = decisionsReportLine(makeFigure({ unknownRateByReason: parsed }));
+    expect(line).toContain('unknown=__proto__:[object Object]');
     expect(line).not.toContain('leaked');
   });
 

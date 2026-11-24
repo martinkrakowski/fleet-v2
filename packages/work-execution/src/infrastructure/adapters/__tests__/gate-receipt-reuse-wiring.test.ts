@@ -58,6 +58,8 @@ class ScriptedExecutor implements CommandExecutorPort {
   failingProbes = new Set<string>();
   throwEverything = false;
   gateExit: Record<string, number> = {};
+  /** The worktree's dependency state file: true unless a test removes it. */
+  stateFilePresent = true;
 
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     if (this.throwEverything) {
@@ -98,6 +100,12 @@ class ScriptedExecutor implements CommandExecutorPort {
         return ok(HEAD + '\n');
       }
       return ok(argv.includes('rev-list') ? '2\n' : '');
+    }
+    // The environment probe is not a gate run; it never counts.
+    if (head === 'test') {
+      return this.stateFilePresent
+        ? ok('')
+        : { exitCode: 1, signal: null, stdout: '', stderr: '' };
     }
     // After `fleet-gate <worktree>` comes the declared gate-slot prefix (env, two settings, the wrapper) or the command.
     const rest = argv.slice(argv.indexOf('fleet-gate') + 2);
@@ -272,8 +280,27 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     }
   });
 
-  it('refuses a worktree path that is not absolute as an unusable request, running nothing', async () => {
-    for (const worktreePath of ['-uX', 'rel/dir', '.', '--', './x']) {
+  it('ensures the worktree environment before reusing a cached passing receipt', async () => {
+    const store = new SpyStore();
+    await adapterOver(new ScriptedExecutor(), store).evaluateGatePredicates(requestWith([GATE]));
+    expect(store.recorded).toHaveLength(1);
+    // The state file is now absent and the install cannot make it present:
+    // the cached passing receipt must not bypass the environment check.
+    const executor = new ScriptedExecutor();
+    executor.stateFilePresent = false;
+    const results = commandResults(
+      await adapterOver(executor, store).evaluateGatePredicates(requestWith([GATE])),
+    );
+    expect(results[0]).toMatchObject({
+      verdict: 'unknown',
+      cause: 'environment-not-installed',
+      detail: 'dependencies not installed in the worktree',
+    });
+    expect(results[0]?.detail.startsWith('reused receipt: ')).toBe(false);
+    expect(executor.gateRuns).not.toContain('gate-a');
+  });
+
+  it('refuses a worktree path that is not absolute as an unusable request, running nothing', async () => {    for (const worktreePath of ['-uX', 'rel/dir', '.', '--', './x']) {
       const executor = new ScriptedExecutor();
       const result = await adapterOver(executor, new SpyStore()).evaluateGatePredicates({
         ...requestWith([GATE]),

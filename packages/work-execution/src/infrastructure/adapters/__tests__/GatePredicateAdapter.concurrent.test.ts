@@ -85,6 +85,10 @@ class RecordingExecutor implements CommandExecutorPort {
   }
 
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
+    // The environment probe is not a command predicate; it never counts.
+    if (argv[0] === 'test') {
+      return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+    }
     if (argv[0] === 'git') {
       if (this.gitThrows) {
         throw new Error('git transport crashed');

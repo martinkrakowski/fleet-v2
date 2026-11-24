@@ -120,6 +120,9 @@ const RESOURCE_EXHAUSTED_EXIT_CODES: ReadonlySet<number> = new Set([137, 143]);
 const GATE_SLOT_MAX_WAIT_SECONDS = 600;
 const GATE_SLOT_WAIT_DIVISOR_MS = 3000;
 const GIT_TIMEOUT_MS = 60 * 1000;
+/** Yarn's marker that the worktree's dependencies are installed (node-modules linker). */
+const YARN_STATE_FILE = join('node_modules', '.yarn-state.yml');
+const YARN_INSTALL_ARGV: readonly string[] = ['yarn', 'install', '--immutable'];
 const GIT_HARDENING: readonly string[] = [
   '-c',
   'core.fsmonitor=false',
@@ -127,9 +130,91 @@ const GIT_HARDENING: readonly string[] = [
   'core.hooksPath=/dev/null',
 ];
 
-/** A run that never reported a completed exit is not a verdict. */
-function gitFailed(run: CommandRunResult): boolean {
-  return run.error !== undefined || run.exitCode === null;
+/**
+ * Reads one own data property of untrusted runtime input without ever
+ * invoking it: a getter (own accessor property) or a missing property is a
+ * refusal (`present: false`), never a read. A `Proxy` whose traps throw is
+ * caught and refused; one that lies consistently in every trap is an
+ * accepted residual.
+ */
+function ownDataProperty(
+  container: object,
+  key: string,
+): { readonly present: boolean; readonly value: unknown } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(container, key);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { present: false, value: undefined };
+    }
+    return { present: true, value: descriptor.value };
+  } catch {
+    return { present: false, value: undefined };
+  }
+}
+
+/** The own data property's value when it is a string; undefined otherwise (a getter or a missing property is never read). */
+function stringField(container: object, key: string): string | undefined {
+  const field = ownDataProperty(container, key);
+  return field.present && typeof field.value === 'string' ? field.value : undefined;
+}
+
+/**
+ * A dense array of untrusted runtime input: a real array whose every index is
+ * an own data property. A hole (skipped by `every`, `map` and friends), an
+ * index getter and a non-array (an array-like is not a real array) are all
+ * refused, so nothing later can reach the executor as `undefined`.
+ */
+function isDenseDataArray(value: unknown): value is readonly unknown[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!ownDataProperty(value, String(index)).present) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * An untrusted `CommandRunResult` that is a record with only usable own data
+ * fields: a `null` or safe-integer-number exit code, string stdout/stderr,
+ * string-or-null signal, and a string-or-absent error. A getter on any field
+ * (own accessor property) is refused without ever being invoked, a missing
+ * field is a refusal, and a wrong primitive is a refusal — never a pass.
+ */
+function isUsableRun(run: unknown): run is CommandRunResult {
+  if (run === null || typeof run !== 'object') {
+    return false;
+  }
+  const exitCode = ownDataProperty(run, 'exitCode');
+  if (
+    !exitCode.present ||
+    (exitCode.value !== null &&
+      (typeof exitCode.value !== 'number' || !Number.isSafeInteger(exitCode.value)))
+  ) {
+    return false;
+  }
+  for (const key of ['stdout', 'stderr'] as const) {
+    const field = ownDataProperty(run, key);
+    if (!field.present || typeof field.value !== 'string') {
+      return false;
+    }
+  }
+  const signal = ownDataProperty(run, 'signal');
+  if (!signal.present || (signal.value !== null && typeof signal.value !== 'string')) {
+    return false;
+  }
+  const error = ownDataProperty(run, 'error');
+  if (error.present && error.value !== undefined && typeof error.value !== 'string') {
+    return false;
+  }
+  return true;
+}
+
+/** A run that never reported a completed exit is not a verdict. Untrusted runtime input: an unusable shape reads as failed. */
+function gitFailed(run: unknown): boolean {
+  return !isUsableRun(run) || run.error !== undefined || run.exitCode === null;
 }
 
 /** The last stderr line after stripping one trailing newline, trimmed. */
@@ -154,8 +239,17 @@ function commandName(command: GateCommand, index: number): string {
   return gateCommandPredicateName(command.argv, index);
 }
 
-/** Raw command verdict before coverage is applied; exit 255 is only a transport failure when remote. */
+/**
+ * Raw command verdict before coverage is applied; exit 255 is only a transport
+ * failure when remote. Untrusted runtime input: the run's fields are read
+ * through their own data properties (a getter is refused, never invoked), and
+ * a wrong shape — a non-number or missing exit code, a non-string stream, a
+ * getter on any field — is `unknown`, never a pass.
+ */
 function rawVerdict(run: CommandRunResult, isRemote: boolean): EvidenceResultValue {
+  if (!isUsableRun(run)) {
+    return 'unknown';
+  }
   if (run.error !== undefined || run.exitCode === null) {
     return 'unknown';
   }
@@ -197,6 +291,59 @@ function resourceExhaustedResult(name: string, exitCode: number, durationMs: num
         : 'resource exhausted (exit 143, SIGTERM)',
     cause: 'resource-exhausted',
   };
+}
+
+/**
+ * A command whose worktree never got its dependencies (`node_modules/.yarn-state.yml`
+ * absent after one bounded `yarn install --immutable`, or a missing-module
+ * failure while the state file is absent) never reported its own verdict: it
+ * is `unknown` with `cause: 'environment-not-installed'`, so the run retries
+ * once the environment is installed instead of recording a hard failure. It
+ * carries no output tail and no failing file: the failure is the
+ * environment's, not the command's.
+ */
+function environmentNotInstalledResult(
+  name: string,
+  exitCode: number | null,
+  durationMs: number,
+): GatePredicateResult {
+  return {
+    name,
+    kind: 'command',
+    verdict: 'unknown',
+    exitCode,
+    durationMs,
+    detail: 'dependencies not installed in the worktree',
+    cause: 'environment-not-installed',
+  };
+}
+
+/**
+ * The fixed command argv for running one argv inside the worktree through the
+ * trusted wrapper, optionally prefixed with the host's gate-slot throttle.
+ */
+function worktreeCommandArgv(
+  worktreePath: string,
+  gateSlot: GateSlotConfiguration | undefined,
+  commandArgv: readonly string[],
+  waitSeconds: number,
+): string[] {
+  return [
+    'sh',
+    '-c',
+    'cd -- "$1" && shift && exec "$@"',
+    'fleet-gate',
+    worktreePath,
+    ...(gateSlot === undefined
+      ? []
+      : [
+          '/usr/bin/env',
+          'FLEET_V2_GATE_SLOTS=' + String(readGateSlotCapacity(gateSlot.slots)),
+          'FLEET_V2_GATE_WAIT_MAX_SECONDS=' + String(waitSeconds),
+          gateSlot.path,
+        ]),
+    ...commandArgv,
+  ];
 }
 
 function detailForCommand(
@@ -466,34 +613,57 @@ function unknownResult(
   return { name, kind, verdict: 'unknown', exitCode: null, durationMs, detail };
 }
 
-function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
-  if (request === null || typeof request !== 'object' || typeof request.worktreePath !== 'string') {
+/**
+ * Request validation over untrusted runtime input: every property is read
+ * through its own data property descriptor, so a getter is refused without
+ * ever being invoked, a missing property is a refusal, and an array must be
+ * dense (a hole is a refusal, never skipped) — the same rule for the
+ * `spec.commands` array, each command's `argv` array and the allowed path
+ * prefixes. Never throws: a hostile value can only end in `false`.
+ */
+function isUsableRequest(request: unknown): boolean {
+  if (request === null || typeof request !== 'object') {
     return false;
   }
-  if (
-    request.worktreePath.length === 0 ||
-    !isAbsolute(request.worktreePath) ||
-    !Array.isArray(request.allowedPathPrefixes)
-  ) {
+  const worktreePath = stringField(request, 'worktreePath');
+  if (worktreePath === undefined || worktreePath.length === 0 || !isAbsolute(worktreePath)) {
     return false;
   }
-  const spec = request.spec as { commands?: unknown } | null | undefined;
-  if (spec === null || typeof spec !== 'object' || !Array.isArray(spec.commands)) {
+  const allowedPathPrefixes = ownDataProperty(request, 'allowedPathPrefixes');
+  if (!allowedPathPrefixes.present || !isDenseDataArray(allowedPathPrefixes.value)) {
     return false;
   }
-  if (spec.commands.length < 1 || spec.commands.length > MAX_GATE_COMMANDS) {
+  const specField = ownDataProperty(request, 'spec');
+  if (!specField.present || specField.value === null || typeof specField.value !== 'object') {
     return false;
   }
-  return spec.commands.every(
-    (command: unknown) =>
-      command !== null &&
-      typeof command === 'object' &&
-      Array.isArray((command as { argv?: unknown }).argv) &&
-      (command as { argv: unknown[] }).argv.length > 0 &&
-      (command as { argv: unknown[] }).argv.length <= MAX_GATE_ARGV_ENTRIES &&
-      (command as { argv: unknown[] }).argv.every(
-        (entry) => typeof entry === 'string' && entry.length <= MAX_GATE_ARG_CHARACTERS && !entry.includes('\0'),
-      ),
+  const commandsField = ownDataProperty(specField.value as object, 'commands');
+  if (!commandsField.present || !isDenseDataArray(commandsField.value)) {
+    return false;
+  }
+  const commands = commandsField.value;
+  if (commands.length < 1 || commands.length > MAX_GATE_COMMANDS) {
+    return false;
+  }
+  return commands.every((command: unknown) => isUsableCommand(command));
+}
+
+/** One command of an untrusted spec: an object with a dense, bounded, string argv (no hole, no getter, no array-like). */
+function isUsableCommand(command: unknown): boolean {
+  if (command === null || typeof command !== 'object') {
+    return false;
+  }
+  const argvField = ownDataProperty(command, 'argv');
+  if (!argvField.present || !isDenseDataArray(argvField.value)) {
+    return false;
+  }
+  const argv = argvField.value;
+  if (argv.length < 1 || argv.length > MAX_GATE_ARGV_ENTRIES) {
+    return false;
+  }
+  return argv.every(
+    (entry: unknown) =>
+      typeof entry === 'string' && entry.length <= MAX_GATE_ARG_CHARACTERS && !entry.includes('\0'),
   );
 }
 
@@ -503,6 +673,15 @@ interface ReceiptContext {
   readonly toolchainVersions: unknown;
   readonly declaredEnvironmentDigest: unknown;
 }
+
+/**
+ * The per-gate-run outcome of the worktree environment check: ready, or not
+ * ready with the failed install's exit code and duration (null/0 when the
+ * install itself never completed).
+ */
+type EnvironmentReadiness =
+  | { readonly ready: true }
+  | { readonly ready: false; readonly exitCode: number | null; readonly durationMs: number };
 
 export class GatePredicateAdapter implements GatePredicatePort {
   private readonly executorForRecordedHost: (
@@ -576,11 +755,15 @@ export class GatePredicateAdapter implements GatePredicatePort {
   }
 
   private async evaluateGuarded(
-    request: EvaluateGatePredicatesRequest,
+    untrustedRequest: unknown,
   ): Promise<EvaluateGatePredicatesResult> {
-    if (!isUsableRequest(request)) {
+    if (!isUsableRequest(untrustedRequest)) {
       return { outcome: 'unavailable', reason: 'gate predicate request is malformed' };
     }
+    // Validation confirmed the shapes the adapter reads; the cast carries no
+    // trust beyond that (a `Proxy` lying consistently in every trap is an
+    // accepted residual).
+    const request = untrustedRequest as EvaluateGatePredicatesRequest;
     const resolved = this.executorForRecordedHost(request.runner);
     if (!resolved.ok) {
       return { outcome: 'unavailable', reason: boundedDetail(resolved.reason) };
@@ -618,10 +801,22 @@ export class GatePredicateAdapter implements GatePredicatePort {
       receiptContext ??= this.readReceiptContext(executor, request, budget);
       return receiptContext;
     };
+    // Per-gate-run environment readiness, memoized: the worktree's dependency
+    // state is probed once and at most one bounded install runs, even when
+    // several command predicates start concurrently under the slot budget.
+    const environmentReady = this.environmentInstaller(executor, request.worktreePath, gateSlot, budget);
     // Every command starts at once; the budget decides how many really run. Each
     // predicateForCommand call settles on its own and never throws, so one
     // command's failure or timeout cannot cancel or relabel another's result.
-    const commandResults = await this.runCommands(executor, request, gated, gateSlot, budget, contextOnce);
+    const commandResults = await this.runCommands(
+      executor,
+      request,
+      gated,
+      gateSlot,
+      budget,
+      contextOnce,
+      environmentReady,
+    );
 
     return {
       outcome: 'evaluated',
@@ -637,6 +832,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
     gateSlot: GateSlotConfiguration | undefined,
     budget: GateSlotBudget,
     contextOnce: () => Promise<ReceiptContext | null>,
+    environmentReady: () => Promise<EnvironmentReadiness>,
   ): Promise<GatePredicateResult[]> {
     const commands = request.spec.commands;
     if (budget.capacity !== 1) {
@@ -647,7 +843,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
         commands.map((command, index) =>
           gated
             ? Promise.resolve(skipped(commandName(command, index), 'command'))
-            : this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+            : this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce, environmentReady),
         ),
       );
     }
@@ -659,7 +855,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
       results.push(
         blocked
           ? skipped(commandName(command, index), 'command')
-          : await this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+          : await this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce, environmentReady),
       );
     }
     return results;
@@ -699,11 +895,28 @@ export class GatePredicateAdapter implements GatePredicatePort {
     gateSlot: GateSlotConfiguration | undefined,
     budget: GateSlotBudget,
     contextOnce: () => Promise<ReceiptContext | null>,
+    environmentReady: () => Promise<EnvironmentReadiness>,
   ): Promise<GatePredicateResult> {
     const name = commandName(command, index);
     const started = this.nowMs();
     try {
+      // The environment check runs once per gate run, before any receipt is
+      // read and before any command runs: a cached passing receipt (a store
+      // hit or another lane's in-flight pass) must never bypass it — the
+      // worktree's dependencies are ensured before gating, reuse included.
+      // Memoized, so this adds no probe or install beyond the first check.
+      const environment = await environmentReady();
+      if (!environment.ready) {
+        return environmentNotInstalledResult(name, environment.exitCode, environment.durationMs);
+      }
       const execute = async (): Promise<GatePredicateResult> => {
+        // The environment check runs once per gate run before the first
+        // command predicate; when it cannot make the worktree ready, no
+        // command runs and every one of them reports the same typed cause.
+        const environment = await environmentReady();
+        if (!environment.ready) {
+          return environmentNotInstalledResult(name, environment.exitCode, environment.durationMs);
+        }
         const run = await budget.run(() =>
           this.runCommand(executor, request.worktreePath, command, index, gateSlot),
         );
@@ -837,6 +1050,88 @@ export class GatePredicateAdapter implements GatePredicatePort {
       ['git', '-C', worktreePath, ...GIT_HARDENING, ...argv],
       { cwd: worktreePath, timeoutMs: GIT_TIMEOUT_MS },
     );
+  }
+
+  /**
+   * Whether `<worktreePath>/node_modules/.yarn-state.yml` exists, checked
+   * through the host executor (never a local `fs` read: the worktree lives on
+   * the recorded host). Any failure — non-zero exit, executor error, throw —
+   * reads as absent.
+   */
+  private async stateFilePresent(executor: CommandExecutorPort, worktreePath: string): Promise<boolean> {
+    try {
+      const probe = await executor.run(['test', '-f', join(worktreePath, YARN_STATE_FILE)], {
+        cwd: worktreePath,
+        timeoutMs: PROBE_TIMEOUT_MS,
+      });
+      return isUsableRun(probe) && probe.error === undefined && probe.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The memoized environment check of ONE gate run: probe the dependency
+   * state file once; when it is absent, run at most one bounded
+   * `yarn install --immutable` through the same executor and gate-slot
+   * wrapper as the commands, then probe again. Ready when the state file is
+   * (or becomes) present; otherwise not ready, with the install's exit code
+   * and duration. The returned closure is per `evaluateGatePredicates` call
+   * and never shared across gate runs.
+   */
+  private environmentInstaller(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    gateSlot: GateSlotConfiguration | undefined,
+    budget: GateSlotBudget,
+  ): () => Promise<EnvironmentReadiness> {
+    let flight: Promise<EnvironmentReadiness> | null = null;
+    return () => {
+      flight ??= this.ensureEnvironment(executor, worktreePath, gateSlot, budget);
+      return flight;
+    };
+  }
+
+  private async ensureEnvironment(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    gateSlot: GateSlotConfiguration | undefined,
+    budget: GateSlotBudget,
+  ): Promise<EnvironmentReadiness> {
+    if (await this.stateFilePresent(executor, worktreePath)) {
+      return { ready: true };
+    }
+    const started = this.nowMs();
+    let installExitCode: number | null = null;
+    try {
+      const waitSeconds = Math.max(
+        1,
+        Math.min(
+          GATE_SLOT_MAX_WAIT_SECONDS,
+          Math.floor(this.commandTimeoutMs / GATE_SLOT_WAIT_DIVISOR_MS),
+        ),
+      );
+      // The install takes one of the host's gate slots when one is declared,
+      // exactly like the commands it unblocks. Its output is discarded: no
+      // predicate result ever carries it.
+      const install = await budget.run(() =>
+        executor.run(worktreeCommandArgv(worktreePath, gateSlot, YARN_INSTALL_ARGV, waitSeconds), {
+          cwd: worktreePath,
+          timeoutMs: this.commandTimeoutMs,
+          maxBufferBytes: this.maxOutputBytes,
+        }),
+      );
+      if (install.ok && isUsableRun(install.value) && install.value.error === undefined) {
+        installExitCode = install.value.exitCode;
+      }
+    } catch {
+      installExitCode = null;
+    }
+    const installed =
+      installExitCode === 0 && (await this.stateFilePresent(executor, worktreePath));
+    return installed
+      ? { ready: true }
+      : { ready: false, exitCode: installExitCode, durationMs: this.nowMs() - started };
   }
 
   private async commitPredicate(
@@ -1010,22 +1305,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
         Math.floor(this.commandTimeoutMs / GATE_SLOT_WAIT_DIVISOR_MS),
       ),
     );
-    const argv = [
-      'sh',
-      '-c',
-      'cd -- "$1" && shift && exec "$@"',
-      'fleet-gate',
-      worktreePath,
-      ...(gateSlot === undefined
-        ? []
-        : [
-            '/usr/bin/env',
-            'FLEET_V2_GATE_SLOTS=' + String(readGateSlotCapacity(gateSlot.slots)),
-            'FLEET_V2_GATE_WAIT_MAX_SECONDS=' + String(waitSeconds),
-            gateSlot.path,
-          ]),
-      ...command.argv,
-    ];
+    const argv = worktreeCommandArgv(worktreePath, gateSlot, command.argv, waitSeconds);
     let run: CommandRunResult;
     try {
       run = await executor.run(argv, {
@@ -1034,6 +1314,20 @@ export class GatePredicateAdapter implements GatePredicatePort {
         maxBufferBytes: this.maxOutputBytes,
       });
     } catch {
+      return {
+        name,
+        kind: 'command',
+        verdict: 'unknown',
+        exitCode: null,
+        durationMs: this.nowMs() - started,
+        detail: 'command did not complete',
+      };
+    }
+    // Untrusted runtime input: a run whose shape is not a usable record (a
+    // non-string stream, a wrong exit code, a getter on any field) is refused
+    // whole — no field is read afterwards, so a getter is never invoked and a
+    // wrong-typed value can never pass.
+    if (!isUsableRun(run)) {
       return {
         name,
         kind: 'command',
@@ -1080,6 +1374,19 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
 
     const raw = rawVerdict(run, this.isRemote(executor));
+    // A command that failed while naming a missing module is the worktree
+    // environment's failure, not the command's own verdict — but only when
+    // the dependency state file really is absent; with it present the
+    // missing module is a real failure of the command (e.g. a wrong import).
+    if (raw === 'fail') {
+      const combined = run.stdout + '\n' + run.stderr;
+      if (combined.includes('Cannot find module') || combined.includes('ERR_MODULE_NOT_FOUND')) {
+        const present = await this.stateFilePresent(executor, worktreePath);
+        if (!present) {
+          return environmentNotInstalledResult(name, run.exitCode, this.nowMs() - started);
+        }
+      }
+    }
     const verdict = mapVerdict(raw);
     // PT1a: a failing command's output may name the file that failed; only the
     // screened, repo-relative path is carried, never the output.

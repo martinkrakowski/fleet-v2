@@ -4,6 +4,7 @@ import {
   evaluateShadowStateIntegrity,
   evaluateShadowTickHealth,
   SHADOW_OPEN_INTENT_GRACE_MS,
+  SHADOW_MAX_HEALTH_ITEMS,
   SHADOW_MIN_TICKS_PER_DAY,
   SHADOW_LAST_TICK_GRACE_MS,
   SHADOW_MAX_TICK_GAP_MS,
@@ -673,6 +674,68 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
       s9Eval('unknown', 'invalid-input'),
     );
     expect(calls).toBe(0);
+  });
+
+  it('#4ac: a malformed journal entry wins invalid-input over state-check-failed (bad: 1)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 5, bad: 1 },
+      journal: [{ kind: 'intent', recordedAtIso: SAMPLE_AT }],
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a non-array journal wins invalid-input over state-check-failed (bad: 1)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 5, bad: 1 },
+      journal: 'nope',
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a journal over SHADOW_MAX_HEALTH_ITEMS wins invalid-input over state-check-failed (bad: 1)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 5, bad: 1 },
+      journal: Array.from({ length: SHADOW_MAX_HEALTH_ITEMS + 1 }, () => journalEntry('lane:k1', 'intent', null, SAMPLE_AT)),
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a bad sampledAtIso wins invalid-input over state-check-failed (bad: 1)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 5, bad: 1 },
+      sampledAtIso: 'not-a-date',
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a malformed journal entry wins invalid-input over state-check-unavailable (stateCheck: null)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: null,
+      journal: [{ kind: 'intent', recordedAtIso: SAMPLE_AT }],
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a bad sampledAtIso wins invalid-input over state-check-unavailable (stateCheck: null)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: null,
+      sampledAtIso: 'not-a-date',
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a malformed journal entry wins invalid-input over state-check-unavailable (checked: 0)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 0, bad: 0 },
+      journal: [{ kind: 'intent', recordedAtIso: SAMPLE_AT }],
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: a bad sampledAtIso wins invalid-input over state-check-unavailable (checked: 0)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 0, bad: 0 },
+      sampledAtIso: 'not-a-date',
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('#4ac: invalid stateCheck counts refuse as invalid-input even with checked: 0', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      stateCheck: { checked: 0, bad: 'nope' },
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 
   it('fails state-check-failed when stateCheck.bad is 1', () => {

@@ -883,7 +883,7 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     expect(harness.forge.calls).toBe(0);
   });
 
-  it('refusal: invalid entry headOid does not exclude', async () => {
+  it('an invalid-headOid entry is dropped by queue validation and the cross-head rule still excludes a matched sibling and reads an unmatched one', async () => {
     // An invalid headOid never reaches selection (queue-record validation
     // drops it), and head12Of of it is null, so the cross-head rule cannot
     // match would-supersede for that entry. A readable sibling with both

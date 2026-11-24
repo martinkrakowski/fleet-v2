@@ -8,10 +8,13 @@ import {
   MAX_STRUCTURED_FINDINGS,
   MAX_FINDING_SUMMARY_LENGTH,
   containsReviewSecretShape,
+  classifyUnreadableReviewAnswer,
   extractSingleTrailingJsonFence,
   isSafeRelativeFilePath,
+  scanUntrustedEchoBlocks,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
+import type { UnreadableReviewAnswerLabel } from '../../domain/review-answer-schema.js';
 import { checkJsonDuplicateKeys } from '../../domain/json-duplicate-keys.js';
 import { parseReviewStreamGrammar, MAX_REVIEW_STREAM_LENGTH } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
@@ -1024,13 +1027,6 @@ export const MAX_PARSED_FINDINGS = 1000;
 export const MAX_FINDING_LINE_LENGTH = 8192;
 
 /**
- * The untrusted-block markers the prompt wraps lane-written text in. An echoed
- * block (the reviewer repeating the diff or brief it was given) is data, so
- * neither its markers nor its body may ever contribute a finding.
- */
-const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"]*">>>$/;
-
-/**
  * Every line of `text` that is not inside an echoed `<<<UNTRUSTED ...>>>`
  * block (open marker to its matching close, or to EOF when it never closes)
  * or inside a fenced diff block. Linear over the line count; the scan never
@@ -1038,34 +1034,6 @@ const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"
  */
 export function stripUntrustedEchoBlocks(text: string): string {
   return scanUntrustedEchoBlocks(text).stripped;
-}
-
-/**
- * The stripped text plus whether an untrusted block was opened and never
- * closed. An unclosed block is a malformed answer: callers refuse it
- * (no verdict is read) rather than trusting whatever the strip left.
- */
-function scanUntrustedEchoBlocks(text: string): {
-  readonly stripped: string;
-  readonly unclosed: boolean;
-} {
-  const kept: string[] = [];
-  let openNonce: string | null = null;
-  for (const line of text.split(/\r?\n/)) {
-    if (openNonce !== null) {
-      if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
-        openNonce = null;
-      }
-      continue;
-    }
-    const openMatch = UNTRUSTED_OPEN_PATTERN.exec(line.trim());
-    if (openMatch !== null) {
-      openNonce = openMatch[1] ?? null;
-      continue;
-    }
-    kept.push(line);
-  }
-  return { stripped: kept.join('\n'), unclosed: openNonce !== null };
 }
 
 /**
@@ -1239,17 +1207,21 @@ function boundedFallbackFindings(parsed: ParsedFindingLines): ReviewFindingRecor
  * kept only so existing callers compile.
  */
 function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
-  const UNPARSEABLE: ParsedReviewReply = {
+  // CB7: every non-empty refusal carries a per-label cause token
+  // (`unparseable-verdict-<label>`); the label is computed by the pure
+  // classifier from the same reply text and is a fixed token, never review
+  // text. The plain `empty` and `no-findings-on-fail` codes are unchanged.
+  const unparseable = (label: UnreadableReviewAnswerLabel): ParsedReviewReply => ({
     result: 'unknown',
     findings: [],
-    unknownReason: 'unparseable-verdict',
-  };
+    unknownReason: `unparseable-verdict-${label}` as ReviewUnknownReason,
+  });
   if (
     typeof text !== 'string' ||
     (_ignoredVerdictText !== undefined && typeof _ignoredVerdictText !== 'string') ||
     text.length > MAX_REVIEW_REPLY_LENGTH
   ) {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   if (text.trim() === '') {
     return { result: 'unknown', findings: [], unknownReason: 'empty' };
@@ -1259,7 +1231,7 @@ function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string):
   // and therefore ignored. An unclosed block anywhere is a malformed answer.
   const scanned = scanUntrustedEchoBlocks(text);
   if (scanned.unclosed) {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   const fence = extractSingleTrailingJsonFence(scanned.stripped);
   if (fence.kind === 'none') {
@@ -1269,28 +1241,28 @@ function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string):
     return {
       result: 'unknown',
       findings: boundedFallbackFindings(parseFindingLines(scanned.stripped)),
-      unknownReason: 'unparseable-verdict',
+      unknownReason: `unparseable-verdict-${classifyUnreadableReviewAnswer(text)}` as ReviewUnknownReason,
     };
   }
   if (fence.kind === 'invalid') {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   // RV2: `JSON.parse` silently keeps the last value of a duplicate key, so
   // the exact `fence.jsonText` handed to `JSON.parse` is first scanned for
   // duplicate object keys at any depth; a duplicate is a malformed answer.
   const duplicateKeyCheck = checkJsonDuplicateKeys(fence.jsonText);
   if (!duplicateKeyCheck.ok) {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(fence.jsonText);
   } catch {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   const validated = validateReviewAnswerObject(parsed);
   if (!validated.ok) {
-    return UNPARSEABLE;
+    return unparseable(classifyUnreadableReviewAnswer(text));
   }
   const findings: ReviewFindingRecord[] = validated.value.findings.map(
     (entry, index): ReviewFindingRecord => ({

@@ -190,13 +190,68 @@ describe('decideParkEscalation', () => {
     });
     expect(decideParkEscalation(PARKED_FIX, [hostileElement], DIRTY)).toEqual(malformed);
     expect(traps).toEqual(['getPrototypeOf']);
+  });
 
+  it('returns malformed-parked-record when a throwing history Proxy is caught by the outer guard', () => {
     // A Proxy whose trap throws inside the history scan is caught: a typed
-    // refusal on the outer catch, never a throw.
+    // refusal on the outer catch, never a throw. The length read is what
+    // throws; the decision does not escape as an exception.
     const throwingProxy = new Proxy([historyEntry()], {
       get() { throw new Error('boom'); },
     });
     expect(decideParkEscalation(PARKED_FIX, throwingProxy, DIRTY)).toEqual(STAY_PARKED_MALFORMED_PARKED);
+  });
+
+  it('returns malformed-parked-record for an unknown park class', () => {
+    // A present class that is not in LANE_RUN_PARK_CLASSES is malformed, whether
+    // it is an unknown string, a wrong primitive, or null. Absent class stays
+    // the pre-PT1a shape and is covered by the escalate test.
+    for (const parkClass of ['XYZZY', 7, null]) {
+      expect(decideParkEscalation({ ...PARKED_FIX, class: parkClass }, [], DIRTY)).toEqual(STAY_PARKED_MALFORMED_PARKED);
+    }
+    // A declared class is not a refusal: the same park still escalates. This
+    // fails a constant `malformed-parked-record` implementation.
+    expect(decideParkEscalation({ ...PARKED_FIX, class: 'other' }, [], DIRTY)).toEqual({
+      kind: 'escalate',
+      mode: 'commit-pending',
+    });
+  });
+
+  it('returns malformed-history for a subclassed array, a symbol key, a non-enumerable index, an extra named key and an own __proto__ key', () => {
+    const malformed = { kind: 'stay-parked', reason: 'malformed-history' };
+
+    // A subclass is an array whose prototype is not Array.prototype. The old
+    // index loop accepted it; `readBoundedDenseArray` refuses it.
+    class HostileHistory extends Array {}
+    const subclassed = new HostileHistory(1);
+    subclassed[0] = historyEntry();
+
+    const symbolKeyed = [historyEntry()];
+    Object.defineProperty(symbolKeyed, Symbol('extra'), { value: 1, enumerable: false });
+
+    const hiddenIndex = [historyEntry()];
+    Object.defineProperty(hiddenIndex, 0, {
+      value: historyEntry(),
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+
+    const paddedIndex = [historyEntry()];
+    Object.defineProperty(paddedIndex, '01', {
+      value: historyEntry(),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+
+    const protoKey = [historyEntry()];
+    Object.defineProperty(protoKey, '__proto__', { enumerable: true, value: { polluted: true } });
+
+    for (const history of [subclassed, symbolKeyed, hiddenIndex, paddedIndex, protoKey]) {
+      expect(decideParkEscalation(PARKED_FIX, history, DIRTY)).toEqual(malformed);
+    }
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   it('returns history-too-long without scanning past the cap when history exceeds PARK_ESCALATION_HISTORY_MAX', () => {

@@ -8,6 +8,12 @@ import { REVIEW_KINDS } from '../../../domain/evidence-records.js';
 import { MAX_REVIEW_REPLY_LENGTH, MAX_STRUCTURED_FINDINGS } from '../../../domain/review-answer-schema.js';
 import { MAX_JSON_SCAN_DEPTH } from '../../../domain/json-duplicate-keys.js';
 import { MAX_REVIEW_STREAM_EVENTS, MAX_REVIEW_STREAM_LENGTH } from '../../../domain/review-stream-grammar.js';
+
+// CB7: a non-empty refusal carries the per-label cause token
+// `unparseable-verdict-<label>`; the bare token stays only on receipts
+// recorded before CB7. Tables of many malformed replies assert the token
+// shape; exact-label cases assert the exact token.
+const UNPARSEABLE_REASON = /^unparseable-verdict-[a-z-]+$/;
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
   ALLOWED_PART_TYPES,
@@ -562,11 +568,11 @@ describe('OcmReviewTransport', () => {
       // Idle `--wait`, then the review.
       expect(spawnCalls).toBe(2);
       expect(result.result).toBe('unknown');
-      expect(result.unknownReason).toBe('unparseable-verdict');
+      expect(result.unknownReason).toMatch(UNPARSEABLE_REASON);
       expect(result.findings).toEqual([]);
     }
     for (const part1 of [open, fenceOpen]) {
-      const expected = { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+      const expected = { result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) };
       expect(parseReviewReplyStrict(`${part1}\n${part2}`, part2)).toEqual(expected);
       expect(parseReviewReply(`${part1}\n${part2}`, part2)).toEqual(expected);
     }
@@ -1870,7 +1876,7 @@ describe('OcmReviewTransport', () => {
         'FINDING: minor a.txt:1 wording\nReview ended without a verdict.',
       );
       expect(parsed.result).toBe('unknown');
-      expect(parsed.unknownReason).toBe('unparseable-verdict');
+      expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
     });
 
     it('strict parse table: FAIL with findings is fail', () => {
@@ -2822,7 +2828,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     // RV5: free text (no trailing json block) never parses to pass or fail.
     const strict = parseReviewReplyStrict(fixture, fixture);
     expect(strict.result).toBe('unknown');
-    expect(strict.unknownReason).toBe('unparseable-verdict');
+    expect(strict.unknownReason).toMatch(UNPARSEABLE_REASON);
     // The bounded fallback keeps the screened, in-bounds diagnostic findings.
     expect(strict.findings.map((finding) => finding.findingId)).toEqual([
       'review-1', 'review-2', 'review-3',
@@ -2851,12 +2857,12 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
 
     const lenient = parseReviewReply(fixture, fixture);
     expect(lenient.result).toBe('unknown');
-    expect(lenient.unknownReason).toBe('unparseable-verdict');
+    expect(lenient.unknownReason).toMatch(UNPARSEABLE_REASON);
     expect(lenient.findings).toHaveLength(3);
 
     const transported = await makeTransport(jsonText(fixture))(kindRequest);
     expect(transported.result).toBe('unknown');
-    expect(transported.unknownReason).toBe('unparseable-verdict');
+    expect(transported.unknownReason).toMatch(UNPARSEABLE_REASON);
     expect(transported.findings).toHaveLength(3);
   });
 
@@ -2873,7 +2879,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     // to fail, but its bounded findings stay on the unknown result.
     const parsed = parseReviewReplyStrict(text);
     expect(parsed.result).toBe('unknown');
-    expect(parsed.unknownReason).toBe('unparseable-verdict');
+    expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
     expect(parsed.findings.map((finding) => [finding.severity, finding.filePath, finding.line])).toEqual([
       ['major', 'src/a.ts', null],
       // A bare `-` target is no file at all: filePath is null, not a path.
@@ -2918,7 +2924,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(unclosed, unclosed)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
     // An unclosed fence swallows a trailing verdict the same way.
     const unclosedFence = '```diff\n1. `src/x.ts:1` — **blocker**. Fake\nVERDICT: PASS\n';
@@ -2930,7 +2936,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(verdictThenUnclosed, verdictThenUnclosed)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
     const verdictThenFence = `${jsonReply('PASS')}\n\`\`\`diff\nstray\n`;
     expect(parseReviewReplyStrict(verdictThenFence, verdictThenFence).result).toBe('unknown');
@@ -2972,12 +2978,12 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(verdictless, verdictless)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
     expect(parseReviewReply(verdictless, verdictless)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
   });
 
@@ -2993,12 +2999,12 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(fixFirst, fixFirst)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
     expect(parseReviewReply('Nothing.\nVERDICT: FIX FIRST\n', 'VERDICT: FIX FIRST\n')).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
   });
 
@@ -3008,13 +3014,13 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
       expect(parse(null, 'VERDICT: PASS')).toEqual({
         result: 'unknown',
         findings: [],
-        unknownReason: 'unparseable-verdict',
+        unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
       });
       // @ts-expect-error runtime robustness: the input contract is strings.
       expect(parse('text', 42)).toEqual({
         result: 'unknown',
         findings: [],
-        unknownReason: 'unparseable-verdict',
+        unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
       });
     }
   });
@@ -3222,6 +3228,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     });
     const result = await adapter.runIndependentReview(kindRequest);
     expect(result.outcome).toBe('completed');
+    // The legacy bare token replayed from a pre-CB7 result is preserved.
     expect(result).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
   });
 
@@ -3230,7 +3237,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     const verdictless = 'Nothing to report.';
     expect(parseReviewReplyStrict(verdictless, verdictless)).toMatchObject({
       result: 'unknown',
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
     const findingless = jsonReply('FAIL');
     expect(parseReviewReplyStrict(findingless, findingless)).toMatchObject({
@@ -3253,7 +3260,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     const parsed = parseReviewReplyStrict(longLine);
     expect(parsed.findings).toEqual([]);
     expect(parsed.result).toBe('unknown');
-    expect(parsed.unknownReason).toBe('unparseable-verdict');
+    expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
 
     // More findings than the cap are not parsed past it: the RV5 fallback is
     // bounded at MAX_STRUCTURED_FINDINGS, never the old 1000.
@@ -3271,7 +3278,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(tooManyFindings)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
 
     // A 301-character summary refuses the answer.
@@ -3279,7 +3286,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(oversizedSummary)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
 
     // A >500-character file path refuses the answer.
@@ -3287,7 +3294,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(oversizedFile)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
 
     // A reply over MAX_REVIEW_REPLY_LENGTH is refused before any parsing.
@@ -3295,7 +3302,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(parseReviewReplyStrict(oversizedReply)).toEqual({
       result: 'unknown',
       findings: [],
-      unknownReason: 'unparseable-verdict',
+      unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
     });
 
     // rawOutput stays capped even when the answer is far longer.
@@ -3360,7 +3367,7 @@ describe('structured review answers (RV5)', () => {
       for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
         const parsed = parse(text);
         expect(parsed.result, text).toBe('unknown');
-        expect(parsed.unknownReason, text).toBe('unparseable-verdict');
+        expect(parsed.unknownReason, text).toMatch(UNPARSEABLE_REASON);
         expect(parsed.result, text).not.toBe('pass');
       }
     }
@@ -3370,7 +3377,7 @@ describe('structured review answers (RV5)', () => {
     const parsed = parseReviewReplyStrict(
       jsonReply('PASS') + '\n' + jsonReply('FAIL', [finding('major', 'src/a.ts', 1, 'x')]),
     );
-    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
   });
 
   it('two json blocks give unknown, whatever lies between them', () => {
@@ -3383,7 +3390,7 @@ describe('structured review answers (RV5)', () => {
       for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
         const parsed = parse(input);
         expect(parsed.result).toBe('unknown');
-        expect(parsed.unknownReason).toBe('unparseable-verdict');
+        expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
         expect(parsed.findings).toEqual([]);
       }
     }
@@ -3394,7 +3401,7 @@ describe('structured review answers (RV5)', () => {
     for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
       const parsed = parse(input);
       expect(parsed.result).toBe('unknown');
-      expect(parsed.unknownReason).toBe('unparseable-verdict');
+      expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
       expect(parsed.findings).toEqual([]);
     }
   });
@@ -3414,7 +3421,7 @@ describe('structured review answers (RV5)', () => {
     for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
       const parsed = parse(input);
       expect(parsed.result).toBe('unknown');
-      expect(parsed.unknownReason).toBe('unparseable-verdict');
+      expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
       expect(parsed.findings).toEqual([]);
     }
   });
@@ -3431,7 +3438,7 @@ describe('structured review answers (RV5)', () => {
       expect(parse(echoedAlone)).toEqual({
         result: 'unknown',
         findings: [],
-        unknownReason: 'unparseable-verdict',
+        unknownReason: expect.stringMatching(UNPARSEABLE_REASON),
       });
     }
     // Inside a diff fence: same.
@@ -3453,7 +3460,7 @@ describe('structured review answers (RV5)', () => {
     for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
       const parsed = parse(input);
       expect(parsed.result).toBe('unknown');
-      expect(parsed.unknownReason).toBe('unparseable-verdict');
+      expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
       expect(parsed.findings).toEqual([]);
     }
   });
@@ -3476,7 +3483,7 @@ describe('structured review answers (RV5)', () => {
     for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
       const parsed = parse(unclosedEchoed);
       expect(parsed.result).toBe('unknown');
-      expect(parsed.unknownReason).toBe('unparseable-verdict');
+      expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
       expect(parsed.findings).toEqual([]);
     }
   });
@@ -3495,14 +3502,14 @@ describe('structured review answers (RV5)', () => {
     for (const reply of violations) {
       const parsed = parseReviewReplyStrict(reply);
       expect(parsed.result, reply).toBe('unknown');
-      expect(parsed.unknownReason, reply).toBe('unparseable-verdict');
+      expect(parsed.unknownReason, reply).toMatch(UNPARSEABLE_REASON);
       expect(parsed.findings, reply).toEqual([]);
     }
   });
 
   it('an oversized summary stays unknown', () => {
     const parsed = parseReviewReplyStrict(jsonReply('FAIL', [finding('major', 'a.ts', 1, 'z'.repeat(301))]));
-    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
   });
 });
 
@@ -3528,7 +3535,7 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
         const parsed = parse(reply);
         expect(parsed.result).toBe('unknown');
-        expect(parsed.unknownReason).toBe('unparseable-verdict');
+        expect(parsed.unknownReason).toMatch(UNPARSEABLE_REASON);
       }
     }
   });
@@ -3549,7 +3556,7 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
         const parsed = parse(`${line}\nVERDICT: PASS`);
         expect(parsed.result, line).toBe('unknown');
-        expect(parsed.unknownReason, line).toBe('unparseable-verdict');
+        expect(parsed.unknownReason, line).toMatch(UNPARSEABLE_REASON);
       }
     }
   });
@@ -3576,7 +3583,7 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
     ]) {
       const parsed = parseReviewReplyStrict(prose);
       expect(parsed.result, prose).toBe('unknown');
-      expect(parsed.unknownReason, prose).toBe('unparseable-verdict');
+      expect(parsed.unknownReason, prose).toMatch(UNPARSEABLE_REASON);
     }
   });
 });
@@ -4139,7 +4146,7 @@ describe('OcmReviewTransport: duplicate JSON keys in the fenced answer (RV2)', (
     const parsed = parseReviewReply(reply);
     expect(parsed.result).toBe('unknown');
     expect(parsed.findings).toEqual([]);
-    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+    expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
   });
 
   it('refuses a reply nested past MAX_JSON_SCAN_DEPTH as unparseable-verdict before JSON.parse runs', () => {
@@ -4150,7 +4157,7 @@ describe('OcmReviewTransport: duplicate JSON keys in the fenced answer (RV2)', (
     const parseSpy = vi.spyOn(JSON, 'parse');
     try {
       const parsed = parseReviewReply(tooDeep);
-      expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+      expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
       expect(parseSpy).not.toHaveBeenCalled();
     } finally {
       parseSpy.mockRestore();
@@ -4163,9 +4170,9 @@ describe('OcmReviewTransport: duplicate JSON keys in the fenced answer (RV2)', (
       '```json\n{"verdict":"FAIL","findings":[],"\\u0076erdict":"PASS"}\n```',
     ]) {
       const parsed = parseReviewReply(reply);
-      expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+      expect(parsed).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
       const strict = parseReviewReplyStrict(reply);
-      expect(strict).toEqual({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' });
+      expect(strict).toEqual({ result: 'unknown', findings: [], unknownReason: expect.stringMatching(UNPARSEABLE_REASON) });
     }
   });
 

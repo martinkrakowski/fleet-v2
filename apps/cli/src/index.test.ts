@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
-import type { SubprocessRunner } from '@fleet/work-execution';
+import { RegisterWorkOrderUseCase, type SubprocessRunner } from '@fleet/work-execution';
 import { exitCodeForResult, resolveRunnerSettings, runCli, type CliIo } from './index.js';
 import { createFleetCliRuntime } from './composition.js';
 
@@ -340,6 +340,213 @@ describe('CLI installation wiring', () => {
       expect(parsed.usage.reason).toBe('no session id');
       const saved = await runtime.execution.attemptRepository.findAttemptById(attemptId);
       expect(saved?.usage?.reason).toBe('no session id');
+    });
+  });
+
+  describe('work-order rerun stored baseBranch (RP1c)', () => {
+    const activeProfile = {
+      projectId: 'proj-1',
+      status: 'active' as const,
+      repository: 'git@example.org:acme/app.git',
+      clones: {},
+      gateProcedures: [],
+      revision: 1,
+    };
+
+    /** A runtime whose store holds one stopped work order `wo-old` with the given extra fields. */
+    async function seedStoppedWorkOrder(extra: Record<string, unknown>) {
+      const runtime = createFleetCliRuntime({ stateDir: mkdtempSync(join(tempDir, 'rerun-')) });
+      // Registration runs the real use case over the runtime's own work-order store with a fixed active profile.
+      Object.assign(runtime.execution, {
+        registerWorkOrder: new RegisterWorkOrderUseCase({
+          workOrderRepo: runtime.execution.workOrderRepository,
+          profileRead: { readProjectProfile: async () => activeProfile },
+        }),
+      });
+      await runtime.execution.workOrderRepository.saveWorkOrder({
+        id: 'wo-old',
+        projectId: 'proj-1',
+        taskId: 'task-1',
+        laneId: 'lane-1',
+        repository: 'git@example.org:acme/app.git',
+        baseCommit: 'abc123',
+        ownedPaths: ['packages/app-a/**'],
+        policyRevision: 'policy-7',
+        prerequisiteWorkOrderIds: [],
+        state: 'stopped',
+        revision: 1,
+        createdAtIso: '2026-11-21T08:00:00.000Z',
+        updatedAtIso: '2026-11-21T08:00:00.000Z',
+        ...extra,
+      } as unknown as Parameters<typeof runtime.execution.workOrderRepository.saveWorkOrder>[0]);
+      return runtime;
+    }
+
+    it('refuses a stopped work order whose stored baseBranch is staging with unsupported-base-branch, exits 1 and registers nothing', async () => {
+      const runtime = await seedStoppedWorkOrder({ baseBranch: 'staging' });
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(stdout.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'unsupported-base-branch',
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      });
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+    });
+
+    it('reruns a stopped work order with an absent stored baseBranch on main and a chain/<name> one on that chain', async () => {
+      for (const [extra, expected] of [
+        [{}, 'main'],
+        [{ baseBranch: 'main' }, 'main'],
+        [{ baseBranch: 'chain/example-1' }, 'chain/example-1'],
+      ] as const) {
+        const runtime = await seedStoppedWorkOrder(extra);
+        const { io, stdout } = createMockIo();
+        const exitCode = await runCli(
+          ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+          io,
+          runtime,
+        );
+
+        expect(exitCode).toBe(0);
+        expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'registered' });
+        expect((await runtime.execution.workOrderRepository.findWorkOrderById('wo-new'))?.baseBranch).toBe(expected);
+      }
+    });
+
+    it('refuses a work order whose getOwnPropertyDescriptor trap throws with unsupported-base-branch and does not surface the trap as a generic error', async () => {
+      const runtime = await seedStoppedWorkOrder({});
+      let trapped = false;
+      const workOrder = new Proxy(
+        {
+          id: 'wo-old',
+          state: 'stopped',
+          projectId: 'proj-1',
+          taskId: 'task-1',
+          laneId: 'lane-1',
+          repository: 'git@example.org:acme/app.git',
+          baseCommit: 'abc123',
+          ownedPaths: ['packages/app-a/**'],
+          policyRevision: 'policy-7',
+          prerequisiteWorkOrderIds: [] as string[],
+          revision: 1,
+        },
+        {
+          getOwnPropertyDescriptor(target, prop) {
+            if (prop === 'baseBranch') {
+              trapped = true;
+              throw new Error('getOwnPropertyDescriptor trap');
+            }
+            return Reflect.getOwnPropertyDescriptor(target, prop);
+          },
+        },
+      );
+      Object.assign(runtime.execution, {
+        inspectWorkOrder: {
+          inspectWorkOrder: async () => ({
+            outcome: 'found' as const,
+            workOrder,
+            attempts: [],
+            activeReservations: [],
+          }),
+        },
+      });
+      const before = await runtime.execution.workOrderRepository.findWorkOrderById('wo-old');
+      expect(before?.state).toBe('stopped');
+      const { io, stdout, stderr } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(trapped).toBe(true);
+      expect(exitCode).toBe(1);
+      expect(stderr.join('')).toBe('');
+      expect(JSON.parse(stdout.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'unsupported-base-branch',
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      });
+      expect(stdout.join('')).not.toContain('getOwnPropertyDescriptor trap');
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-old')).toEqual(before);
+    });
+
+    /** A runtime whose inspect port returns the given work-order object verbatim (so a getter or prototype survives). */
+    async function seedInspected(workOrder: object) {
+      const runtime = await seedStoppedWorkOrder({});
+      Object.assign(runtime.execution, {
+        inspectWorkOrder: {
+          inspectWorkOrder: async () => ({
+            outcome: 'found' as const,
+            workOrder,
+            attempts: [],
+            activeReservations: [],
+          }),
+        },
+      });
+      return runtime;
+    }
+
+    const rerunBase = {
+      id: 'wo-old',
+      state: 'stopped',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'git@example.org:acme/app.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/app-a/**'],
+      policyRevision: 'policy-7',
+      prerequisiteWorkOrderIds: [] as string[],
+      revision: 1,
+    };
+
+    it('refuses an own baseBranch getter returning main as unsupported-base-branch without invoking the getter', async () => {
+      let invoked = 0;
+      const workOrder = Object.defineProperty({ ...rerunBase }, 'baseBranch', {
+        enumerable: true,
+        get() {
+          invoked += 1;
+          return 'main';
+        },
+      });
+      const runtime = await seedInspected(workOrder);
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(invoked).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'refused', reason: 'unsupported-base-branch' });
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+    });
+
+    it('treats an inherited baseBranch staging on the prototype as absent and reruns on main', async () => {
+      const workOrder = Object.assign(Object.create({ baseBranch: 'staging' }) as object, rerunBase);
+      expect('baseBranch' in workOrder).toBe(true);
+      expect(Object.hasOwn(workOrder, 'baseBranch')).toBe(false);
+      const runtime = await seedInspected(workOrder);
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'registered' });
+      expect((await runtime.execution.workOrderRepository.findWorkOrderById('wo-new'))?.baseBranch).toBe('main');
     });
   });
 

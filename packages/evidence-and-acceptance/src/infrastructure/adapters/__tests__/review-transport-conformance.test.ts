@@ -120,7 +120,12 @@ describe.each(['cli', 'opencode', 'api'] as const)('review transport conformance
     const result = await transport(opts)(makeConformanceRequest());
     expect(result.result).toBe('unknown');
     expect(result.result).not.toBe('pass');
-    expect(result.unknownReason).toBe('unparseable-verdict');
+    // CB7 per-label cause token: prose alone is `no-json` on the OCM
+    // transport; the CLI stdout envelope carries braces, so it reads
+    // `no-fence`; the API transport keeps its own flat refusal code.
+    expect(result.unknownReason).toBe(
+      kind === 'api' ? 'unparseable-verdict' : kind === 'cli' ? 'unparseable-verdict-no-fence' : 'unparseable-verdict-no-json',
+    );
   });
 
   if (kind === 'api') {

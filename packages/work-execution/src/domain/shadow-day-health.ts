@@ -689,19 +689,18 @@ function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation 
     // nothing.
     stateCheck = stateCheckSnapshot as { checked?: unknown; bad?: unknown };
   }
-  if (stateCheck === null || stateCheck.checked === 0) {
-    return stateIntegrityResult('unknown', 'state-check-unavailable', ZERO_STATE_COUNTS);
-  }
-  if (!isCount(stateCheck.checked) || !isCount(stateCheck.bad)) {
+  // #4ac: every structural input is validated BEFORE any state-check verdict,
+  // so a malformed or oversized `journal`, a bad `sampledAtIso`, or invalid
+  // `stateCheck` counts refuse as `invalid-input` even when the state check
+  // would otherwise have been `state-check-unavailable` (null / zero checked)
+  // or `state-check-failed` (bad > 0).
+  if (stateCheck !== null && (!isCount(stateCheck.checked) || !isCount(stateCheck.bad))) {
     return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
-  if (stateCheck.bad > 0) {
-    return stateIntegrityResult('fail', 'state-check-failed', {
-      ...ZERO_STATE_COUNTS,
-      stateChecked: stateCheck.checked,
-      stateBad: stateCheck.bad,
-    });
-  }
+  // The counts were validated above; snapshot them as numbers so the verdicts
+  // below never re-read an `unknown`-typed property.
+  const stateChecked = stateCheck === null ? 0 : stateCheck.checked as number;
+  const stateBad = stateCheck === null ? 0 : stateCheck.bad as number;
   const journal = readBoundedDenseArray(snapshot.journal, SHADOW_MAX_HEALTH_ITEMS);
   if (journal === null) {
     return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
@@ -719,11 +718,23 @@ function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation 
   if (typeof snapshot.sampledAtIso !== 'string' || !isZonedIsoDateTime(snapshot.sampledAtIso)) {
     return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
+  // The structural inputs are all valid here; only now may the state-check
+  // verdicts take over (precedence per #4ac).
+  if (stateCheck === null || stateChecked === 0) {
+    return stateIntegrityResult('unknown', 'state-check-unavailable', ZERO_STATE_COUNTS);
+  }
+  if (stateBad > 0) {
+    return stateIntegrityResult('fail', 'state-check-failed', {
+      ...ZERO_STATE_COUNTS,
+      stateChecked,
+      stateBad,
+    });
+  }
   return judgeJournalIntegrity(
     entries,
     new Date(snapshot.sampledAtIso).toISOString(),
-    stateCheck.checked,
-    stateCheck.bad,
+    stateChecked,
+    stateBad,
     day,
   );
 }

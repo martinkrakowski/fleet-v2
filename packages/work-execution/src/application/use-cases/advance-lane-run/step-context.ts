@@ -14,9 +14,11 @@ import { causingParkFindingsView } from '../../../domain/park-findings-view.js';
 import { preserveParkedWorktree } from './park-preserve.js';
 import { classifyPark } from '../../../domain/park-class.js';
 import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.js';
-import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
-import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
+import { readBoundedDenseArray } from '../../../domain/plain-record-reads.js';
+import { canEnterLaneRunState, checkParkEscalation, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { workOrderHoldFacts } from '../work-order-hold-facts.js';
 
@@ -532,4 +534,158 @@ export async function saveOrRefuse(ctx: AdvanceStepContext, next: LaneRunRecord,
     nowIso: request.nowIso,
   });
   return saved.outcome === 'saved' ? { ok: true, record: saved.record } : { ok: false, reason: 'save-refused' };
+}
+
+/**
+ * Cost bound of one inspection's uncommitted path list. Longer lists are
+ * refused in O(1) by `readBoundedDenseArray` before any key is enumerated.
+ * Far above a real worktree's tracked dirty set.
+ */
+const PARK_ESCALATION_UNCOMMITTED_MAX = 4096;
+
+const STAY_PARKED: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'parked' };
+
+/**
+ * The dirty-worktree fact for a park escalation (CE1w), modelled on
+ * `worktreeCleanForReGateOf`. An unwired port, a missing recorded host
+ * (Q2a-2: never the local executor), a throw (a timeout included) or a
+ * malformed `uncommittedPaths` is `undefined` (`missing-dirty-worktree-fact`),
+ * never a guess and never a throw. The path list is read through its own
+ * descriptor and `readBoundedDenseArray`: O(1) refusal of a non-array, a
+ * wrong prototype, an accessor or a list longer than the cap, then one
+ * descriptor per index. A getter on the list never runs.
+ */
+async function dirtyWorktreeFactOf(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord | null,
+): Promise<{ readonly trackedFilesChanged: number } | undefined> {
+  const port = ctx.deps.worktreeInspect;
+  if (port?.inspectWorktree === undefined || latest === null) {
+    return undefined;
+  }
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return undefined;
+  }
+  let inspection: unknown;
+  try {
+    inspection = await port.inspectWorktree({
+      worktreePath: latest.worktreePath,
+      baseCommit: latest.baseCommit,
+      expectedArtifactPaths: [],
+      recordedHost,
+    });
+  } catch {
+    return undefined;
+  }
+  if (typeof inspection !== 'object' || inspection === null) {
+    return undefined;
+  }
+  let paths: unknown;
+  try {
+    // Own data descriptor only: an accessor's `value` is absent, so the
+    // getter never runs.
+    paths = Object.getOwnPropertyDescriptor(inspection, 'uncommittedPaths')?.value;
+  } catch {
+    return undefined;
+  }
+  const bounded = readBoundedDenseArray(paths, PARK_ESCALATION_UNCOMMITTED_MAX);
+  if (bounded === null) {
+    return undefined;
+  }
+  return { trackedFilesChanged: bounded.length };
+}
+
+/**
+ * Escalate a parked `fix-no-progress` run into `fixing` (`commit-pending`)
+ * once, when the worktree has tracked uncommitted edits (CE1w). Every refusal
+ * stays parked or is a typed `refused`; nothing here throws, and a run at
+ * round 2 or above is not escalated (`fixingRules` would re-park
+ * `blocker-after-round-2` on the next tick). The round check and the halt /
+ * pending-intent guards are O(1) and run before any port read.
+ */
+export async function tryEscalatePark(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  if (request.halted === true || gathered.facts.pendingIntent !== null) {
+    return STAY_PARKED;
+  }
+  // O(1). Round 2 is the last fix round; entering `fixing` from it mints
+  // round 3, which `fixingRules` parks immediately.
+  if (!Number.isSafeInteger(record.round) || record.round >= 2) {
+    return STAY_PARKED;
+  }
+  const dirtyWorktree = await dirtyWorktreeFactOf(ctx, gathered.latestAttempt);
+  // The escalation history is a fresh journal read. The value is untrusted:
+  // a non-array, a throwing Proxy or an over-long list stays parked inside
+  // `checkParkEscalation` / `decideParkEscalation`, and a throw from the
+  // read itself stays parked too.
+  let history: unknown;
+  try {
+    history = await ctx.deps.runJournal.listForRun(request.runId);
+  } catch {
+    return STAY_PARKED;
+  }
+  let check: ReturnType<typeof checkParkEscalation>;
+  try {
+    check = checkParkEscalation({
+      record,
+      state: gathered.facts.state,
+      stopMode: gathered.facts.stopMode,
+      expectedRevision: record.revision,
+      history: history as readonly unknown[],
+      dirtyWorktree,
+    });
+  } catch {
+    return STAY_PARKED;
+  }
+  if (!check.ok) {
+    return STAY_PARKED;
+  }
+  const built = buildLaneRunStepKey({
+    runId: record.runId,
+    round: record.round,
+    step: 'park',
+    seatIndex: record.parkCount,
+    attemptOrdinal: null,
+    head12: null,
+    retry: null,
+  });
+  if (!built.ok) {
+    return STAY_PARKED;
+  }
+  if (!canEnterLaneRunState('parked', check.to, null, false, undefined, true)) {
+    return { outcome: 'refused', reason: 'illegal-transition' };
+  }
+  const intentRefusal = await appendRunIntent(ctx, request, built.key, null);
+  if (intentRefusal !== null) {
+    return refusedResult(intentRefusal);
+  }
+  const conducted = await appendConduct(ctx, request, check.to);
+  if (!conducted.ok) {
+    return refusedResult(conducted);
+  }
+  const saved = await saveOrRefuse(ctx, {
+    ...record,
+    parked: null,
+    revision: record.revision + 1,
+  }, request);
+  if (!saved.ok) {
+    return { outcome: 'refused', reason: saved.reason };
+  }
+  const resultRefusal = await appendRunResult(
+    ctx,
+    request,
+    built.key,
+    'completed',
+    check.journalReasonCode,
+    check.journalDetail,
+  );
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
+  }
+  return { outcome: 'entered', state: check.to };
 }

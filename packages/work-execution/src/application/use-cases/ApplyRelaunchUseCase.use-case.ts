@@ -21,7 +21,7 @@ import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { readLaneRunRecord } from '../../domain/entities/LaneRun.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { parseWorkOrderRisk } from '../../domain/execution-records.js';
+import { parseWorkOrderRisk, type AttemptRecord, type CollectedAttemptArtifacts } from '../../domain/execution-records.js';
 import { SHA256_HEX_PATTERN } from '../../domain/lane-plan-records.js';
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
@@ -64,6 +64,11 @@ import type {
 } from '../ports/in/ApplyRelaunchPort.in-port.js';
 import type { SaveLaneEditsPort } from '../ports/in/SaveLaneEditsPort.in-port.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -96,6 +101,13 @@ export interface ApplyRelaunchDependencies {
   /** The run journals of the runs the preflight reconciles; `listForRun` required, `listForRuns` optional. */
   readonly runJournal?: RunJournalRunReads;
   readonly adoptLane?: Pick<AdoptLanePort, 'adoptLane'>['adoptLane'];
+  /**
+   * AR3d: the attempt store, required for an `attempt-recorded` lane whose
+   * `adopt` is still incomplete: its `running` attempt record must be
+   * transitioned to `ended`/`partial` before `adoptLane` will accept it.
+   * Optional so dry-run and `unrecorded`-lane callers never need it.
+   */
+  readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById' | 'saveAttempt'>;
   readonly mintEntryId?: () => string;
 }
 
@@ -1507,6 +1519,18 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
         if (adoptStatus !== 'completed' && adoptInput === undefined) {
           return refusedLane('stale-plan-state', lane.laneId);
         }
+        // AR3d: an `attempt-recorded` lane whose adopt is still incomplete
+        // needs its `running` attempt transitioned through the attempt store;
+        // without that port the lane could only fail after the grant and the
+        // save were spent, so it refuses here, before any side effect.
+        if (
+          lane.population === 'attempt-recorded' &&
+          adoptStatus !== 'completed' &&
+          (typeof deps.attemptRepo?.findAttemptById !== 'function' ||
+            typeof deps.attemptRepo?.saveAttempt !== 'function')
+        ) {
+          return refusedLane('stale-plan-state', lane.laneId);
+        }
         if (adoptInput !== undefined) {
           const saveInput = saveInputs.get(lane.laneId);
           if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
@@ -1519,6 +1543,10 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
           // (save-missing / save-unverified), which needs the save's own result.
           if (adoptStatus !== 'completed' && adoptLaneInputFault(adoptInput, deps.computeDigest) !== null) {
             return refusedLane('adopt-failed', lane.laneId);
+          }
+          if (adoptStatus !== 'completed' && saveInput !== undefined && lane.population === 'attempt-recorded') {
+            const identity = await preflightAttemptIdentity(deps, lane, saveInput, adoptInput);
+            if (identity !== null) return identity;
           }
         }
       }
@@ -1593,6 +1621,12 @@ interface WaveContext {
   readonly adoptInputs: ReadonlyMap<string, ApplyRelaunchAdoptInput>;
   /** Per-lane `save-ref` sources: derived from the journal, updated by the wave's saves. */
   readonly savedSources: Map<string, AdoptLaneSource>;
+  /**
+   * AR3d: the lanes whose abort succeeded in this wave (or whose abort was
+   * already completed in the journal). An `end-attempt` transition may run
+   * only after a completed abort, whatever the preflight snapshot says.
+   */
+  readonly abortedInWave: Set<string>;
 }
 
 /** Journal one entry; any non-`appended` result or throw is a write failure. */
@@ -1604,6 +1638,8 @@ async function appendEntry(
     readonly digest?: string;
     readonly outcome?: 'completed' | 'refused';
     readonly reasonCode?: string;
+    /** AR3d: the save commit an `end-attempt` result records. */
+    readonly commitId?: string;
   },
 ): Promise<boolean> {
   const { deps } = ctx;
@@ -1614,6 +1650,7 @@ async function appendEntry(
       entryId: deps.mintEntryId!(),
       recordedAtIso: ctx.nowIso,
       ...(request.digest !== undefined ? { digest: request.digest } : {}),
+      ...(request.commitId !== undefined ? { commitId: request.commitId } : {}),
       ...(request.outcome !== undefined ? { outcome: request.outcome, reasonCode: request.reasonCode ?? null } : {}),
     });
     return own(appended, 'outcome') === 'appended';
@@ -1823,9 +1860,16 @@ async function abortStepOfLane(
     return refusedLane('abort-failed', lane.laneId);
   }
   if (abortStatus === 'intent-only' || abortStatus === 'ambiguous') {
-    return reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    const reconciled = await reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    if (reconciled === null) ctx.abortedInWave.add(lane.laneId);
+    return reconciled;
   }
-  if (abortStatus === 'absent') return performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  if (abortStatus === 'absent') {
+    const aborted = await performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    if (aborted === null) ctx.abortedInWave.add(lane.laneId);
+    return aborted;
+  }
+  ctx.abortedInWave.add(lane.laneId);
   return null;
 }
 
@@ -1853,6 +1897,324 @@ async function saveAndAbortLane(
 }
 
 /**
+ * AR3d: read an untrusted `AttemptRecord` from `attemptRepo.findAttemptById`
+ * as a plain validated snapshot, or `null` when it is not one. Every own key
+ * is read through its property descriptor, so no getter ever runs; the cost
+ * is O(own keys, bounded at 32). A hostile record — an accessor on any own
+ * key, a polluting own key, a non-plain prototype, a wrong type, a wrong id,
+ * a non-integer revision — is refused, never passed.
+ */
+const MAX_ATTEMPT_OWN_KEYS = 32;
+const POLLUTING_ATTEMPT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * The own data properties of a plain object, copied through their descriptors
+ * so no getter ever runs, or `null` when the value is not one: a non-object,
+ * an array, a non-plain prototype, more than `MAX_ATTEMPT_OWN_KEYS` keys, a
+ * symbol or polluting key, an accessor, or a trap that throws.
+ */
+function plainDataCopy(value: unknown): Record<string, unknown> | null {
+  const plain: Record<string, unknown> = {};
+  try {
+    // Inside the try: `Array.isArray` throws on a revoked Proxy.
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return null;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > MAX_ATTEMPT_OWN_KEYS) return null;
+    for (const key of keys) {
+      if (typeof key !== 'string' || POLLUTING_ATTEMPT_KEYS.has(key)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+        return null;
+      }
+      plain[key] = descriptor.value;
+    }
+  } catch {
+    return null;
+  }
+  return plain;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
+function isStringOrAbsent(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+function isRevisionOrAbsent(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
+}
+
+/** The identity and shape fields every stored attempt record this apply may touch must carry. */
+function attemptFieldsValid(plain: Record<string, unknown>): boolean {
+  return (
+    isNonEmptyString(plain['workOrderId']) &&
+    isNonEmptyString(plain['worktreePath']) &&
+    isNonEmptyString(plain['baseCommit']) &&
+    isNonEmptyString(plain['createdAtIso']) &&
+    isNonEmptyString(plain['updatedAtIso']) &&
+    plain['kind'] === 'initial' &&
+    plain['fixNumber'] === 0 &&
+    (plain['state'] === 'running' || plain['state'] === 'ended') &&
+    (plain['outcome'] === null || typeof plain['outcome'] === 'string') &&
+    (plain['briefDigest'] === null || typeof plain['briefDigest'] === 'string') &&
+    isStringOrAbsent(plain['briefPackagePath']) &&
+    isStringOrAbsent(plain['priorAttemptId']) &&
+    isStringOrAbsent(plain['sessionId']) &&
+    isRevisionOrAbsent(plain['revision'])
+  );
+}
+
+/**
+ * The collected artifacts of the record: only an `ended` record is read for
+ * its `headCommit` (the replay check), and it must carry one; a `running`
+ * record's artifacts may be `null` and are never read.
+ */
+function snapshotArtifacts(plain: Record<string, unknown>): CollectedAttemptArtifacts | null | undefined {
+  if (plain['state'] !== 'ended') return null;
+  const artifacts = plainDataCopy(plain['artifacts']);
+  const headCommit = artifacts?.['headCommit'];
+  if (!isNonEmptyString(headCommit)) return undefined;
+  return { headCommit, commitsSinceBase: [headCommit], collectedArtifactPaths: [], notes: 'missing' };
+}
+
+function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRecord | null {
+  const plain = plainDataCopy(value);
+  if (plain === null || plain['id'] !== attemptId || !attemptFieldsValid(plain)) return null;
+  const artifacts = snapshotArtifacts(plain);
+  if (artifacts === undefined) return null;
+  return {
+    ...(plain as unknown as AttemptRecord),
+    priorAttemptId: (plain['priorAttemptId'] ?? null) as string | null,
+    briefPackagePath: (plain['briefPackagePath'] ?? null) as string | null,
+    sessionId: (plain['sessionId'] ?? null) as string | null,
+    artifacts: artifacts ?? ((plain['artifacts'] ?? null) as CollectedAttemptArtifacts | null),
+  };
+}
+
+/**
+ * AR3d: whether a stored attempt record is NOT the one this lane's apply
+ * owns. Every identity check `AdoptLaneUseCase.sameAttempt` makes (work
+ * order, brief digest, base commit) plus the save input's worktree path; any
+ * difference means a foreign or stale record that must never be written.
+ */
+function attemptIdentityMismatch(
+  snapshot: AttemptRecord,
+  saveInput: ApplyRelaunchSaveInput,
+  adoptInput: ApplyRelaunchAdoptInput,
+): boolean {
+  return (
+    snapshot.worktreePath !== saveInput.worktreePath ||
+    snapshot.workOrderId !== adoptInput.workOrder.workOrderId ||
+    snapshot.briefDigest !== adoptInput.brief.expectedBriefDigest ||
+    snapshot.baseCommit !== adoptInput.workOrder.baseCommit ||
+    snapshot.baseCommit !== saveInput.baseCommit
+  );
+}
+
+/**
+ * AR3d: the read-only identity check of an `attempt-recorded` lane's stored
+ * attempt, run in the preflight, before the grant is spent and before the
+ * save or the abort: the lane's own attempt id must be the save input's, and
+ * a stored record, when there is one, must be that lane's own. O(1) port call
+ * plus the bounded descriptor scan of `validatedAttemptSnapshot`.
+ */
+async function preflightAttemptIdentity(
+  deps: ApplyRelaunchDependencies,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+  adoptInput: ApplyRelaunchAdoptInput,
+): Promise<ApplyRelaunchResult | null> {
+  if (lane.attemptId !== saveInput.attemptId) return refusedLane('stale-plan-state', lane.laneId);
+  let existing: unknown;
+  try {
+    existing = await deps.attemptRepo!.findAttemptById(saveInput.attemptId);
+  } catch {
+    return refusedLane('adopt-failed', lane.laneId);
+  }
+  if (existing === null) return null;
+  const snapshot = validatedAttemptSnapshot(existing, saveInput.attemptId);
+  if (snapshot === null || attemptIdentityMismatch(snapshot, saveInput, adoptInput)) {
+    return refusedLane('adopt-failed', lane.laneId);
+  }
+  return null;
+}
+
+/** AR3d: whether the lane's abort step is journaled complete or succeeded in this wave. */
+function abortConfirmed(ctx: WaveContext, lane: PlanLane): boolean {
+  return (
+    lane.steps.some((entry) => entry.step === 'abort') &&
+    (ctx.statusOf(lane.laneId, 'abort') === 'completed' || ctx.abortedInWave.has(lane.laneId))
+  );
+}
+
+type EndAttemptStatus = ReturnType<typeof relaunchStepStatus>;
+
+/**
+ * AR3d: journal the `end-attempt` step's intent when it is still absent, and
+ * its completed result when the step is not already complete. Returns a
+ * `journal-write-failed` refusal, or `null`.
+ */
+async function journalEndAttempt(
+  ctx: WaveContext,
+  laneId: string,
+  endKey: string,
+  endStatus: EndAttemptStatus,
+  phase: 'intent' | 'result',
+  commitOid: string,
+  reasonCode: string,
+): Promise<ApplyRelaunchResult | null> {
+  if (phase === 'intent') {
+    if (endStatus === 'absent' && !(await appendEntry(ctx, { key: endKey, kind: 'intent', digest: commitOid }))) {
+      return refusedLane('journal-write-failed', laneId);
+    }
+    return null;
+  }
+  if (
+    (endStatus === 'absent' || endStatus === 'intent-only') &&
+    !(await appendEntry(ctx, { key: endKey, kind: 'result', outcome: 'completed', reasonCode, commitId: commitOid }))
+  ) {
+    return refusedLane('journal-write-failed', laneId);
+  }
+  return null;
+}
+
+/**
+ * AR3d: replay of a record already `ended`/`partial` at the apply's save
+ * commit: never written a second time, only the `end-attempt` ledger is
+ * completed. Any other ended record is refused.
+ */
+async function replayEndedAttempt(
+  ctx: WaveContext,
+  laneId: string,
+  snapshot: AttemptRecord,
+  commitOid: string,
+  endKey: string,
+  endStatus: EndAttemptStatus,
+): Promise<ApplyRelaunchResult | null> {
+  if (snapshot.outcome !== 'partial' || snapshot.artifacts?.headCommit !== commitOid) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  return (
+    (await journalEndAttempt(ctx, laneId, endKey, endStatus, 'intent', commitOid, 'already-ended')) ??
+    (await journalEndAttempt(ctx, laneId, endKey, endStatus, 'result', commitOid, 'already-ended'))
+  );
+}
+
+/** AR3d: whether a `saveAttempt` failure is the store's optimistic-concurrency refusal. */
+function isRevisionConflict(error: unknown): boolean {
+  try {
+    return (
+      error instanceof AttemptRevisionConflictError ||
+      (error !== null && typeof error === 'object' && (error as { name?: unknown }).name === 'AttemptRevisionConflictError')
+    );
+  } catch {
+    // A revoked Proxy or a throwing `name` getter is not a conflict; the caller refuses either way.
+    return false;
+  }
+}
+
+/**
+ * AR3d: the one write — a `running` record becomes `ended`/`partial` at the
+ * apply's save commit, journaled intent-before-action, through the store's
+ * compare-and-swap. The write spreads the validated snapshot (every own key
+ * was read as a data descriptor), so the runner, seat and usage fields the
+ * checks do not read are kept.
+ */
+async function transitionRunningAttempt(
+  ctx: WaveContext,
+  laneId: string,
+  snapshot: AttemptRecord,
+  commitOid: string,
+  endKey: string,
+  endStatus: EndAttemptStatus,
+): Promise<ApplyRelaunchResult | null> {
+  const intentRefusal = await journalEndAttempt(ctx, laneId, endKey, endStatus, 'intent', commitOid, 'attempt-ended');
+  if (intentRefusal !== null) return intentRefusal;
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  // A revision at the safe-integer ceiling has no safe successor: refuse before the write.
+  const nextRevision = nextAttemptRevision(snapshot);
+  if (!Number.isSafeInteger(nextRevision)) return refusedLane('adopt-failed', laneId);
+  const endedRecord: AttemptRecord = {
+    ...snapshot,
+    state: 'ended',
+    outcome: 'partial',
+    revision: nextRevision,
+    artifacts: { headCommit: commitOid, commitsSinceBase: [commitOid], collectedArtifactPaths: [], notes: 'missing' },
+    updatedAtIso: ctx.nowIso,
+  };
+  try {
+    await ctx.deps.attemptRepo!.saveAttempt(endedRecord);
+  } catch (error) {
+    // Optimistic-concurrency refusal: journal the failure if possible, never
+    // clobber the concurrent record.
+    if (isRevisionConflict(error)) {
+      await appendEntry(ctx, { key: endKey, kind: 'result', outcome: 'refused', reasonCode: 'attempt-revision-conflict' });
+    }
+    return refusedLane('adopt-failed', laneId);
+  }
+  return journalEndAttempt(ctx, laneId, endKey, endStatus, 'result', commitOid, 'attempt-ended');
+}
+
+/**
+ * AR3d: before `adoptLane` runs on an `attempt-recorded` lane, the runner's
+ * still-`running` attempt record is transitioned to `ended`/`partial` at the
+ * apply's own save commit, through a journaled `end-attempt` step
+ * (intent-before-action, idempotent on replay). Every guard — a confirmed
+ * abort, the apply's own `save-ref` result, the lane's, the save input's and
+ * the adopt input's attempt ids, the record's own identity — holds before any
+ * write. Returns `null` when the attempt may proceed to `adoptLane`.
+ */
+async function endRunningAttemptBeforeAdopt(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+  adoptInput: ApplyRelaunchAdoptInput,
+  source: AdoptLaneSource,
+): Promise<ApplyRelaunchResult | null> {
+  const laneId = lane.laneId;
+  const savedSource = ctx.savedSources.get(laneId);
+  if (
+    !abortConfirmed(ctx, lane) ||
+    savedSource === undefined ||
+    savedSource.kind !== 'save-ref' ||
+    source.kind !== 'save-ref' ||
+    source.commitOid !== savedSource.commitOid ||
+    lane.attemptId !== saveInput.attemptId ||
+    adoptInput.attempt.attemptId !== saveInput.attemptId
+  ) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  let existing: unknown;
+  try {
+    existing = await ctx.deps.attemptRepo!.findAttemptById(saveInput.attemptId);
+  } catch {
+    return refusedLane('adopt-failed', laneId);
+  }
+  // The `end-attempt` ledger is read before the missing-record case too: a refused
+  // or inconsistent ledger must stop the lane even when no record exists to end.
+  const endKey = `relaunch/${ctx.planDigest}/${laneId}/end-attempt`;
+  const journal = await loadJournalSnapshot(ctx.deps, ctx.planDigest);
+  if (!journal.ok) return journal.result;
+  const endStatus = relaunchStepStatus(journal.value, endKey);
+  if (endStatus === 'refused' || endStatus === 'ambiguous') return refusedLane('adopt-failed', laneId);
+  if (endStatus === 'inconsistent') return refusedLane('step-inconsistent', laneId);
+  if (existing === null) return null;
+  const snapshot = validatedAttemptSnapshot(existing, saveInput.attemptId);
+  if (snapshot === null || attemptIdentityMismatch(snapshot, saveInput, adoptInput)) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  if (snapshot.state === 'ended') {
+    return replayEndedAttempt(ctx, laneId, snapshot, savedSource.commitOid, endKey, endStatus);
+  }
+  if (snapshot.state !== 'running') return refusedLane('adopt-failed', laneId);
+  return transitionRunningAttempt(ctx, laneId, snapshot, savedSource.commitOid, endKey, endStatus);
+}
+
+/**
  * AR2c: adopt the lane's existing worktree into a conducted run through
  * `AdoptLanePort` (idempotent on replay — a completed adopt is never
  * re-called), then append the redispatch intent only. A lane with no adopt
@@ -1865,6 +2227,7 @@ async function saveAndAbortLane(
 async function adoptAndRedispatchLane(
   ctx: WaveContext,
   lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
   adoptInput: ApplyRelaunchAdoptInput | undefined,
 ): Promise<ApplyRelaunchResult | null> {
   const hasAdoptStep = lane.steps.some((entry) => entry.step === 'adopt');
@@ -1881,6 +2244,14 @@ async function adoptAndRedispatchLane(
       const source = adoptInput?.source ?? ctx.savedSources.get(lane.laneId);
       if (adoptInput === undefined || source === undefined) {
         return refusedLane('stale-plan-state', lane.laneId);
+      }
+      // AR3d: an attempt-recorded lane's still-running attempt is transitioned
+      // to ended/partial at the apply's own save commit before the adopt.
+      if (lane.population === 'attempt-recorded') {
+        const endRefusal = await endRunningAttemptBeforeAdopt(ctx, lane, saveInput, adoptInput, source);
+        if (endRefusal !== null) return endRefusal;
+        // The transition's awaits may have spent the deadline: never adopt past it.
+        if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
       }
       // The parse proved the clone is a plain snapshot (the descriptor-only
       // scan refused every accessor before the `structuredClone`), so its
@@ -1982,7 +2353,7 @@ async function executeWave(
     const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
     const refused =
       (await saveAndAbortLane(ctx, lane, saveInput)) ??
-      (await adoptAndRedispatchLane(ctx, lane, ctx.adoptInputs.get(lane.laneId)));
+      (await adoptAndRedispatchLane(ctx, lane, saveInput, ctx.adoptInputs.get(lane.laneId)));
     if (refused !== null) return refused;
   }
   return null;
@@ -2046,6 +2417,7 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     counts,
     adoptInputs,
     savedSources: new Map(savedSources),
+    abortedInWave: new Set<string>(),
   };
   const handoffRefusal = await journalHandoffs(ctx, storedPlan, preflight.handedOff);
   if (handoffRefusal !== null) return handoffRefusal;

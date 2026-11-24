@@ -67,10 +67,12 @@ const READY_FAMILY_STATES: readonly LaneRunStateValue[] = Object.freeze([
 
 /**
  * States from which a `park` step may be issued: every `LANE_RUN_STATES`
- * value except `merged`, `stopped` and `parked`. Cost: constant.
+ * value except the terminals `merged` and `stopped`. `parked` is included so
+ * a `fix-no-progress` escalation can journal its one-way `park` intent
+ * (CE1w); without it that intent is `stray-one-way-action`. Cost: constant.
  */
 const PARK_ISSUE_STATES: readonly LaneRunStateValue[] = Object.freeze(
-  LANE_RUN_STATES.filter((state) => state !== 'merged' && state !== 'stopped' && state !== 'parked'),
+  LANE_RUN_STATES.filter((state) => state !== 'merged' && state !== 'stopped'),
 );
 
 /**
@@ -205,8 +207,16 @@ interface MergedRun {
 }
 
 type Selection =
-  | { readonly kind: 'unknown'; readonly reason: 'merge-ambiguous' | 'pull-request-has-several-runs' }
+  | {
+      readonly kind: 'unknown';
+      readonly reason: 'merge-ambiguous' | 'pull-request-has-several-runs' | 'duplicate-run-conflict';
+    }
   | { readonly kind: 'ok'; readonly runs: readonly MergedRun[] };
+
+/** Deduped runs, or a conflict that must not be judged. */
+type DedupedRuns =
+  | { readonly kind: 'unknown'; readonly reason: 'duplicate-run-conflict' }
+  | { readonly kind: 'ok'; readonly runs: readonly ShadowConformanceRun[] };
 
 interface Counts {
   mergedRuns: number;
@@ -256,8 +266,11 @@ const REVIEW_RESULTS: readonly ReviewResult[] = ['pending', 'pass', 'fail', 'unk
  * before any element is read.
  * Every value is read through its own property descriptor, so no getter
  * runs and a Proxy either is refused or yields the plain data's result
- * with no `get` trap. Never throws. Never echoes an input value. A set
- * that clears every rule and the floor returns `pass/conducted-runs-conform`.
+ * with no `get` trap. Never throws. Never echoes an input value. Identical
+ * records for one `runId` are counted once; conflicting records for one
+ * `runId` return `unknown/duplicate-run-conflict` before any run is judged.
+ * A set that clears every rule and the floor returns
+ * `pass/conducted-runs-conform`.
  */
 export function evaluateShadowConductedConformance(input: unknown): ShadowConformanceEvaluation {
   try {
@@ -349,12 +362,99 @@ function earliestCode(codes: readonly ShadowNonconformanceCode[]): ShadowNonconf
   return null;
 }
 
+/**
+ * One in-window merge per distinct `runId`. Identical records for one
+ * `runId` are collapsed first, so a repeated attempt is not a second run.
+ * Conflicting records for one `runId` are `duplicate-run-conflict` and are
+ * not judged. Distinct `runId`s that share a pull request still yield
+ * `pull-request-has-several-runs`.
+ */
 function selectMergedRuns(parsed: ParsedInput): Selection {
+  const deduped = dedupeRunsByRunId(parsed.runs);
+  if (deduped.kind === 'unknown') return deduped;
   const byPullRequest = mergesInWindow(parsed.merges, parsed.bounds);
-  if (hasAmbiguousMerge(parsed.runs, byPullRequest)) {
+  if (hasAmbiguousMerge(deduped.runs, byPullRequest)) {
     return { kind: 'unknown', reason: 'merge-ambiguous' };
   }
-  return claimMergedRuns(parsed.runs, byPullRequest);
+  return claimMergedRuns(deduped.runs, byPullRequest);
+}
+
+/**
+ * Collapse identical `runId` records to one run. A second record for the
+ * same `runId` is skipped when `tier`, `pullRequest`, `headOid`,
+ * `reviewReceipts` and `journal` match field for field. Any difference is
+ * `duplicate-run-conflict`: neither record is picked, and the result is
+ * never a pass.
+ *
+ * Cost: linear in `runs`, capped by `SHADOW_CONFORMANCE_MAX_RUNS`. Each
+ * duplicate `runId` is compared field-by-field, which is linear in that
+ * pair's `reviewReceipts` and `journal`, each capped by
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ */
+function dedupeRunsByRunId(runs: readonly ShadowConformanceRun[]): DedupedRuns {
+  const byRunId = new Map<string, ShadowConformanceRun>();
+  for (const run of runs) {
+    const existing = byRunId.get(run.runId);
+    if (existing === undefined) {
+      byRunId.set(run.runId, run);
+      continue;
+    }
+    if (!sameRunRecord(existing, run)) {
+      return { kind: 'unknown', reason: 'duplicate-run-conflict' };
+    }
+  }
+  return { kind: 'ok', runs: [...byRunId.values()] };
+}
+
+/**
+ * True when the two records agree on every field a duplicate may repeat.
+ * `runId` is the map key, so it already matches. Cost: linear in the two
+ * capped receipt and journal lists.
+ */
+function sameRunRecord(left: ShadowConformanceRun, right: ShadowConformanceRun): boolean {
+  return (
+    left.tier === right.tier &&
+    left.pullRequest === right.pullRequest &&
+    left.headOid === right.headOid &&
+    sameReceipts(left.reviewReceipts, right.reviewReceipts) &&
+    sameJournal(left.journal, right.journal)
+  );
+}
+
+/** Cost: linear in the two receipt lists, each capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`. */
+function sameReceipts(left: readonly ReviewReceipt[], right: readonly ReviewReceipt[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (a === undefined || b === undefined) return false;
+    if (a.kind !== b.kind || a.result !== b.result) return false;
+  }
+  return true;
+}
+
+/** Cost: linear in the two journals, each capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`. */
+function sameJournal(
+  left: readonly ShadowConformanceJournalEntry[],
+  right: readonly ShadowConformanceJournalEntry[],
+): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (a === undefined || b === undefined) return false;
+    if (
+      a.kind !== b.kind ||
+      a.key !== b.key ||
+      a.recordedAtIso !== b.recordedAtIso ||
+      a.outcome !== b.outcome ||
+      a.reasonCode !== b.reasonCode ||
+      a.state !== b.state
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** True when any run's pull request has more than one merge inside W. */
@@ -593,10 +693,11 @@ function enqueueUnseen(
  * key was already issued, or when the current state is outside
  * `SHADOW_ONE_WAY_STEP_STATES` for the step (`park` included). `park` is
  * dropped from the duplicate check: its key is `<run>/r<round>/park/<seat>`
- * with no ordinal, so two legitimate parks in one round share a key. There
- * is no `step: 'park'` in non-test source on origin/main, so nothing is
- * lost. An unparseable key is ignored. Cost: linear in the journal, capped
- * by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ * with no ordinal, so two legitimate parks in one round share a key. A
+ * `park` intent is also issued from `parked` for the commit-pending
+ * escalation (CE1w), which is why that state is in the park row. An
+ * unparseable key is ignored. Cost: linear in the journal, capped by
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
 function ruleOneWayDiscipline(
   run: ShadowConformanceRun,

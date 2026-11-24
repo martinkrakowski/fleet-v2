@@ -44,6 +44,7 @@ export type PlanRelaunchRefusalReason =
   | 'invalid-request'
   | 'budget-exhausted'
   | 'limit-exceeded'
+  | 'unsupported-base-branch'
   | 'dependency-cycle'
   | 'digest-mismatch'
   | 'digest-conflict'

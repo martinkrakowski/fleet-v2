@@ -2,9 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   PrepareBriefPackageUseCase,
+  prepareBriefRejectionDetail,
+  PROSE_MARKDOWN_MAX_BYTES,
   simpleDeterministicHexDigest,
   type PrepareBriefPackageUseCaseRequest,
 } from '../PrepareBriefPackageUseCase.use-case.js';
+import { MAX_HANDOVER_BRIEF_BYTES } from '../../../domain/lane-run-handover.js';
 import { readBriefPackageManifest } from '../../../domain/value-objects/BriefPackage.vo.js';
 import type { GateCoverageReader } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
@@ -951,5 +954,131 @@ describe('PrepareBriefPackageUseCase CO28b schemaVersion 2 and frozen inputs', (
     expect(manifest.ownerDecisionReferences).toEqual(['decision-1']);
     expect(manifest.ownedPaths).toEqual(['packages/app-a/**']);
     expect(manifest.baseCommit).toBe('abc123');
+  });
+
+  describe('CB6: brief caps and rejection categories', () => {
+    // Both caps are UTF-8 byte caps, and the handover cap keeps a 4096-byte
+    // margin below the placement cap, so a byte-measured handover can never
+    // grow past the placement limit between the two checks. Constant pins:
+    // no runtime cost beyond two integer comparisons.
+    it('pins MAX_HANDOVER_BRIEF_BYTES at exactly 4096 bytes below PROSE_MARKDOWN_MAX_BYTES', () => {
+      expect(MAX_HANDOVER_BRIEF_BYTES).toBe(60 * 1024);
+      expect(PROSE_MARKDOWN_MAX_BYTES).toBe(64 * 1024);
+      expect(PROSE_MARKDOWN_MAX_BYTES - MAX_HANDOVER_BRIEF_BYTES).toBe(4096);
+      expect(MAX_HANDOVER_BRIEF_BYTES).toBeLessThan(PROSE_MARKDOWN_MAX_BYTES);
+    });
+
+    // Each lookup is one exact-equality switch over a closed vocabulary: O(1)
+    // regardless of input, never a scan of free text, and it never throws —
+    // a throwing getter or a lying Proxy reads as the generic token because
+    // `switch` compares with strict equality without touching any property.
+    it('maps every known proseMarkdown refusal reason to its closed detail token', () => {
+      expect(prepareBriefRejectionDetail('proseMarkdown must be at most 64 KiB')).toBe(
+        'prepare-brief-rejected-too-large',
+      );
+      expect(prepareBriefRejectionDetail('proseMarkdown contains a secret-shaped value and was refused')).toBe(
+        'prepare-brief-rejected-secret-shaped',
+      );
+      expect(prepareBriefRejectionDetail('proseMarkdown must be a non-empty string')).toBe(
+        'prepare-brief-rejected-invalid',
+      );
+    });
+
+    it('falls back to the generic token for every hostile or unknown reason without throwing', () => {
+      // A getter that throws: `switch` never reads it, so the call returns.
+      const hostile = {
+        get toStringSource(): string {
+          throw new Error('getter');
+        },
+        [Symbol.toPrimitive]() {
+          throw new Error('toPrimitive');
+        },
+      };
+      const lyingProxy = new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('trap');
+          },
+          getOwnPropertyDescriptor() {
+            throw new Error('trap');
+          },
+          ownKeys() {
+            throw new Error('trap');
+          },
+        },
+      );
+      const hostileReasons: unknown[] = [
+        'an unknown reason string',
+        '',
+        'prepare-refused',
+        null,
+        undefined,
+        7,
+        {},
+        hostile,
+        lyingProxy,
+      ];
+      for (const reason of hostileReasons) {
+        expect(prepareBriefRejectionDetail(reason)).toBe('prepare-brief-rejected');
+      }
+    });
+
+    it('maps the real use-case rejections to their categories without any outbound call', async () => {
+      const captured = makeCapturingArtifactPort();
+      const useCase = new PrepareBriefPackageUseCase({
+        briefAuthoring: makeBriefAuthoring(),
+        artifactPort: captured.port,
+        worktreePath: '/wt',
+      });
+
+      // Too large: one byte past the 64 KiB prose cap.
+      const tooLarge = await useCase.prepareBriefPackage(
+        validRequest({ proseMarkdown: 'x'.repeat(PROSE_MARKDOWN_MAX_BYTES + 1) }),
+      );
+      expect(tooLarge).toEqual({
+        outcome: 'rejected',
+        reason: 'proseMarkdown must be at most 64 KiB',
+      });
+      expect(prepareBriefRejectionDetail(
+        tooLarge.outcome === 'rejected' ? tooLarge.reason : undefined,
+      )).toBe('prepare-brief-rejected-too-large');
+
+      // Invalid: an empty prose.
+      const empty = await useCase.prepareBriefPackage(validRequest({ proseMarkdown: '   ' }));
+      expect(empty).toEqual({
+        outcome: 'rejected',
+        reason: 'proseMarkdown must be a non-empty string',
+      });
+      expect(prepareBriefRejectionDetail(
+        empty.outcome === 'rejected' ? empty.reason : undefined,
+      )).toBe('prepare-brief-rejected-invalid');
+
+      // Secret-shaped: the use case refuses before any placement.
+      const secretShaped = await useCase.prepareBriefPackage(
+        validRequest({ proseMarkdown: `prefix ${['AK', 'IA', '1'.repeat(16)].join('')}` }),
+      );
+      expect(secretShaped).toEqual({
+        outcome: 'rejected',
+        reason: 'proseMarkdown contains a secret-shaped value and was refused',
+      });
+      expect(prepareBriefRejectionDetail(
+        secretShaped.outcome === 'rejected' ? secretShaped.reason : undefined,
+      )).toBe('prepare-brief-rejected-secret-shaped');
+
+      // A rejection that is none of the three maps to the generic token —
+      // this is the exact composition review-fix journals through
+      // `prepareBriefRejectionDetail(briefResult.reason)`.
+      const other = await useCase.prepareBriefPackage(validRequest({ baseCommit: '' }));
+      if (other.outcome === 'rejected') {
+        expect(prepareBriefRejectionDetail(other.reason)).toBe('prepare-brief-rejected');
+      } else {
+        throw new Error('expected a rejection for an empty baseCommit');
+      }
+
+      // No rejection above ever reached the artifact port.
+      expect(captured.placedRequests).toHaveLength(0);
+      expect(captured.verifyIgnoredPathsRequests).toHaveLength(0);
+    });
   });
 });

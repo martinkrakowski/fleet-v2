@@ -1124,6 +1124,218 @@ describe('hostile input', () => {
 
 });
 
+/**
+ * A field-by-field copy. Reference equality must not be what makes two
+ * records the same run.
+ */
+function copiedRun(run: RunRecord): RunRecord {
+  return {
+    runId: run.runId,
+    tier: run.tier,
+    pullRequest: run.pullRequest,
+    headOid: run.headOid,
+    reviewReceipts: run.reviewReceipts.map((item) => ({ kind: item.kind, result: item.result })),
+    journal: run.journal.map((entry) => ({
+      kind: entry.kind,
+      key: entry.key,
+      recordedAtIso: entry.recordedAtIso,
+      outcome: entry.outcome,
+      reasonCode: entry.reasonCode,
+      state: entry.state,
+    })),
+  };
+}
+
+describe('duplicate runId dedupe and superseded attempts (S6d)', () => {
+  it('two identical entries for one runId count once and do not yield pull-request-has-several-runs', () => {
+    const added = conforming(6, 1, iso(DAY, 16));
+    const once = evaluate(onTop(added));
+    const twice = evaluate(inputFrom([...passing(), added, { run: copiedRun(added.run), merge: null }]));
+    expect(once).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    expect(twice).toEqual(once);
+    expect(twice.mergedRuns).toBe(6);
+    expect(twice.conforming).toBe(6);
+    expect(twice.conformingTier1).toBe(4);
+    expect(twice.reason).not.toBe('pull-request-has-several-runs');
+    expectCodesOnly(twice, added.run.runId, added.run.headOid, head12(added.run.headOid), String(added.run.pullRequest));
+  });
+
+  it.each([
+    {
+      field: 'headOid',
+      run: (base: RunRecord): RunRecord => ({ ...base, headOid: headFor(90) }),
+    },
+    {
+      field: 'tier',
+      run: (base: RunRecord): RunRecord => ({ ...base, tier: 2 }),
+    },
+    {
+      field: 'pullRequest',
+      run: (base: RunRecord): RunRecord => ({ ...base, pullRequest: pullFor(90) }),
+    },
+    {
+      field: 'receipt result',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        reviewReceipts: base.reviewReceipts.map((item) =>
+          item.kind === 'code-review' ? { kind: item.kind, result: 'fail' as const } : item,
+        ),
+      }),
+    },
+    {
+      field: 'journal recordedAtIso',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) =>
+          index === 0 ? { ...entry, recordedAtIso: shifted(entry.recordedAtIso, -1000) } : entry,
+        ),
+      }),
+    },
+    {
+      field: 'journal kind',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) => (index === 0 ? { ...entry, kind: 'intent' } : entry)),
+      }),
+    },
+    {
+      field: 'journal key',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) => (index === 0 ? { ...entry, key: 'journal-key-twin' } : entry)),
+      }),
+    },
+    {
+      // Gate entry only: outcome 'completed' vs 'failed'. Dropping the outcome
+      // comparison collapses this twin onto the conforming record (first-wins)
+      // and the day passes.
+      field: 'journal outcome',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) => (index === 0 ? { ...entry, outcome: 'failed' } : entry)),
+      }),
+    },
+    {
+      field: 'journal reasonCode',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) => (index === 0 ? { ...entry, reasonCode: 'gate-failed' } : entry)),
+      }),
+    },
+    {
+      field: 'journal state',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        journal: base.journal.map((entry, index) => (index === 0 ? { ...entry, state: 'running' } : entry)),
+      }),
+    },
+    {
+      field: 'receipt kind',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        reviewReceipts: base.reviewReceipts.map((item) =>
+          item.kind === 'code-review' ? { kind: 'brief-check', result: item.result } : item,
+        ),
+      }),
+    },
+    {
+      field: 'reviewReceipts length',
+      run: (base: RunRecord): RunRecord => ({
+        ...base,
+        reviewReceipts: [...base.reviewReceipts, receipt('pre-merge', 'pass')],
+      }),
+    },
+    {
+      field: 'journal length',
+      run: (base: RunRecord): RunRecord => {
+        const first = base.journal[0];
+        if (first === undefined) throw new Error('fixture journal missing');
+        return {
+          ...base,
+          journal: [...base.journal, resultEntry('journal-length-twin', 'gate-passed', first.recordedAtIso)],
+        };
+      },
+    },
+  ])('duplicate runIds differing in $field yield unknown/duplicate-run-conflict', ({ run }) => {
+    const added = conforming(6, 1, iso(DAY, 16));
+    const base = copiedRun(added.run);
+    const conflict = run(copiedRun(added.run));
+    expect(conflict).not.toEqual(base);
+    const result = evaluate(inputFrom([...passing(), added, { run: conflict, merge: null }]));
+    expect(result).toEqual(scored('unknown', 'duplicate-run-conflict'));
+    expect(result.status).not.toBe('pass');
+    expect(result.reason).toBe('duplicate-run-conflict');
+    expect(result.mergedRuns).toBe(0);
+    expect(result.conforming).toBe(0);
+    expectCodesOnly(
+      result,
+      added.run.runId,
+      added.run.headOid,
+      conflict.headOid,
+      head12(added.run.headOid),
+      String(added.run.pullRequest),
+      String(conflict.pullRequest),
+    );
+  });
+
+  it('a superseded attempt with gate only at an older head does not count as conforming', () => {
+    const current = conforming(6, 1, iso(DAY, 16));
+    const olderHead = headFor(90);
+    const recordedAtIso = shifted(iso(DAY, 16), -60 * 60 * 1000);
+    const superseded = withJournal(current, [
+      resultEntry(gateKey(current.run.runId, olderHead), 'gate-passed', recordedAtIso),
+      resultEntry(postedKey(current.run.runId, olderHead), 'premerge-success', recordedAtIso),
+    ]);
+    expect(superseded.run.headOid).not.toBe(olderHead);
+    const result = evaluate(onTop(superseded));
+    expect(result).toEqual(
+      scored('fail', 'gate-not-passed', { ...PASSING_COUNTS, mergedRuns: 6, nonconformingOnDay: 1 }, { 'gate-not-passed': 1 }),
+    );
+    expect(result.conforming).toBe(PASSING_COUNTS.conforming);
+    expect(result.status).not.toBe('pass');
+    expectCodesOnly(
+      result,
+      superseded.run.runId,
+      superseded.run.headOid,
+      olderHead,
+      head12(olderHead),
+      String(superseded.run.pullRequest),
+    );
+  });
+
+  it('a constant verdict cannot describe both an identical duplicate and a conflicting duplicate', () => {
+    const added = conforming(6, 1, iso(DAY, 16));
+    const identical = evaluate(inputFrom([...passing(), added, { run: copiedRun(added.run), merge: null }]));
+    const conflicting = evaluate(
+      inputFrom([...passing(), added, { run: { ...copiedRun(added.run), headOid: headFor(90) }, merge: null }]),
+    );
+    expect(identical.status).toBe('pass');
+    expect(identical.reason).toBe('conducted-runs-conform');
+    expect(conflicting.status).toBe('unknown');
+    expect(conflicting.reason).toBe('duplicate-run-conflict');
+    expect(identical.status).not.toBe(conflicting.status);
+    expect(identical.reason).not.toBe(conflicting.reason);
+  });
+
+  it('an identity echo of a duplicate-run input would fail and the result echoes no run id, head or pull request', () => {
+    const added = conforming(6, 1, iso(DAY, 16));
+    const input = inputFrom([...passing(), added, { run: copiedRun(added.run), merge: null }]);
+    const result = evaluate(input);
+    expect(result).not.toBe(input);
+    expect(result).not.toEqual(input);
+    expect(result.reason).toBe('conducted-runs-conform');
+    const json = JSON.stringify(result);
+    expect(json).not.toContain(added.run.runId);
+    expect(json).not.toContain(added.run.headOid);
+    expect(json).not.toContain(String(added.run.pullRequest));
+    for (const fixture of passing()) {
+      expect(json).not.toContain(fixture.run.runId);
+      expect(json).not.toContain(fixture.run.headOid);
+      expect(json).not.toContain(String(fixture.run.pullRequest));
+    }
+  });
+});
+
 describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
   const at = iso(DAY, 15);
 
@@ -1279,15 +1491,24 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
-  it('a park intent while the state is merged, stopped or parked yields fail/stray-one-way-action', () => {
+  it('a park intent while the state is merged or stopped yields fail/stray-one-way-action', () => {
     const base = added();
     const key = oneWayKey(base.run.runId, 'park', null, null);
-    for (const state of ['merged', 'stopped', 'parked']) {
+    for (const state of ['merged', 'stopped']) {
       const broken = extendJournal(base, [conductAt(state, at), intentAt(key, at)]);
       expect(evaluate(onTop(broken))).toEqual(
         scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
       );
     }
+  });
+
+  it('a park intent while the state is parked conforms', () => {
+    // CE1w: the commit-pending escalation journals its one-way park intent
+    // from `parked`. That intent is in the park row, so it is not stray.
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null);
+    const run = extendJournal(base, [conductAt('parked', at), intentAt(key, at)]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
   it('an entry with an unparseable key is ignored', () => {
@@ -1334,10 +1555,11 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect([...SHADOW_ONE_WAY_STEP_STATES['open-pr']]).toEqual(['opening-pr']);
     expect([...SHADOW_ONE_WAY_STEP_STATES.push]).toEqual(['pushing']);
     expect([...SHADOW_ONE_WAY_STEP_STATES.merge]).toEqual(['merging']);
-    const blocked = ['merged', 'stopped', 'parked'];
+    const blocked = ['merged', 'stopped'];
     const park = [...SHADOW_ONE_WAY_STEP_STATES.park];
     expect(park).toEqual(LANE_RUN_STATES.filter((state) => !blocked.includes(state)));
     expect(park).toHaveLength(LANE_RUN_STATES.length - blocked.length);
+    expect(park).toContain('parked');
     for (const state of blocked) expect(park).not.toContain(state);
   });
 });

@@ -50,6 +50,12 @@ function isCommitObjectId(value: string): boolean {
 /** Cost bound of the dirty-path count: a longer list reads no fact rather than being walked. */
 const DIRTY_PATH_LIST_MAX = 100_000;
 
+/** The value of an own data property, or undefined for a missing key or an accessor (never runs a getter). O(1). */
+function ownDataValue(target: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+}
+
 /**
  * The length of a path list whose every index is an own data property holding a string, or
  * null for anything else (not an array, a hole, an accessor, a non-string, longer than the
@@ -796,10 +802,11 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     // getter on any read property must fail closed (no fact at all, so the
     // escalation refuses), never escape this use case.
     try {
-      const read = inspection as {
-        checkedOutCommit?: unknown;
-        uncommittedPaths?: unknown;
-        untrackedPaths?: unknown;
+      // Own data properties only: an accessor is never run (it yields undefined, so no fact).
+      const read = {
+        checkedOutCommit: ownDataValue(inspection, 'checkedOutCommit'),
+        uncommittedPaths: ownDataValue(inspection, 'uncommittedPaths'),
+        untrackedPaths: ownDataValue(inspection, 'untrackedPaths'),
       };
       const facts: {
         dirtyWorktree?: { readonly trackedFilesChanged: number };

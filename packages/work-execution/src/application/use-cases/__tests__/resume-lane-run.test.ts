@@ -1369,6 +1369,36 @@ describe('ResumeLaneRunUseCase CE1/CE3 park escalation', () => {
     expect(record?.parked).toEqual(FIX_PARK);
   });
 
+  it('an accessor on the inspection result is never run: its fabricated dirty and head facts are ignored and the run refuses', async () => {
+    const fx = await seededFixPark();
+    const base = inspectionOf({ uncommittedPaths: [], untrackedPaths: [], checkedOutCommit: HEAD_ADVANCED });
+    const withGetters = { ...base };
+    let getterRuns = 0;
+    for (const [key, value] of [['checkedOutCommit', HEAD_ADVANCED], ['uncommittedPaths', ['a.ts']], ['untrackedPaths', []]] as const) {
+      Object.defineProperty(withGetters, key, {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return value;
+        },
+      });
+    }
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => fixAttemptRecord() },
+      worktreeInspect: { inspectWorktree: async () => withGetters },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'missing-dirty-worktree-fact' });
+    expect(getterRuns).toBe(0);
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
   it('an unreadable worktree reads no fact and refuses without escalating (missing-dirty-worktree-fact)', async () => {
     const fx = await seededFixPark();
     const resume = new ResumeLaneRunUseCase({
@@ -1390,14 +1420,14 @@ describe('ResumeLaneRunUseCase CE1/CE3 park escalation', () => {
     expect(record?.parked).toEqual(FIX_PARK);
   });
 
-  it('a throwing getter on the inspection result reads no fact and refuses without escalating (fail closed, no escape)', async () => {
+  it('a throwing descriptor trap on the inspection result reads no fact and refuses without escalating (fail closed, no escape)', async () => {
     const fx = await seededFixPark();
     const hostile = new Proxy(inspectionOf({ uncommittedPaths: [], untrackedPaths: [], checkedOutCommit: HEAD_ADVANCED }), {
-      get(target, prop) {
+      getOwnPropertyDescriptor(target, prop) {
         if (prop === 'uncommittedPaths') {
-          throw new Error('hostile getter');
+          throw new Error('hostile descriptor trap');
         }
-        return Reflect.get(target, prop);
+        return Reflect.getOwnPropertyDescriptor(target, prop);
       },
     });
     const resume = new ResumeLaneRunUseCase({

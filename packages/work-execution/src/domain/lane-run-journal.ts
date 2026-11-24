@@ -20,6 +20,7 @@ import { containsSecretShape } from '@fleet/shared';
 import { parseBaseBranch } from './base-branch.js';
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from './lane-run-keys.js';
+import type { ParkEscalationMode } from './park-escalation.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
@@ -59,8 +60,12 @@ export interface LaneRunJournalEntryRecord {
   /** The run the entry belongs to: the key's run for step, stop and resume keys; null or a run id for request and reaper keys; required for conduct. */
   readonly runId: string | null;
   readonly recordedAtIso: string;
-  /** A stop intent: the mode its key names (§3.9.1). Every other entry: null. */
-  readonly mode: LaneRunStopKeyMode | null;
+  /**
+   * A stop intent: the mode its key names (§3.9.1).
+   * An escalation conduct into `fixing`: `commit-pending`, the once-per-run marker.
+   * Every other entry: null. A mode on an intent is only a stop.
+   */
+  readonly mode: LaneRunStopKeyMode | ParkEscalationMode | null;
   /** A stop or resume intent: the run revision the requester read (§3.8). Every other entry: null. */
   readonly expectedRevision: number | null;
   /** An intent: the id minted for its action before it runs (attempt id, review request id, question key; §3.2), or null. Other kinds: null. */
@@ -200,7 +205,7 @@ function buildJournalEntry(
     key: snapshot.key as string | null,
     runId: snapshot.runId as string | null,
     recordedAtIso: new Date(snapshot.recordedAtIso as string).toISOString(),
-    mode: snapshot.mode as LaneRunStopKeyMode | null,
+    mode: snapshot.mode as LaneRunStopKeyMode | ParkEscalationMode | null,
     expectedRevision: snapshot.expectedRevision as number | null,
     mintedId: snapshot.mintedId as string | null,
     outcome: snapshot.outcome as LaneRunJournalOutcome | null,
@@ -235,7 +240,7 @@ function entryPayloadError(
   parsedKey: ParsedLaneRunKey | null,
   snapshot: Record<string, unknown>,
 ): string | null {
-  const modeError = entryModeError(kind, parsedKey, snapshot.mode);
+  const modeError = entryModeError(kind, parsedKey, snapshot.mode, snapshot.state);
   if (modeError !== null) {
     return modeError;
   }
@@ -372,11 +377,17 @@ function entryModeError(
   kind: LaneRunJournalEntryKind,
   parsedKey: ParsedLaneRunKey | null,
   mode: unknown,
+  state: unknown,
 ): string | null {
   if (kind === 'intent' && parsedKey !== null && parsedKey.kind === 'stop') {
     if (mode !== parsedKey.mode) {
       return 'LaneRunJournal mode does not match its key';
     }
+    return null;
+  }
+  // The once-per-run escalation marker is only this conduct shape. A mode on
+  // any intent is a stop, so the marker never rides an intent.
+  if (kind === 'conduct' && mode === 'commit-pending' && state === 'fixing') {
     return null;
   }
   if (mode !== null) {

@@ -753,3 +753,26 @@ describe('refusals', () => {
     });
   });
 });
+
+describe('escalation conduct marker', () => {
+  it('round-trips a fixing commit-pending conduct and refuses every other mode', async () => {
+    const marker = { ...conduct('fixing'), mode: 'commit-pending' as const };
+    expect(readLaneRunJournalEntry(marker)).toMatchObject({
+      ok: true,
+      entry: { kind: 'conduct', state: 'fixing', mode: 'commit-pending' },
+    });
+    const dir = await stateDir();
+    await writeJournal(dir, [marker]);
+    const listed = await new LaneRunJournalAdapter({ stateDir: dir, readOnly: true }).listForRun(RUN_ID);
+    expect(listed).toEqual([
+      expect.objectContaining({ kind: 'conduct', state: 'fixing', mode: 'commit-pending' }),
+    ]);
+    expect(laneRunJournalState(listed, RUN_ID)).toBe('fixing');
+    expect(laneRunJournalStopFacts(listed, RUN_ID)).toEqual({ stopMode: null, stopRequestedAtIso: null });
+
+    expect(readLaneRunJournalEntry({ ...conduct('collecting'), mode: 'commit-pending' }).ok).toBe(false);
+    expect(readLaneRunJournalEntry({ ...conduct('fixing'), mode: 'graceful' }).ok).toBe(false);
+    expect(readLaneRunJournalEntry({ ...intent(COLLECT_LEGACY), mode: 'commit-pending' }).ok).toBe(false);
+    expect(readLaneRunJournalEntry({ ...result(COLLECT_LEGACY, 'completed'), mode: 'commit-pending' }).ok).toBe(false);
+  });
+});

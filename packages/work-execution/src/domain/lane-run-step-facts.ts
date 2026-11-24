@@ -13,6 +13,7 @@ import { LANE_RUN_MAX_RETRY, buildLaneRunStepKey, parseLaneRunKey } from './lane
 import type { ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
+import type { ParkEscalationMode } from './park-escalation.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { SeatFailureOutcome } from './seat-selection.js';
 
@@ -51,7 +52,13 @@ export const LANE_RUN_RESULT_REASON_CODES = [
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
-export function laneRunConductEntry(entryId: string, runId: string, state: LaneRunStateValue, nowIso: string): LaneRunJournalEntryRecord {
+export function laneRunConductEntry(
+  entryId: string,
+  runId: string,
+  state: LaneRunStateValue,
+  nowIso: string,
+  mode: ParkEscalationMode | null = null,
+): LaneRunJournalEntryRecord {
   return Object.freeze({
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
     entryId,
@@ -59,7 +66,7 @@ export function laneRunConductEntry(entryId: string, runId: string, state: LaneR
     key: null,
     runId,
     recordedAtIso: nowIso,
-    mode: null,
+    mode,
     expectedRevision: null,
     mintedId: null,
     outcome: null,

@@ -1338,7 +1338,7 @@ function retroChecksPredateMerge(facts: RetroFacts, policy: RetroPolicy): boolea
       return false;
     }
     const createdAt = fact.value.createdAtIso;
-    return typeof createdAt === 'string' && isZonedIsoDateTime(createdAt) && Date.parse(createdAt) <= mergedAtMs;
+    return typeof createdAt === 'string' && isZonedIsoDateTime(createdAt) && Date.parse(createdAt) < mergedAtMs;
   });
 }
 

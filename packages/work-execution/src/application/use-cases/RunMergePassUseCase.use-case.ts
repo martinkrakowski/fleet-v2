@@ -481,6 +481,69 @@ export class RunMergePassUseCase implements RunMergePassPort {
     );
   }
 
+  /**
+   * Shadow `already-merged` (SH24a + EV2): journal the dry-run so
+   * shadow-effective liveness can exclude the entry, preceded on the first
+   * observation by the retro `would-merge` when the decider would have merged
+   * that exact head with every required check created before the merge.
+   */
+  private async actOnShadowAlreadyMerged(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    facts: MergeStepFacts,
+  ): Promise<MergePassEntryReport> {
+    // SH24a: the forge says the PR is merged; journal the dry-run so
+    // shadow-effective liveness can exclude the entry without a write.
+    // EV2: on the FIRST already-merged observation for this head12
+    // (no `would-already-merged` result yet), re-evaluate the live
+    // path's decider predicates on the facts already gathered; if they
+    // all pass, the retro `would-merge` is journaled first, keyed with
+    // the merged head as its linkedId, before `would-already-merged`.
+    const head12 = head12Of(entry.headOid);
+    const built = buildMergeKey({
+      repoDigest: request.repoDigest,
+      pullRequest: entry.pullRequest,
+      head12: head12 ?? '',
+      action: 'would-already-merged',
+      attemptOrdinal: null,
+      retry: null,
+    });
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'key-refused', null);
+    }
+    this.ensureBudget(request); // D-DT9: guard before the journal read
+    const existing = await this.deps.journal.listForKey(built.key);
+    if (existing.some((candidate) => candidate.kind === 'result')) {
+      return this.report(entry, 'no-action', 'already-journalled', null);
+    }
+    if (isMergedHeadRetroMergeEligible(entry, facts, request.policy, this.deps.nowIso())) {
+      // A refused retro append must not be followed by `would-already-merged`:
+      // that result is the first-observation mark, and writing it would
+      // make the retro unrecoverable. An already-journalled `would-merge`
+      // (a prior pass wrote it, then stopped) still continues, so the
+      // already-merged pair can be completed.
+      const retro = await this.journalShadowAct(
+        request,
+        entry,
+        {
+          kind: 'act',
+          action: 'merge-pr',
+          execution: 'shadow',
+          shadowReason: 'would-merge',
+          expectedHeadOid: entry.headOid,
+          receiptHeadOid: null,
+          procedure: null,
+          vetoShadow: null,
+        },
+        'retro',
+      );
+      if (retro.decision !== 'journalled' && retro.reasonCode !== 'already-journalled') {
+        return retro;
+      }
+    }
+    return this.journalShadowOutcome(request, entry, 'would-already-merged', null);
+  }
+
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
   private async actOnDecision(
     request: RunMergePassRequest,
@@ -506,56 +569,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
     if (decision.kind === 'wait') {
       if (request.policy.shadow === true && decision.reason === 'already-merged') {
-        // SH24a: the forge says the PR is merged; journal the dry-run so
-        // shadow-effective liveness can exclude the entry without a write.
-        // EV2: on the FIRST already-merged observation for this head12
-        // (no `would-already-merged` result yet), re-evaluate the live
-        // path's decider predicates on the facts already gathered; if they
-        // all pass, the retro `would-merge` is journaled first, keyed with
-        // the merged head as its linkedId, before `would-already-merged`.
-        const head12 = head12Of(entry.headOid);
-        const built = buildMergeKey({
-          repoDigest: request.repoDigest,
-          pullRequest: entry.pullRequest,
-          head12: head12 ?? '',
-          action: 'would-already-merged',
-          attemptOrdinal: null,
-          retry: null,
-        });
-        if (!built.ok) {
-          return this.report(entry, 'no-action', 'key-refused', null);
-        }
-        this.ensureBudget(request); // D-DT9: guard before the journal read
-        const existing = await this.deps.journal.listForKey(built.key);
-        if (existing.some((candidate) => candidate.kind === 'result')) {
-          return this.report(entry, 'no-action', 'already-journalled', null);
-        }
-        if (isMergedHeadRetroMergeEligible(entry, facts, request.policy, this.deps.nowIso())) {
-          // A refused retro append must not be followed by `would-already-merged`:
-          // that result is the first-observation mark, and writing it would
-          // make the retro unrecoverable. An already-journalled `would-merge`
-          // (a prior pass wrote it, then stopped) still continues, so the
-          // already-merged pair can be completed.
-          const retro = await this.journalShadowAct(
-            request,
-            entry,
-            {
-              kind: 'act',
-              action: 'merge-pr',
-              execution: 'shadow',
-              shadowReason: 'would-merge',
-              expectedHeadOid: entry.headOid,
-              receiptHeadOid: null,
-              procedure: null,
-              vetoShadow: null,
-            },
-            'retro',
-          );
-          if (retro.decision !== 'journalled' && retro.reasonCode !== 'already-journalled') {
-            return retro;
-          }
-        }
-        return this.journalShadowOutcome(request, entry, 'would-already-merged', null);
+        return this.actOnShadowAlreadyMerged(request, entry, facts);
       }
       return this.report(entry, 'no-action', decision.reason, null);
     }

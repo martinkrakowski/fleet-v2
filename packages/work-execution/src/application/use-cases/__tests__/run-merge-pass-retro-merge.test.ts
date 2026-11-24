@@ -703,6 +703,25 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
     expect(isMergedHeadRetroMergeEligible(entry, sameInstant, policy, NOW)).toBe(true);
   });
 
+  it('refuses a required context created at the merge instant or within the same millisecond', () => {
+    const entry = makeEntry();
+    const policy = makePolicy();
+    // Control: a context created before the merge is eligible.
+    expect(isMergedHeadRetroMergeEligible(entry, makeFacts(), policy, NOW)).toBe(true);
+    const contextsAt = (createdAtIso: string): Record<string, unknown> => ({
+      gate: { state: 'success', creatorLogin: null, createdAtIso: CREATED_AT },
+      premerge: { state: 'success', creatorLogin: POSTER, createdAtIso },
+    });
+    // Exactly the merge instant.
+    expect(
+      isMergedHeadRetroMergeEligible(entry, makeFacts({ mergedAtIso: '2026-11-01T11:00:00.000Z', contexts: contextsAt('2026-11-01T11:00:00.000Z') }), policy, NOW),
+    ).toBe(false);
+    // Sub-millisecond: the context is later than the merge, but both parse to the same millisecond.
+    expect(
+      isMergedHeadRetroMergeEligible(entry, makeFacts({ mergedAtIso: '2026-11-01T11:00:00.0001Z', contexts: contextsAt('2026-11-01T11:00:00.0009Z') }), policy, NOW),
+    ).toBe(false);
+  });
+
   it('refuses when the observed base does not match or a macos procedure is configured', () => {
     // Control: the unmodified eligible input passes, so a constant `false` fails this test.
     expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);

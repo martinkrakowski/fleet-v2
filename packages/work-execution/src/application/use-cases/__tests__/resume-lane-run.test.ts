@@ -1338,6 +1338,37 @@ describe('ResumeLaneRunUseCase CE1/CE3 park escalation', () => {
     expect(record?.revision).toBe(2);
   });
 
+  it('a sparse uncommitted-path list is no dirty-worktree fact: the run refuses missing-dirty-worktree-fact instead of escalating', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.uncommittedPaths = new Array<string>(1);
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'missing-dirty-worktree-fact' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
+  it('a base commit with a trailing newline yields no head fact: a reset to the canonical base stays parked as worktree-clean', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.checkedOutCommit = HEAD_BASE;
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      newUlid: ulidMinter(),
+      attemptRepo: { findAttemptById: async () => ({ ...fixAttemptRecord(), baseCommit: `${HEAD_BASE}\n` }) },
+      worktreeInspect: { inspectWorktree: async () => inspectionOf(fx.inspection) },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'worktree-clean' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+  });
+
   it('an unreadable worktree reads no fact and refuses without escalating (missing-dirty-worktree-fact)', async () => {
     const fx = await seededFixPark();
     const resume = new ResumeLaneRunUseCase({

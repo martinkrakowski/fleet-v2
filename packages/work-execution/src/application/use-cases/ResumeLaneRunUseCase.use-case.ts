@@ -41,6 +41,32 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 
 /** A git commit object id: 40 hex (sha-1) or 64 hex (sha-256) characters, lower-case. */
 const COMMIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** JavaScript's `$` (no `m` flag) matches only at the very end, so a trailing newline fails. */
+function isCommitObjectId(value: string): boolean {
+  return COMMIT_OBJECT_ID_PATTERN.test(value);
+}
+
+/** Cost bound of the dirty-path count: a longer list reads no fact rather than being walked. */
+const DIRTY_PATH_LIST_MAX = 100_000;
+
+/**
+ * The length of a path list whose every index is an own data property holding a string, or
+ * null for anything else (not an array, a hole, an accessor, a non-string, longer than the
+ * bound). Never runs a getter. O(n) with n at most DIRTY_PATH_LIST_MAX.
+ */
+function denseStringListLength(value: unknown): number | null {
+  if (!Array.isArray(value) || value.length > DIRTY_PATH_LIST_MAX) {
+    return null;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || typeof descriptor.value !== 'string') {
+      return null;
+    }
+  }
+  return value.length;
+}
 import type {
   ApplyPendingResumeRequest,
   ApplyPendingResumeResult,
@@ -779,10 +805,10 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
         dirtyWorktree?: { readonly trackedFilesChanged: number };
         headFact?: { readonly headAdvanced: boolean };
       } = {};
-      if (Array.isArray(read.uncommittedPaths) && Array.isArray(read.untrackedPaths)) {
-        facts.dirtyWorktree = {
-          trackedFilesChanged: read.uncommittedPaths.length + read.untrackedPaths.length,
-        };
+      const uncommitted = denseStringListLength(read.uncommittedPaths);
+      const untracked = denseStringListLength(read.untrackedPaths);
+      if (uncommitted !== null && untracked !== null) {
+        facts.dirtyWorktree = { trackedFilesChanged: uncommitted + untracked };
       }
       const collectedHead = attempt.artifacts?.headCommit;
       // A head is a fact only when all three commits are well-formed object ids: a malformed
@@ -792,9 +818,9 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       if (
         typeof collectedHead === 'string' &&
         typeof observedHead === 'string' &&
-        COMMIT_OBJECT_ID_PATTERN.test(collectedHead) &&
-        COMMIT_OBJECT_ID_PATTERN.test(observedHead) &&
-        COMMIT_OBJECT_ID_PATTERN.test(attempt.baseCommit)
+        isCommitObjectId(collectedHead) &&
+        isCommitObjectId(observedHead) &&
+        isCommitObjectId(attempt.baseCommit)
       ) {
         facts.headFact = {
           headAdvanced: observedHead !== collectedHead && observedHead !== attempt.baseCommit,

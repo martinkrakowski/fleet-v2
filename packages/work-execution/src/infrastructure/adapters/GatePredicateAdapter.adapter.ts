@@ -306,15 +306,16 @@ function resourceExhaustedResult(name: string, exitCode: number, durationMs: num
  * A command whose worktree never got its dependencies (`node_modules/.yarn-state.yml`
  * absent after one bounded `yarn install --immutable`, or a missing-module
  * failure while the state file is absent) never reported its own verdict: it
- * is `unknown` with `cause: 'environment-not-installed'`, so the run retries
- * once the environment is installed instead of recording a hard failure. It
- * carries no output tail and no failing file: the failure is the
- * environment's, not the command's.
+ * is `unknown` with `cause: 'environment-not-installed'`, so one transient
+ * miss retries instead of recording a hard failure. It carries no failing
+ * file. `outputTail`, when present, is the bounded secret-screened install
+ * tail (4 KiB) or, on the missing-module path, the command's own tail.
  */
 function environmentNotInstalledResult(
   name: string,
   exitCode: number | null,
   durationMs: number,
+  outputTail?: string,
 ): GatePredicateResult {
   return {
     name,
@@ -324,6 +325,7 @@ function environmentNotInstalledResult(
     durationMs,
     detail: 'dependencies not installed in the worktree',
     cause: 'environment-not-installed',
+    ...(outputTail === undefined ? {} : { outputTail }),
   };
 }
 
@@ -420,6 +422,8 @@ function withBoundedDetail(result: GatePredicateResult): GatePredicateResult {
  * printed a screenful.
  */
 const MAX_OUTPUT_TAIL_BYTES = 32 * 1024;
+/** A failed `yarn install --immutable` keeps a shorter tail than a command: the last 4 KiB. */
+const MAX_INSTALL_OUTPUT_TAIL_BYTES = 4 * 1024;
 const MAX_OUTPUT_TAIL_LINES = 200;
 const OUTPUT_TAIL_WITHHELD = '[output withheld: secret-shaped text]';
 const OUTPUT_TAIL_REDACTED_LINE = '[redacted: secret-shaped line]';
@@ -445,14 +449,17 @@ function isSecretShapedLine(line: string): boolean {
  * the whole tail is withheld with one fixed marker.
  *
  * Fix round 2: the scan bound is on the COMBINED text. Each stream is first
- * cut to its last `MAX_OUTPUT_TAIL_BYTES + 1` characters only so the exact
- * last-32-KiB window of the raw combined text can be located without reading
- * more; the combined window itself is then cut to at most 32 KiB (+ the one
- * join newline of slack) BEFORE any strip, scan or split, and the 200-line
- * limit is applied by scanning newline positions inside that window rather
- * than splitting it whole. Every step therefore costs O(32 KiB) total
- * regardless of how much a failing command printed — never O(64 KiB) or an
- * unbounded line split.
+ * cut to its last `maxBytes + 1` characters only so the exact last-window of
+ * the raw combined text can be located without reading more; the combined
+ * window itself is then cut to at most `maxBytes` (+ the one join newline of
+ * slack) BEFORE any strip, scan or split, and the 200-line limit is applied
+ * by scanning newline positions inside that window rather than splitting it
+ * whole. Every step therefore costs O(maxBytes) total regardless of how much
+ * a failing command printed.
+ *
+ * `maxBytes` defaults to the command tail (32 KiB). A failed install passes
+ * the 4 KiB cap and goes through this same ANSI-strip, partial-first-line
+ * drop, 200-line cap, per-line secret redaction, and withhold fallback.
  */
 /** The last `max` UTF-8 bytes of `text`, cut on a code-point boundary. */
 function lastUtf8Bytes(text: string, max: number): string {
@@ -476,16 +483,18 @@ function lastUtf8Bytes(text: string, max: number): string {
   return text.slice(start);
 }
 
-export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): string | undefined {
-  // Retain at most the last 32 KiB + 1 of each stream: more than the largest
+export function boundedRedactedOutputTail(
+  stdout: unknown,
+  stderr: unknown,
+  maxBytes: number = MAX_OUTPUT_TAIL_BYTES,
+): string | undefined {
+  // Retain at most the last maxBytes + 1 of each stream: more than the largest
   // window any later step can need is never retained. O(1) slice per stream.
   const bounded = (stream: unknown): string | undefined => {
     if (typeof stream !== 'string') {
       return undefined;
     }
-    return stream.length > MAX_OUTPUT_TAIL_BYTES + 1
-      ? stream.slice(stream.length - (MAX_OUTPUT_TAIL_BYTES + 1))
-      : stream;
+    return stream.length > maxBytes + 1 ? stream.slice(stream.length - (maxBytes + 1)) : stream;
   };
   const boundedStdout = bounded(stdout);
   const boundedStderr = bounded(stderr);
@@ -496,25 +505,25 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
   const b = boundedStderr ?? '';
   const joinNewline = boundedStdout !== undefined && boundedStderr !== undefined ? '\n' : '';
   const rawCombinedLength = a.length + joinNewline.length + b.length;
-  // Cut the raw combined text to its last MAX_OUTPUT_TAIL_BYTES characters
-  // (the join newline counts towards the bound) without ever materialising
-  // the whole join: ANSI stripping only removes characters, so the processed
-  // tail can never exceed this window's 32 KiB.
+  // Cut the raw combined text to its last maxBytes characters (the join
+  // newline counts towards the bound) without ever materialising the whole
+  // join: ANSI stripping only removes characters, so the processed tail can
+  // never exceed this window.
   let rawWindow: string;
-  if (rawCombinedLength <= MAX_OUTPUT_TAIL_BYTES) {
+  if (rawCombinedLength <= maxBytes) {
     rawWindow = a + joinNewline + b;
-  } else if (b.length >= MAX_OUTPUT_TAIL_BYTES) {
-    rawWindow = b.slice(b.length - MAX_OUTPUT_TAIL_BYTES);
+  } else if (b.length >= maxBytes) {
+    rawWindow = b.slice(b.length - maxBytes);
   } else {
-    const headKeep = MAX_OUTPUT_TAIL_BYTES - joinNewline.length - b.length;
+    const headKeep = maxBytes - joinNewline.length - b.length;
     rawWindow = a.slice(a.length - headKeep) + joinNewline + b;
   }
   // Any cut of the raw window may have split a line (and so a token): that
   // first line is partial, its prefix lost, so it is dropped rather than
   // scanned (a token whose prefix was cut would otherwise slip past the scan).
-  const windowCut = rawCombinedLength > MAX_OUTPUT_TAIL_BYTES;
+  const windowCut = rawCombinedLength > maxBytes;
   const ansiFree = rawWindow.replace(ANSI_PATTERN, '');
-  let stripped = lastUtf8Bytes(ansiFree, MAX_OUTPUT_TAIL_BYTES);
+  let stripped = lastUtf8Bytes(ansiFree, maxBytes);
   const partialFirstLine = windowCut || stripped.length !== ansiFree.length;
   if (partialFirstLine) {
     stripped = dropFirstLine(stripped);
@@ -555,10 +564,29 @@ export function boundedRedactedOutputTail(stdout: unknown, stderr: unknown): str
   // The byte bound holds AFTER redaction: a marker can be longer than the
   // line it replaces. Re-cut the redacted text (already safe to cut) and drop
   // the first, possibly partial, line of the cut.
-  if (Buffer.byteLength(redacted, 'utf8') > MAX_OUTPUT_TAIL_BYTES) {
-    redacted = dropFirstLine(lastUtf8Bytes(redacted, MAX_OUTPUT_TAIL_BYTES));
+  if (Buffer.byteLength(redacted, 'utf8') > maxBytes) {
+    redacted = dropFirstLine(lastUtf8Bytes(redacted, maxBytes));
   }
   return redacted;
+}
+
+/**
+ * The install's bounded tail, or undefined when there is no run, the streams
+ * are empty, or reading them throws (a getter on stdout or stderr). Never throws.
+ */
+function boundedInstallOutputTail(run: unknown): string | undefined {
+  try {
+    if (run === null || typeof run !== 'object') {
+      return undefined;
+    }
+    return boundedRedactedOutputTail(
+      (run as { readonly stdout?: unknown }).stdout,
+      (run as { readonly stderr?: unknown }).stderr,
+      MAX_INSTALL_OUTPUT_TAIL_BYTES,
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 /** The text after its first newline; empty when it has none. */
@@ -690,7 +718,13 @@ interface ReceiptContext {
  */
 type EnvironmentReadiness =
   | { readonly ready: true }
-  | { readonly ready: false; readonly exitCode: number | null; readonly durationMs: number };
+  | {
+      readonly ready: false;
+      readonly exitCode: number | null;
+      readonly durationMs: number;
+      /** Bounded secret-screened install tail; omitted when the install produced none, or when it exited 0. */
+      readonly outputTail?: string;
+    };
 
 export class GatePredicateAdapter implements GatePredicatePort {
   private readonly executorForRecordedHost: (
@@ -909,22 +943,19 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const name = commandName(command, index);
     const started = this.nowMs();
     try {
-      // The environment check runs once per gate run, before any receipt is
-      // read and before any command runs: a cached passing receipt (a store
-      // hit or another lane's in-flight pass) must never bypass it — the
-      // worktree's dependencies are ensured before gating, reuse included.
-      // Memoized, so this adds no probe or install beyond the first check.
-      const environment = await environmentReady();
-      if (!environment.ready) {
-        return environmentNotInstalledResult(name, environment.exitCode, environment.durationMs);
-      }
       const execute = async (): Promise<GatePredicateResult> => {
-        // The environment check runs once per gate run before the first
-        // command predicate; when it cannot make the worktree ready, no
-        // command runs and every one of them reports the same typed cause.
+        // Receipt reuse and another lane's in-flight pass both missed. The
+        // environment check (already memoized for this gate run) runs here,
+        // so a cached passing receipt never installs. When the worktree cannot
+        // be made ready, the command does not run.
         const environment = await environmentReady();
         if (!environment.ready) {
-          return environmentNotInstalledResult(name, environment.exitCode, environment.durationMs);
+          return environmentNotInstalledResult(
+            name,
+            environment.exitCode,
+            environment.durationMs,
+            environment.outputTail,
+          );
         }
         const run = await budget.run(() =>
           this.runCommand(executor, request.worktreePath, command, index, gateSlot),
@@ -1135,6 +1166,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
     const started = this.nowMs();
     let installExitCode: number | null = null;
+    let installRun: unknown;
     try {
       const waitSeconds = Math.max(
         1,
@@ -1144,8 +1176,9 @@ export class GatePredicateAdapter implements GatePredicatePort {
         ),
       );
       // The install takes one of the host's gate slots when one is declared,
-      // exactly like the commands it unblocks. Its output is discarded: no
-      // predicate result ever carries it.
+      // exactly like the commands it unblocks. A failed install keeps a
+      // bounded, secret-screened tail so a later persistent failure can
+      // archive it; a pass discards it.
       const install = await budget.run(() =>
         executor.run(worktreeCommandArgv(worktreePath, gateSlot, YARN_INSTALL_ARGV, waitSeconds), {
           cwd: worktreePath,
@@ -1153,17 +1186,32 @@ export class GatePredicateAdapter implements GatePredicatePort {
           maxBufferBytes: this.maxOutputBytes,
         }),
       );
-      if (install.ok && isUsableRun(install.value) && install.value.error === undefined) {
-        installExitCode = install.value.exitCode;
+      if (install.ok) {
+        installRun = install.value;
+        if (isUsableRun(install.value) && install.value.error === undefined && install.value.exitCode !== null) {
+          installExitCode = install.value.exitCode;
+        }
       }
     } catch {
       installExitCode = null;
+      installRun = undefined;
     }
+    const outputTail = boundedInstallOutputTail(installRun);
     const installed =
       installExitCode === 0 && (await this.stateFilePresent(executor, worktreePath));
-    return installed
-      ? { ready: true }
-      : { ready: false, exitCode: installExitCode, durationMs: this.nowMs() - started };
+    if (installed) {
+      return { ready: true };
+    }
+    // Exit 0 with the marker still absent is not an install-output failure
+    // (the command reported success). Every other miss — non-zero exit,
+    // timeout, executor error, throw, or a budget that did not complete —
+    // keeps the tail when there is one.
+    return {
+      ready: false,
+      exitCode: installExitCode,
+      durationMs: this.nowMs() - started,
+      ...(installExitCode !== 0 && outputTail !== undefined ? { outputTail } : {}),
+    };
   }
 
   private async commitPredicate(
@@ -1413,9 +1461,20 @@ export class GatePredicateAdapter implements GatePredicatePort {
     if (raw === 'fail') {
       const combined = run.stdout + '\n' + run.stderr;
       if (combined.includes('Cannot find module') || combined.includes('ERR_MODULE_NOT_FOUND')) {
-        const present = await this.stateFilePresent(executor, worktreePath);
+        // A non-yarn worktree can never be environment-not-installed (nothing
+        // here could install it): its failure stays the command's own verdict.
+        const present =
+          (await this.stateFilePresent(executor, worktreePath)) ||
+          !(await this.isYarnProject(executor, worktreePath));
         if (!present) {
-          return environmentNotInstalledResult(name, run.exitCode, this.nowMs() - started);
+          // The missing-module path carries the command's own tail (the 32 KiB
+          // command bound), not the shorter install tail.
+          return environmentNotInstalledResult(
+            name,
+            run.exitCode,
+            this.nowMs() - started,
+            boundedRedactedOutputTail(run.stdout, run.stderr),
+          );
         }
       }
     }

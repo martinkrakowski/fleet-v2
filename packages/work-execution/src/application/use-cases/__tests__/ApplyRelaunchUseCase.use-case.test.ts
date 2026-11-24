@@ -2935,6 +2935,35 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     expect([record.state, record.revision, record.artifacts?.headCommit]).toEqual(['ended', 1, COMMIT]);
   });
 
+  it('AR3d-revision-at-ceiling: a stored revision of Number.MAX_SAFE_INTEGER refuses adopt-failed and writes nothing', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, record: { revision: Number.MAX_SAFE_INTEGER } });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('AR3d-hostile-save-error: a saveAttempt that rejects with a throwing-name object or a revoked Proxy refuses adopt-failed instead of throwing', async () => {
+    const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const throwingName = Object.defineProperty({}, 'name', {
+      get() {
+        throw new Error('name getter must be contained');
+      },
+    });
+    for (const hostile of [revoked, throwingName]) {
+      const harness = await makeRealHarness({ stubAdopt: true });
+      harness.deps.attemptRepo = {
+        findAttemptById: (id: string) => harness.attemptRepo.findAttemptById(id),
+        saveAttempt: async () => {
+          throw hostile;
+        },
+      };
+      const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+      expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    }
+  });
+
   it('AR3d-happy-path-replay: re-applying a fully completed lane runs saveAttempt exactly once across both calls and stays applied', async () => {
     const harness = await makeRealHarness();
     const useCase = new ApplyRelaunchUseCase(harness.deps);

@@ -2106,10 +2106,15 @@ async function replayEndedAttempt(
 
 /** AR3d: whether a `saveAttempt` failure is the store's optimistic-concurrency refusal. */
 function isRevisionConflict(error: unknown): boolean {
-  return (
-    error instanceof AttemptRevisionConflictError ||
-    (error !== null && typeof error === 'object' && (error as { name?: unknown }).name === 'AttemptRevisionConflictError')
-  );
+  try {
+    return (
+      error instanceof AttemptRevisionConflictError ||
+      (error !== null && typeof error === 'object' && (error as { name?: unknown }).name === 'AttemptRevisionConflictError')
+    );
+  } catch {
+    // A revoked Proxy or a throwing `name` getter is not a conflict; the caller refuses either way.
+    return false;
+  }
 }
 
 /**
@@ -2130,11 +2135,14 @@ async function transitionRunningAttempt(
   const intentRefusal = await journalEndAttempt(ctx, laneId, endKey, endStatus, 'intent', commitOid, 'attempt-ended');
   if (intentRefusal !== null) return intentRefusal;
   if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  // A revision at the safe-integer ceiling has no safe successor: refuse before the write.
+  const nextRevision = nextAttemptRevision(snapshot);
+  if (!Number.isSafeInteger(nextRevision)) return refusedLane('adopt-failed', laneId);
   const endedRecord: AttemptRecord = {
     ...snapshot,
     state: 'ended',
     outcome: 'partial',
-    revision: nextAttemptRevision(snapshot),
+    revision: nextRevision,
     artifacts: { headCommit: commitOid, commitsSinceBase: [commitOid], collectedArtifactPaths: [], notes: 'missing' },
     updatedAtIso: ctx.nowIso,
   };

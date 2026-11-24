@@ -646,6 +646,12 @@ function parseInspect(value: unknown, attemptId: string, sessionId: string): Run
     if (typeof artifactsCollected !== 'boolean') {
       return null;
     }
+    // An unreachable runner cannot vouch for anything else it reports: the
+    // other claims (preparation, command, receipt, artifacts) are replaced by
+    // the safe defaults instead of being passed through.
+    if (runnerReachable === 'unreachable') {
+      return unreachableStatus();
+    }
     return {
       runnerReachable,
       workspacePreparation,

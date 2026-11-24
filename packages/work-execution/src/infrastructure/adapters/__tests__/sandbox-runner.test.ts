@@ -548,6 +548,30 @@ describe('SandboxRunnerAdapter', () => {
     });
   });
 
+  describe('inspectSession with an unreachable runner', () => {
+    it('replaces every other claim with the safe defaults when the driver reports the runner unreachable', async () => {
+      // Control: the same claims with a reachable runner pass through.
+      const control = makeAdapter();
+      await expectStarted(control.adapter);
+      const reachable = await control.adapter.inspectSession({ attemptId: ATTEMPT_ID, sessionId: SESSION_ID });
+      expect(reachable.runnerReachable).toBe('reachable');
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      driver.inspectResult = {
+        runnerReachable: 'unreachable',
+        workspacePreparation: 'prepared',
+        workerCommand: 'ended',
+        completionReceipt: null,
+        artifactsCollected: true,
+      };
+      const status = await adapter.inspectSession({ attemptId: ATTEMPT_ID, sessionId: SESSION_ID });
+      expect(status.runnerReachable).toBe('unreachable');
+      expect(status.artifactsCollected).toBe(false);
+      expect(status.completionReceipt).toBeNull();
+      expect(status.workerCommand).not.toBe('ended');
+    });
+  });
+
   describe('inspectSession', () => {
     it('reports all five RunnerSessionStatus fields separately', async () => {
       const { adapter, driver } = makeAdapter();

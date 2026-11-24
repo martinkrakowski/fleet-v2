@@ -26,9 +26,15 @@ export type GatePredicateVerdict = 'pass' | 'fail' | 'unknown' | 'skipped';
  * Why a command verdict is `unknown` without being the command's own result:
  * `gate-slot-wait-limit` is host congestion (exit 75 with the fixed gate-slot
  * stderr line); `resource-exhausted` is the OS or cgroup killing the command
- * (exit 137 SIGKILL or 143 SIGTERM).
+ * (exit 137 SIGKILL or 143 SIGTERM); `environment-not-installed` is the
+ * worktree's dependencies being missing (no `node_modules/.yarn-state.yml`
+ * and a failed or ineffective `yarn install --immutable`), or a command whose
+ * output names a missing module while the state file is absent.
  */
-export type GatePredicateCause = 'gate-slot-wait-limit' | 'resource-exhausted';
+export type GatePredicateCause =
+  | 'gate-slot-wait-limit'
+  | 'resource-exhausted'
+  | 'environment-not-installed';
 
 export interface GatePredicateResult {
   /** 'commit', 'diff-check', or 'command <n>: <argv joined by spaces, cut to 120 characters>'. */
@@ -44,8 +50,11 @@ export interface GatePredicateResult {
    * Set only when an `unknown` command verdict is not the command's own
    * result (KF-30c): `gate-slot-wait-limit` is host congestion (exit 75 with
    * the fixed gate-slot stderr line); `resource-exhausted` is the command
-   * terminated by the OS or cgroup with exit 137 (SIGKILL) or 143 (SIGTERM).
-   * Any other result omits it.
+   * terminated by the OS or cgroup with exit 137 (SIGKILL) or 143 (SIGTERM);
+   * `environment-not-installed` is the worktree's dependencies missing (no
+   * `node_modules/.yarn-state.yml` after one bounded `yarn install
+   * --immutable`, or a missing-module failure while the state file is
+   * absent). Any other result omits it.
    */
   readonly cause?: GatePredicateCause;
   /** Commands with a coverage declaration that ran. */

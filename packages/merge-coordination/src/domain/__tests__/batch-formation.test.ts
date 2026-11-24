@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_BATCH_POLICY } from '../admission-policy.js';
 import type { AdmissionClass } from '../admission-policy.js';
-import type { BatchFormationInput, BatchFormationDecision } from '../batch-formation.js';
+import type { AdmissionCandidate, BatchFormationInput, BatchFormationDecision } from '../batch-formation.js';
 import { formBatch } from '../batch-formation.js';
 import type { QueueEntryRecord } from '../entities/QueueEntryRecord.js';
 
@@ -29,6 +29,15 @@ function input(candidates: BatchFormationInput['candidates'], overrides?: Partia
     inFlightBatches: 0,
     ...overrides,
   };
+}
+
+function withPremerge(
+  prNumber: number,
+  changedPaths: readonly string[],
+  enqueuedAtMs: number,
+  premergeStatus: AdmissionCandidate['premergeStatus'],
+): AdmissionCandidate {
+  return { ...candidate(prNumber, changedPaths, enqueuedAtMs), premergeStatus };
 }
 
 const NORMAL = ['packages/a/src/x.ts'];
@@ -219,5 +228,474 @@ describe('formBatch — unknown paths', () => {
     if (result.kind !== 'form') throw new Error('unreachable');
     expect(result.members.map((m) => m.prNumber)).toEqual([1]);
     expect(result.classes).toEqual<AdmissionClass[]>(['alone']);
+  });
+});
+
+const NONE_INPUT = { kind: 'none', reason: 'invalid batch formation input' } as const;
+const NONE_CANDIDATES = { kind: 'none', reason: 'invalid candidates list' } as const;
+const NONE_ELIGIBLE = { kind: 'none', reason: 'no eligible entries' } as const;
+
+describe('formBatch — premerge status', () => {
+  it('selects the ready PR as head of train when an earlier PR is premerge-pending', () => {
+    const candidates = [
+      withPremerge(1, NORMAL, 10, 'pending'),
+      withPremerge(2, ['packages/b/src/y.ts'], 20, 'ready'),
+    ];
+    const snapshot = structuredClone(candidates);
+    const result = formBatch(input(candidates));
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([2]);
+    expect(result.members.map((member) => member.headSha)).toEqual([SHA(2)]);
+    expect(result.skipped).toEqual([{ prNumber: 1, headSha: SHA(1), reason: 'premerge-pending' }]);
+    expect(candidates).toEqual(snapshot);
+  });
+
+  it('returns none and lists every premerge-pending PR when all are pending', () => {
+    const result = formBatch(
+      input([withPremerge(1, NORMAL, 10, 'pending'), withPremerge(2, ['packages/b/src/y.ts'], 20, 'pending')]),
+    );
+    expect(result).toEqual({
+      kind: 'none',
+      reason: 'no eligible entries',
+      skipped: [
+        { prNumber: 1, headSha: SHA(1), reason: 'premerge-pending' },
+        { prNumber: 2, headSha: SHA(2), reason: 'premerge-pending' },
+      ],
+    });
+  });
+
+  it('does not let a premerge-pending PR wedge a later ready PR', () => {
+    const shared = ['packages/c/src/z.ts'];
+    const result = formBatch(
+      input([
+        withPremerge(1, ['packages/a/src/x.ts'], 10, 'ready'),
+        withPremerge(2, shared, 20, 'pending'),
+        withPremerge(3, shared, 30, 'ready'),
+      ]),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([1, 3]);
+    expect(result.skipped).toEqual([{ prNumber: 2, headSha: SHA(2), reason: 'premerge-pending' }]);
+  });
+
+  it('leaves a blocked entry out of skipped while recording a pending one', () => {
+    const result = formBatch(
+      input([
+        candidate(1, NORMAL, 10, { kind: 'blocked', reason: 'conflict' }),
+        withPremerge(2, ['packages/b/src/y.ts'], 20, 'pending'),
+        withPremerge(3, ['packages/c/src/z.ts'], 30, 'ready'),
+      ]),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([3]);
+    expect(result.skipped).toEqual([{ prNumber: 2, headSha: SHA(2), reason: 'premerge-pending' }]);
+  });
+
+  it('records premerge-pending on a wait decision', () => {
+    const result = formBatch(
+      input(
+        [withPremerge(1, NORMAL, 990_000, 'pending'), withPremerge(2, ['packages/b/src/y.ts'], 990_000, 'ready')],
+        { inFlightBatches: 1 },
+      ),
+    );
+    expect(result).toEqual({
+      kind: 'wait',
+      reason: expect.stringContaining('still collecting') as unknown as string,
+      retryAfterMs: 80_000,
+      skipped: [{ prNumber: 1, headSha: SHA(1), reason: 'premerge-pending' }],
+    });
+  });
+
+  it('returns none when candidates is not an array', () => {
+    const call = (candidates: unknown): BatchFormationDecision =>
+      formBatch({ ...input([]), candidates: candidates as BatchFormationInput['candidates'] });
+
+    expect(call(null)).toEqual(NONE_CANDIDATES);
+    expect(call(undefined)).toEqual(NONE_CANDIDATES);
+    expect(call({})).toEqual(NONE_CANDIDATES);
+    expect(call('prs')).toEqual(NONE_CANDIDATES);
+    expect(call(3)).toEqual(NONE_CANDIDATES);
+    expect(call(true)).toEqual(NONE_CANDIDATES);
+    expect(call({ length: 1, 0: candidate(1, NORMAL, 10) })).toEqual(NONE_CANDIDATES);
+    expect(call({ length: Number.MAX_SAFE_INTEGER })).toEqual(NONE_CANDIDATES);
+    expect(call(new Uint8Array(4))).toEqual(NONE_CANDIDATES);
+
+    const { proxy, revoke } = Proxy.revocable([candidate(1, NORMAL, 10)], {});
+    revoke();
+    expect(call(proxy)).toEqual(NONE_CANDIDATES);
+
+    const lyingLength = new Proxy([] as unknown[], {
+      get(target, property, receiver) {
+        if (property === 'length') {
+          return Number.MAX_SAFE_INTEGER;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(call(lyingLength)).toEqual(NONE_CANDIDATES);
+  });
+
+  it('returns none when input or policy is null', () => {
+    const base = input([candidate(1, NORMAL, 10)]);
+    expect(formBatch(null as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+    expect(formBatch(undefined as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+    expect(formBatch('batch' as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+    expect(formBatch(1 as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, policy: null as unknown as BatchFormationInput['policy'] })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, policy: undefined as unknown as BatchFormationInput['policy'] })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, policy: 'strict' as unknown as BatchFormationInput['policy'] })).toEqual(NONE_INPUT);
+
+    const throwingPolicy = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('policy');
+        },
+      },
+    );
+    expect(formBatch({ ...base, policy: throwingPolicy as unknown as BatchFormationInput['policy'] })).toEqual(NONE_INPUT);
+
+    const throwingInput = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('input');
+        },
+      },
+    );
+    expect(formBatch(throwingInput as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+
+    const { proxy, revoke } = Proxy.revocable(base, {});
+    revoke();
+    expect(formBatch(proxy as unknown as BatchFormationInput)).toEqual(NONE_INPUT);
+
+    const carrier: Record<string, unknown> = {
+      candidates: [candidate(1, NORMAL, 10)],
+      policy: DEFAULT_BATCH_POLICY,
+      nowMs: 1_000_000,
+      inFlightBatches: 0,
+    };
+    Object.defineProperty(carrier, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+    });
+    Object.defineProperty(carrier, 'constructor', {
+      value: { prototype: { polluted: true } },
+      enumerable: true,
+    });
+    const result = formBatch(carrier as unknown as BatchFormationInput);
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([1]);
+    expect(result.skipped).toBeUndefined();
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+  });
+
+  it('skips null and malformed candidate records without throwing', () => {
+    const ready = withPremerge(4, ['packages/d/src/w.ts'], 40, 'ready');
+    const readableMalformed = {
+      entry: { id: 'q-8', schemaVersion: 1 as const, prNumber: 8, headSha: SHA(8), eligibility: null },
+      changedPaths: NORMAL,
+      enqueuedAtMs: 15,
+    };
+    const badSha = {
+      entry: { id: 'q-9', schemaVersion: 1 as const, prNumber: 9, headSha: 'not-a-sha', eligibility: { kind: 'eligible' as const } },
+      changedPaths: ['packages/i/src/x.ts'],
+      enqueuedAtMs: 16,
+    };
+    const badPaths = {
+      entry: entry(6, { kind: 'eligible' }),
+      changedPaths: 'packages/a/src/x.ts',
+      enqueuedAtMs: 17,
+    };
+    const sparse: unknown[] = [];
+    sparse[0] = null;
+    sparse[2] = undefined;
+    sparse[3] = 7;
+    sparse[4] = 'pr';
+    sparse[5] = true;
+    sparse[6] = {};
+    sparse[7] = { entry: null };
+    sparse[8] = { entry: { prNumber: 'x', headSha: 5, eligibility: { kind: 'eligible' } }, changedPaths: NORMAL, enqueuedAtMs: 18 };
+    sparse[9] = readableMalformed;
+    sparse[10] = badSha;
+    sparse[11] = badPaths;
+    sparse[12] = ready;
+
+    const result = formBatch(input(sparse as unknown as BatchFormationInput['candidates']));
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([4]);
+    expect(result.skipped).toEqual([
+      { prNumber: 8, headSha: SHA(8), reason: 'premerge-unknown' },
+      { prNumber: 9, headSha: 'not-a-sha', reason: 'premerge-unknown' },
+      { prNumber: 6, headSha: SHA(6), reason: 'premerge-unknown' },
+    ]);
+
+    expect(
+      formBatch(input([null, undefined, {}, { entry: null }, 1, 'pr'] as unknown as BatchFormationInput['candidates'])),
+    ).toEqual(NONE_ELIGIBLE);
+  });
+
+  it('skips a candidate with a throwing premergeStatus getter without throwing', () => {
+    const throwingStatus = {
+      entry: entry(1, { kind: 'eligible' }),
+      changedPaths: NORMAL,
+      enqueuedAtMs: 10,
+      get premergeStatus(): 'ready' {
+        throw new Error('premergeStatus');
+      },
+    };
+    const throwingEntry = {
+      get entry(): QueueEntryRecord {
+        throw new Error('entry');
+      },
+      changedPaths: ['packages/e/src/x.ts'],
+      enqueuedAtMs: 20,
+      premergeStatus: 'ready' as const,
+    };
+    const host = entry(3, { kind: 'eligible' });
+    const throwingEligibility = {
+      entry: {
+        id: host.id,
+        schemaVersion: 1 as const,
+        prNumber: host.prNumber,
+        headSha: host.headSha,
+        get eligibility(): QueueEntryRecord['eligibility'] {
+          throw new Error('eligibility');
+        },
+      },
+      changedPaths: ['packages/f/src/x.ts'],
+      enqueuedAtMs: 30,
+    };
+    const throwingPaths = {
+      entry: entry(7, { kind: 'eligible' }),
+      get changedPaths(): readonly string[] {
+        throw new Error('changedPaths');
+      },
+      enqueuedAtMs: 35,
+      premergeStatus: 'ready' as const,
+    };
+    const proxyCandidate = new Proxy(
+      {
+        entry: entry(5, { kind: 'eligible' }),
+        changedPaths: ['packages/h/src/x.ts'] as readonly string[],
+        enqueuedAtMs: 50,
+        premergeStatus: 'ready' as const,
+      },
+      {
+        get(target, property, receiver) {
+          if (property === 'premergeStatus') {
+            throw new Error('proxy premerge');
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const ready = withPremerge(4, ['packages/d/src/w.ts'], 40, 'ready');
+
+    const result = formBatch(
+      input(
+        [throwingStatus, throwingEntry, throwingEligibility, throwingPaths, ready, proxyCandidate] as unknown as BatchFormationInput['candidates'],
+      ),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([4]);
+    expect(result.skipped).toEqual([
+      { prNumber: 1, headSha: SHA(1), reason: 'premerge-unknown' },
+      { prNumber: 3, headSha: SHA(3), reason: 'premerge-unknown' },
+      { prNumber: 7, headSha: SHA(7), reason: 'premerge-unknown' },
+      { prNumber: 5, headSha: SHA(5), reason: 'premerge-unknown' },
+    ]);
+
+    expect(formBatch(input([throwingEntry] as unknown as BatchFormationInput['candidates']))).toEqual(NONE_ELIGIBLE);
+  });
+
+  it('never treats unknown, null, or failed premergeStatus as ready', () => {
+    const result = formBatch(
+      input([
+        withPremerge(1, NORMAL, 10, 'unknown'),
+        withPremerge(2, ['packages/b/src/y.ts'], 20, null as unknown as 'ready'),
+        withPremerge(3, ['packages/c/src/z.ts'], 30, 'failed'),
+        withPremerge(5, ['packages/e/src/x.ts'], 50, 1 as unknown as 'ready'),
+        withPremerge(4, ['packages/d/src/w.ts'], 40, 'ready'),
+      ]),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([4]);
+    expect(result.skipped).toEqual([
+      { prNumber: 1, headSha: SHA(1), reason: 'premerge-unknown' },
+      { prNumber: 2, headSha: SHA(2), reason: 'premerge-unknown' },
+      { prNumber: 3, headSha: SHA(3), reason: 'premerge-unknown' },
+      { prNumber: 5, headSha: SHA(5), reason: 'premerge-unknown' },
+    ]);
+  });
+
+  it('returns none on non-finite nowMs or inFlightBatches', () => {
+    const base = input([candidate(1, NORMAL, 10)]);
+    expect(formBatch({ ...base, nowMs: Number.NaN })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, nowMs: Number.POSITIVE_INFINITY })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, nowMs: Number.NEGATIVE_INFINITY })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, nowMs: '1000' as unknown as number })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, inFlightBatches: Number.NaN })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, inFlightBatches: Number.POSITIVE_INFINITY })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, inFlightBatches: Number.NEGATIVE_INFINITY })).toEqual(NONE_INPUT);
+    expect(formBatch({ ...base, inFlightBatches: undefined as unknown as number })).toEqual(NONE_INPUT);
+  });
+});
+
+describe('formBatch — policy constraints', () => {
+  it('refuses maxBatchSize 0 and minBatchSize 1 for one eligible candidate', () => {
+    const result = formBatch(
+      input([candidate(1, NORMAL, 10)], {
+        policy: { maxBatchSize: 0, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(result).toEqual(NONE_INPUT);
+  });
+
+  it('refuses non-integer, non-positive, and inverted policy fields', () => {
+    const eligible = [candidate(1, NORMAL, 10)];
+    const policies: Array<BatchFormationInput['policy']> = [
+      { maxBatchSize: -1, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 0, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 1, minBatchSize: 2, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4.5, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1.5, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: -1, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 1.5, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 0 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: -1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1.5 },
+    ];
+    for (const policy of policies) {
+      expect(formBatch(input(eligible, { policy }))).toEqual(NONE_INPUT);
+    }
+  });
+
+  it('refuses a policy whose maxBatchSize is above 64', () => {
+    const eligible = [candidate(1, NORMAL, 10)];
+    const atLimit = formBatch(
+      input(eligible, {
+        policy: { maxBatchSize: 64, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(atLimit.kind).toBe('form');
+    if (atLimit.kind !== 'form') throw new Error('unreachable');
+    expect(atLimit.members.map((member) => member.prNumber)).toEqual([1]);
+
+    for (const maxBatchSize of [65, 100_000]) {
+      expect(
+        formBatch(
+          input(eligible, {
+            policy: { maxBatchSize, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+          }),
+        ),
+      ).toEqual(NONE_INPUT);
+    }
+  });
+});
+
+describe('formBatch — walk budget', () => {
+  it('forms the head when 100_000 one-path candidates land on the walk budget', () => {
+    const onePath = ['src/shared.ts'];
+    const many = Array.from({ length: 100_000 }, (_, index) => candidate(index + 1, onePath, index + 1));
+    // Getter-free counter: one visit per candidate and one per changedPaths element.
+    let visits = 0;
+    for (const item of many) {
+      visits += 1 + item.changedPaths.length;
+    }
+    expect(many.every((item) => item.changedPaths === onePath)).toBe(true);
+    expect(visits).toBe(200_000);
+
+    const result = formBatch(input(many));
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([1]);
+    expect(many).toHaveLength(100_000);
+  });
+
+  it('refuses 100_000 candidates sharing one 100_000-element changedPaths array', () => {
+    const sharedPaths = new Array<string>(100_000).fill('src/app.ts');
+    const candidates = Array.from({ length: 100_000 }, (_, index) => candidate(index + 1, sharedPaths, index + 1));
+    // Getter-free counter of a finished walk. It is above the 200_000 admission
+    // budget, so the typed refusal is the walk stopping inside that budget.
+    // A finished walk would form the eligible head, because nothing is in flight.
+    let unboundedVisits = 0;
+    for (const item of candidates) {
+      unboundedVisits += 1 + item.changedPaths.length;
+    }
+    expect(candidates.every((item) => item.changedPaths === sharedPaths)).toBe(true);
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(candidates).toHaveLength(100_000);
+    expect(unboundedVisits).toBe(100_000 * (1 + 100_000));
+    expect(unboundedVisits).toBeGreaterThan(200_000);
+
+    const result = formBatch(input(candidates));
+    expect(result).toEqual({ kind: 'none', reason: 'walk-budget-exceeded' });
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(sharedPaths[0]).toBe('src/app.ts');
+    expect(sharedPaths[99_999]).toBe('src/app.ts');
+    expect(candidates).toHaveLength(100_000);
+  });
+
+  it('keeps recorded premerge-pending skips when the walk budget is then exceeded', () => {
+    const sharedPaths = new Array<string>(100_000).fill('src/app.ts');
+    const pending = withPremerge(1, ['src/pending.ts'], 1, 'pending');
+    const candidates = [pending, candidate(2, sharedPaths, 2), candidate(3, sharedPaths, 3)];
+    // A finished walk visits one slot per candidate and every changedPaths element.
+    // That total is above the 200_000 admission budget, so the walk stops inside it
+    // after the pending skip has already been recorded.
+    let finishedWalk = 0;
+    for (const item of candidates) {
+      finishedWalk += 1 + item.changedPaths.length;
+    }
+    expect(finishedWalk).toBe(1 + pending.changedPaths.length + (1 + 100_000) + (1 + 100_000));
+    expect(finishedWalk).toBeGreaterThan(200_000);
+
+    const result = formBatch(input(candidates));
+    expect(result).toEqual({
+      kind: 'none',
+      reason: 'walk-budget-exceeded',
+      skipped: [{ prNumber: 1, headSha: SHA(1), reason: 'premerge-pending' }],
+    });
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(candidates).toHaveLength(3);
+  });
+});
+
+describe('formBatch — eligible pool cap', () => {
+  it('forms only from the first 512 eligible entries when the pool is larger', () => {
+    const poolCap = 512;
+    const total = poolCap + 1;
+    // Input order is not FIFO. The last row has the earliest enqueue time, so
+    // after admission it is the head. A cap taken before that sort would drop it.
+    const candidates = Array.from({ length: total }, (_, index) => {
+      const prNumber = index + 1;
+      const enqueuedAtMs = prNumber === total ? 1 : 1_000 + prNumber;
+      return candidate(prNumber, [`packages/p${prNumber}/src/x.ts`], enqueuedAtMs);
+    });
+    const fifo = [total, ...Array.from({ length: total - 1 }, (_, index) => index + 1)];
+    expect(fifo).toHaveLength(total);
+    expect(fifo[0]).toBe(total);
+    expect(fifo[poolCap]).toBe(poolCap);
+
+    const result = formBatch(
+      input(candidates, {
+        policy: { maxBatchSize: 64, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    const memberPrs = result.members.map((member) => member.prNumber);
+    expect(memberPrs).toEqual(fifo.slice(0, 64));
+    expect(memberPrs.every((prNumber) => fifo.indexOf(prNumber) < poolCap)).toBe(true);
+    expect(memberPrs).not.toContain(fifo[poolCap]);
+    expect(result.skipped).toBeUndefined();
   });
 });

@@ -9,7 +9,7 @@
  */
 
 import type { LaneRunKeyVia } from '../../../domain/lane-run-keys.js';
-import type { LaneRunResumeRefusal } from '../../../domain/lane-run-transitions.js';
+import type { LaneRunResumeRefusal, ParkEscalationTransitionRefusal } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 
 export interface RequestResumeRequest {
@@ -27,7 +27,7 @@ export type RequestResumeResult =
   /** duplicate-key: the run already says what was asked (exit 0). */
   | { readonly outcome: 'already-requested'; readonly runId: string; readonly key: string }
   | { readonly outcome: 'not-found'; readonly runId: string }
-  | { readonly outcome: 'refused'; readonly reason: LaneRunResumeRefusal | 'invalid-request' | 'journal-refused' };
+  | { readonly outcome: 'refused'; readonly reason: LaneRunResumeRefusal | ParkEscalationTransitionRefusal | 'invalid-request' | 'journal-refused' };
 
 export interface ApplyPendingResumeRequest {
   readonly runId: string;
@@ -39,7 +39,7 @@ export interface ApplyPendingResumeRequest {
 export type ApplyPendingResumeResult =
   | { readonly outcome: 'none' }
   | { readonly outcome: 'resumed'; readonly to: LaneRunStateValue; readonly key: string }
-  | { readonly outcome: 'refused'; readonly key: string | null; readonly reason: LaneRunResumeRefusal | 'save-refused' | 'journal-refused' | 'invalid-request' | 'run-not-found' | 'forge-ambiguous' };
+  | { readonly outcome: 'refused'; readonly key: string | null; readonly reason: LaneRunResumeRefusal | ParkEscalationTransitionRefusal | 'save-refused' | 'journal-refused' | 'invalid-request' | 'run-not-found' | 'forge-ambiguous' };
 
 export interface ResumeLaneRunPort {
   requestResume(request: RequestResumeRequest): Promise<RequestResumeResult>;

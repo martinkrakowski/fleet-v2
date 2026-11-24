@@ -9,8 +9,14 @@
  */
 
 import { LANE_RUN_PARK_REASONS } from './lane-run-records.js';
+import { parseParkClass } from './park-class.js';
 import { PARK_FINDINGS_MAX_COUNT } from './park-findings-view.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from './plain-record-reads.js';
+import {
+  readBoundedDenseArray,
+  readExactPlainRecord,
+  readPlainRecordWithOptionalKeys,
+  snapshotPlainDataRecord,
+} from './plain-record-reads.js';
 import { isPlainRecordObject } from './record-schema-version.js';
 
 /** The escalation modes of the first slice; later slices add more (CE3). */
@@ -81,10 +87,15 @@ function validateFindingsShape(findings: unknown): boolean {
 
 /**
  * The pure park-escalation decision (CE1). Checks in this order: the parked
- * record's shape and `reason`, then the run's journal history (an earlier
- * `commit-pending` escalation is final — once per run), then the observed
- * dirty-worktree fact. `fix-no-progress` is the only escalatable park reason.
- * Total: any throw (a hostile Proxy trap) reads as `malformed-parked-record`.
+ * record's shape, `class` and `reason`, then the run's journal history (an
+ * earlier `commit-pending` escalation is final — once per run), then the
+ * observed dirty-worktree fact. `fix-no-progress` is the only escalatable
+ * park reason. The history walk is `readBoundedDenseArray` at
+ * `PARK_ESCALATION_HISTORY_MAX`: an `O(1)` length check refuses a longer
+ * history before any element is read, and the bounded reader then refuses a
+ * subclass, a hole, an accessor, a symbol key or an extra own key in `O(K)`
+ * own keys plus `O(cap)` descriptor checks. Total: any throw (a hostile
+ * Proxy trap) reads as `malformed-parked-record`.
  */
 export function decideParkEscalation(parked: unknown, history: unknown, dirtyWorktree?: unknown): ParkEscalationDecision {
   try {
@@ -103,26 +114,39 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     if (!validateFindingsShape(parkedRecord.findings)) {
       return STAY_MALFORMED_PARKED;
     }
+    // Optional `class`: absent is the pre-PT1a shape; a present value that is
+    // not a declared park class is malformed. `parseParkClass` is a fixed-list
+    // membership test, so this check is O(1) and never runs a getter (the
+    // value was copied from the record's own data descriptor).
+    if (parkedRecord.class !== undefined && parseParkClass(parkedRecord.class) === undefined) {
+      return STAY_MALFORMED_PARKED;
+    }
     if (reason !== 'fix-no-progress') {
       return { kind: 'stay-parked', reason: 'park-reason-not-escalatable' };
     }
+    // O(1) shape and cap gates. They stay ahead of `readBoundedDenseArray` so
+    // a history longer than the cap is `history-too-long` (one `.length` read,
+    // no element scan) rather than the bounded reader's generic null.
     if (!Array.isArray(history)) {
       return STAY_MALFORMED_HISTORY;
     }
     if (history.length > PARK_ESCALATION_HISTORY_MAX) {
       return { kind: 'stay-parked', reason: 'history-too-long' };
     }
+    // The bounded reader refuses a subclassed array, a hole, an accessor
+    // element, a non-enumerable index, a symbol key and an extra own key
+    // (`01`, `__proto__`) without running a getter. Cost: O(K) own keys, then
+    // O(cap) descriptor checks, cap = PARK_ESCALATION_HISTORY_MAX.
+    const bounded = readBoundedDenseArray(history, PARK_ESCALATION_HISTORY_MAX);
+    if (bounded === null) {
+      return STAY_MALFORMED_HISTORY;
+    }
     // Validate EVERY entry before looking for the marker, so a malformed later
-    // entry is never skipped behind an earlier escalation marker.
+    // entry is never skipped behind an earlier escalation marker. Each
+    // snapshot is O(keys of that entry); the entry count is at most the cap.
     const snapshots: NonNullable<ReturnType<typeof snapshotPlainDataRecord>>[] = [];
-    for (let i = 0; i < history.length; i += 1) {
-      // Every element is read through its own descriptor: a hole or an
-      // accessor element (getter/setter) is refused without running any getter.
-      const descriptor = Object.getOwnPropertyDescriptor(history, i);
-      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
-        return STAY_MALFORMED_HISTORY;
-      }
-      const snapshot = snapshotPlainDataRecord(descriptor.value);
+    for (const entry of bounded.array) {
+      const snapshot = snapshotPlainDataRecord(entry);
       if (snapshot === null) {
         return STAY_MALFORMED_HISTORY;
       }

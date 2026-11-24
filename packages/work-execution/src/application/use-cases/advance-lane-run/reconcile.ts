@@ -69,7 +69,55 @@ export async function performReconcile(ctx: AdvanceStepContext,
   if (decision.step === 'brief-check' || decision.step === 'code-review') {
     return reconcileReview(ctx, record, gathered, decision, request);
   }
+  if (decision.step === 'park') {
+    return reconcileParkEscalation(ctx, record, gathered, decision, request);
+  }
   return { outcome: 'not-built', decision: 'reconcile', step: decision.step };
+}
+
+/**
+ * An interrupted `park` escalation (CE1w). The intent is already journaled, so
+ * this appends no second intent. When the record is still parked, conduct
+ * `fixing` (only while the journal state is still `parked`) and clear the
+ * park. Park repair runs before the decision and may already have cleared
+ * `record.parked`; that tick appends the reconciled result only. Cost: a
+ * constant number of journal and repository writes, no history scan.
+ */
+async function reconcileParkEscalation(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  if (record.parked !== null) {
+    if (gathered.facts.state === 'parked') {
+      const conducted = await appendConduct(ctx, request, 'fixing');
+      if (!conducted.ok) {
+        return refusedResult(conducted);
+      }
+    }
+    const saved = await saveOrRefuse(ctx, {
+      ...record,
+      parked: null,
+      revision: record.revision + 1,
+    }, request);
+    if (!saved.ok) {
+      return { outcome: 'refused', reason: saved.reason };
+    }
+  }
+  const resultRefusal = await appendRunResult(
+    ctx,
+    request,
+    decision.key,
+    'reconciled',
+    'park-escalated',
+    'commit-pending',
+  );
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
+  }
+  return { outcome: 'entered', state: 'fixing' };
 }
 
 /**

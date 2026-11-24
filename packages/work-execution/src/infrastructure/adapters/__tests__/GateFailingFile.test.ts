@@ -93,6 +93,10 @@ describe('GatePredicateAdapter failingFile (PT1a)', () => {
     // The commit predicate's git calls answer as a clean two-commit branch at HEAD; the command answers `result`.
     const executor: CommandExecutorPort = {
       run: async (argv) => {
+        // The environment probe is not the command under test.
+        if (argv[0] === 'test') {
+          return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+        }
         const git = ['rev-parse', 'merge-base', 'rev-list', 'status'].find((sub) => argv.includes(sub));
         if (git === 'rev-parse') {
           return { exitCode: 0, signal: null, stdout: HEAD + '\n', stderr: '' };

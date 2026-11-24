@@ -2964,6 +2964,21 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     }
   });
 
+  it('AR3d-missing-record-refused-ledger: no stored record with a refused end-attempt ledger refuses adopt-failed and never reaches adoptLane', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, record: null });
+    const key = endKeyOf(harness.digest);
+    const entries = [
+      { key, kind: 'intent', entryId: ulid(77), recordedAtIso: CLOCK_NOW },
+      { key, kind: 'result', entryId: ulid(78), recordedAtIso: CLOCK_NOW, outcome: 'refused', reasonCode: 'simulated-refusal' },
+    ];
+    for (const entry of entries) {
+      expect(await harness.cutover.append(entry as never)).toMatchObject({ outcome: 'appended' });
+    }
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.deps.adoptLane).not.toHaveBeenCalled();
+  });
+
   it('AR3d-happy-path-replay: re-applying a fully completed lane runs saveAttempt exactly once across both calls and stays applied', async () => {
     const harness = await makeRealHarness();
     const useCase = new ApplyRelaunchUseCase(harness.deps);

@@ -2194,17 +2194,19 @@ async function endRunningAttemptBeforeAdopt(
   } catch {
     return refusedLane('adopt-failed', laneId);
   }
-  if (existing === null) return null;
-  const snapshot = validatedAttemptSnapshot(existing, saveInput.attemptId);
-  if (snapshot === null || attemptIdentityMismatch(snapshot, saveInput, adoptInput)) {
-    return refusedLane('adopt-failed', laneId);
-  }
+  // The `end-attempt` ledger is read before the missing-record case too: a refused
+  // or inconsistent ledger must stop the lane even when no record exists to end.
   const endKey = `relaunch/${ctx.planDigest}/${laneId}/end-attempt`;
   const journal = await loadJournalSnapshot(ctx.deps, ctx.planDigest);
   if (!journal.ok) return journal.result;
   const endStatus = relaunchStepStatus(journal.value, endKey);
   if (endStatus === 'refused' || endStatus === 'ambiguous') return refusedLane('adopt-failed', laneId);
   if (endStatus === 'inconsistent') return refusedLane('step-inconsistent', laneId);
+  if (existing === null) return null;
+  const snapshot = validatedAttemptSnapshot(existing, saveInput.attemptId);
+  if (snapshot === null || attemptIdentityMismatch(snapshot, saveInput, adoptInput)) {
+    return refusedLane('adopt-failed', laneId);
+  }
   if (snapshot.state === 'ended') {
     return replayEndedAttempt(ctx, laneId, snapshot, savedSource.commitOid, endKey, endStatus);
   }

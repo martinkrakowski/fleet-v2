@@ -1014,6 +1014,122 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     expect(keyGetterCalls).toBe(0);
   });
 
+  it('refuses prepare-no-failure-source on an enormous sparse journal length without walking it', async () => {
+    // A sparse-length journal whose length is enormous: without a
+    // maximum-length bound the backward walk would iterate billions of
+    // entries. The walk must refuse such a journal outright — even though
+    // one real entry sits at index 0 — and return promptly (the assertion
+    // completes, no hang).
+    let keyGetterCalls = 0;
+    const entry: Record<string, unknown> = {
+      kind: 'result',
+      outcome: 'completed',
+      runId: RUN_ID,
+      reasonCode: 'review-failed',
+      detail: null,
+    };
+    Object.defineProperty(entry, 'key', {
+      enumerable: true,
+      get: () => {
+        keyGetterCalls += 1;
+        return reviewKey('brief-check', 0, HEAD12_A);
+      },
+    });
+    const hostile = new Array(2 ** 32 - 2) as unknown[];
+    hostile[0] = entry;
+    // Also hostile: a length that is not a safe non-negative integer (a
+    // Proxy over an array target still passes `Array.isArray`).
+    const lying = new Proxy(new Array(1), {
+      get(target, property, receiver) {
+        if (property === 'length') {
+          return '999999';
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as unknown[];
+
+    const first = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(first, () => hostile))).toBe('prepare-no-failure-source');
+    const second = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(second, () => lying))).toBe('prepare-no-failure-source');
+    expect(keyGetterCalls).toBe(0);
+  });
+
+  it('refuses prepare-no-failure-source without throwing on a journal or entry whose proxy traps throw', async () => {
+    // A Proxy over an array whose `hasOwnProperty` reach throws: the hole
+    // check must not propagate the throw; the entry is skipped.
+    const throwingIndexProbe = new Proxy(new Array(1), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile descriptor trap');
+      },
+    });
+    const first = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(first, () => throwingIndexProbe))).toBe('prepare-no-failure-source');
+
+    // A Proxy whose descriptor traps report plain own data properties but
+    // whose `get` trap throws on the first field read: the entry is skipped
+    // and the walk refuses instead of throwing.
+    const plain = {
+      kind: 'result',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      outcome: 'completed',
+      runId: RUN_ID,
+      reasonCode: 'review-failed',
+      detail: null,
+    };
+    const lyingGet = new Proxy(plain, {
+      get() {
+        throw new Error('hostile get trap');
+      },
+    });
+    const second = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(second, () => [lyingGet]))).toBe('prepare-no-failure-source');
+  });
+
+  it('refuses prepare-no-failure-source and never runs an inherited accessor on an entry', async () => {
+    let inheritedGetterCalls = 0;
+    // The entry itself has plain data fields, but `key` is an inherited
+    // accessor: reading it would classify the entry as a review source. Only
+    // own data properties are readable, so the entry is skipped and the
+    // accessor is never invoked.
+    const proto = Object.create(Object.prototype, {
+      key: {
+        enumerable: true,
+        get: () => {
+          inheritedGetterCalls += 1;
+          return reviewKey('brief-check', 0, HEAD12_A);
+        },
+      },
+    });
+    const inherited = Object.create(proto, {
+      kind: { enumerable: true, value: 'result' },
+      outcome: { enumerable: true, value: 'completed' },
+      runId: { enumerable: true, value: RUN_ID },
+      reasonCode: { enumerable: true, value: 'review-failed' },
+      detail: { enumerable: true, value: null },
+    });
+    // A throwing `getPrototypeOf` trap is refused the same way.
+    const opaqueProto = new Proxy(Object.prototype, {
+      getPrototypeOf() {
+        throw new Error('hostile prototype trap');
+      },
+    });
+    const opaque = Object.create(opaqueProto, {
+      kind: { enumerable: true, value: 'result' },
+      outcome: { enumerable: true, value: 'completed' },
+      runId: { enumerable: true, value: RUN_ID },
+      reasonCode: { enumerable: true, value: 'review-failed' },
+      detail: { enumerable: true, value: null },
+      key: { enumerable: true, value: reviewKey('brief-check', 0, HEAD12_A) },
+    });
+
+    const first = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(first, () => [inherited]))).toBe('prepare-no-failure-source');
+    const second = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(second, () => [opaque]))).toBe('prepare-no-failure-source');
+    expect(inheritedGetterCalls).toBe(0);
+  });
+
   it('refuses prepare-gate-journal-unreadable when the execution journal read throws', async () => {
     const harness = await seededFixingHarness();
     // Driven through performFixPrepare directly: the unreadable journal must

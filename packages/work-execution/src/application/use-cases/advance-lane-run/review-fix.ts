@@ -979,15 +979,44 @@ function fixingSourceOfEntry(
 const FIXING_WALK_ENTRY_FIELDS = ['kind', 'key', 'outcome', 'runId', 'reasonCode', 'detail'] as const;
 
 /**
- * True when any field the walk reads sits on an accessor descriptor. The walk
- * never runs a getter — hostile input may throw or lie — so the whole entry
- * is skipped before any field is read. Cost: one own-property descriptor
- * lookup per field, O(1) per entry.
+ * Upper bound on the journal entries the fix-source walk will inspect. A
+ * hostile `listForRun` may return a sparse array whose `length` is enormous
+ * (e.g. `Number.MAX_SAFE_INTEGER`): without a cap the backward walk would
+ * iterate billions of times. Real run journals are far smaller, so exceeding
+ * this bound is malformed input and the walk refuses (`null`) instead. Cost:
+ * O(min(entries.length, FIXING_WALK_MAX_ENTRIES)) — each per-entry check is
+ * O(1) plus the O(fields × prototype depth) descriptor scan.
+ */
+const FIXING_WALK_MAX_ENTRIES = 10_000;
+
+/**
+ * True when any field the walk reads is an accessor — its own descriptor, or
+ * an inherited one anywhere on the prototype chain. The walk never runs a
+ * getter — hostile input may throw or lie — so the whole entry is skipped
+ * before any field is read. Every trap-reachable operation (the descriptor
+ * lookup and the prototype hop) is guarded: a throwing `Proxy` trap means
+ * hostile input, and the entry is refused, never a throw to the caller. Cost:
+ * O(fields × prototype depth) descriptor lookups per entry, all O(1) each.
  */
 function hasAccessorWalkField(entry: object): boolean {
-  for (const field of FIXING_WALK_ENTRY_FIELDS) {
-    const descriptor = Object.getOwnPropertyDescriptor(entry, field);
-    if (descriptor !== undefined && typeof descriptor.get === 'function') {
+  let current: object | null = entry;
+  while (current !== null) {
+    for (const field of FIXING_WALK_ENTRY_FIELDS) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(current, field);
+      } catch {
+        // A throwing trap is hostile input, not a readable shape.
+        return true;
+      }
+      if (descriptor !== undefined && typeof descriptor.get === 'function') {
+        return true;
+      }
+    }
+    try {
+      current = Object.getPrototypeOf(current);
+    } catch {
+      // An unreadable prototype is hostile input.
       return true;
     }
   }
@@ -999,8 +1028,24 @@ function fixingFailureSourceOf(
   runId: string,
 ): FixingSource | null {
   // Hostile input: a non-array journal yields no source; the caller refuses
-  // with `prepare-no-failure-source` instead of throwing.
+  // with `prepare-no-failure-source` instead of throwing. `Array.isArray`
+  // reads the internal kind, so it never runs a trap.
   if (!Array.isArray(entries)) {
+    return null;
+  }
+  // Hostile input: `length` itself may be a throwing Proxy trap or a wrong
+  // primitive; any such journal is refused, and an enormous length is refused
+  // against a named bound instead of walking billions of holes.
+  let length: number;
+  try {
+    length = entries.length;
+  } catch {
+    return null;
+  }
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    return null;
+  }
+  if (length > FIXING_WALK_MAX_ENTRIES) {
     return null;
   }
   // CB9: heads whose gate already passed LATER on the walk, keyed
@@ -1010,12 +1055,19 @@ function fixingFailureSourceOf(
   // CB9: the round of the gate failure a later pass superseded, when one was
   // skipped; a source found after it must carry the same round.
   let supersededRound: number | null = null;
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    // A sparse journal array has a hole: it is skipped, never read as an entry.
-    if (!Object.prototype.hasOwnProperty.call(entries, index)) {
+  for (let index = length - 1; index >= 0; index -= 1) {
+    // A sparse journal array has a hole: it is skipped, never read as an
+    // entry. A throwing `hasOwnProperty`/index `Proxy` trap is hostile input
+    // and skips the entry too — the walk never throws to its caller.
+    let entry: unknown;
+    try {
+      if (!Object.prototype.hasOwnProperty.call(entries, index)) {
+        continue;
+      }
+      entry = entries[index];
+    } catch {
       continue;
     }
-    const entry: unknown = entries[index];
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
       continue;
     }
@@ -1023,43 +1075,57 @@ function fixingFailureSourceOf(
       continue;
     }
     const record = entry as LaneRunJournalEntryRecord;
-    const parsed = parseLaneRunKey(record.key);
+    // The descriptor scan above proved the read fields carry no accessor, but
+    // a Proxy may still lie between its descriptor trap and its `get` trap;
+    // such a throw is hostile input and skips the entry, never escapes.
+    let parsed: ReturnType<typeof parseLaneRunKey>;
+    try {
+      parsed = parseLaneRunKey(record.key);
+    } catch {
+      continue;
+    }
     // CB9: a later final gate pass on the same `(round, head12)` supersedes
     // an earlier gate failure on that head — the retried gate recovered it,
     // so the failure is not what sent the run fixing. An ambiguous or
     // non-result gate entry never counts as a pass (unknown is never success).
-    if (
-      parsed !== null &&
-      parsed.kind === 'step' &&
-      parsed.step === 'gate' &&
-      parsed.head12 !== null &&
-      record.kind === 'result' &&
-      record.outcome !== 'ambiguous' &&
-      record.runId === runId
-    ) {
-      if (record.reasonCode === 'gate-passed') {
-        passedGateHeads.add(parsed.round + ':' + parsed.head12);
+    // Field reads may still throw on a Proxy whose traps lie inconsistently;
+    // such a throw is hostile input and skips the entry, never escapes.
+    try {
+      if (
+        parsed !== null &&
+        parsed.kind === 'step' &&
+        parsed.step === 'gate' &&
+        parsed.head12 !== null &&
+        record.kind === 'result' &&
+        record.outcome !== 'ambiguous' &&
+        record.runId === runId
+      ) {
+        if (record.reasonCode === 'gate-passed') {
+          passedGateHeads.add(parsed.round + ':' + parsed.head12);
+          continue;
+        }
+        if (record.reasonCode === 'gate-failed' && passedGateHeads.has(parsed.round + ':' + parsed.head12)) {
+          supersededRound = parsed.round;
+          continue;
+        }
+      }
+      const verdict = fixingSourceOfEntry(record, parsed, runId);
+      if (verdict.kind === 'skip') {
         continue;
       }
-      if (record.reasonCode === 'gate-failed' && passedGateHeads.has(parsed.round + ':' + parsed.head12)) {
-        supersededRound = parsed.round;
-        continue;
+      if (verdict.kind === 'stop') {
+        return null;
       }
-    }
-    const verdict = fixingSourceOfEntry(record, parsed, runId);
-    if (verdict.kind === 'skip') {
+      // CB9 (bounded walk): after a superseded gate failure, only a source in
+      // the superseded round may take over the fix trigger; a failure from any
+      // other round is not what this fix round answers.
+      if (supersededRound !== null && (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound)) {
+        return null;
+      }
+      return verdict.source;
+    } catch {
       continue;
     }
-    if (verdict.kind === 'stop') {
-      return null;
-    }
-    // CB9 (bounded walk): after a superseded gate failure, only a source in
-    // the superseded round may take over the fix trigger; a failure from any
-    // other round is not what this fix round answers.
-    if (supersededRound !== null && (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound)) {
-      return null;
-    }
-    return verdict.source;
   }
   return null;
 }

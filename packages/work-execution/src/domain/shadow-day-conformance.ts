@@ -69,8 +69,9 @@ const READY_FAMILY_STATES: readonly LaneRunStateValue[] = Object.freeze([
  * States from which a `park` step may be issued: every `LANE_RUN_STATES`
  * value except the terminals `merged` and `stopped`. `parked` is included so
  * the one commit-pending escalation can journal its `park` intent (CE1w).
- * Rule 6 still requires a later `park-escalated` result and at most one such
- * intent per run. Without `parked` in this row that intent is
+ * Rule 6 still requires a later `park-escalated` result, at most one such
+ * intent per run, and at most one distinct park ordinal across
+ * `park-escalated` result keys. Without `parked` in this row that intent is
  * `stray-one-way-action`. Cost: constant.
  */
 const PARK_ISSUE_STATES: readonly LaneRunStateValue[] = Object.freeze(
@@ -243,9 +244,13 @@ const MAX_JOURNAL_KEY_LENGTH = 256;
 const MAX_JOURNAL_TOKEN_LENGTH = 64;
 
 /**
- * Result `reasonCode` that records a park-from-parked escalation (CE1).
- * Only a `fix-no-progress` park produces it. The result's key and outcome
- * are not part of the check: a crashed escalation settles on the resume key.
+ * Result `reasonCode` that records a park escalation (CE1). Only a
+ * `fix-no-progress` park produces it. The outcome is not part of the check:
+ * a crashed escalation settles on the resume key. A park step key
+ * (`<run>/r<round>/park/<parkCount>`) and a resume key
+ * (`<run>/park/<parkCount>/resume@<via>`) both contribute `<parkCount>`.
+ * More than one distinct ordinal in the run is stray. A null or
+ * unparseable key contributes none.
  */
 const PARK_ESCALATED_REASON_CODE = 'park-escalated';
 
@@ -709,13 +714,18 @@ interface ParkedEscalation {
  * the state is not `parked` skips the duplicate check: its key is
  * `<run>/r<round>/park/<seat>` with no ordinal, so two legitimate parks in
  * one round share a key. A `park` intent issued from `parked` is the
- * commit-pending escalation (CE1w). Its seat index is the run's `parkCount`,
- * so the key is unique per park and `repeatedKey` applies. That intent is
- * accepted only once per run, and only when a later `result` has
- * `reasonCode` `park-escalated` (any key, any outcome). A marker earlier in
- * the journal does not count. A second park-from-parked intent is stray
- * even with a distinct key. An unparseable key is ignored. Cost: linear in
- * the journal, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ * commit-pending escalation (CE1w). It is accepted only once per run, and
+ * only when a later `result` has `reasonCode` `park-escalated` (any key,
+ * any outcome). A marker earlier in the journal does not count. A second
+ * park-from-parked intent is stray. Escalations are also counted by
+ * distinct park ordinals across every `park-escalated` result key: a park
+ * step key (`<run>/r<round>/park/<parkCount>`) contributes its seat index,
+ * and a resume key (`<run>/park/<parkCount>/resume@<via>`) contributes its
+ * park ordinal. More than one distinct ordinal is `stray-one-way-action`.
+ * The same ordinal on both keys, or repeated after a crash, counts once.
+ * A null or unparseable key contributes nothing. An unparseable intent key
+ * is ignored. Cost: linear in the journal, capped by
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
 function ruleOneWayDiscipline(
   run: ShadowConformanceRun,
@@ -727,20 +737,30 @@ function ruleOneWayDiscipline(
 }
 
 /**
- * True when the journal issues a stray one-way intent.
+ * True when the journal issues a stray one-way intent, or records
+ * `park-escalated` results under more than one distinct park ordinal.
  * `escalatedFromParked` starts false and records the one accepted
- * park-from-parked escalation. Later-marker flags are one backward pass,
- * so the walk stays linear in the capped journal. Cost: linear in
- * `journal`, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ * park-from-parked escalation. `escalationOrdinals` holds each ordinal
+ * read from a park step key or a resume key. Later-marker flags are one
+ * backward pass, so the walk stays linear in the capped journal. Cost:
+ * linear in `journal`, capped by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
 function hasStrayOneWay(journal: readonly ShadowConformanceJournalEntry[]): boolean {
   const seen = new Set<string>();
   const escalation: ParkedEscalation = { escalatedFromParked: false };
+  const escalationOrdinals = new Set<number>();
   const later = parkEscalatedLater(journal);
   let state: string | null = 'ready';
   let index = 0;
   for (const entry of journal) {
     if (strayIntent(entry, state, seen, escalation, later[index] === true)) return true;
+    if (entry.kind === 'result' && entry.reasonCode === PARK_ESCALATED_REASON_CODE) {
+      const ordinal = parkEscalationOrdinal(entry.key);
+      if (ordinal !== null) {
+        escalationOrdinals.add(ordinal);
+        if (escalationOrdinals.size > 1) return true;
+      }
+    }
     if (entry.kind === 'conduct') state = entry.state;
     index += 1;
   }
@@ -767,11 +787,12 @@ function parkEscalatedLater(journal: readonly ShadowConformanceJournalEntry[]): 
 
 /**
  * True when `entry` is a stray one-way intent. `park` from a state other
- * than `parked` does not call `repeatedKey`. `park` from `parked` does, then
- * requires `hasLaterParkEscalation`, then the still-unused
- * `escalation.escalatedFromParked` slot. Accepting one sets that flag, then
- * checks `stateAllows`. Cost: constant aside from the key parse, which is
- * linear in the capped key.
+ * than `parked` does not call `repeatedKey`. `park` from `parked` requires
+ * `hasLaterParkEscalation`, then the still-unused
+ * `escalation.escalatedFromParked` slot. Accepting one sets that flag and
+ * is not stray: `parked` is an allowed park state, so this branch does not
+ * consult `stateAllows` or `repeatedKey`. Cost: constant aside from the
+ * key parse, which is linear in the capped key.
  */
 function strayIntent(
   entry: ShadowConformanceJournalEntry,
@@ -784,11 +805,10 @@ function strayIntent(
   const step = oneWayStep(entry.key);
   if (step === null) return false;
   if (step === 'park' && state === 'parked') {
-    if (repeatedKey(entry.key, seen)) return true;
     if (!hasLaterParkEscalation) return true;
     if (escalation.escalatedFromParked) return true;
     escalation.escalatedFromParked = true;
-    return !stateAllows(step, state);
+    return false;
   }
   if (step !== 'park' && repeatedKey(entry.key, seen)) return true;
   return !stateAllows(step, state);
@@ -799,6 +819,24 @@ function oneWayStep(key: string | null): OneWayStep | null {
   const parsed = parseLaneRunKey(key);
   if (parsed === null || parsed.kind !== 'step') return null;
   return oneWayOf(parsed.step);
+}
+
+/**
+ * Park ordinal of a `park-escalated` result key, or null when the key is
+ * not a park step and not a resume key. A park step's seat index is the
+ * run's `<parkCount>`. A resume key carries the same ordinal. A null or
+ * unparseable key returns null and does not throw. Cost: linear in the
+ * capped key.
+ */
+function parkEscalationOrdinal(key: string | null): number | null {
+  const parsed = parseLaneRunKey(key);
+  if (parsed !== null && parsed.kind === 'step' && parsed.step === 'park') {
+    return parsed.seatIndex;
+  }
+  if (parsed !== null && parsed.kind === 'resume') {
+    return parsed.parkOrdinal;
+  }
+  return null;
 }
 
 /** Cost: constant (`LANE_RUN_ONE_WAY_STEPS` is a fixed list). */

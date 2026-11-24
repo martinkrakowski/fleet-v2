@@ -294,7 +294,7 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
       configurable: true,
     });
     expect(Object.getPrototypeOf(pollutingPolicy)).toBe(Object.prototype);
-    expect(isMergedHeadRetroMergeEligible(entry, facts, pollutingPolicy as MergeRepoPolicy, NOW)).toBe(false);
+    expect(isMergedHeadRetroMergeEligible(entry, facts, pollutingPolicy as unknown as MergeRepoPolicy, NOW)).toBe(false);
     // Malformed `nowIso`.
     expect(isMergedHeadRetroMergeEligible(entry, facts, policy, 'not-a-timestamp')).toBe(false);
     expect(isMergedHeadRetroMergeEligible(entry, facts, policy, 42 as unknown as string)).toBe(false);

@@ -315,9 +315,12 @@ function oneWayKey(
   return built.key;
 }
 
-/** Resume keys come from the builder. A crashed escalation settles its marker on this key. */
-function resumeKey(runId: string, parkOrdinal = 1): string {
-  const built = laneRunResumeKey(runId, parkOrdinal);
+/**
+ * Resume keys come from the builder. `via` defaults to `web`. A crashed
+ * escalation settles its marker on this key.
+ */
+function resumeKey(runId: string, parkOrdinal = 1, via: 'web' | 'cli' = 'web'): string {
+  const built = laneRunResumeKey(runId, parkOrdinal, via);
   if (!built.ok) throw new Error('fixture resume key refused');
   return built.key;
 }
@@ -1634,6 +1637,76 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
       marker,
     ]);
     expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('resume-then-advance double escalation yields fail/stray-one-way-action', () => {
+    // The resume path writes park-escalated on the resume key and no park
+    // intent. A later advance writes it on the next park step key. Either
+    // marker alone conforms; the two ordinals together are stray.
+    const base = added();
+    const resume = resumeKey(base.run.runId, 1, 'web');
+    const advance = oneWayKey(base.run.runId, 'park', null, null, 2);
+    expect(resume).not.toBe(advance);
+    const resumeMarker = resultEntry(resume, 'park-escalated', at, 'reconciled');
+    const advanceMarker = resultEntry(advance, 'park-escalated', at, 'completed');
+    const markers = [resumeMarker, advanceMarker];
+    const result = evaluate(onTop(extendJournal(base, markers)));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, resume, advance, String(base.run.pullRequest), 'park-escalated');
+    for (const dropped of [0, 1]) {
+      const one = markers.filter((_, index) => index !== dropped);
+      expect(evaluate(onTop(extendJournal(base, one)))).toEqual(
+        scored('pass', 'conducted-runs-conform', SIX_PASS),
+      );
+    }
+  });
+
+  it('resume-then-resume double escalation yields fail/stray-one-way-action', () => {
+    const base = added();
+    const web = resumeKey(base.run.runId, 1, 'web');
+    const cli = resumeKey(base.run.runId, 2, 'cli');
+    expect(web).not.toBe(cli);
+    const webMarker = resultEntry(web, 'park-escalated', at, 'reconciled');
+    const cliMarker = resultEntry(cli, 'park-escalated', at, 'reconciled');
+    const markers = [webMarker, cliMarker];
+    const result = evaluate(onTop(extendJournal(base, markers)));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, web, cli, String(base.run.pullRequest), 'park-escalated');
+    for (const dropped of [0, 1]) {
+      const one = markers.filter((_, index) => index !== dropped);
+      expect(evaluate(onTop(extendJournal(base, one)))).toEqual(
+        scored('pass', 'conducted-runs-conform', SIX_PASS),
+      );
+    }
+  });
+
+  it('a single escalation via either park or resume key conforms', () => {
+    const base = added();
+    const park = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const resume = resumeKey(base.run.runId, 1, 'web');
+    const viaPark = extendJournal(base, [resultEntry(park, 'park-escalated', at, 'completed')]);
+    const viaResume = extendJournal(base, [resultEntry(resume, 'park-escalated', at, 'reconciled')]);
+    expect(evaluate(onTop(viaPark))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    expect(evaluate(onTop(viaResume))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('a crashed escalation that settled once on the same park ordinal conforms', () => {
+    // One escalation written on both the resume key and the park step key,
+    // or twice on the resume key after crash recovery, is one ordinal.
+    const base = added();
+    const resume = resumeKey(base.run.runId, 1, 'web');
+    const park = oneWayKey(base.run.runId, 'park', null, null, 1);
+    expect(resume).not.toBe(park);
+    const bothShapes = extendJournal(base, [
+      resultEntry(resume, 'park-escalated', at, 'reconciled'),
+      resultEntry(park, 'park-escalated', at, 'completed'),
+    ]);
+    const repeatedResume = extendJournal(base, [
+      resultEntry(resume, 'park-escalated', at, 'reconciled'),
+      resultEntry(resume, 'park-escalated', at, 'reconciled'),
+    ]);
+    expect(evaluate(onTop(bothShapes))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    expect(evaluate(onTop(repeatedResume))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
   it('an entry with an unparseable key is ignored', () => {

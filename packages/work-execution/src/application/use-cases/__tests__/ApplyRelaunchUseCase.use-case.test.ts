@@ -2938,7 +2938,7 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(1);
   });
 
-  it('AR3d-crash-replay-before-write: a journaled end-attempt intent whose result append failed is replayed — the apply completes with saveAttempt run exactly once across both calls', async () => {
+  it('AR3d-crash-replay-result-append-failed: a journaled end-attempt intent whose result append failed after the write is replayed — the apply completes with saveAttempt run exactly once across both calls', async () => {
     const harness = await makeRealHarness();
     // Crash simulation: the first apply fails when the end-attempt result
     // append refuses, after the intent and the record write landed.
@@ -2993,21 +2993,25 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
   });
 
-  it('AR3d-foreign-lane-attempt-id: a lane whose own attemptId differs from the save input refuses adopt-failed before any write', async () => {
+  it('AR3d-foreign-lane-attempt-id: a lane whose own attemptId differs from the save input refuses stale-plan-state in the preflight, before the save, the abort or any write', async () => {
     const harness = await makeRealHarness({
       stubAdopt: true,
       plan: buildPlan([conductedLaneWithRun(), attemptRecordedLane('lane-2', 'attempt-foreign')]),
     });
     const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
-    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(refused).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(harness.deps.saveLaneEdits).not.toHaveBeenCalled();
+    expect(harness.deps.runner!.abortWorktreeRun).not.toHaveBeenCalled();
     expect(harness.saveSpy.calls).toBe(0);
     expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
   });
 
-  it('AR3d-mismatched-worktree-path: a stored record whose worktreePath differs from the save input refuses adopt-failed without a write', async () => {
+  it('AR3d-mismatched-worktree-path: a stored record whose worktreePath differs from the save input refuses adopt-failed in the preflight, before the save, the abort or any write', async () => {
     const harness = await makeRealHarness({ stubAdopt: true, record: { worktreePath: '/wt/somewhere-else' } });
     const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
     expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.deps.saveLaneEdits).not.toHaveBeenCalled();
+    expect(harness.deps.runner!.abortWorktreeRun).not.toHaveBeenCalled();
     expect(harness.saveSpy.calls).toBe(0);
     expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
   });
@@ -3045,8 +3049,9 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     const withGetter = getterOn(runningAttemptRecord() as unknown as object, 'workOrderId', getterCalls);
     // An own `__proto__` data key (a literal would set the prototype instead).
     const polluting = JSON.parse('{"__proto__": {"hijacked": true}, "id": "attempt-1"}') as Record<string, unknown>;
+    // The `ownKeys` trap throws; `then` stays readable so the await itself succeeds.
     const throwingProxy = new Proxy(runningAttemptRecord(), {
-      get() {
+      ownKeys() {
         throw new Error('proxy trap');
       },
     });
@@ -3118,6 +3123,49 @@ describe('AR3d — end-attempt transition on relaunch adopt', () => {
     expect(refused).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
     expect(authorize).not.toHaveBeenCalled();
     expect(harness.saveSpy.calls).toBe(0);
+  });
+
+  it('AR3d-crash-replay-before-write: an end-attempt intent journaled before a failed write leaves the record running, and the retry writes it exactly once', async () => {
+    const harness = await makeRealHarness();
+    let attempts = 0;
+    harness.deps.attemptRepo = {
+      findAttemptById: (id: string) => harness.attemptRepo.findAttemptById(id),
+      saveAttempt: async (record: AttemptRecord) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('store down');
+        harness.saveSpy.calls += 1;
+        await harness.attemptRepo.saveAttempt(record);
+      },
+    };
+    const first = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(first).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+    const ledger = (await journalEntries(harness)).filter((entry) => entry.key === endKeyOf(harness.digest));
+    expect(ledger.map((entry) => entry.kind)).toEqual(['intent']);
+    const second = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(second.outcome).toBe('applied');
+    expect(harness.saveSpy.calls).toBe(1);
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect([record.state, record.revision]).toEqual(['ended', 1]);
+  });
+
+  it('AR3d-budget-spent-during-transition: a deadline that expires while the attempt is being written refuses budget-exhausted and never reaches adoptLane', async () => {
+    const spent = { afterWrite: false };
+    const harness = await makeRealHarness({ stubAdopt: true, clock: () => (spent.afterWrite ? PAST_DEADLINE : CLOCK_NOW) });
+    const inner = harness.deps.attemptRepo!;
+    harness.deps.attemptRepo = {
+      findAttemptById: (id: string) => inner.findAttemptById(id),
+      saveAttempt: async (record: AttemptRecord) => {
+        await inner.saveAttempt(record);
+        spent.afterWrite = true;
+      },
+    };
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(
+      applyRequest(harness.digest, { deadlineIso: DEADLINE }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(harness.saveSpy.calls).toBe(1);
+    expect(harness.deps.adoptLane).not.toHaveBeenCalled();
   });
 
   it('AR3d-budget-exhausted: an expired deadline refuses budget-exhausted before any attempt write or grant use', async () => {

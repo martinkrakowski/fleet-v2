@@ -262,6 +262,25 @@ type ReadResult =
  * taken only from those own data descriptors. Own-key inspection stops at
  * `MAX_OWN_KEYS`.
  */
+/** Copies the named own data fields into a null-prototype record; refuses accessors, unknown and polluting keys. */
+function copyOwnDataFields(value: object, names: readonly string[], allowedKeys: ReadonlySet<string>): ReadResult {
+  const data: Record<string, unknown> = Object.create(null);
+  for (const name of names) {
+    if (PROTO_POLLUTING_KEYS.has(name)) {
+      return { ok: false, failure: 'prototype-polluting-key' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+      return { ok: false, failure: 'getter' };
+    }
+    if (!allowedKeys.has(name)) {
+      return { ok: false, failure: 'unknown-key' };
+    }
+    Object.defineProperty(data, name, { value: descriptor.value, enumerable: true, writable: true, configurable: true });
+  }
+  return { ok: true, data };
+}
+
 function readPlain(value: unknown, allowedKeys: ReadonlySet<string>): ReadResult {
   try {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -287,34 +306,14 @@ function readPlain(value: unknown, allowedKeys: ReadonlySet<string>): ReadResult
     if (names.length > MAX_OWN_KEYS || names.length > allowedKeys.size) {
       return { ok: false, failure: 'unknown-key' };
     }
-    const data: Record<string, unknown> = Object.create(null);
-    for (const name of names) {
-      if (PROTO_POLLUTING_KEYS.has(name)) {
-        return { ok: false, failure: 'prototype-polluting-key' };
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, name);
-      if (
-        descriptor === undefined ||
-        descriptor.get !== undefined ||
-        descriptor.set !== undefined ||
-        !('value' in descriptor)
-      ) {
-        return { ok: false, failure: 'getter' };
-      }
-      if (!allowedKeys.has(name)) {
-        return { ok: false, failure: 'unknown-key' };
-      }
-      Object.defineProperty(data, name, {
-        value: descriptor.value,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
+    const copied = copyOwnDataFields(value, names, allowedKeys);
+    if (!copied.ok) {
+      return copied;
     }
     if (Object.getOwnPropertySymbols(value).length > 0) {
       return { ok: false, failure: 'symbol-key' };
     }
-    return { ok: true, data };
+    return copied;
   } catch {
     return { ok: false, failure: 'not-an-object' };
   }
@@ -367,7 +366,7 @@ function asReference(value: unknown): string | null {
   if (value.includes('\0') || value.includes('\r') || value.includes('\n')) {
     return null;
   }
-  if (value.split(/[\\/]/).some((segment) => segment === '..')) {
+  if (value.split(/[\\/]/).includes('..')) {
     return null;
   }
   return value;
@@ -826,7 +825,7 @@ function adoptDriverCall<T>(gate: { open: boolean }, next: DriverCall<T>): Drive
  * Race one driver call against the injected clock and always clear that clock.
  * Removing this race leaves a never-settling driver pending for good.
  */
-function raceDriverCall<T>(
+async function raceDriverCall<T>(
   promise: Promise<T>,
   timeoutMs: number,
   setTimer: ArmTimer,
@@ -847,16 +846,11 @@ function raceDriverCall<T>(
       (value): DriverCall<T> => adoptDriverCall(gate, { kind: 'value', value }),
       (): DriverCall<T> => adoptDriverCall(gate, { kind: 'threw' }),
     );
-    return Promise.race([operation, deadline]).finally(() => {
-      if (timer.armed) {
-        clearArmedTimer(clearTimer, timer.handle);
-      }
-    });
-  } catch (error) {
+    return await Promise.race([operation, deadline]);
+  } finally {
     if (timer.armed) {
       clearArmedTimer(clearTimer, timer.handle);
     }
-    return Promise.reject(error);
   }
 }
 
@@ -1104,7 +1098,7 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
     }
 
     const record = this.environments.get(attemptId);
-    if (record === undefined || record.state !== 'live' || record.sessionId !== sessionId) {
+    if (record?.state !== 'live' || record.sessionId !== sessionId) {
       return { outcome: 'refused', reason: REASON_UNKNOWN_SESSION };
     }
     const confirmedSessionId = record.sessionId;

@@ -573,7 +573,7 @@ describe('SandboxRunnerAdapter', () => {
         attemptId: ATTEMPT_ID,
         sessionId: SESSION_ID,
       });
-      expect(mismatchedAttempt.completionReceipt).toBe(null);
+      expect(mismatchedAttempt.completionReceipt).toBeNull();
       expect(mismatchedAttempt.workspacePreparation).toBe('prepared');
 
       const { adapter: sessionBound, driver: sessionDriver } = makeAdapter();
@@ -585,7 +585,7 @@ describe('SandboxRunnerAdapter', () => {
         attemptId: ATTEMPT_ID,
         sessionId: SESSION_ID,
       });
-      expect(mismatchedSession.completionReceipt).toBe(null);
+      expect(mismatchedSession.completionReceipt).toBeNull();
     });
 
     it('reports runnerReachable unreachable without throwing when driver inspect fails', async () => {
@@ -619,7 +619,7 @@ describe('SandboxRunnerAdapter', () => {
       });
       expect(status.runnerReachable).toBe('unreachable');
       expect(status.workspacePreparation).toBe('unprepared');
-      expect(status.completionReceipt).toBe(null);
+      expect(status.completionReceipt).toBeNull();
     });
   });
 
@@ -1383,7 +1383,7 @@ describe('SandboxRunnerAdapter', () => {
         sessionId: SESSION_ID,
       });
       expect(flag.read).toBe(false);
-      expect(status.completionReceipt).toBe(null);
+      expect(status.completionReceipt).toBeNull();
       expect(status.runnerReachable).toBe('reachable');
       expect(status.workspacePreparation).toBe('prepared');
       expect(status.workerCommand).toBe('active');

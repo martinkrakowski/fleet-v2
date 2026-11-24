@@ -188,6 +188,24 @@ function copyDenseStringArray(value: object): string[] | null {
   return copy;
 }
 
+const REFUSED: unique symbol = Symbol("refused");
+
+/** An array field is copied dense; any other value is carried as-is for the later type check. */
+function snapshotArrayField(field: unknown): unknown {
+  if (typeof field !== "object" || field === null) {
+    return field;
+  }
+  return copyDenseStringArray(field) ?? REFUSED;
+}
+
+/** True when a scalar field is neither an object, a function nor a symbol (null passes). */
+function isPlainScalar(field: unknown): boolean {
+  if (field === null) {
+    return true;
+  }
+  return typeof field !== "object" && typeof field !== "function" && typeof field !== "symbol";
+}
+
 /**
  * Snapshot the declared own data fields of a plain object. Refuses (null) a
  * Proxy, an array, a non-plain prototype, a symbol or prototype-polluting
@@ -223,21 +241,13 @@ function snapshotDeclaredFields<T>(
     }
     const field: unknown = descriptor.value;
     if (arrayFields.includes(key)) {
-      if (typeof field === "object" && field !== null) {
-        const copy = copyDenseStringArray(field);
-        if (copy === null) {
-          return null;
-        }
-        snapshot[key] = copy;
-      } else {
-        snapshot[key] = field;
+      const copied = snapshotArrayField(field);
+      if (copied === REFUSED) {
+        return null;
       }
+      snapshot[key] = copied;
     } else if (scalarFields.includes(key)) {
-      if (
-        (typeof field === "object" && field !== null) ||
-        typeof field === "function" ||
-        typeof field === "symbol"
-      ) {
+      if (!isPlainScalar(field)) {
         return null;
       }
       snapshot[key] = field;

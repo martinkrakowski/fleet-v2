@@ -1,11 +1,12 @@
 // GatePredicateAdapter environment tests — worktree dependency installation.
 /**
  * Covers the worktree-environment behaviour of GatePredicateAdapter: before
- * the first command predicate of a gate run the adapter probes
- * `<worktreePath>/node_modules/.yarn-state.yml` through the host executor,
- * runs at most one bounded `yarn install --immutable` when it is absent, and
- * reclassifies missing-module command failures as
- * `cause: 'environment-not-installed'` only while the state file is absent.
+ * a command that is actually run (a cached passing receipt never reaches it)
+ * the adapter probes `<worktreePath>/node_modules/.yarn-state.yml` through the
+ * host executor, runs at most one bounded `yarn install --immutable` when it
+ * is absent on a yarn project, and reclassifies missing-module command
+ * failures as `cause: 'environment-not-installed'` only while the state file
+ * is absent. A failed install keeps a 4 KiB secret-screened output tail.
  *
  * Cost bound proved here: per gate run the environment adds exactly one
  * `test -f` probe and at most one `yarn install --immutable` (plus its
@@ -261,7 +262,7 @@ describe('GatePredicateAdapter worktree environment', () => {
       }
       if (argv[0] === 'sh') {
         if (argv.includes('--immutable')) {
-          return { exitCode: 1, stderr: 'error: lockfile would have been modified\n' };
+          return { exitCode: 1, stdout: 'error: lockfile would have been modified\n' };
         }
         return { exitCode: 0 };
       }
@@ -276,8 +277,8 @@ describe('GatePredicateAdapter worktree environment', () => {
       cause: 'environment-not-installed',
       exitCode: 1,
       detail: 'dependencies not installed in the worktree',
+      outputTail: 'error: lockfile would have been modified',
     });
-    expect(results[0]).not.toHaveProperty('outputTail');
     expect(results[0]).not.toHaveProperty('failingFile');
     // Sequential gate: the second command is skipped after the first non-pass.
     expect(results[1]).toMatchObject({ verdict: 'skipped' });
@@ -290,7 +291,7 @@ describe('GatePredicateAdapter worktree environment', () => {
         return { exitCode: 1 };
       }
       if (argv[0] === 'sh') {
-        return { exitCode: 0 };
+        return { exitCode: 0, stderr: 'yarn install done\n' };
       }
       return happyGit(argv);
     });
@@ -302,6 +303,7 @@ describe('GatePredicateAdapter worktree environment', () => {
       cause: 'environment-not-installed',
       exitCode: 0,
     });
+    // Exit 0 is not an install-output failure: the tail stays off the result.
     expect(results[0]).not.toHaveProperty('outputTail');
   });
 
@@ -347,8 +349,8 @@ describe('GatePredicateAdapter worktree environment', () => {
       verdict: 'unknown',
       cause: 'environment-not-installed',
       exitCode: 1,
+      outputTail: "\nError: Cannot find module '@fleet/shared'",
     });
-    expect(results[0]).not.toHaveProperty('outputTail');
     expect(results[0]).not.toHaveProperty('failingFile');
   });
 
@@ -618,5 +620,197 @@ describe('GatePredicateAdapter hostile command results and requests', () => {
     );
     expect(result).toEqual({ outcome: 'unavailable', reason: 'gate predicate request is malformed' });
     expect(executor.argvRecords.length).toBe(0);
+  });
+});
+
+describe('GatePredicateAdapter install tail and receipt deferral (CB1b)', () => {
+  const secretLine = 'sk-' + 'a'.repeat(24);
+
+  function installExecutor(install: Partial<CommandRunResult>, yarnProject = true): ScriptedExecutor {
+    return new ScriptedExecutor((argv) => {
+      if (argv[0] === 'test') {
+        return { exitCode: 1 };
+      }
+      if (argv[0] === 'sh' && argv.includes('--immutable')) {
+        return install;
+      }
+      return happyGit(argv);
+    }, yarnProject);
+  }
+
+  it('install failure attaches bounded 4 KiB redacted outputTail', async () => {
+    const marker = 'INSTALL-TAIL-MARKER';
+    const stderr = 'H'.repeat(20_000) + '\n' + marker + '\n';
+    const executor = installExecutor({ exitCode: 1, stderr });
+    const { adapter } = makeAdapter(executor);
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(1))));
+    expect(executor.installs()).toBe(1);
+    expect(executor.commands()).toBe(0);
+    expect(results[0]).toMatchObject({
+      verdict: 'unknown',
+      cause: 'environment-not-installed',
+      exitCode: 1,
+      outputTail: marker,
+    });
+    expect(Buffer.byteLength(results[0]?.outputTail ?? '', 'utf8')).toBeLessThanOrEqual(4 * 1024);
+    expect(results[0]?.outputTail).not.toContain('HHH');
+  });
+
+  it('empty install output omits outputTail', async () => {
+    for (const streams of [
+      { stdout: '', stderr: '' },
+      { stdout: ' \n\t', stderr: '\n' },
+      { stdout: '   ', stderr: '' },
+    ]) {
+      const executor = installExecutor({ exitCode: 1, ...streams });
+      const { adapter } = makeAdapter(executor);
+      const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(1))));
+      expect(results[0]).toMatchObject({ verdict: 'unknown', cause: 'environment-not-installed', exitCode: 1 });
+      expect(results[0]).not.toHaveProperty('outputTail');
+    }
+  });
+
+  it('secret-shaped install output is redacted or withheld', async () => {
+    const executor = installExecutor({
+      exitCode: 1,
+      stderr: 'lockfile drift\n' + secretLine + '\n',
+    });
+    const { adapter } = makeAdapter(executor);
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(1))));
+    const tail = results[0]?.outputTail ?? '';
+    expect(results[0]).toMatchObject({ verdict: 'unknown', cause: 'environment-not-installed' });
+    expect(
+      tail === '[output withheld: secret-shaped text]' || tail.includes('[redacted: secret-shaped line]'),
+    ).toBe(true);
+    expect(tail).not.toContain(secretLine);
+    expect(tail).not.toContain('sk-');
+  });
+
+  it('install timeout or executor throw returns unknown environment-not-installed', async () => {
+    const timedOut = installExecutor({ exitCode: null, error: 'timed out', stdout: 'partial install log\n' });
+    const timeoutAdapter = makeAdapter(timedOut).adapter;
+    const timeoutResults = commandResultsOf(
+      evaluatedResults(await timeoutAdapter.evaluateGatePredicates(request(1))),
+    );
+    expect(timeoutResults[0]).toMatchObject({
+      verdict: 'unknown',
+      cause: 'environment-not-installed',
+      exitCode: null,
+      outputTail: 'partial install log',
+    });
+    expect(timeoutResults[0]?.verdict).not.toBe('pass');
+
+    const crashing: CommandExecutorPort = {
+      async run(argv: readonly string[]): Promise<CommandRunResult> {
+        if (argv[0] === 'git') {
+          return { exitCode: 0, signal: null, stdout: '', stderr: '', ...happyGit(argv) };
+        }
+        if (argv[0] === 'test') {
+          return {
+            exitCode: argv.includes('-a') ? 0 : 1,
+            signal: null,
+            stdout: '',
+            stderr: '',
+          };
+        }
+        throw new Error('install crashed');
+      },
+    };
+    const fakeDiff = new FakeLaneDiffCheck({ outcome: 'clean' });
+    let now = 0;
+    const guarded = new GatePredicateAdapter({
+      executorForRecordedHost: () => ({ ok: true, executor: crashing }),
+      laneDiffCheckFor: () => fakeDiff,
+      nowMs: () => {
+        now += 1;
+        return now;
+      },
+    });
+    const thrown = commandResultsOf(evaluatedResults(await guarded.evaluateGatePredicates(request(1))));
+    expect(thrown[0]).toMatchObject({
+      verdict: 'unknown',
+      cause: 'environment-not-installed',
+      exitCode: null,
+    });
+    expect(thrown[0]).not.toHaveProperty('outputTail');
+    expect(thrown[0]?.verdict).not.toBe('pass');
+  });
+
+  it('exhausted budget returns unknown', async () => {
+    const executor = new ScriptedExecutor((argv) => {
+      if (argv[0] === 'test') {
+        return { exitCode: 0 };
+      }
+      if (argv[0] === 'sh') {
+        return { exitCode: 0, stdout: 'ok\n' };
+      }
+      return happyGit(argv);
+    });
+    const { adapter } = makeAdapter(executor, {
+      isRemote: () => {
+        throw new Error('budgeted command task failed');
+      },
+    });
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(1))));
+    expect(results[0]).toMatchObject({
+      verdict: 'unknown',
+      exitCode: null,
+      detail: 'command did not complete',
+    });
+    expect(results[0]?.verdict).not.toBe('pass');
+    expect(results[0]).not.toHaveProperty('cause');
+  });
+
+  it('throwing stdout getter does not crash install tail', async () => {
+    const hostile: CommandExecutorPort = {
+      async run(argv: readonly string[]): Promise<CommandRunResult> {
+        if (argv[0] === 'git') {
+          return { exitCode: 0, signal: null, stdout: '', stderr: '', ...happyGit(argv) };
+        }
+        if (argv[0] === 'test') {
+          return { exitCode: argv.includes('-a') ? 0 : 1, signal: null, stdout: '', stderr: '' };
+        }
+        return {
+          exitCode: 1,
+          signal: null,
+          get stdout(): string {
+            throw new Error('stdout getter');
+          },
+          get stderr(): string {
+            throw new Error('stderr getter');
+          },
+        };
+      },
+    };
+    const fakeDiff = new FakeLaneDiffCheck({ outcome: 'clean' });
+    let now = 0;
+    const guarded = new GatePredicateAdapter({
+      executorForRecordedHost: () => ({ ok: true, executor: hostile }),
+      laneDiffCheckFor: () => fakeDiff,
+      nowMs: () => {
+        now += 1;
+        return now;
+      },
+    });
+    const results = commandResultsOf(evaluatedResults(await guarded.evaluateGatePredicates(request(1))));
+    expect(results[0]).toMatchObject({
+      verdict: 'unknown',
+      cause: 'environment-not-installed',
+    });
+    expect(results[0]).not.toHaveProperty('outputTail');
+    expect(results[0]?.verdict).not.toBe('pass');
+  });
+
+  it('non-yarn worktree never installs and never returns environment-not-installed', async () => {
+    const executor = installExecutor({ exitCode: 1, stderr: 'should not install\n' }, false);
+    const { adapter } = makeAdapter(executor);
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(2))));
+    expect(executor.installs()).toBe(0);
+    expect(executor.commands()).toBe(2);
+    for (const result of results) {
+      expect(result).toMatchObject({ verdict: 'pass', exitCode: 0 });
+      expect(result.cause).toBeUndefined();
+      expect(result).not.toHaveProperty('outputTail');
+    }
   });
 });

@@ -284,27 +284,28 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     }
   });
 
-  it('ensures the worktree environment before reusing a cached passing receipt', async () => {
+  it('cached receipt pass skips ensureEnvironment', async () => {
     const store = new SpyStore();
     await adapterOver(new ScriptedExecutor(), store).evaluateGatePredicates(requestWith([GATE]));
     expect(store.recorded).toHaveLength(1);
-    // The state file is now absent and the install cannot make it present:
-    // the cached passing receipt must not bypass the environment check.
+    // The state file is now absent. A cached passing receipt is returned
+    // before the environment check, so yarn install is never started and the
+    // command is not run again.
     const executor = new ScriptedExecutor();
     executor.stateFilePresent = false;
     const results = commandResults(
       await adapterOver(executor, store).evaluateGatePredicates(requestWith([GATE])),
     );
-    expect(results[0]).toMatchObject({
-      verdict: 'unknown',
-      cause: 'environment-not-installed',
-      detail: 'dependencies not installed in the worktree',
-    });
-    expect(results[0]?.detail.startsWith('reused receipt: ')).toBe(false);
-    expect(executor.gateRuns).not.toContain('gate-a');
+    expect(results[0]).toMatchObject({ verdict: 'pass', exitCode: 0 });
+    expect(results[0]?.detail.startsWith('reused receipt: ')).toBe(true);
+    expect(results[0]?.cause).toBeUndefined();
+    expect(executor.gateRuns).toEqual([]);
+    expect(executor.calls.some((call) => call.argv[0] === 'test')).toBe(false);
+    expect(executor.calls.some((call) => call.argv.includes('--immutable'))).toBe(false);
   });
 
-  it('refuses a worktree path that is not absolute as an unusable request, running nothing', async () => {    for (const worktreePath of ['-uX', 'rel/dir', '.', '--', './x']) {
+  it('refuses a worktree path that is not absolute as an unusable request, running nothing', async () => {
+    for (const worktreePath of ['-uX', 'rel/dir', '.', '--', './x']) {
       const executor = new ScriptedExecutor();
       const result = await adapterOver(executor, new SpyStore()).evaluateGatePredicates({
         ...requestWith([GATE]),

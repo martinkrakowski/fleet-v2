@@ -49,6 +49,7 @@ import type {
   OverlapBlockerKind,
 } from '../../domain/held-work-order.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 import type {
   RegisterWorkOrderPort,
   RegisterWorkOrderRequest,
@@ -226,6 +227,14 @@ function registeredBaseBranch(request: RegisterWorkOrderRequest): RegisteredBase
     return { accepted: false };
   }
   return { accepted: true, value: parsed, fromProfile: false };
+}
+
+/** The rejection for a project whose profile is retired; it accepts no new work orders. */
+function retiredProjectRejection(projectId: string): RegisterWorkOrderResult {
+  return {
+    outcome: 'rejected',
+    reason: `project ${projectId} is retired; it accepts no new work orders — register the work under a new project id`,
+  };
 }
 
 /** A string field that is absent or a bounded string free of secret shapes; anything else is untrustworthy. */
@@ -432,6 +441,16 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
           reason: `project ${projectId} has no profile; register it with 'fleet-v2 projects add', or 'fleet-v2 projects adopt' when it already has work orders`,
         };
       }
+      // RP1c: a retired project is decided first, so a retired profile with a
+      // malformed or unsupported `defaultBranch` still gets the retired
+      // rejection. Only an own data `status` on a plain record counts, so a
+      // non-plain profile stays `malformed-profile` below.
+      const profileStatus = isPlainRecordObject(profile as unknown)
+        ? Object.getOwnPropertyDescriptor(profile, 'status')?.value
+        : undefined;
+      if (profileStatus === 'retired') {
+        return retiredProjectRejection(projectId);
+      }
       if (baseBranchDecision.accepted && baseBranchDecision.fromProfile) {
         // RP1: with no explicit `request.baseBranch`, the active profile's
         // `defaultBranch` decides. A malformed profile or an unsafe declared
@@ -449,10 +468,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         baseBranchDecision.value = resolved.baseBranch;
       }
       if (profile.status !== 'active') {
-        return {
-          outcome: 'rejected',
-          reason: `project ${projectId} is retired; it accepts no new work orders — register the work under a new project id`,
-        };
+        return retiredProjectRejection(projectId);
       }
     }
 

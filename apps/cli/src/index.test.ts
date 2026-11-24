@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { FleetInstallation } from '@fleet/installation';
-import type { SubprocessRunner } from '@fleet/work-execution';
+import { RegisterWorkOrderUseCase, type SubprocessRunner } from '@fleet/work-execution';
 import { exitCodeForResult, resolveRunnerSettings, runCli, type CliIo } from './index.js';
 import { createFleetCliRuntime } from './composition.js';
 
@@ -340,6 +340,84 @@ describe('CLI installation wiring', () => {
       expect(parsed.usage.reason).toBe('no session id');
       const saved = await runtime.execution.attemptRepository.findAttemptById(attemptId);
       expect(saved?.usage?.reason).toBe('no session id');
+    });
+  });
+
+  describe('work-order rerun stored baseBranch (RP1c)', () => {
+    const activeProfile = {
+      projectId: 'proj-1',
+      status: 'active' as const,
+      repository: 'git@example.org:acme/app.git',
+      clones: {},
+      gateProcedures: [],
+      revision: 1,
+    };
+
+    /** A runtime whose store holds one stopped work order `wo-old` with the given extra fields. */
+    async function seedStoppedWorkOrder(extra: Record<string, unknown>) {
+      const runtime = createFleetCliRuntime({ stateDir: mkdtempSync(join(tempDir, 'rerun-')) });
+      // Registration runs the real use case over the runtime's own work-order store with a fixed active profile.
+      Object.assign(runtime.execution, {
+        registerWorkOrder: new RegisterWorkOrderUseCase({
+          workOrderRepo: runtime.execution.workOrderRepository,
+          profileRead: { readProjectProfile: async () => activeProfile },
+        }),
+      });
+      await runtime.execution.workOrderRepository.saveWorkOrder({
+        id: 'wo-old',
+        projectId: 'proj-1',
+        taskId: 'task-1',
+        laneId: 'lane-1',
+        repository: 'git@example.org:acme/app.git',
+        baseCommit: 'abc123',
+        ownedPaths: ['packages/app-a/**'],
+        policyRevision: 'policy-7',
+        prerequisiteWorkOrderIds: [],
+        state: 'stopped',
+        revision: 1,
+        createdAtIso: '2026-11-21T08:00:00.000Z',
+        updatedAtIso: '2026-11-21T08:00:00.000Z',
+        ...extra,
+      } as unknown as Parameters<typeof runtime.execution.workOrderRepository.saveWorkOrder>[0]);
+      return runtime;
+    }
+
+    it('refuses a stopped work order whose stored baseBranch is staging with unsupported-base-branch, exits 1 and registers nothing', async () => {
+      const runtime = await seedStoppedWorkOrder({ baseBranch: 'staging' });
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(stdout.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'unsupported-base-branch',
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      });
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+    });
+
+    it('reruns a stopped work order with an absent stored baseBranch on main and a chain/<name> one on that chain', async () => {
+      for (const [extra, expected] of [
+        [{}, 'main'],
+        [{ baseBranch: 'main' }, 'main'],
+        [{ baseBranch: 'chain/example-1' }, 'chain/example-1'],
+      ] as const) {
+        const runtime = await seedStoppedWorkOrder(extra);
+        const { io, stdout } = createMockIo();
+        const exitCode = await runCli(
+          ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+          io,
+          runtime,
+        );
+
+        expect(exitCode).toBe(0);
+        expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'registered' });
+        expect((await runtime.execution.workOrderRepository.findWorkOrderById('wo-new'))?.baseBranch).toBe(expected);
+      }
     });
   });
 

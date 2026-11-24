@@ -263,4 +263,43 @@ describe('RegisterWorkOrderUseCase profile defaultBranch (RP1)', () => {
     const result = await useCase.registerWorkOrder(validRequest());
     expect(result).toEqual({ outcome: 'refused', reason: 'malformed-profile' });
   });
+
+  it('rejects a retired project with the retired reason even when its defaultBranch is malformed or unsupported', async () => {
+    for (const defaultBranch of ['staging', 'bad..branch', '-x', 'a'.repeat(201), 42]) {
+      const workOrderRepo = new FakeWorkOrderRepo();
+      const useCase = new RegisterWorkOrderUseCase({
+        workOrderRepo,
+        profileRead: new FakeProfileRead(
+          new Map([['proj-1', profileView({ status: 'retired', defaultBranch: defaultBranch as string })]]),
+        ),
+      });
+      const result = await useCase.registerWorkOrder(validRequest());
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: expect.stringContaining('project proj-1 is retired; it accepts no new work orders'),
+      });
+      expect(workOrderRepo.orders.size).toBe(0);
+    }
+  });
+
+  it('accepts an explicit baseBranch main whatever the profile defaultBranch is, and refuses the same profile without one', async () => {
+    for (const defaultBranch of ['bad..branch', 'staging', '-x']) {
+      const workOrderRepo = new FakeWorkOrderRepo();
+      const useCase = new RegisterWorkOrderUseCase({
+        workOrderRepo,
+        profileRead: new FakeProfileRead(new Map([['proj-1', profileView({ defaultBranch })]])),
+      });
+      const explicit = await useCase.registerWorkOrder(validRequest({ baseBranch: 'main' }));
+      expect(explicit.outcome).toBe('registered');
+      expect(workOrderRepo.orders.get('wo-1')?.baseBranch).toBe('main');
+
+      // Without an explicit base the profile default still decides: the same profile is refused.
+      const implicit = await useCase.registerWorkOrder(validRequest({ workOrderId: 'wo-2' }));
+      expect(implicit).toEqual({
+        outcome: 'refused',
+        reason: defaultBranch === 'staging' ? 'unsupported-profile-base' : 'malformed-profile',
+      });
+      expect(workOrderRepo.orders.has('wo-2')).toBe(false);
+    }
+  });
 });

@@ -203,7 +203,8 @@ describe('parseInstallation premergePosterLogin', () => {
   });
 
   it('refuses whitespace in premergePosterLogin as an invalid GitHub login', () => {
-    for (const value of [' ', 'octo cat', '\t']) {
+    // A trailing line terminator must not slip past the end anchor.
+    for (const value of [' ', 'octo cat', '\t', 'octocat\n', 'octocat\r\n']) {
       const parsed = parsePolicy({
         repos: { 'owner/repo': { projectId: 'p', premergePosterLogin: value } },
       });

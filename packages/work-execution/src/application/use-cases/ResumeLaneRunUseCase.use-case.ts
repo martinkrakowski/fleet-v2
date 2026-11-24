@@ -89,8 +89,17 @@ function isSecretShaped(text: string): boolean {
 }
 
 /** Never throws and never echoes: a non-plain or throwing-getter request, or any invalid field, is null. */
+/** `snapshotPlainDataRecord`, but a Proxy whose trap throws reads as not-a-record instead of throwing. */
+function safeSnapshotPlainDataRecord(value: unknown): ReturnType<typeof snapshotPlainDataRecord> {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
 function validateRequestResumeRequest(request: unknown): RequestResumeRequest | null {
-  const snap = snapshotPlainDataRecord(request);
+  const snap = safeSnapshotPlainDataRecord(request);
   if (snap === null) {
     return null;
   }
@@ -121,11 +130,11 @@ function validateRequestResumeRequest(request: unknown): RequestResumeRequest | 
 
 /** Never throws and never echoes: the lease holder, fence, run id and time of an apply request, or null. */
 function validateApplyPendingResumeRequest(request: unknown): ApplyPendingResumeRequest | null {
-  const snap = snapshotPlainDataRecord(request);
+  const snap = safeSnapshotPlainDataRecord(request);
   if (snap === null) {
     return null;
   }
-  const lease = snapshotPlainDataRecord(snap.lease);
+  const lease = safeSnapshotPlainDataRecord(snap.lease);
   if (lease === null) {
     return null;
   }
@@ -697,7 +706,20 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (finished.outcome !== 'saved') {
       return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
     }
-    if (!(await this.appendResult(runId, firstPendingKey, 'reconciled', 'resumed', nowIso, resumeDetail))) {
+    // A `fix-no-progress` park's conducted exit is its escalation: the recovery
+    // must leave the same `park-escalated` marker the normal path does, or the
+    // once-per-run history check would miss this escalation.
+    const escalated = record.parked !== null && record.parked.reason === 'fix-no-progress';
+    if (
+      !(await this.appendResult(
+        runId,
+        firstPendingKey,
+        'reconciled',
+        escalated ? 'park-escalated' : 'resumed',
+        nowIso,
+        escalated ? 'commit-pending' : resumeDetail,
+      ))
+    ) {
       return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
     }
     await this.refuseRemainingPendingResumes(runId, pending, nowIso);

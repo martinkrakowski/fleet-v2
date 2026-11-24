@@ -331,6 +331,25 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
     expect(await request(timingOut)).toEqual({ outcome: 'refused', reason: 'fix-no-progress' });
   });
 
+  it('records park-escalated commit-pending when an escalation crashed after its conduct entry and before its save', async () => {
+    const fx = await seededEscalation();
+    expect(await request(fx)).toMatchObject({ outcome: 'resume-recorded', to: 'fixing' });
+    // Crash simulation: the conduct entry landed, the unparked record never saved.
+    expect(await fx.journal.append(laneRunConductEntry(nextEntryId(), RUN_ID, 'fixing', LATER))).toMatchObject({
+      outcome: 'appended',
+    });
+    expect(await apply(fx)).toEqual({ outcome: 'resumed', to: 'fixing', key: RESUME_CLI_KEY });
+    expect((await fx.repo.get(RUN_ID))?.parked).toBeNull();
+    const result = (await entriesForRun(fx)).find((entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY);
+    expect(result).toMatchObject({ outcome: 'reconciled', reasonCode: 'park-escalated', detail: 'commit-pending' });
+  });
+
+  it('refuses a request whose Proxy traps throw with invalid-request instead of throwing', async () => {
+    const fx = await seededEscalation();
+    const hostile = new Proxy({ runId: RUN_ID, via: 'cli' }, { getPrototypeOf: () => { throw new Error('hostile trap'); } });
+    expect(await fx.resume.requestResume(hostile as never)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+  });
+
   it('refuses fix-no-progress when inspectWorktree returns malformed or getter-backed data', async () => {
     const getterBacked: Record<string, unknown> = { ...DIRTY_INSPECTION };
     Reflect.deleteProperty(getterBacked, 'uncommittedPaths');

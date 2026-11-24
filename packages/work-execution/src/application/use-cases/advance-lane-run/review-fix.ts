@@ -975,23 +975,231 @@ function fixingSourceOfEntry(
  * review results at that head to the fix round; `performFixPrepare` then picks
  * the candidate whose receipt carries unresolved findings (MX7).
  */
+/** The entry fields the backwards walk reads; an accessor on any of them skips the entry. */
+const FIXING_WALK_ENTRY_FIELDS = ['kind', 'key', 'outcome', 'runId', 'reasonCode', 'detail'] as const;
+
+/**
+ * Upper bound on the journal entries the fix-source walk will inspect. A
+ * hostile `listForRun` may return a sparse array whose `length` is enormous
+ * (e.g. `Number.MAX_SAFE_INTEGER`): without a cap the backward walk would
+ * iterate billions of times. Real run journals are far smaller, so exceeding
+ * this bound is malformed input and the walk refuses (`null`) instead. Cost:
+ * O(min(entries.length, FIXING_WALK_MAX_ENTRIES)) — each per-entry check is
+ * O(1) plus the O(fields × prototype depth) descriptor scan.
+ */
+const FIXING_WALK_MAX_ENTRIES = 10_000;
+
+/**
+ * True when any field the walk reads is not a plain OWN data property. The
+ * walk never runs a getter — hostile input may throw or lie — so an accessor
+ * on any read field refuses the whole entry before any field is read. A field
+ * with no own descriptor is refused too: an entry shaped with
+ * `Object.create(proto)` could otherwise supply `kind`, `key`, `outcome`,
+ * `runId` or `reasonCode` through inherited data fields and pass as a failure
+ * source it never recorded. When every read field is an own data property the
+ * reads below never touch the prototype chain, so inherited accessors are
+ * unreachable. Every trap-reachable operation (the descriptor lookup) is
+ * guarded: a throwing `Proxy` trap means hostile input, and the entry is
+ * refused, never a throw to the caller. Cost: O(fields) own descriptor
+ * lookups per entry, each O(1); no prototype walk is needed.
+ */
+/**
+ * A plain snapshot of the walk fields, built ONLY from the entry's own data
+ * descriptors' values: a getter is never invoked and a Proxy `get` trap is
+ * never consulted, so the walk classifies exactly what the descriptors say.
+ * A missing, inherited or accessor field, or a throwing trap, yields null.
+ */
+function snapshotWalkEntry(entry: object): LaneRunJournalEntryRecord | null {
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const field of FIXING_WALK_ENTRY_FIELDS) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(entry, field);
+    } catch {
+      return null;
+    }
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    snapshot[field] = descriptor.value;
+  }
+  return snapshot as unknown as LaneRunJournalEntryRecord;
+}
+
+/**
+ * The journal listing's length, or null when the listing is not a readable
+ * array (a non-array, a revoked Proxy, a throwing or non-integer `length`) or
+ * exceeds FIXING_WALK_MAX_ENTRIES. Never throws.
+ */
+function readWalkLength(entries: unknown): number | null {
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(entries);
+  } catch {
+    return null;
+  }
+  if (!isArray) {
+    return null;
+  }
+  let length: unknown;
+  try {
+    length = (entries as readonly unknown[]).length;
+  } catch {
+    return null;
+  }
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > FIXING_WALK_MAX_ENTRIES) {
+    return null;
+  }
+  return length;
+}
+
+/**
+ * The entry object at `index`, read only from the slot's own data descriptor
+ * (an accessor at an index is never invoked), or null for a hole, an accessor,
+ * a non-object, an array, a revoked Proxy or a throwing trap. Never throws.
+ */
+function readWalkSlot(entries: unknown, index: number): object | null {
+  let value: unknown;
+  try {
+    const slot = Object.getOwnPropertyDescriptor(entries as object, index);
+    if (slot === undefined || !('value' in slot) || slot.get !== undefined || slot.set !== undefined) {
+      return null;
+    }
+    value = slot.value;
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== 'object') {
+    return null;
+  }
+  try {
+    if (Array.isArray(value)) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return value;
+}
+
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
 ): FixingSource | null {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index]!;
-    const parsed = parseLaneRunKey(entry.key);
-    const verdict = fixingSourceOfEntry(entry, parsed, runId);
-    if (verdict.kind === 'skip') {
+  const length = readWalkLength(entries);
+  if (length === null) {
+    return null;
+  }
+  // CB9: walk state. `passedGateHeads` holds `round:head12` keys of gate
+  // passes met LATER on the walk (composed strings only, so no entry value
+  // ever becomes an object key); `supersededRound` is the round of the most
+  // recent gate failure a later pass superseded.
+  const walk: FixingWalkState = { passedGateHeads: new Set<string>(), supersededRound: null };
+  for (let index = length - 1; index >= 0; index -= 1) {
+    const step = fixingWalkStep(entries, index, runId, walk);
+    if (step.kind === 'continue') {
       continue;
     }
-    if (verdict.kind === 'stop') {
-      return null;
-    }
-    return verdict.source;
+    return step.source;
   }
   return null;
+}
+
+interface FixingWalkState {
+  readonly passedGateHeads: Set<string>;
+  supersededRound: number | null;
+}
+
+type FixingWalkStepResult = { readonly kind: 'continue' } | { readonly kind: 'done'; readonly source: FixingSource | null };
+
+const WALK_CONTINUE: FixingWalkStepResult = { kind: 'continue' };
+
+/**
+ * One backward step of the fix-source walk. A hole, an accessor slot, a
+ * hostile entry or a throwing trap continues the walk; it never throws.
+ */
+function fixingWalkStep(entries: unknown, index: number, runId: string, walk: FixingWalkState): FixingWalkStepResult {
+  const entry = readWalkSlot(entries, index);
+  if (entry === null) {
+    return WALK_CONTINUE;
+  }
+  const record = snapshotWalkEntry(entry);
+  if (record === null) {
+    return WALK_CONTINUE;
+  }
+  try {
+    const parsed = parseLaneRunKey(record.key);
+    if (noteGateSupersession(record, parsed, runId, walk)) {
+      return WALK_CONTINUE;
+    }
+    const verdict = fixingSourceOfEntry(record, parsed, runId);
+    if (verdict.kind === 'skip') {
+      return WALK_CONTINUE;
+    }
+    if (verdict.kind === 'stop') {
+      return { kind: 'done', source: null };
+    }
+    return { kind: 'done', source: boundedFixingSource(verdict.source, parsed, walk.supersededRound) };
+  } catch {
+    return WALK_CONTINUE;
+  }
+}
+
+/**
+ * CB9: records a final gate pass, or skips a gate failure that a LATER pass
+ * on the same `(round, head12)` superseded (the retried gate recovered it).
+ * An ambiguous or non-result gate entry never counts as a pass. Walking
+ * backward, the FIRST superseded failure met is the most recent: its round
+ * is kept as the bound, and an older one never widens it. Returns true when
+ * the entry was consumed here.
+ */
+function noteGateSupersession(
+  record: LaneRunJournalEntryRecord,
+  parsed: ReturnType<typeof parseLaneRunKey>,
+  runId: string,
+  walk: FixingWalkState,
+): boolean {
+  if (
+    parsed === null ||
+    parsed.kind !== 'step' ||
+    parsed.step !== 'gate' ||
+    parsed.head12 === null ||
+    record.kind !== 'result' ||
+    record.outcome === 'ambiguous' ||
+    record.runId !== runId
+  ) {
+    return false;
+  }
+  const headKey = parsed.round + ':' + parsed.head12;
+  if (record.reasonCode === 'gate-passed') {
+    walk.passedGateHeads.add(headKey);
+    return true;
+  }
+  if (record.reasonCode === 'gate-failed' && walk.passedGateHeads.has(headKey)) {
+    if (walk.supersededRound === null) {
+      walk.supersededRound = parsed.round;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * CB9 (bounded walk): after a superseded gate failure, only a source in the
+ * superseded round may take over the fix trigger.
+ */
+function boundedFixingSource(
+  source: FixingSource,
+  parsed: ReturnType<typeof parseLaneRunKey>,
+  supersededRound: number | null,
+): FixingSource | null {
+  if (supersededRound === null) {
+    return source;
+  }
+  if (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound) {
+    return null;
+  }
+  return source;
 }
 
 /** Receipt findings map one-to-one onto the renderer's typed findings. */
@@ -1277,8 +1485,16 @@ async function fixPreparePriorSourceStep(shared: FixPrepareWired): Promise<FixPr
   if (head === null) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-no-head') };
   }
-  const entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
-  const failure = fixingFailureSourceOf(entries, shared.record.runId);
+  // Hostile input: awaiting a revoked Proxy listing reads its `then` and
+  // throws; any throw from the listing or the walk refuses, never escapes.
+  let failure: FixingSource | null;
+  let entries: Awaited<ReturnType<typeof shared.ctx.deps.runJournal.listForRun>> = [];
+  try {
+    entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
+    failure = fixingFailureSourceOf(entries, shared.record.runId);
+  } catch {
+    failure = null;
+  }
   if (failure === null) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-no-failure-source') };
   }

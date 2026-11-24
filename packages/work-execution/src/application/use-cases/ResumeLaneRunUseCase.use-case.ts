@@ -24,7 +24,7 @@ import { LANE_RUN_KEY_VIAS, head12Of, laneRunResumeKey, parseLaneRunKey } from '
 import type { LaneRunKeyVia } from '../../domain/lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { isCalendarDateTime, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { isCalendarDateTime, readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import {
   LANE_RUN_INTENT_ABANDONED_REASON_CODE,
   laneRunConductEntry,
@@ -33,8 +33,10 @@ import {
   planGateFailedRetry,
 } from '../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../domain/lane-run-step-facts.js';
-import { checkLaneRunResume } from '../../domain/lane-run-transitions.js';
-import type { RunStopMode } from '../../domain/lane-run-transitions.js';
+import { canEnterLaneRunState, checkLaneRunResume, checkParkEscalation } from '../../domain/lane-run-transitions.js';
+import type { ParkEscalationTransitionRefusal, RunStopMode } from '../../domain/lane-run-transitions.js';
+import type { DirtyWorktreeFact } from '../../domain/park-escalation.js';
+import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
@@ -59,6 +61,8 @@ export interface ResumeLaneRunDependencies {
   readonly forgeRead?: ForgeReadPort;
   /** R4a: the attempt records the branch fallback and the lane head read from. */
   readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById'>;
+  /** CE1 (this change): the worktree read that decides a `fix-no-progress` park's escalation. */
+  readonly worktreeInspect?: Pick<WorkspacePort, 'inspectWorktree'>;
 }
 
 interface ResumeFacts {
@@ -85,8 +89,17 @@ function isSecretShaped(text: string): boolean {
 }
 
 /** Never throws and never echoes: a non-plain or throwing-getter request, or any invalid field, is null. */
+/** `snapshotPlainDataRecord`, but a Proxy whose trap throws reads as not-a-record instead of throwing. */
+function safeSnapshotPlainDataRecord(value: unknown): ReturnType<typeof snapshotPlainDataRecord> {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
 function validateRequestResumeRequest(request: unknown): RequestResumeRequest | null {
-  const snap = snapshotPlainDataRecord(request);
+  const snap = safeSnapshotPlainDataRecord(request);
   if (snap === null) {
     return null;
   }
@@ -117,11 +130,11 @@ function validateRequestResumeRequest(request: unknown): RequestResumeRequest | 
 
 /** Never throws and never echoes: the lease holder, fence, run id and time of an apply request, or null. */
 function validateApplyPendingResumeRequest(request: unknown): ApplyPendingResumeRequest | null {
-  const snap = snapshotPlainDataRecord(request);
+  const snap = safeSnapshotPlainDataRecord(request);
   if (snap === null) {
     return null;
   }
-  const lease = snapshotPlainDataRecord(snap.lease);
+  const lease = safeSnapshotPlainDataRecord(snap.lease);
   if (lease === null) {
     return null;
   }
@@ -163,6 +176,33 @@ function branchNameOf(record: LaneRunRecord, latest: AttemptRecord): string | nu
 
 const LANE_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
+/**
+ * Cost bound on the escalation's worktree read: a longer `uncommittedPaths`
+ * list is refused, never counted (the count is the only fact this path uses).
+ */
+const PARK_ESCALATION_UNCOMMITTED_PATHS_MAX = 4096;
+
+/**
+ * The `checkParkEscalation` refusals that are already result reason codes; any
+ * other escalation refusal (a stay reason, `malformed-input`) is journaled as
+ * `fix-no-progress` with the precise reason in the result's detail.
+ */
+const RESUME_REFUSAL_REASON_CODES: ReadonlySet<string> = new Set([
+  'run-stopped',
+  'stale-revision',
+  'not-parked',
+  'stop-pending',
+  'one-way-door',
+  'fix-no-progress',
+]);
+
+function escalationRefusalCode(reason: ParkEscalationTransitionRefusal): { code: LaneRunResultReasonCode; detail: string | null } {
+  if (RESUME_REFUSAL_REASON_CODES.has(reason)) {
+    return { code: reason as LaneRunResultReasonCode, detail: null };
+  }
+  return { code: 'fix-no-progress', detail: reason };
+}
+
 /** GU2: the only park reason a gate-failed park from gating carries (afterLaneRunFailure); every other reason takes the normal resume path. */
 const GATE_RETRY_PARK_REASON = 'blocker-after-round-2';
 
@@ -193,6 +233,114 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       stopMode: laneRunJournalStopFacts(entries, record.runId).stopMode,
       pendingIntent: laneRunJournalPendingIntent(entries, record.runId),
     };
+  }
+
+  /**
+   * CE1 (this change): the dirty-worktree fact of the run's latest attempt,
+   * read through the optional `worktreeInspect` port. Fail closed: an
+   * unwired port or attempt repo, an empty `attemptIds`, an unreadable
+   * attempt, a missing or non-40-hex collected `headCommit`, a throwing or
+   * malformed inspection (a non-plain record, a getter anywhere on the read
+   * fields, a hole or an accessor in `uncommittedPaths`, a non-40-hex
+   * `checkedOutCommit`, an over-bound path list) all read null, so the
+   * caller keeps the plain `fix-no-progress` refusal. Cost: the read is one
+   * port call; validation is O(1) on the record fields plus the
+   * `readBoundedDenseArray` O(cap) walk with
+   * `PARK_ESCALATION_UNCOMMITTED_PATHS_MAX`, so no unbounded hostile input
+   * is ever iterated and no getter ever runs.
+   */
+  private async dirtyWorktreeFactOf(record: LaneRunRecord): Promise<DirtyWorktreeFact | null> {
+    const inspect = this.deps.worktreeInspect;
+    const attemptRepo = this.deps.attemptRepo;
+    if (inspect?.inspectWorktree === undefined || attemptRepo?.findAttemptById === undefined) {
+      return null;
+    }
+    const attemptId = record.attemptIds[record.attemptIds.length - 1];
+    if (typeof attemptId !== 'string' || attemptId === '') {
+      return null;
+    }
+    let attempt: AttemptRecord | null = null;
+    try {
+      attempt = await attemptRepo.findAttemptById(attemptId);
+    } catch {
+      return null;
+    }
+    if (attempt === null) {
+      return null;
+    }
+    // The attempt is read through own data descriptors too: a getter on any field
+    // it exposes (or a throwing Proxy trap) reads as an unreadable attempt.
+    const attemptFields = safeSnapshotPlainDataRecord(attempt);
+    const artifacts = safeSnapshotPlainDataRecord(attemptFields?.artifacts);
+    const headCommit = artifacts?.headCommit;
+    if (attemptFields === null || typeof headCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(headCommit)) {
+      return null;
+    }
+    const { worktreePath, baseCommit, runner } = attemptFields;
+    if (typeof worktreePath !== 'string' || typeof baseCommit !== 'string') {
+      return null;
+    }
+    let inspection: unknown;
+    try {
+      inspection = await inspect.inspectWorktree({
+        worktreePath,
+        baseCommit,
+        expectedArtifactPaths: [],
+        recordedHost: (runner ?? null) as AttemptRecord['runner'] ?? null,
+      });
+    } catch {
+      return null;
+    }
+    // Own data descriptors only: a snapshot refuses any accessor, so no
+    // getter on the inspection ever runs. A Proxy whose trap throws reads as
+    // malformed too: the validation never lets an exception out of the use case.
+    try {
+      const snapshot = snapshotPlainDataRecord(inspection);
+      if (snapshot === null) {
+        return null;
+      }
+      const checkedOutCommit = snapshot.checkedOutCommit;
+      if (typeof checkedOutCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(checkedOutCommit)) {
+        return null;
+      }
+      const paths = readBoundedDenseArray(snapshot.uncommittedPaths, PARK_ESCALATION_UNCOMMITTED_PATHS_MAX);
+      if (paths === null) {
+        return null;
+      }
+      for (const path of paths.array) {
+        if (typeof path !== 'string') {
+          return null;
+        }
+      }
+      return { trackedFilesChanged: paths.length };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * CE1 (this change): the escalation decision for a `fix-no-progress` park.
+   * Null when the worktree facts are unreadable or unwired; otherwise the
+   * transition check `checkParkEscalation` gives, with the run's own journal
+   * history and revision.
+   */
+  private async escalationCheck(
+    record: LaneRunRecord,
+    facts: ResumeFacts,
+    expectedRevision: number,
+  ): Promise<ReturnType<typeof checkParkEscalation> | null> {
+    const dirtyWorktree = await this.dirtyWorktreeFactOf(record);
+    if (dirtyWorktree === null) {
+      return null;
+    }
+    return checkParkEscalation({
+      record,
+      state: facts.state,
+      stopMode: facts.stopMode,
+      expectedRevision,
+      history: facts.entries,
+      dirtyWorktree,
+    });
   }
 
   /** The resume intent entry: every field null except the resume's own. */
@@ -311,7 +459,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (snapshot === null) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
-    const { runId, via, expectedRevision } = snapshot;
+    const { runId, expectedRevision } = snapshot;
 
     const record = await this.deps.runRepo.get(runId);
     if (record === null) {
@@ -327,6 +475,21 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       expectedRevision: expected,
     });
     if (!check.ok) {
+      // CE1 (this change): a `fix-no-progress` park escalates instead of
+      // refusing, when the worktree holds uncommitted tracked work and the
+      // run has not escalated before. `checkParkEscalation` re-walks the
+      // resume check order first, so a stop, a stale revision or a one-way
+      // door is never bypassed by the escalation.
+      if (check.reason === 'fix-no-progress') {
+        const esc = await this.escalationCheck(record, facts, expected);
+        if (esc === null) {
+          return { outcome: 'refused', reason: 'fix-no-progress' };
+        }
+        if (!esc.ok) {
+          return { outcome: 'refused', reason: esc.reason };
+        }
+        return this.recordResumeIntent(snapshot, record, expected, esc.to);
+      }
       return { outcome: 'refused', reason: check.reason };
     }
 
@@ -339,15 +502,25 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       }
     }
 
-    const built = laneRunResumeKey(runId, record.parkCount, via);
+    return this.recordResumeIntent(snapshot, record, expected, check.to);
+  }
+
+  /** CE1 (this change): build the resume key and append the intent, mapping the journal's outcomes to the request result. */
+  private async recordResumeIntent(
+    snapshot: RequestResumeRequest,
+    record: LaneRunRecord,
+    expected: number,
+    to: LaneRunStateValue,
+  ): Promise<RequestResumeResult> {
+    const runId = snapshot.runId;
+    const built = laneRunResumeKey(runId, record.parkCount, snapshot.via);
     if (!built.ok) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const key = built.key;
-
     const appended = await this.deps.runJournal.append(this.resumeIntentEntry(snapshot, key, expected));
     if (appended.outcome === 'appended') {
-      return { outcome: 'resume-recorded', runId, to: check.to, key };
+      return { outcome: 'resume-recorded', runId, to, key };
     }
     if (appended.reason === 'duplicate-key') {
       return { outcome: 'already-requested', runId, key };
@@ -541,7 +714,20 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (finished.outcome !== 'saved') {
       return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
     }
-    if (!(await this.appendResult(runId, firstPendingKey, 'reconciled', 'resumed', nowIso, resumeDetail))) {
+    // A `fix-no-progress` park's conducted exit is its escalation: the recovery
+    // must leave the same `park-escalated` marker the normal path does, or the
+    // once-per-run history check would miss this escalation.
+    const escalated = record.parked !== null && record.parked.reason === 'fix-no-progress';
+    if (
+      !(await this.appendResult(
+        runId,
+        firstPendingKey,
+        'reconciled',
+        escalated ? 'park-escalated' : 'resumed',
+        nowIso,
+        escalated ? 'commit-pending' : resumeDetail,
+      ))
+    ) {
       return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
     }
     await this.refuseRemainingPendingResumes(runId, pending, nowIso);
@@ -565,15 +751,42 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     const { runId, lease, nowIso } = snapshot;
     const { holderId, fence } = lease;
     const first = pending[0];
-    const check = checkLaneRunResume({
-      record,
-      state: facts.state,
-      stopMode: facts.stopMode,
-      expectedRevision: first.expectedRevision ?? record.revision,
-    });
-    if (!check.ok) {
-      await this.appendResult(runId, first.key as string, 'refused', check.reason, nowIso);
-      return { outcome: 'refused', key: first.key, reason: check.reason };
+    let resumeTo: LaneRunStateValue;
+    let escalationDetail: 'commit-pending' | null = null;
+    // CE1 (this change): a `fix-no-progress` park escalates to `fixing`
+    // (mode `commit-pending`) instead of the plain resume check refusing it.
+    // `checkParkEscalation` walks the resume check order first, so a stop, a
+    // stale revision, a not-parked run or a one-way door is never bypassed;
+    // the worktree fact is read fresh here.
+    if (record.parked !== null && record.parked.reason === 'fix-no-progress') {
+      const esc = await this.escalationCheck(record, facts, first.expectedRevision ?? record.revision);
+      if (esc === null) {
+        await this.appendResult(runId, first.key as string, 'refused', 'fix-no-progress', nowIso);
+        return { outcome: 'refused', key: first.key, reason: 'fix-no-progress' };
+      }
+      if (!esc.ok) {
+        const { code, detail } = escalationRefusalCode(esc.reason);
+        await this.appendResult(runId, first.key as string, 'refused', code, nowIso, detail);
+        return { outcome: 'refused', key: first.key, reason: esc.reason };
+      }
+      if (!canEnterLaneRunState('parked', esc.to, record.parked.parkedFrom, false, undefined, true)) {
+        await this.appendResult(runId, first.key as string, 'refused', 'fix-no-progress', nowIso);
+        return { outcome: 'refused', key: first.key, reason: 'fix-no-progress' };
+      }
+      resumeTo = esc.to;
+      escalationDetail = esc.journalDetail;
+    } else {
+      const check = checkLaneRunResume({
+        record,
+        state: facts.state,
+        stopMode: facts.stopMode,
+        expectedRevision: first.expectedRevision ?? record.revision,
+      });
+      if (!check.ok) {
+        await this.appendResult(runId, first.key as string, 'refused', check.reason, nowIso);
+        return { outcome: 'refused', key: first.key, reason: check.reason };
+      }
+      resumeTo = check.to;
     }
     const firstKey = first.key as string;
 
@@ -592,7 +805,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
 
     const conduct = await this.deps.runJournal.append(
-      laneRunConductEntry(this.deps.newUlid(), runId, check.to, nowIso),
+      laneRunConductEntry(this.deps.newUlid(), runId, resumeTo, nowIso),
     );
     if (conduct.outcome !== 'appended') {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
@@ -611,12 +824,18 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: firstKey, reason: 'save-refused' };
     }
 
-    if (!(await this.appendResult(runId, firstKey, 'completed', 'resumed', nowIso, resumeDetail))) {
+    if (escalationDetail !== null) {
+      // CE1 (this change): the escalation's own result codes the once-per-run
+      // history scan looks for: `park-escalated` with detail `commit-pending`.
+      if (!(await this.appendResult(runId, firstKey, 'completed', 'park-escalated', nowIso, escalationDetail))) {
+        return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+      }
+    } else if (!(await this.appendResult(runId, firstKey, 'completed', 'resumed', nowIso, resumeDetail))) {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
     }
 
     await this.refuseRemainingPendingResumes(runId, pending, nowIso);
-    return { outcome: 'resumed', to: check.to, key: firstKey };
+    return { outcome: 'resumed', to: resumeTo, key: firstKey };
   }
 
   /**

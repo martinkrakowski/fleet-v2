@@ -1604,6 +1604,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runRepo: conductor.laneRunRepository,
     runJournal: conductor.laneRunJournal,
     adoptLane: (request) => adoptLaneUseCase.adoptLane(request),
+    attemptRepo: attemptRepository,
     mintEntryId: daemon.newUlid,
   });
   const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });

@@ -2120,7 +2120,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // A real wall-clock gap, matching SH5c's persistence intent: two
     // independently-moving systems sampled seconds apart can manufacture a
     // divergence that resolves itself immediately after.
-    await this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS);
+    // #6 bullet 4: the settle sleep is an outbound wait like any other — a
+    // rejection must not throw out of `execute` and lose the other criteria's
+    // verdicts; a post-deadline settlement must abort with
+    // `deadline-exceeded` through `this.call`'s re-check.
+    const slept = await this.call(context.deadlineIso, () => this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS));
+    if (slept.kind === 'threw') {
+      return { outcome: unevaluatedOutcome('S8', 'intake-sample-interrupted'), chains: undefined };
+    }
     const second = await this.intakeSample(context, journal);
     const evaluation = evaluateShadowIntake({ samples: [first.sample, second.sample] });
     return {

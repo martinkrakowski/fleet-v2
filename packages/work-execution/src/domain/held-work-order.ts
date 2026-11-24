@@ -457,28 +457,55 @@ function isBoundedPlainString(value: unknown, maxLength: number): value is strin
   );
 }
 
-/** A dense array of at most `max` elements read through own data descriptors only; `null` otherwise. */
+/**
+ * A dense array of at most `max` elements, read through own data descriptors
+ * only. Returns `null`, and never throws, when `value` is not an array,
+ * `max` or `length` is not a non-negative safe integer, `length` exceeds
+ * `max`, any index is missing or an accessor, or a Proxy trap throws
+ * (including a revoked Proxy).
+ */
 export function readDenseUnknownArray(value: unknown, max: number): readonly unknown[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  const length: unknown = lengthDescriptor?.value;
-  if (typeof length !== 'number' || length > max) {
-    return null;
-  }
-  const out: unknown[] = [];
-  for (let index = 0; index < length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(value, index)) {
+  try {
+    if (!Number.isSafeInteger(max) || max < 0) {
       return null;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    if (!Array.isArray(value)) {
       return null;
     }
-    out.push(descriptor.value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    // Refuse an accessor before reading `.value`, so a throwing getter never runs.
+    if (
+      lengthDescriptor === undefined ||
+      lengthDescriptor.get !== undefined ||
+      lengthDescriptor.set !== undefined
+    ) {
+      return null;
+    }
+    const length: unknown = lengthDescriptor.value;
+    if (typeof length !== 'number') {
+      return null;
+    }
+    // `length <= max` bounds the walk. An enormous reported length is refused
+    // here, before any index is read. Callers pass a small constant `max`.
+    if (!Number.isSafeInteger(length) || length < 0 || length > max) {
+      return null;
+    }
+    const out: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index)) {
+        return null;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+        return null;
+      }
+      out.push(descriptor.value);
+    }
+    return out;
+  } catch {
+    // A revoked Proxy, or a trap this walk actually reaches, is a refusal.
+    return null;
   }
-  return out;
 }
 
 function isValidBlocker(kind: unknown, id: unknown): kind is OverlapBlockerKind {

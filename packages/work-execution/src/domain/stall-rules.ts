@@ -122,6 +122,17 @@ const FAILING_REVIEW_CODES: ReadonlySet<string> = new Set([
   'seat-busy',
   'review-unknown',
   'unparseable-verdict',
+  // CB7: the closed per-label set, mirrored from UNREADABLE_REVIEW_ANSWER_LABELS.
+  'unparseable-verdict-empty',
+  'unparseable-verdict-no-json',
+  'unparseable-verdict-no-fence',
+  'unparseable-verdict-multiple-fences',
+  'unparseable-verdict-duplicate-keys',
+  'unparseable-verdict-extra-keys',
+  'unparseable-verdict-bad-verdict-word',
+  'unparseable-verdict-bad-findings',
+  'unparseable-verdict-truncated',
+  'unparseable-verdict-other',
 ]);
 
 /** The provider error classes that count as a provider limit. */

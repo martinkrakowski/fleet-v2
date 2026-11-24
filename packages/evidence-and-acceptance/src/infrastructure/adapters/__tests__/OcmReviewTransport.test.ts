@@ -4023,10 +4023,13 @@ describe('RVG2: the reviewer stream must match the grammar', () => {
   });
 
   it('a stream one event over MAX_REVIEW_STREAM_EVENTS refuses as stream-grammar', async () => {
-    const tools = (count: number): string[] => Array.from({ length: count }, () => READ);
-    const atCap = [START, ...tools(MAX_REVIEW_STREAM_EVENTS - 3), PASS_TEXT, FINISH].join('\n');
+    // One block of READ lines, shared by both streams. Spreading two
+    // ~50_000-element arrays inside this test exceeds the 5000 ms default under CI.
+    const readBlock = `${READ}\n`.repeat(MAX_REVIEW_STREAM_EVENTS - 3);
+    const atCap = `${START}\n${readBlock}${PASS_TEXT}\n${FINISH}`;
     expect((await run(atCap)).result).toBe('pass');
-    const over = await run([START, ...tools(MAX_REVIEW_STREAM_EVENTS - 2), PASS_TEXT, FINISH].join('\n'));
+    const overInput = `${START}\n${readBlock}${READ}\n${PASS_TEXT}\n${FINISH}`;
+    const over = await run(overInput);
     expect(over.result).toBe('unknown');
     expect(over.rawOutput).toBe('stream-grammar');
   });

@@ -107,6 +107,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
+import * as publicPackageExports from '@fleet/operator-coordination';
 import { canonicalDecisionBytes, verifyDecisionSignature } from './DecisionSignature.adapter.js';
 import {
   deriveOwnerPublicKeyFromFile,
@@ -663,9 +664,8 @@ describe('signing round trip', () => {
 });
 
 describe('public package exports', () => {
-  it("the package's runtime exports contain no seam or deps object", async () => {
-    const exported = await import('@fleet/operator-coordination');
-    const names = Object.keys(exported);
+  it("the package's runtime exports contain no seam or deps object", () => {
+    const names = Object.keys(publicPackageExports);
     for (const name of names) {
       expect(name).not.toBe('ownerKeyIdentitySeam');
       expect(name).not.toBe('realOwnerKeyFsDeps');
@@ -674,7 +674,7 @@ describe('public package exports', () => {
       // seam in disguise; none may leave the module.
       expect(name).not.toMatch(/Deps$/);
     }
-    expect(exported).not.toHaveProperty('ownerKeyIdentitySeam');
-    expect(exported).not.toHaveProperty('realOwnerKeyFsDeps');
+    expect(publicPackageExports).not.toHaveProperty('ownerKeyIdentitySeam');
+    expect(publicPackageExports).not.toHaveProperty('realOwnerKeyFsDeps');
   });
 });

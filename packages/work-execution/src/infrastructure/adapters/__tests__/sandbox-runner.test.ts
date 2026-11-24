@@ -854,7 +854,7 @@ describe('SandboxRunnerAdapter', () => {
         },
       });
       const getterAdapter = makeAdapter({
-        capabilities: capabilities as RunnerIsolationCapabilities,
+        capabilities: capabilities as unknown as RunnerIsolationCapabilities,
       });
       const getterProfile = getterAdapter.adapter.describeCapabilities();
       expect(flag.read).toBe(false);
@@ -1140,7 +1140,7 @@ describe('SandboxRunnerAdapter', () => {
         });
         const result = await adapter.startSession(
           startRequest({
-            requiredCapabilities: capabilities as StartRunnerSessionRequest['requiredCapabilities'],
+            requiredCapabilities: capabilities as unknown as StartRunnerSessionRequest['requiredCapabilities'],
           }),
         );
         expect(result, key).toMatchObject({ outcome: 'refused' });
@@ -1432,7 +1432,7 @@ describe('SandboxRunnerAdapter', () => {
         configurable: true,
       });
       const status = await adapter.inspectSession(
-        inspectBody as Parameters<SandboxRunnerAdapter['inspectSession']>[0],
+        inspectBody as unknown as Parameters<SandboxRunnerAdapter['inspectSession']>[0],
       );
       expect(status.runnerReachable).toBe('unreachable');
       expect(driver.inspectCalls).toHaveLength(1);
@@ -1448,7 +1448,7 @@ describe('SandboxRunnerAdapter', () => {
         configurable: true,
       });
       const stopped = await adapter.stopSession(
-        stopBody as Parameters<SandboxRunnerAdapter['stopSession']>[0],
+        stopBody as unknown as Parameters<SandboxRunnerAdapter['stopSession']>[0],
       );
       expect(stopped).toMatchObject({ outcome: 'refused' });
       expect(driver.destroyCalls).toHaveLength(0);

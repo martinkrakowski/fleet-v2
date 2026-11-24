@@ -7,6 +7,9 @@
  * keyed `dry-run` result per acted entry under the `merge/` key family. It
  * never writes to the forge, never writes the queue, and never performs a
  * live action: a live policy decision is reported `live-deferred` for DT9b.
+ * A shadow pass does not forge-read a live entry whose current head already
+ * has a journaled `would-already-merged` dry-run; every failure of that
+ * lookup leaves the entry live.
  */
 
 import type {
@@ -77,7 +80,7 @@ export interface RunMergePassDependencies {
   readonly notifier?: MergeNotificationPort;
   readonly forgeRead: ForgeMergeReadPort;
   readonly verification: MergeVerificationPort;
-  readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey'>;
+  readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey' | 'listForKeyPrefix'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly newUlid: () => string;   // a fresh ULID per journal entry
   readonly nowIso: () => string;    // the pass clock, read fresh
@@ -222,6 +225,89 @@ function callAllowed(nowIso: string, deadlineIso: string): boolean {
   return computeCallBudget({ nowIso, deadlineIso, normalTimeoutMs: NORMAL_CALL_TIMEOUT_MS }).allowed;
 }
 
+type AlreadyMergedIndex =
+  | { readonly outcome: 'indexed'; readonly keys: ReadonlySet<string> }
+  | { readonly outcome: 'budget-exhausted' };
+
+/**
+ * The journal key of one `would-already-merged` dry-run result.
+ * A null, a non-object, a closed intent, or a throwing getter is not a key:
+ * the record is skipped and the pass continues.
+ */
+function wouldAlreadyMergedKey(record: unknown): string | null {
+  try {
+    const view = record as {
+      kind: unknown;
+      outcome: unknown;
+      reasonCode: unknown;
+      key: unknown;
+    };
+    const kind = view.kind;
+    const outcome = view.outcome;
+    const reasonCode = view.reasonCode;
+    const key = view.key;
+    if (
+      kind === 'result' &&
+      outcome === 'dry-run' &&
+      reasonCode === 'would-already-merged' &&
+      typeof key === 'string'
+    ) {
+      return key;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** One pass over the prefix listing. A record that cannot be read is ignored. */
+function keysFromJournalRecords(records: readonly unknown[]): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const record of records) {
+    const key = wouldAlreadyMergedKey(record);
+    if (key !== null) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+/**
+ * True when this entry's current head already has a journaled
+ * `would-already-merged` dry-run. An unreadable head or a refused key is
+ * not a match: the entry stays live.
+ */
+function matchesJournaledAlreadyMerged(
+  repoDigest: string,
+  entry: MergeQueueEntryRecord,
+  keys: ReadonlySet<string>,
+): boolean {
+  const head12 = head12Of(entry.headOid);
+  if (head12 === null) {
+    return false;
+  }
+  const built = buildMergeKey({
+    repoDigest,
+    pullRequest: entry.pullRequest,
+    head12,
+    action: 'would-already-merged',
+    attemptOrdinal: null,
+    retry: null,
+  });
+  return built.ok && keys.has(built.key);
+}
+
+function withoutJournaledAlreadyMerged(
+  repoDigest: string,
+  ordered: readonly MergeQueueEntryRecord[],
+  keys: ReadonlySet<string>,
+): readonly MergeQueueEntryRecord[] {
+  if (keys.size === 0) {
+    return ordered;
+  }
+  return ordered.filter((entry) => !matchesJournaledAlreadyMerged(repoDigest, entry, keys));
+}
+
 /** The queue adapter signals a passed deadline with a dedicated error. */
 function isQueueDeadlineError(error: unknown): boolean {
   return error instanceof Error && error.name === 'MergeQueueDeadlineError';
@@ -304,7 +390,22 @@ export class RunMergePassUseCase implements RunMergePassPort {
     );
     const ordered = orderMergeQueue(repoRecords, request.repoDigest);
     const head = findMergeQueueHead(ordered, request.repoDigest);
-    const live = selectEntriesForPass(ordered, head, Date.parse(this.deps.nowIso()));
+    // Shadow only: one prefix read of journaled `would-already-merged`
+    // dry-runs, then drop those heads before the per-entry forge reads.
+    // `repoRecords` stays whole so `updatesInLastHour` still sees every record.
+    // `head` is the real queue head and is what `actOnEntry` uses for
+    // `isQueueHead`; `passHead` is that head only while it remains a candidate.
+    const indexed = await this.readJournaledWouldAlreadyMerged(request);
+    if (indexed.outcome === 'budget-exhausted') {
+      return { outcome: 'budget-exhausted', reasonCode: null, entries };
+    }
+    const candidates =
+      request.policy.shadow === true
+        ? withoutJournaledAlreadyMerged(request.repoDigest, ordered, indexed.keys)
+        : ordered;
+    const passHead =
+      head !== null && candidates.some((candidate) => candidate.entryId === head.entryId) ? head : null;
+    const live = selectEntriesForPass(candidates, passHead, Date.parse(this.deps.nowIso()));
 
     // D-DT9: the budget is checked before every entry's outbound reads,
     // including the halt re-read below.
@@ -336,6 +437,35 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     return { outcome: 'completed', reasonCode: null, entries };
+  }
+
+  /**
+   * Journaled `would-already-merged` dry-run keys for this repository, from
+   * one `listForKeyPrefix` of `merge/<repoDigest>/`. Live passes do not read.
+   * A missing method, a throw, or a non-array answer fails open to an empty
+   * set. A spent budget does not call the port.
+   */
+  private async readJournaledWouldAlreadyMerged(request: RunMergePassRequest): Promise<AlreadyMergedIndex> {
+    if (request.policy.shadow !== true) {
+      return { outcome: 'indexed', keys: new Set() };
+    }
+    if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
+      return { outcome: 'budget-exhausted' };
+    }
+    const listForKeyPrefix = this.deps.journal.listForKeyPrefix;
+    if (listForKeyPrefix === undefined) {
+      return { outcome: 'indexed', keys: new Set() };
+    }
+    let records: unknown;
+    try {
+      records = await listForKeyPrefix.call(this.deps.journal, `merge/${request.repoDigest}/`);
+    } catch {
+      return { outcome: 'indexed', keys: new Set() };
+    }
+    if (!Array.isArray(records)) {
+      return { outcome: 'indexed', keys: new Set() };
+    }
+    return { outcome: 'indexed', keys: keysFromJournalRecords(records) };
   }
 
   private isValidRequest(request: RunMergePassRequest): boolean {

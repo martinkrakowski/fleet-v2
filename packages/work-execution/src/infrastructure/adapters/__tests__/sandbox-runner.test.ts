@@ -511,7 +511,23 @@ describe('SandboxRunnerAdapter', () => {
       expect(driver.destroyCalls).toHaveLength(2);
     });
 
-    it('returns unknown when driver destroy times out and destroys again on the next stop', async () => {
+    it('refuses an overlapping stop while a destroy is in flight and lets a later stop retry', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      driver.destroyResult = { outcome: 'still-present' };
+      const stop = { attemptId: ATTEMPT_ID, sessionId: SESSION_ID, gracePeriodSeconds: 5 };
+      const [first, second] = await Promise.all([adapter.stopSession(stop), adapter.stopSession(stop)]);
+      expect(first.outcome).toBe('still-running');
+      expect(second).toMatchObject({ outcome: 'refused' });
+      expect(driver.destroyCalls).toHaveLength(1);
+      // The reservation is released: a later stop calls destroy again and can terminate.
+      driver.destroyResult = { outcome: 'destroyed' };
+      const third = await adapter.stopSession(stop);
+      expect(third.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toHaveLength(2);
+    });
+
+    it('returns unknown when driver destroy is unconfirmed and destroys again on the next stop', async () => {
       const { adapter, driver } = makeAdapter();
       await expectStarted(adapter);
       driver.destroyResult = { outcome: 'unconfirmed' };

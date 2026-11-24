@@ -146,6 +146,7 @@ const REASON_CREATE_REFUSED = 'Sandbox driver refused to create the environment'
 const REASON_CREATE_UNKNOWN = 'Sandbox driver result was unconfirmed or malformed';
 const REASON_MALFORMED_STOP = 'Stop request is malformed or hostile';
 const REASON_UNKNOWN_SESSION = 'Session is not known to this sandbox runner';
+const REASON_STOP_IN_FLIGHT = 'A stop for this session is already in progress';
 const REASON_DESTROY_UNKNOWN = 'Sandbox driver did not answer the destroy request';
 const REASON_STILL_PRESENT = 'Sandbox driver reports the environment still present';
 const REASON_DESTROY_TIMEOUT = 'Sandbox driver destroy did not settle before the deadline';
@@ -831,26 +832,29 @@ function raceDriverCall<T>(
   setTimer: ArmTimer,
   clearTimer: DisarmTimer,
 ): Promise<DriverCall<T>> {
-  let handle: unknown;
+  // `armed` records that setTimer returned, whatever handle it returned
+  // (a valid injected timer may return `undefined`): it is always cleared.
+  const timer: { armed: boolean; handle: unknown } = { armed: false, handle: undefined };
   const gate = { open: true };
   try {
     const deadline = new Promise<DriverCall<T>>((resolve) => {
-      handle = setTimer(() => {
+      timer.handle = setTimer(() => {
         resolve(adoptDriverCall(gate, { kind: 'timeout' }));
       }, timeoutMs);
+      timer.armed = true;
     });
     const operation = Promise.resolve(promise).then(
       (value): DriverCall<T> => adoptDriverCall(gate, { kind: 'value', value }),
       (): DriverCall<T> => adoptDriverCall(gate, { kind: 'threw' }),
     );
     return Promise.race([operation, deadline]).finally(() => {
-      if (handle !== undefined) {
-        clearArmedTimer(clearTimer, handle);
+      if (timer.armed) {
+        clearArmedTimer(clearTimer, timer.handle);
       }
     });
   } catch (error) {
-    if (handle !== undefined) {
-      clearArmedTimer(clearTimer, handle);
+    if (timer.armed) {
+      clearArmedTimer(clearTimer, timer.handle);
     }
     return Promise.reject(error);
   }
@@ -980,6 +984,8 @@ function prepareStart(
 
 export class SandboxRunnerAdapter implements ExecutionRunnerPort {
   private readonly environments = new Map<string, EnvironmentRecord>();
+  /** Attempts with a destroy in flight: a concurrent stop is refused, never a second destroy. */
+  private readonly stopsInFlight = new Set<string>();
   private readonly driverTimeoutMs: number;
   private readonly setTimer: ArmTimer;
   private readonly clearTimer: DisarmTimer;
@@ -1102,19 +1108,28 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
       return { outcome: 'refused', reason: REASON_UNKNOWN_SESSION };
     }
     const confirmedSessionId = record.sessionId;
-
-    let raced: DriverCall<unknown>;
-    try {
-      raced = await raceDriverCall<unknown>(
-        this.options.driver.destroy(confirmedSessionId),
-        this.driverTimeoutMs,
-        this.setTimer,
-        this.clearTimer,
-      );
-    } catch {
-      return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+    if (this.stopsInFlight.has(attemptId)) {
+      return { outcome: 'refused', reason: REASON_STOP_IN_FLIGHT };
     }
-    return this.applyDestroyResult(attemptId, confirmedSessionId, raced);
+    // Reserved synchronously before the first await, so an overlapping stop
+    // sees it; released whatever the outcome, so a later stop can retry.
+    this.stopsInFlight.add(attemptId);
+    try {
+      let raced: DriverCall<unknown>;
+      try {
+        raced = await raceDriverCall<unknown>(
+          this.options.driver.destroy(confirmedSessionId),
+          this.driverTimeoutMs,
+          this.setTimer,
+          this.clearTimer,
+        );
+      } catch {
+        return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+      }
+      return this.applyDestroyResult(attemptId, confirmedSessionId, raced);
+    } finally {
+      this.stopsInFlight.delete(attemptId);
+    }
   }
 
   /** A timeout leaves the live record in place so a later stop calls destroy again. */

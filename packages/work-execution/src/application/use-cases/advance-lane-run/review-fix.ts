@@ -1030,8 +1030,15 @@ function fixingFailureSourceOf(
 ): FixingSource | null {
   // Hostile input: a non-array journal yields no source; the caller refuses
   // with `prepare-no-failure-source` instead of throwing. `Array.isArray`
-  // reads the internal kind, so it never runs a trap.
-  if (!Array.isArray(entries)) {
+  // reads the internal kind, so it never runs a trap, but it THROWS on a
+  // revoked Proxy: that is refused too, never thrown.
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(entries);
+  } catch {
+    return null;
+  }
+  if (!isArray) {
     return null;
   }
   // Hostile input: `length` itself may be a throwing Proxy trap or a wrong

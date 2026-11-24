@@ -1154,6 +1154,17 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     );
   });
 
+  it('refuses prepare-no-failure-source and never throws when the whole journal listing is a revoked Proxy', async () => {
+    // `Array.isArray` itself throws TypeError on a revoked Proxy: the listing
+    // check must catch that and refuse, not let the throw escape prepare.
+    const listingRevocation = Proxy.revocable([] as unknown[], {});
+    listingRevocation.revoke();
+    const harness = await seededFixingHarness();
+    expect(
+      refusedDetailOf(await prepareDirect(harness, () => listingRevocation.proxy as unknown as unknown[])),
+    ).toBe('prepare-no-failure-source');
+  });
+
   it('refuses prepare-no-failure-source when an entry supplies its fields through inherited data properties', async () => {
     // An entry shaped with `Object.create(proto)`: `kind`, `key`, `outcome`,
     // `runId`, `reasonCode` and `detail` are plain data fields ON THE

@@ -281,6 +281,36 @@ describe('ExecutionRunnerAdapter inspectSession confirms an exit-0 status with a
     expect(calls[1]?.args).toEqual(['--status', '--dir', worktree]);
   });
 
+  it('does not spawn the confirming read until the confirming pause has resolved', async () => {
+    const { runner, calls } = scriptedRunner([
+      { exitCode: 0, stdout: 'nothing running', stderr: '' },
+      { exitCode: 0, stdout: endedJson, stderr: '' },
+    ]);
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const adapter = new ExecutionRunnerAdapter({
+      runSubprocess: runner,
+      remotePort: 4166,
+      statusConfirmDelayMs: 500,
+      sleep: () => held,
+    });
+    const pending = adapter.inspectSession({
+      attemptId: 'att-1',
+      sessionId: 'ses_cb2',
+      worktreePath: worktree,
+      runner: runnerRecord,
+    });
+    // Let every microtask the first read can schedule run; the pause is still held.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toHaveLength(1);
+    release();
+    const status = await pending;
+    expect(calls).toHaveLength(2);
+    expect(status.workerCommand).toBe('ended');
+  });
+
   it('reads the runner\u2019s own OCM_WAIT_CONFIRM seconds as the default pause, and falls back to 5000 ms for any other value', async () => {
     const original = process.env['OCM_WAIT_CONFIRM'];
     try {

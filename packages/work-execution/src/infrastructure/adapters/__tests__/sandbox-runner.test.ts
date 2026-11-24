@@ -1770,7 +1770,7 @@ function manualClock(): {
   readonly cleared: number[];
   fired: number;
   setTimer: (callback: () => void, delayMs: number) => number;
-  clearTimer: (handle: number) => void;
+  clearTimer: (handle: unknown) => void;
   fire: () => void;
 } {
   let nextHandle = 1;
@@ -1786,7 +1786,10 @@ function manualClock(): {
       callbacks.set(handle, callback);
       return handle;
     },
-    clearTimer(handle: number): void {
+    clearTimer(handle: unknown): void {
+      if (typeof handle !== 'number') {
+        return;
+      }
       clock.cleared.push(handle);
       callbacks.delete(handle);
     },

@@ -602,7 +602,7 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     const harness = makeHarness({
       records: [entry],
       journal,
-      forgeResult: { ...retroForge(), liveHeadSha: OTHER_HEAD },
+      forgeResult: { ...(retroForge() as Extract<ReadForgeMergeResult, { outcome: 'ok' }>), liveHeadSha: OTHER_HEAD },
     });
 
     const result = await harness.useCase.runMergePass(harness.request);

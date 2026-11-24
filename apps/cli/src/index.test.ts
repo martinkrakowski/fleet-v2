@@ -419,6 +419,65 @@ describe('CLI installation wiring', () => {
         expect((await runtime.execution.workOrderRepository.findWorkOrderById('wo-new'))?.baseBranch).toBe(expected);
       }
     });
+
+    it('refuses a work order whose getOwnPropertyDescriptor trap throws with unsupported-base-branch and does not surface the trap as a generic error', async () => {
+      const runtime = await seedStoppedWorkOrder({});
+      let trapped = false;
+      const workOrder = new Proxy(
+        {
+          id: 'wo-old',
+          state: 'stopped',
+          projectId: 'proj-1',
+          taskId: 'task-1',
+          laneId: 'lane-1',
+          repository: 'git@example.org:acme/app.git',
+          baseCommit: 'abc123',
+          ownedPaths: ['packages/app-a/**'],
+          policyRevision: 'policy-7',
+          prerequisiteWorkOrderIds: [] as string[],
+          revision: 1,
+        },
+        {
+          getOwnPropertyDescriptor(target, prop) {
+            if (prop === 'baseBranch') {
+              trapped = true;
+              throw new Error('getOwnPropertyDescriptor trap');
+            }
+            return Reflect.getOwnPropertyDescriptor(target, prop);
+          },
+        },
+      );
+      Object.assign(runtime.execution, {
+        inspectWorkOrder: {
+          inspectWorkOrder: async () => ({
+            outcome: 'found' as const,
+            workOrder,
+            attempts: [],
+            activeReservations: [],
+          }),
+        },
+      });
+      const before = await runtime.execution.workOrderRepository.findWorkOrderById('wo-old');
+      expect(before?.state).toBe('stopped');
+      const { io, stdout, stderr } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(trapped).toBe(true);
+      expect(exitCode).toBe(1);
+      expect(stderr.join('')).toBe('');
+      expect(JSON.parse(stdout.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'unsupported-base-branch',
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      });
+      expect(stdout.join('')).not.toContain('getOwnPropertyDescriptor trap');
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-old')).toEqual(before);
+    });
   });
 
   describe('coordination resolve-auth head requirement (GR1a2 M5)', () => {

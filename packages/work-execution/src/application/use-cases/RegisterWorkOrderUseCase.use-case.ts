@@ -444,10 +444,17 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       // RP1c: a retired project is decided first, so a retired profile with a
       // malformed or unsupported `defaultBranch` still gets the retired
       // rejection. Only an own data `status` on a plain record counts, so a
-      // non-plain profile stays `malformed-profile` below.
-      const profileStatus = isPlainRecordObject(profile as unknown)
-        ? Object.getOwnPropertyDescriptor(profile, 'status')?.value
-        : undefined;
+      // non-plain profile stays `malformed-profile` below. A Proxy whose
+      // getPrototypeOf trap throws is the same typed refusal: the plain-record
+      // check is one prototype read (O(1)) and must not escape as a throw.
+      let profileStatus: unknown;
+      try {
+        profileStatus = isPlainRecordObject(profile as unknown)
+          ? Object.getOwnPropertyDescriptor(profile, 'status')?.value
+          : undefined;
+      } catch {
+        return { outcome: 'refused', reason: 'malformed-profile' };
+      }
       if (profileStatus === 'retired') {
         return retiredProjectRejection(projectId);
       }

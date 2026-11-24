@@ -302,4 +302,25 @@ describe('RegisterWorkOrderUseCase profile defaultBranch (RP1)', () => {
       expect(workOrderRepo.orders.has('wo-2')).toBe(false);
     }
   });
+
+  it('refuses a profile whose getPrototypeOf trap throws with malformed-profile and writes nothing', async () => {
+    // `isPlainRecordObject` reads the prototype once. A trap that throws is
+    // the typed malformed-profile refusal, not a rejection of the promise.
+    let trapped = false;
+    const profile = new Proxy(profileView(), {
+      getPrototypeOf() {
+        trapped = true;
+        throw new Error('getPrototypeOf trap');
+      },
+    });
+    const workOrderRepo = new FakeWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({
+      workOrderRepo,
+      profileRead: new FakeProfileRead(new Map([['proj-1', profile as unknown as ProjectProfileView]])),
+    });
+    const result = await useCase.registerWorkOrder(validRequest());
+    expect(trapped).toBe(true);
+    expect(result).toEqual({ outcome: 'refused', reason: 'malformed-profile' });
+    expect(workOrderRepo.orders.size).toBe(0);
+  });
 });

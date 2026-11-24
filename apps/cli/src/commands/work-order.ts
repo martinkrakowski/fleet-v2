@@ -149,21 +149,29 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       // A stored base branch is copied through only when it is `main` or
       // `chain/<name>`. A present value that is anything else (for example
       // `staging`, a wrong primitive or an accessor, which is never invoked) is
-      // refused and nothing is registered. An absent, inherited or `undefined`
-      // base is left out of the request, so the registration falls back to the
-      // profile default. Cost: one own-descriptor read and a bounded match.
-      const baseDescriptor = Object.getOwnPropertyDescriptor(source, 'baseBranch');
+      // refused and nothing is registered. A throwing own-descriptor trap is
+      // that same typed refusal, not a generic error. An absent, inherited or
+      // `undefined` base is left out of the request, so the registration falls
+      // back to the profile default. Cost: one own-descriptor read (caught)
+      // and a bounded match.
+      const unsupportedStoredBase = {
+        outcome: 'refused' as const,
+        reason: 'unsupported-base-branch' as const,
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      };
+      let baseDescriptor: PropertyDescriptor | undefined;
+      try {
+        baseDescriptor = Object.getOwnPropertyDescriptor(source, 'baseBranch');
+      } catch {
+        return unsupportedStoredBase;
+      }
       const baseIsAccessor = baseDescriptor !== undefined && !('value' in baseDescriptor);
       const hasStoredBase =
         baseDescriptor !== undefined && (baseIsAccessor || baseDescriptor.value !== undefined);
       const parsedBase =
         hasStoredBase && !baseIsAccessor ? parseBaseBranch(baseDescriptor?.value) : undefined;
       if (hasStoredBase && parsedBase === undefined) {
-        return {
-          outcome: 'refused' as const,
-          reason: 'unsupported-base-branch',
-          message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
-        };
+        return unsupportedStoredBase;
       }
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: newId,

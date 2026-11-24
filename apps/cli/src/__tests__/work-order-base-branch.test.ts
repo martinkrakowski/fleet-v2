@@ -281,10 +281,10 @@ describe('work-order register --base-branch (CB1)', () => {
     expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('chain/example');
   });
 
-  it('rerun supersedes a stored non-main/chain order on a profile whose defaultBranch is main', async () => {
-    // A work order registered before the RP1 fix may hold a profile base such
-    // as `staging`; superseding it must not turn that stored base into an
-    // explicit-base refusal.
+  it('rerun refuses a stored non-main/chain base with unsupported-base-branch when the profile defaultBranch is main, exits 1 and leaves the stored order unchanged', async () => {
+    // A stored `staging` is not copied and is not replaced by the profile
+    // default. Rerun refuses before registration, so the successor is absent
+    // and the stopped order is the same record.
     const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-base-branch-'));
     tempStateDirs.push(stateDir);
     const runtime = createFleetCliRuntime({ stateDir });
@@ -305,6 +305,10 @@ describe('work-order register --base-branch (CB1)', () => {
       createdAtIso: '2026-11-20T08:00:00.000Z',
       updatedAtIso: '2026-11-20T08:00:00.000Z',
     });
+    const before = await inspectOrder(runtime, 'wo-base-branch-8');
+    expect(before.outcome).toBe('found');
+    expect((before.workOrder as Record<string, unknown>).baseBranch).toBe('staging');
+    expect((before.workOrder as Record<string, unknown>).state).toBe('stopped');
 
     const rerun = await cli(runtime, [
       'work-order',
@@ -315,15 +319,22 @@ describe('work-order register --base-branch (CB1)', () => {
       'wo-base-branch-9',
       '--yes',
     ]);
-    expect(rerun.code).toBe(0);
-    expect(JSON.parse(rerun.out).outcome).toBe('registered');
+    expect(rerun.code).toBe(1);
+    expect(JSON.parse(rerun.out)).toEqual({
+      outcome: 'refused',
+      reason: 'unsupported-base-branch',
+      message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+    });
+    expect(rerun.out).not.toContain('staging');
+    expect(rerun.err).not.toContain('staging');
 
-    const inspection = await inspectOrder(runtime, 'wo-base-branch-9');
-    expect(inspection.outcome).toBe('found');
-    expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('main');
+    expect(await inspectOrder(runtime, 'wo-base-branch-8')).toEqual(before);
+    expect((await inspectOrder(runtime, 'wo-base-branch-9')).outcome).toBe('not-found');
   });
 
-  it('rerun supersedes a stored non-main/chain order on a profile whose defaultBranch is chain/example', async () => {
+  it('rerun refuses a stored non-main/chain base with unsupported-base-branch when the profile defaultBranch is chain/example, exits 1 and leaves the stored order unchanged', async () => {
+    // The profile default is a legal chain branch. It must not be written onto
+    // a successor of an order whose stored base is `staging`.
     const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-base-branch-'));
     tempStateDirs.push(stateDir);
     const runtime = createFleetCliRuntime({ stateDir });
@@ -355,6 +366,10 @@ describe('work-order register --base-branch (CB1)', () => {
       createdAtIso: '2026-11-20T08:00:00.000Z',
       updatedAtIso: '2026-11-20T08:00:00.000Z',
     });
+    const before = await inspectOrder(runtime, 'wo-base-branch-10');
+    expect(before.outcome).toBe('found');
+    expect((before.workOrder as Record<string, unknown>).baseBranch).toBe('staging');
+    expect((before.workOrder as Record<string, unknown>).state).toBe('stopped');
 
     const rerun = await cli(runtime, [
       'work-order',
@@ -365,12 +380,18 @@ describe('work-order register --base-branch (CB1)', () => {
       'wo-base-branch-11',
       '--yes',
     ]);
-    expect(rerun.code).toBe(0);
-    expect(JSON.parse(rerun.out).outcome).toBe('registered');
+    expect(rerun.code).toBe(1);
+    expect(JSON.parse(rerun.out)).toEqual({
+      outcome: 'refused',
+      reason: 'unsupported-base-branch',
+      message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+    });
+    expect(rerun.out).not.toContain('staging');
+    expect(rerun.out).not.toContain('chain/example');
+    expect(rerun.err).not.toContain('staging');
 
-    const inspection = await inspectOrder(runtime, 'wo-base-branch-11');
-    expect(inspection.outcome).toBe('found');
-    expect((inspection.workOrder as Record<string, unknown>).baseBranch).toBe('chain/example');
+    expect(await inspectOrder(runtime, 'wo-base-branch-10')).toEqual(before);
+    expect((await inspectOrder(runtime, 'wo-base-branch-11')).outcome).toBe('not-found');
   });
 });
 

@@ -386,6 +386,25 @@ describe('lastStopLeftTimedOutSeat inherited getters on the shared prototypes', 
       expect(lastStopLeftTimedOutSeat(entries, RUN_ID)).toBe(true);
     });
   }
+
+  it('reads false instead of throwing when Object.prototype carries a throwing accessor named get', () => {
+    const entries = [stopTimeoutEntry()];
+    Object.defineProperty(Object.prototype, 'get', {
+      configurable: true,
+      get: () => {
+        throw new Error('inherited get must never be read');
+      },
+    });
+    let result: boolean | 'threw' = 'threw';
+    try {
+      result = lastStopLeftTimedOutSeat(entries, RUN_ID);
+    } catch {
+      result = 'threw';
+    } finally {
+      Reflect.deleteProperty(Object.prototype, 'get');
+    }
+    expect(result).toBe(false);
+  });
 });
 
 describe('performStop stop-timeout preserve (CB3)', () => {

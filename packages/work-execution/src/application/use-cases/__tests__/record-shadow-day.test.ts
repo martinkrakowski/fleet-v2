@@ -2862,6 +2862,76 @@ describe('RecordShadowDayUseCase', () => {
     expect(JSON.stringify(result.unevaluated)).not.toContain(echoed.runId);
   });
 
+  it('records S6 fail/too-few-conforming-runs when an identical twin run is listed with four distinct conforming runs', async () => {
+    // 3 Tier 1 + 1 Tier 2: below the 5-run floor. The fifth list entry is an
+    // identical copy of one of those runs (same runId and the same fields),
+    // so it must count once and must not become duplicate-run-conflict.
+    const specs = conformanceRunSpecs().slice(0, 4);
+    expect(specs.map((spec) => spec.tier)).toEqual([1, 1, 1, 2]);
+    const specPrs = new Set(specs.map((spec) => spec.pr));
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: specs,
+    });
+    const conducted = harness.deps.conducted;
+    if (conducted === undefined) {
+      throw new Error('conducted dependency missing');
+    }
+    const port = conducted.facts.runs as {
+      list: () => Promise<readonly {
+        readonly runId: string;
+        readonly tier: 1 | 2;
+        readonly prNumber: number;
+        readonly attemptIds: readonly string[];
+      }[]>;
+    };
+    const originalList = port.list.bind(port);
+    let presented = 0;
+    let distinctRunIds = 0;
+    port.list = async () => {
+      const listed = await originalList();
+      const conformance = listed.filter((run) => specPrs.has(run.prNumber));
+      const first = conformance[0];
+      if (first === undefined || conformance.length !== 4) {
+        throw new Error('expected four distinct conforming runs');
+      }
+      const twin = {
+        runId: first.runId,
+        tier: first.tier,
+        prNumber: first.prNumber,
+        attemptIds: [...first.attemptIds],
+      };
+      expect(twin).toEqual({
+        runId: first.runId,
+        tier: first.tier,
+        prNumber: first.prNumber,
+        attemptIds: first.attemptIds,
+      });
+      const withTwin = [...listed, twin];
+      const presentedRuns = withTwin.filter((run) => specPrs.has(run.prNumber));
+      presented = presentedRuns.length;
+      distinctRunIds = new Set(presentedRuns.map((run) => run.runId)).size;
+      return withTwin;
+    };
+
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(presented).toBe(5);
+    expect(distinctRunIds).toBe(4);
+    expect(result.recorded.S6).toBe('fail');
+    expect(result.recorded.S6).not.toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S6?.reason).toBe('too-few-conforming-runs');
+    expect(dayRecord?.verdicts.S6).toEqual({
+      verdict: 'fail',
+      reason: 'too-few-conforming-runs',
+      digest: expectedS6Digest(DAY, 'fail', 'too-few-conforming-runs'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S6');
+    expect(result.unevaluated.map((entry) => entry.reason)).not.toContain('duplicate-run-conflict');
+  });
+
   it('records S6 fail/merged-head-unlinked, never pass, when the merged head is more than 32 headMoves away', async () => {
     const pr = 8;
     const mergeHead = conformanceHeadOid(pr);

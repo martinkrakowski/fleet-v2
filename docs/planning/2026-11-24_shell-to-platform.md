@@ -225,3 +225,18 @@ Dependencies inside phases are as the Depends column. SX13 (auto-start) is last 
 - **Is porting the sentinel and watchdog worth it?** Both may be symptoms of the shell train's wedges; after the cutover the daemon may have no stuck-entry state at all, making SX7 dead code. SX6's inventory should decide before SX7 is briefed.
 - **The `agent-cli` transport puts an unattended model run behind a CLI whose permission flags the platform does not control.** The argv goldens help, but a CLI upgrade that widens defaults would not be caught until used. Should the adapter probe the CLI's reported tool set before each run?
 - **Sequencing SX13 last may be too cautious or too bold:** auto-start is where the orchestrator's judgement is most replaced. Is the readiness selector alone (SX11, SX12) enough value, with the orchestrator remaining the one who starts?
+
+## Owner decisions recorded, 2026-11-24
+
+Owner, 2026-11-24: "take the default for all open questions ... Proceed with your recommendations."
+
+D-SP1 to D-SP9 are recorded as recommended:
+- **D-SP1:** start after the switch; only P0 (SX0, SX6, SX15, SX22) before it.
+- **D-SP2:** the owner performs the live swap after a `clear` verdict.
+- **D-SP3:** yes: shadow first, in an empty scratch directory with read-only tools.
+- **D-SP4:** park by default; the owner enables a named substitute per project.
+- **D-SP5:** allowed behind a grant, cap 2.
+- **D-SP6:** informational for 20 lanes, then blocking.
+- **D-SP7:** yes, inside the gate budget.
+- **D-SP8:** generated fixtures.
+- **D-SP9:** watchdog, retry-dispatch, stop-after-merge, sentinel.

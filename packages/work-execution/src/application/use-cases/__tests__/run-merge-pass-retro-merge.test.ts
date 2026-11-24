@@ -799,9 +799,10 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
 
     const second = await useCase.runMergePass(request);
 
+    // MP1: an entry whose would-already-merged result is journaled is excluded
+    // from later passes before any forge read, so the pass reports no entry.
     expect(second.outcome).toBe('completed');
-    expect(second.entries[0].decision).toBe('no-action');
-    expect(second.entries[0].reasonCode).toBe('already-journalled');
+    expect(second.entries).toEqual([]);
     expect(await journal.listForKey(MERGE_KEY)).toEqual(wouldMergeBefore);
     expect(await journal.listForKey(ALREADY_KEY)).toEqual(alreadyBefore);
   });
@@ -981,8 +982,10 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
 
     const second = await useCase.runMergePass(request);
 
-    expect(second.entries[0].decision).toBe('no-action');
-    expect(second.entries[0].reasonCode).toBe('already-journalled');
+    // MP1: the journaled would-already-merged result excludes the entry before
+    // the second forge read, so the now-eligible read is never even made.
+    expect(second.entries).toEqual([]);
+    expect(call).toBe(1);
     expect(await journal.listForKey(MERGE_KEY)).toHaveLength(0);
     expect(await journal.listForKey(ALREADY_KEY)).toHaveLength(2);
   });

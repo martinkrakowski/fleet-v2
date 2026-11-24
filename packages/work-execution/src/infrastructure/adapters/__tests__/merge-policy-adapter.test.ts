@@ -20,6 +20,7 @@ function repository(overrides: Record<string, unknown> = {}): MergePolicyReposit
     macosProcedure: null,
     maxAttempts: 9,
     checksGraceMinutes: 30,
+    premergePosterLogin: null,
     veto: { mode: 'off', holdConfidence: 0.8 },
     ...overrides,
   } as MergePolicyRepository;

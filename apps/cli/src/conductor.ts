@@ -135,7 +135,11 @@ run. The driver obeys the records; nothing here dispatches, and the CLI
 never takes a run lease. stop and resume refuse with reason
 driver-lease-live (exit 1) while another process holds a live driver
 lease; a lapsed or absent lease allows the call; the check and the record
-are one atomic step under the lease store's lock. conductor schedule is a
+are one atomic step under the lease store's lock. A resume of a run parked
+fix-no-progress is refused unless the worktree inspection shows uncommitted
+tracked work: then the resume escalates the park back to fixing for a
+commit-pending fix round, at most once per run; a clean worktree keeps the
+run parked (worktree-clean). conductor schedule is a
 read-only view of the live runs grouped by base branch, in creation order
 within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean

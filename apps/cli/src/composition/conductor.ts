@@ -428,6 +428,7 @@ export function composeConductor(input: ComposeConductorInput) {
       newUlid: conductorNewUlid,
       forgeRead,
       attemptRepo: attemptRepository,
+      worktreeInspect: workspace,
     }),
     // EX-2b: the operator-opt-in worktree reap, built beside the lane-run
     // stores it scans and the execution stores it journals to. C2': the

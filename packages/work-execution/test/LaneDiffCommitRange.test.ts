@@ -137,7 +137,7 @@ describe('LaneDiffCheckAdapter.checkLaneDiffCommitRange (SN2)', () => {
     expect(
       await new LaneDiffCheckAdapter(executor).checkLaneDiffCommitRange(request(repo, base, git('rev-parse', 'HEAD'))),
     ).toEqual({ outcome: 'range-too-large', limit: 'commits' });
-  });
+  }, 60_000); // 51 real git commits can exceed the 5s default under parallel load
 
   it('errors on a merge commit in the range and on a malformed commit id, never a pass', async () => {
     const { repo, git, write, base } = makeRepo();

@@ -67,10 +67,12 @@ const READY_FAMILY_STATES: readonly LaneRunStateValue[] = Object.freeze([
 
 /**
  * States from which a `park` step may be issued: every `LANE_RUN_STATES`
- * value except `merged`, `stopped` and `parked`. Cost: constant.
+ * value except the terminals `merged` and `stopped`. `parked` is included so
+ * a `fix-no-progress` escalation can journal its one-way `park` intent
+ * (CE1w); without it that intent is `stray-one-way-action`. Cost: constant.
  */
 const PARK_ISSUE_STATES: readonly LaneRunStateValue[] = Object.freeze(
-  LANE_RUN_STATES.filter((state) => state !== 'merged' && state !== 'stopped' && state !== 'parked'),
+  LANE_RUN_STATES.filter((state) => state !== 'merged' && state !== 'stopped'),
 );
 
 /**
@@ -691,10 +693,11 @@ function enqueueUnseen(
  * key was already issued, or when the current state is outside
  * `SHADOW_ONE_WAY_STEP_STATES` for the step (`park` included). `park` is
  * dropped from the duplicate check: its key is `<run>/r<round>/park/<seat>`
- * with no ordinal, so two legitimate parks in one round share a key. There
- * is no `step: 'park'` in non-test source on origin/main, so nothing is
- * lost. An unparseable key is ignored. Cost: linear in the journal, capped
- * by `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
+ * with no ordinal, so two legitimate parks in one round share a key. A
+ * `park` intent is also issued from `parked` for the commit-pending
+ * escalation (CE1w), which is why that state is in the park row. An
+ * unparseable key is ignored. Cost: linear in the journal, capped by
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
 function ruleOneWayDiscipline(
   run: ShadowConformanceRun,

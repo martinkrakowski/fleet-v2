@@ -975,18 +975,88 @@ function fixingSourceOfEntry(
  * review results at that head to the fix round; `performFixPrepare` then picks
  * the candidate whose receipt carries unresolved findings (MX7).
  */
+/** The entry fields the backwards walk reads; an accessor on any of them skips the entry. */
+const FIXING_WALK_ENTRY_FIELDS = ['kind', 'key', 'outcome', 'runId', 'reasonCode', 'detail'] as const;
+
+/**
+ * True when any field the walk reads sits on an accessor descriptor. The walk
+ * never runs a getter — hostile input may throw or lie — so the whole entry
+ * is skipped before any field is read. Cost: one own-property descriptor
+ * lookup per field, O(1) per entry.
+ */
+function hasAccessorWalkField(entry: object): boolean {
+  for (const field of FIXING_WALK_ENTRY_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(entry, field);
+    if (descriptor !== undefined && typeof descriptor.get === 'function') {
+      return true;
+    }
+  }
+  return false;
+}
+
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
 ): FixingSource | null {
+  // Hostile input: a non-array journal yields no source; the caller refuses
+  // with `prepare-no-failure-source` instead of throwing.
+  if (!Array.isArray(entries)) {
+    return null;
+  }
+  // CB9: heads whose gate already passed LATER on the walk, keyed
+  // `round:head12`. A Set of composed strings only — no entry value ever
+  // becomes an object key, so there is no prototype-pollution path.
+  const passedGateHeads = new Set<string>();
+  // CB9: the round of the gate failure a later pass superseded, when one was
+  // skipped; a source found after it must carry the same round.
+  let supersededRound: number | null = null;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index]!;
-    const parsed = parseLaneRunKey(entry.key);
-    const verdict = fixingSourceOfEntry(entry, parsed, runId);
+    // A sparse journal array has a hole: it is skipped, never read as an entry.
+    if (!Object.prototype.hasOwnProperty.call(entries, index)) {
+      continue;
+    }
+    const entry: unknown = entries[index];
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      continue;
+    }
+    if (hasAccessorWalkField(entry)) {
+      continue;
+    }
+    const record = entry as LaneRunJournalEntryRecord;
+    const parsed = parseLaneRunKey(record.key);
+    // CB9: a later final gate pass on the same `(round, head12)` supersedes
+    // an earlier gate failure on that head — the retried gate recovered it,
+    // so the failure is not what sent the run fixing. An ambiguous or
+    // non-result gate entry never counts as a pass (unknown is never success).
+    if (
+      parsed !== null &&
+      parsed.kind === 'step' &&
+      parsed.step === 'gate' &&
+      parsed.head12 !== null &&
+      record.kind === 'result' &&
+      record.outcome !== 'ambiguous' &&
+      record.runId === runId
+    ) {
+      if (record.reasonCode === 'gate-passed') {
+        passedGateHeads.add(parsed.round + ':' + parsed.head12);
+        continue;
+      }
+      if (record.reasonCode === 'gate-failed' && passedGateHeads.has(parsed.round + ':' + parsed.head12)) {
+        supersededRound = parsed.round;
+        continue;
+      }
+    }
+    const verdict = fixingSourceOfEntry(record, parsed, runId);
     if (verdict.kind === 'skip') {
       continue;
     }
     if (verdict.kind === 'stop') {
+      return null;
+    }
+    // CB9 (bounded walk): after a superseded gate failure, only a source in
+    // the superseded round may take over the fix trigger; a failure from any
+    // other round is not what this fix round answers.
+    if (supersededRound !== null && (parsed === null || parsed.kind !== 'step' || parsed.round !== supersededRound)) {
       return null;
     }
     return verdict.source;

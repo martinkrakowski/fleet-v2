@@ -4,7 +4,6 @@ import {
   CLOSE_WORK_ORDER_STATES,
   WORK_ORDER_RISKS,
   parseBaseBranch,
-  resolveWorkOrderBaseBranch,
   resolveWorkOrderRisk,
 } from '@fleet/work-execution';
 import { CliUsageError, str, optStr, strArr, enumOf } from './payload.js';
@@ -147,12 +146,33 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       if (Object.hasOwn(source, 'pullRequestTitle') && typeof source.pullRequestTitle !== 'string') {
         return { outcome: 'refused', reason: 'invalid-pull-request-title' };
       }
-      // A stored base branch is copied through only when it still parses as a
-      // supported base (`main` or `chain/<name>`); a stored record from before
-      // that restriction (or a tampered value) is left absent, so the
-      // registration falls back to the profile default instead of turning the
-      // stored base into an explicit-base refusal.
-      const storedBaseBranch = parseBaseBranch(resolveWorkOrderBaseBranch(source));
+      // A stored base branch is copied through only when it is `main` or
+      // `chain/<name>`. A present value that is anything else (for example
+      // `staging`, a wrong primitive or an accessor, which is never invoked) is
+      // refused and nothing is registered. A throwing own-descriptor trap is
+      // that same typed refusal, not a generic error. An absent, inherited or
+      // `undefined` base means `main` and is passed explicitly, so registration
+      // does not apply the active profile's default. Cost: one own-descriptor
+      // read (caught) and a bounded match.
+      const unsupportedStoredBase = {
+        outcome: 'refused' as const,
+        reason: 'unsupported-base-branch' as const,
+        message: 'work-order rerun refused: stored baseBranch must be main or chain/<lowercase-dashes>',
+      };
+      let baseDescriptor: PropertyDescriptor | undefined;
+      try {
+        baseDescriptor = Object.getOwnPropertyDescriptor(source, 'baseBranch');
+      } catch {
+        return unsupportedStoredBase;
+      }
+      const baseIsAccessor = baseDescriptor !== undefined && !('value' in baseDescriptor);
+      const hasStoredBase =
+        baseDescriptor !== undefined && (baseIsAccessor || baseDescriptor.value !== undefined);
+      const parsedBase =
+        hasStoredBase && !baseIsAccessor ? parseBaseBranch(baseDescriptor?.value) : undefined;
+      if (hasStoredBase && parsedBase === undefined) {
+        return unsupportedStoredBase;
+      }
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: newId,
         projectId: source.projectId,
@@ -162,7 +182,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         ownedPaths: source.ownedPaths,
         policyRevision: source.policyRevision,
         risk: resolveWorkOrderRisk(source),
-        ...(storedBaseBranch === undefined ? {} : { baseBranch: storedBaseBranch }),
+        baseBranch: parsedBase ?? 'main',
         baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
         prerequisiteWorkOrderIds: [],
         supersedesWorkOrderId: from,

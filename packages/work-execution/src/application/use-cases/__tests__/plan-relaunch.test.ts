@@ -704,4 +704,78 @@ describe('PlanRelaunchUseCase', () => {
     expect((await useCase.execute(request())).outcome).toBe('planned');
     await expect(new PlanRelaunchUseCase().planRelaunch(request())).rejects.toThrow('Not implemented');
   });
+
+  it('refuses a stored work order baseBranch that is not main or chain/<name> with unsupported-base-branch and stores nothing', async () => {
+    const unsupported: unknown[] = [
+      'staging',
+      'Main',
+      'main ',
+      'chain/',
+      'chain/Bad',
+      'chain/a--b',
+      '',
+      42,
+      true,
+      null,
+      ['main'],
+      { name: 'main' },
+      `chain/${'a'.repeat(100_000)}`,
+    ];
+    for (const stored of unsupported) {
+      const world = emptyWorld();
+      world.rows = [row('att-x')];
+      world.workOrders = [workOrder('wo-x', { baseBranch: stored as string })];
+      world.attempts = [attempt('att-x', 'wo-x')];
+      const { useCase, saves, calls } = rig(world);
+      expect(await useCase.planRelaunch(request())).toEqual({ outcome: 'refused', reason: 'unsupported-base-branch' });
+      expect(saves).toEqual([]);
+      expect(calls).not.toContain('save');
+    }
+  });
+
+  it('refuses an own accessor baseBranch without invoking it and reads an inherited baseBranch as main', async () => {
+    let invoked = 0;
+    const accessorOrder = workOrder('wo-x');
+    Object.defineProperty(accessorOrder, 'baseBranch', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        invoked += 1;
+        return 'main';
+      },
+    });
+    const refusing = emptyWorld();
+    refusing.rows = [row('att-x')];
+    refusing.workOrders = [accessorOrder];
+    refusing.attempts = [attempt('att-x', 'wo-x')];
+    const first = rig(refusing);
+    expect(await first.useCase.planRelaunch(request())).toEqual({ outcome: 'refused', reason: 'unsupported-base-branch' });
+    expect(invoked).toBe(0);
+    expect(first.saves).toEqual([]);
+
+    const inheriting = emptyWorld();
+    inheriting.rows = [row('att-x')];
+    inheriting.workOrders = [Object.assign(Object.create({ baseBranch: 'staging' }) as object, workOrder('wo-x')) as WorkOrderRecord];
+    inheriting.attempts = [attempt('att-x', 'wo-x')];
+    const plan = planned(await rig(inheriting).useCase.planRelaunch(request())).plan;
+    expect(laneOf(plan, 'att-x').baseBranch).toBe('main');
+  });
+
+  it('plans an absent, undefined or main baseBranch on main and a chain/<name> baseBranch on that chain', async () => {
+    const undefinedBase = { baseBranch: undefined } as unknown as Partial<WorkOrderRecord>;
+    const cases: readonly (readonly [Partial<WorkOrderRecord>, string])[] = [
+      [{}, 'main'],
+      [undefinedBase, 'main'],
+      [{ baseBranch: 'main' }, 'main'],
+      [{ baseBranch: 'chain/example-1' }, 'chain/example-1'],
+    ];
+    for (const [extra, expected] of cases) {
+      const world = emptyWorld();
+      world.rows = [row('att-x')];
+      world.workOrders = [workOrder('wo-x', extra)];
+      world.attempts = [attempt('att-x', 'wo-x')];
+      const plan = planned(await rig(world).useCase.planRelaunch(request())).plan;
+      expect(laneOf(plan, 'att-x').baseBranch).toBe(expected);
+    }
+  });
 });

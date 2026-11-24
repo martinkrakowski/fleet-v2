@@ -78,8 +78,12 @@ under a separate system user, so the key file is not readable by them.
 Sign a pending one-way decision with the key:
 
 ```text
-fleet-v2 coordination sign-decision --request <id> --answer yes --key <path> --yes
+fleet-v2 coordination sign-decision --request <id> --answer approve --key <path> --yes
 ```
+
+`--answer` takes `approve` or `decline`; any other value (including `yes`) is a
+usage error (`sign-decision: invalid or unsafe sign-decision input`). Run it
+without `--yes` first to preview the request it will sign.
 
 (KEY1a.) For the standing shadow import grant, pre-sign before
 `request-decision`:

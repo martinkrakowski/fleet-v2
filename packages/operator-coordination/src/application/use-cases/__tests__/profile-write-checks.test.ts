@@ -356,8 +356,10 @@ describe('trimStringArray', () => {
     expect(trimStringArray([obj as unknown as string])[0]).toBe(obj);
     // An array hole is refused with a named error, not accepted or carried
     // through; the scan over the array's own indices is O(n) over a tiny input.
-    // eslint-disable-next-line no-sparse-arrays
-    const sparse = ['  a  ', , 'b'];
+    // Built with delete rather than a sparse array literal, so no lint
+    // suppression is needed to name the hole the refusal exists for.
+    const sparse: string[] = ['  a  ', 'b'];
+    delete sparse[1];
     expect(() => trimStringArray(sparse as unknown as string[])).toThrow(TypeError);
     expect(() => trimStringArray(sparse as unknown as string[])).toThrow(
       'trimStringArray refuses an array hole at index 1',

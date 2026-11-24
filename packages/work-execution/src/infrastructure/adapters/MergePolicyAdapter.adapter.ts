@@ -71,6 +71,11 @@ const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'set
 const STALL_AFTER_KEY = 'stallAfterMinutes';
 /** PT1b1: `autoResumeMax` is optional the same way; an unusable value reads as 2. */
 const AUTO_RESUME_KEY = 'autoResumeMax';
+/** EV1b: `premergePosterLogin` is optional on the source; present, it must be a valid GitHub login. */
+const PREMERGE_POSTER_LOGIN_KEY = 'premergePosterLogin';
+/** EV1a's GitHub login shape (brief-review correction): 1-39 characters of A-Za-z0-9 or '-', no leading or trailing hyphen. */
+const PREMERGE_POSTER_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const PREMERGE_POSTER_LOGIN_MAX_LENGTH = 39;
 const CHAIN_REFRESH_MODES: ReadonlySet<string> = new Set(['shadow', 'invalid']);
 
 const UNREADABLE: MergePolicyAnswer = Object.freeze({
@@ -164,6 +169,23 @@ function isName(value: unknown): value is string {
   return typeof value === 'string' && value.length <= MAX_NAME_LENGTH && NAME_PATTERN.test(value);
 }
 
+/**
+ * EV1b: a present, non-null `premergePosterLogin` must be a valid GitHub login. Cost
+ * bound: O(1) — two length comparisons and one regex over at most 39 UTF-16 code units.
+ */
+function readPremergePosterLogin(value: unknown): string | null | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  if (value.length < 1 || value.length > PREMERGE_POSTER_LOGIN_MAX_LENGTH) {
+    return undefined;
+  }
+  if (!PREMERGE_POSTER_LOGIN_PATTERN.test(value)) {
+    return undefined;
+  }
+  return value;
+}
+
 function isIntegerInRange(value: unknown, range: { readonly min: number; readonly max: number }): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= range.min && value <= range.max;
 }
@@ -225,6 +247,12 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
   const checksGraceMinutes = ownValue(value, 'checksGraceMinutes');
   const requiredContexts = readRequiredContexts(ownValue(value, 'requiredContexts'));
   const veto = readVeto(ownValue(value, 'veto'));
+  // EV1b: read the poster key through its own data property, so an accessor getter
+  // never runs (the descriptor's `value` is `undefined` for a getter-only property).
+  const hasPoster = Object.hasOwn(value, PREMERGE_POSTER_LOGIN_KEY);
+  const rawPoster = ownValue(value, PREMERGE_POSTER_LOGIN_KEY);
+  const premergePosterLogin =
+    !hasPoster || rawPoster === null ? null : readPremergePosterLogin(rawPoster);
   if (
     !isName(owner) ||
     !isName(repo) ||
@@ -237,7 +265,13 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
     !isIntegerInRange(checksGraceMinutes, CHECKS_GRACE_RANGE) ||
     requiredContexts === undefined ||
     veto === undefined ||
-    !hasExactlyKeys(value, REPOSITORY_KEYS) ||
+    premergePosterLogin === undefined ||
+    // EV1b: an unexpected key of any name (own, symbol, or prototype-polluting) still
+    // fails, so the expected set widens only when the poster key is actually present.
+    !hasExactlyKeys(
+      value,
+      hasPoster ? [...REPOSITORY_KEYS, PREMERGE_POSTER_LOGIN_KEY] : REPOSITORY_KEYS,
+    ) ||
     repositoryKey !== `${owner}/${repo}`
   ) {
     return undefined;
@@ -254,6 +288,7 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
     macosProcedure,
     maxAttempts,
     checksGraceMinutes,
+    premergePosterLogin,
     veto,
   });
 }

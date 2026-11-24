@@ -381,6 +381,28 @@ describe('resource-exhausted gate classification', () => {
     expect(firstNonPassingGatePredicateOf([], 'attempt-1', HEAD_SHA)).toBeNull();
   });
 
+  it('parseStoredPredicateResult refuses an entry whose detail is an accessor, never invoking it', () => {
+    let getterRuns = 0;
+    const valid = JSON.stringify({
+      predicate: 'yarn build',
+      kind: 'command',
+      verdict: 'pass',
+      exitCode: 0,
+      durationMs: 1,
+      detail: '',
+    });
+    const entry = {
+      get detail(): string {
+        getterRuns += 1;
+        return valid;
+      },
+    };
+    expect(parseStoredPredicateResult(entry as never)).toBeNull();
+    expect(getterRuns).toBe(0);
+    // The same payload as a plain data property is accepted: the refusal is about the accessor.
+    expect(parseStoredPredicateResult({ detail: valid } as never)).not.toBeNull();
+  });
+
   it('parseStoredPredicateResult rejects an unrecognized cause value', () => {
     const entry = journalEntry(`attempt-1:accept:${HEAD_SHA}:2`, {
       predicate: 'command 1: corepack yarn build',

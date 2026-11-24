@@ -240,9 +240,18 @@ function isGatePredicateVerdict(value: unknown): value is GatePredicateVerdict {
   return value === 'pass' || value === 'fail' || value === 'unknown' || value === 'skipped';
 }
 
-/** Either congestion cause routes an `unknown` gate verdict to the retry path. */
+/**
+ * A congestion-like cause routes an `unknown` gate verdict to the retry path:
+ * host congestion, an OS/cgroup kill, or a worktree whose dependencies were
+ * never installed (installing them is bounded work the next attempt retried
+ * under the same backoff, never a hard failure of the command itself).
+ */
 function isCongestionCause(value: unknown): value is GatePredicateCause {
-  return value === 'gate-slot-wait-limit' || value === 'resource-exhausted';
+  return (
+    value === 'gate-slot-wait-limit' ||
+    value === 'resource-exhausted' ||
+    value === 'environment-not-installed'
+  );
 }
 
 export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
@@ -253,9 +262,15 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
   if (entry === null || typeof entry !== 'object') {
     return null;
   }
+  // The detail is read through its own data descriptor, so an accessor (or a
+  // Proxy whose descriptor trap throws) is refused without ever being invoked.
   let detail: unknown;
   try {
-    detail = (entry as { detail?: unknown }).detail;
+    const descriptor = Object.getOwnPropertyDescriptor(entry, 'detail');
+    if (descriptor === undefined || Object.hasOwn(descriptor, 'get') || Object.hasOwn(descriptor, 'set')) {
+      return null;
+    }
+    detail = descriptor.value;
   } catch {
     return null;
   }

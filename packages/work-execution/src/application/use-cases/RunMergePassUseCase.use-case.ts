@@ -31,7 +31,7 @@ import type {
   MergeStepDecision,
   MergeStepFacts,
 } from '../../domain/merge-queue-decider.js';
-import { decideMergeStep } from '../../domain/merge-queue-decider.js';
+import { decideMergeStep, premergeLoginsMatch } from '../../domain/merge-queue-decider.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
@@ -1306,7 +1306,7 @@ function premergeReceiptHeadOf(
     return null;
   }
   const fact = (facts.contexts as Record<string, MergeContextFact>).premerge;
-  return fact.state === 'success' && fact.creatorLogin === poster ? entry.headOid : null;
+  return fact.state === 'success' && premergeLoginsMatch(fact.creatorLogin, poster) ? entry.headOid : null;
 }
 
 /** Thrown inward when a read answers `budget-exhausted`; never leaves the use case. */

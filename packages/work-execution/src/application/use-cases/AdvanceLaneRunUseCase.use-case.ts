@@ -92,6 +92,7 @@ import {
   raiseParkNotice,
   refusedResult,
   saveOrRefuse,
+  tryEscalatePark,
 } from './advance-lane-run/step-context.js';
 import {
   performDispatch,
@@ -403,6 +404,11 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
     if (decision.kind === 'wait' && decision.reason === 'lane-running' && gathered.deadlineUnknown) {
       return performPark(this.ctx, record, 'ambiguous', 'stop', facts.state, request);
+    }
+    // CE1w: a parked fix-no-progress run with tracked uncommitted edits
+    // escalates once into fixing. Every refusal stays `waiting/parked`.
+    if (decision.kind === 'wait' && decision.reason === 'parked') {
+      return tryEscalatePark(this.ctx, record, gathered, request);
     }
     if (decision.kind === 'wait') {
       return { outcome: 'waiting', reason: decision.reason };

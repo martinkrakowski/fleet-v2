@@ -349,6 +349,10 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
       { ...DIRTY_INSPECTION, checkedOutCommit: 'main' },
       { ...DIRTY_INSPECTION, uncommittedPaths: [5] },
       inspectionWithHole(),
+      // A Proxy whose traps throw must refuse, never throw out of requestResume.
+      new Proxy({ ...DIRTY_INSPECTION }, { ownKeys: () => { throw new Error('hostile ownKeys trap'); } }),
+      new Proxy({ ...DIRTY_INSPECTION }, { getPrototypeOf: () => { throw new Error('hostile prototype trap'); } }),
+      { ...DIRTY_INSPECTION, uncommittedPaths: new Proxy(['src/changed.ts'], { ownKeys: () => { throw new Error('hostile ownKeys trap'); } }) },
     ];
     for (const inspect of malformed) {
       const fx = await seededEscalation({ inspect });

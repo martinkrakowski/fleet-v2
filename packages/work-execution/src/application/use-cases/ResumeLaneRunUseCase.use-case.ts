@@ -275,25 +275,30 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return null;
     }
     // Own data descriptors only: a snapshot refuses any accessor, so no
-    // getter on the inspection ever runs.
-    const snapshot = snapshotPlainDataRecord(inspection);
-    if (snapshot === null) {
-      return null;
-    }
-    const checkedOutCommit = snapshot.checkedOutCommit;
-    if (typeof checkedOutCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(checkedOutCommit)) {
-      return null;
-    }
-    const paths = readBoundedDenseArray(snapshot.uncommittedPaths, PARK_ESCALATION_UNCOMMITTED_PATHS_MAX);
-    if (paths === null) {
-      return null;
-    }
-    for (const path of paths.array) {
-      if (typeof path !== 'string') {
+    // getter on the inspection ever runs. A Proxy whose trap throws reads as
+    // malformed too: the validation never lets an exception out of the use case.
+    try {
+      const snapshot = snapshotPlainDataRecord(inspection);
+      if (snapshot === null) {
         return null;
       }
+      const checkedOutCommit = snapshot.checkedOutCommit;
+      if (typeof checkedOutCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(checkedOutCommit)) {
+        return null;
+      }
+      const paths = readBoundedDenseArray(snapshot.uncommittedPaths, PARK_ESCALATION_UNCOMMITTED_PATHS_MAX);
+      if (paths === null) {
+        return null;
+      }
+      for (const path of paths.array) {
+        if (typeof path !== 'string') {
+          return null;
+        }
+      }
+      return { trackedFilesChanged: paths.length };
+    } catch {
+      return null;
     }
-    return { trackedFilesChanged: paths.length };
   }
 
   /**

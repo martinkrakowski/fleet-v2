@@ -247,6 +247,20 @@ describe('validateHeldWorkOrderRecord', () => {
     expect(validateHeldWorkOrderRecord(revoked)).toBeNull();
   });
 
+  it('never invokes a throwing get trap: a Proxy that only throws on get still round-trips as a fresh record', () => {
+    let getCalls = 0;
+    const getThrows = new Proxy(makeValidRecord(), {
+      get() {
+        getCalls += 1;
+        throw new Error('get trap must never run');
+      },
+    });
+    const result = validateHeldWorkOrderRecord(getThrows);
+    expect(getCalls).toBe(0);
+    expect(result).toEqual(makeValidRecord());
+    expect(Object.is(result, getThrows)).toBe(false);
+  });
+
   it('returns null when given an array (empty, populated, holed, or of enormous length) or an array-like object', () => {
     expect(validateHeldWorkOrderRecord([])).toBeNull();
     expect(validateHeldWorkOrderRecord(Object.assign([], makeValidRecord()))).toBeNull();

@@ -1437,8 +1437,9 @@ async function fixPreparePriorSourceStep(shared: FixPrepareWired): Promise<FixPr
   // Hostile input: awaiting a revoked Proxy listing reads its `then` and
   // throws; any throw from the listing or the walk refuses, never escapes.
   let failure: FixingSource | null;
+  let entries: Awaited<ReturnType<typeof shared.ctx.deps.runJournal.listForRun>> = [];
   try {
-    const entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
+    entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
     failure = fixingFailureSourceOf(entries, shared.record.runId);
   } catch {
     failure = null;

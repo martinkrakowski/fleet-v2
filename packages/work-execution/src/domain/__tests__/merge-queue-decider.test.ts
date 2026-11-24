@@ -295,6 +295,36 @@ describe('observed base gate (between rows 8 and 9)', () => {
     });
   });
 
+  it('matches a mixed-case premerge creator against the poster on ASCII-lowercase', () => {
+    const decision = decideMergeStep(
+      makeReadyEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'success', creatorLogin: 'Martin-K' } },
+      }),
+      makePolicy({ premergePosterLogin: 'martin-k' }),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'act', action: 'merge-pr', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('does not fold non-ASCII letters when matching the premerge creator: a Kelvin sign is not a "k"', () => {
+    const decision = decideMergeStep(
+      makeReadyEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'success', creatorLogin: 'flee-\u212A' } },
+      }),
+      makePolicy({ premergePosterLogin: 'flee-k' }),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'park', reason: 'checks', detail: 'premerge', backoff: true,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0), nextAttempt: 1,
+    });
+  });
+
   it('parks threads for a chain entry observed on its own base', () => {
     const decision = decideMergeStep(
       makeChainEntry(),

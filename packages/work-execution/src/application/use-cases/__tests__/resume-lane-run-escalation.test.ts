@@ -319,6 +319,29 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
     // (the helper returns null for an unknown id).
   });
 
+  it('refuses fix-no-progress without running a getter when the stored attempt exposes one', async () => {
+    const getterCalls = { count: 0 };
+    const hostile = (field: 'artifacts' | 'worktreePath' | 'baseCommit'): AttemptRecord => {
+      const record = makeAttempt() as unknown as Record<string, unknown>;
+      const value = record[field];
+      Reflect.deleteProperty(record, field);
+      Object.defineProperty(record, field, {
+        enumerable: true,
+        get: () => {
+          getterCalls.count += 1;
+          return value;
+        },
+      });
+      return record as unknown as AttemptRecord;
+    };
+    for (const field of ['artifacts', 'worktreePath', 'baseCommit'] as const) {
+      const fx = await seededEscalation({ attempt: hostile(field) });
+      expect(await request(fx), field).toEqual({ outcome: 'refused', reason: 'fix-no-progress' });
+      expect(fx.inspectCalls.count, field).toBe(0);
+    }
+    expect(getterCalls.count).toBe(0);
+  });
+
   it('refuses fix-no-progress when inspectWorktree rejects or times out', async () => {
     const rejecting = await seededEscalation({
       inspectFactory: () => Promise.reject(new Error('boom')),

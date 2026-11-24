@@ -268,17 +268,25 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (attempt === null) {
       return null;
     }
-    const headCommit = attempt.artifacts?.headCommit;
-    if (typeof headCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(headCommit)) {
+    // The attempt is read through own data descriptors too: a getter on any field
+    // it exposes (or a throwing Proxy trap) reads as an unreadable attempt.
+    const attemptFields = safeSnapshotPlainDataRecord(attempt);
+    const artifacts = safeSnapshotPlainDataRecord(attemptFields?.artifacts);
+    const headCommit = artifacts?.headCommit;
+    if (attemptFields === null || typeof headCommit !== 'string' || !LANE_HEAD_SHA_PATTERN.test(headCommit)) {
+      return null;
+    }
+    const { worktreePath, baseCommit, runner } = attemptFields;
+    if (typeof worktreePath !== 'string' || typeof baseCommit !== 'string') {
       return null;
     }
     let inspection: unknown;
     try {
       inspection = await inspect.inspectWorktree({
-        worktreePath: attempt.worktreePath,
-        baseCommit: attempt.baseCommit,
+        worktreePath,
+        baseCommit,
         expectedArtifactPaths: [],
-        recordedHost: attempt.runner ?? null,
+        recordedHost: (runner ?? null) as AttemptRecord['runner'] ?? null,
       });
     } catch {
       return null;

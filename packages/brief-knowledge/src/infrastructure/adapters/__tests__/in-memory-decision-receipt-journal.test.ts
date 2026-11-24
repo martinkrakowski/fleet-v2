@@ -891,6 +891,44 @@ describe("InMemoryDecisionReceiptJournalAdapter", () => {
       await expect(adapter.reserve(reserveQuery())).resolves.toMatchObject({ ok: true });
     });
 
+    it("never reads an inherited consumer getter planted on Object.prototype for a missing own consumer", async () => {
+      const adapter = makeAdapter();
+      const probe: Probe = { calls: 0 };
+      const original = Object.getOwnPropertyDescriptor(Object.prototype, "consumer");
+      Object.defineProperty(Object.prototype, "consumer", {
+        configurable: true,
+        get() {
+          probe.calls += 1;
+          return CLAIM_TRIAGE_CONSUMER;
+        },
+      });
+      try {
+        const id = await reserveOk(adapter);
+        const before = await journalState(adapter);
+        const noConsumer: Record<string, unknown> = { ...receipt() };
+        delete noConsumer["consumer"];
+        await expect(
+          adapter.settle(id, asReceipt(noConsumer)),
+        ).rejects.toThrow();
+        await expect(
+          adapter.readJournal(asRead({})),
+        ).rejects.toThrow();
+        expect(await journalState(adapter)).toEqual(before);
+        const noConsumerQuery: Record<string, unknown> = { ...reserveQuery() };
+        delete noConsumerQuery["consumer"];
+        await expect(
+          adapter.reserve(asQuery(noConsumerQuery)),
+        ).resolves.toMatchObject({ ok: true });
+        expect(probe.calls).toBe(0);
+      } finally {
+        if (original === undefined) {
+          delete (Object.prototype as Record<string, unknown>)["consumer"];
+        } else {
+          Object.defineProperty(Object.prototype, "consumer", original);
+        }
+      }
+    });
+
     it("refuses an array, a Date and an inheriting object as a receipt", async () => {
       const adapter = makeAdapter();
       const id = await reserveOk(adapter);

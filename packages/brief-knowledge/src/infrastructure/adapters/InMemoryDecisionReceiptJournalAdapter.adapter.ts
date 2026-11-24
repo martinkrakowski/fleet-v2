@@ -207,7 +207,7 @@ function snapshotDeclaredFields<T>(
   if (prototype !== Object.prototype && prototype !== null) {
     return null;
   }
-  const snapshot: Record<string, unknown> = {};
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string" || POLLUTING_KEYS.has(key)) {
       return null;

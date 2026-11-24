@@ -76,6 +76,7 @@ import {
   MERGE_POLICY_BOUNDS,
   PREPARE_FORBIDDEN_CHAR_RE,
   PREPARE_PARENT_TRAVERSAL_RE,
+  isValidGithubLogin,
   parseMergeRepositoryKey,
 } from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
@@ -2850,6 +2851,37 @@ type MergeRepositoryFields = {
     | undefined;
 };
 
+/**
+ * EV1a: read `premergePosterLogin` from a written repository entry. The value
+ * is read through its own data property (never `entry.premergePosterLogin`),
+ * so a getter on the entry never runs. Error messages name the field only and
+ * never echo the rejected value.
+ */
+function readMergePremergePosterLogin(
+  entry: JsonObject,
+  path: string,
+  errors: string[],
+): string | undefined {
+  const value = readOwnDataProperty(entry as Record<string, unknown>, 'premergePosterLogin');
+  if (typeof value !== 'string') {
+    errors.push(`${path}.premergePosterLogin: must be a string`);
+    return undefined;
+  }
+  // Cost bound: the length check inside `isValidGithubLogin` is O(1) and runs
+  // before the O(n) secret scan, so an enormous string never reaches
+  // `containsSecretShape`.
+  if (!isValidGithubLogin(value)) {
+    errors.push(
+      `${path}.premergePosterLogin: must be a valid GitHub login (1-39 characters of A-Z, a-z, 0-9, or -, with no leading, trailing, or consecutive hyphen)`,
+    );
+    return undefined;
+  }
+  if (containsSecretShape(value)) {
+    errors.push(`${path}.premergePosterLogin: must not contain secret-shaped text`);
+    return undefined;
+  }
+  return value;
+}
 function ifPresent<T>(entry: JsonObject, field: string, read: () => T): T | undefined {
   return Object.hasOwn(entry, field) ? read() : undefined;
 }
@@ -2941,6 +2973,7 @@ function buildMergeRepositoryPolicy(
 ): MergeRepositoryPolicy {
   const { shadow, unattended, requiredContexts, updateBranch } = fields;
   const { macosProcedure, maxAttempts, checksGraceMinutes, veto, prepare } = fields;
+  const { premergePosterLogin } = fields;
   return {
     projectId,
     ...(shadow !== undefined ? { shadow } : {}),
@@ -2949,6 +2982,7 @@ function buildMergeRepositoryPolicy(
     ...(updateBranch !== undefined ? { updateBranch } : {}),
     ...(macosProcedure !== undefined ? { macosProcedure } : {}),
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+    ...(premergePosterLogin !== undefined ? { premergePosterLogin } : {}),
     ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
     ...(veto !== undefined ? { veto } : {}),
     ...(prepare !== undefined ? { prepare } : {}),
@@ -2986,6 +3020,9 @@ function parseMergeRepository(
     ),
     maxAttempts: ifPresent(entry, 'maxAttempts', () =>
       readMergeInteger(entry, 'maxAttempts', path, MERGE_POLICY_BOUNDS.maxAttempts, errors),
+    ),
+    premergePosterLogin: ifPresent(entry, 'premergePosterLogin', () =>
+      readMergePremergePosterLogin(entry, path, errors),
     ),
     checksGraceMinutes: ifPresent(entry, 'checksGraceMinutes', () =>
       readMergeInteger(

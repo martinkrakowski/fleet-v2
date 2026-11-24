@@ -1026,14 +1026,12 @@ function snapshotWalkEntry(entry: object): LaneRunJournalEntryRecord | null {
   return snapshot as unknown as LaneRunJournalEntryRecord;
 }
 
-function fixingFailureSourceOf(
-  entries: readonly LaneRunJournalEntryRecord[],
-  runId: string,
-): FixingSource | null {
-  // Hostile input: a non-array journal yields no source; the caller refuses
-  // with `prepare-no-failure-source` instead of throwing. `Array.isArray`
-  // reads the internal kind, so it never runs a trap, but it THROWS on a
-  // revoked Proxy: that is refused too, never thrown.
+/**
+ * The journal listing's length, or null when the listing is not a readable
+ * array (a non-array, a revoked Proxy, a throwing or non-integer `length`) or
+ * exceeds FIXING_WALK_MAX_ENTRIES. Never throws.
+ */
+function readWalkLength(entries: unknown): number | null {
   let isArray: boolean;
   try {
     isArray = Array.isArray(entries);
@@ -1043,19 +1041,53 @@ function fixingFailureSourceOf(
   if (!isArray) {
     return null;
   }
-  // Hostile input: `length` itself may be a throwing Proxy trap or a wrong
-  // primitive; any such journal is refused, and an enormous length is refused
-  // against a named bound instead of walking billions of holes.
-  let length: number;
+  let length: unknown;
   try {
-    length = entries.length;
+    length = (entries as readonly unknown[]).length;
   } catch {
     return null;
   }
-  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > FIXING_WALK_MAX_ENTRIES) {
     return null;
   }
-  if (length > FIXING_WALK_MAX_ENTRIES) {
+  return length;
+}
+
+/**
+ * The entry object at `index`, read only from the slot's own data descriptor
+ * (an accessor at an index is never invoked), or null for a hole, an accessor,
+ * a non-object, an array, a revoked Proxy or a throwing trap. Never throws.
+ */
+function readWalkSlot(entries: unknown, index: number): object | null {
+  let value: unknown;
+  try {
+    const slot = Object.getOwnPropertyDescriptor(entries as object, index);
+    if (slot === undefined || !('value' in slot) || slot.get !== undefined || slot.set !== undefined) {
+      return null;
+    }
+    value = slot.value;
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== 'object') {
+    return null;
+  }
+  try {
+    if (Array.isArray(value)) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return value;
+}
+
+function fixingFailureSourceOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+): FixingSource | null {
+  const length = readWalkLength(entries);
+  if (length === null) {
     return null;
   }
   // CB9: heads whose gate already passed LATER on the walk, keyed
@@ -1069,27 +1101,8 @@ function fixingFailureSourceOf(
     // A sparse journal array has a hole: it is skipped, never read as an
     // entry. A throwing `hasOwnProperty`/index `Proxy` trap is hostile input
     // and skips the entry too — the walk never throws to its caller.
-    // The slot is read from its own data descriptor: an accessor at an index
-    // (a getter fabricating an entry) is skipped and never invoked.
-    let entry: unknown;
-    try {
-      const slot = Object.getOwnPropertyDescriptor(entries, index);
-      if (slot === undefined || !('value' in slot) || slot.get !== undefined || slot.set !== undefined) {
-        continue;
-      }
-      entry = slot.value;
-    } catch {
-      continue;
-    }
-    // `Array.isArray` on a revoked Proxy throws TypeError, so it runs inside
-    // the try: hostile input skips the entry, never escapes to the caller.
-    let entryIsArray: boolean;
-    try {
-      entryIsArray = Array.isArray(entry);
-    } catch {
-      continue;
-    }
-    if (entry === null || typeof entry !== 'object' || entryIsArray) {
+    const entry = readWalkSlot(entries, index);
+    if (entry === null) {
       continue;
     }
     const record = snapshotWalkEntry(entry);

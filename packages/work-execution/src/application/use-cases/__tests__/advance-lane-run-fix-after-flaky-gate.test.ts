@@ -1079,7 +1079,7 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     expect(keyGetterCalls).toBe(0);
   });
 
-  it('refuses prepare-no-failure-source without throwing on a journal or entry whose proxy traps throw', async () => {
+  it('never throws on a journal or entry whose proxy traps throw, and never consults a get trap', async () => {
     // A Proxy over an array whose `hasOwnProperty` reach throws: the hole
     // check must not propagate the throw; the entry is skipped.
     const throwingIndexProbe = new Proxy(new Array(1), {
@@ -1091,8 +1091,11 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     expect(refusedDetailOf(await prepareDirect(first, () => throwingIndexProbe))).toBe('prepare-no-failure-source');
 
     // A Proxy whose descriptor traps report plain own data properties but
-    // whose `get` trap throws on the first field read: the entry is skipped
-    // and the walk refuses instead of throwing.
+    // whose `get` trap throws: the walk classifies the entry from its
+    // descriptor values only, so the `get` trap never runs and nothing throws.
+    // The descriptors honestly describe a review failure, so prepare gets past
+    // the source step and refuses later for the missing review request.
+    let getCalls = 0;
     const plain = {
       kind: 'result',
       key: reviewKey('brief-check', 0, HEAD12_A),
@@ -1103,11 +1106,13 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     };
     const lyingGet = new Proxy(plain, {
       get() {
+        getCalls += 1;
         throw new Error('hostile get trap');
       },
     });
     const second = await seededFixingHarness();
-    expect(refusedDetailOf(await prepareDirect(second, () => [lyingGet]))).toBe('prepare-no-failure-source');
+    expect(refusedDetailOf(await prepareDirect(second, () => [lyingGet]))).toBe('prepare-no-review-request');
+    expect(getCalls).toBe(0);
   });
 
   it('refuses prepare-no-failure-source and never runs an inherited accessor on an entry', async () => {

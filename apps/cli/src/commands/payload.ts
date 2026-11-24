@@ -96,17 +96,15 @@ export function strOrNull(payload: Payload, key: string): string | null {
  */
 function parseFiniteNumber(payload: Payload, key: string): number | undefined {
   if (key === '__proto__' || key === 'constructor' || key === 'prototype') return undefined;
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
-  // A Proxy can throw from its `getOwnPropertyDescriptor` trap (or be revoked)
-  // before any descriptor is read, and the descriptor object itself may be a
-  // Proxy whose traps throw on the `'value' in desc` membership test; both are
-  // refusals with the typed `undefined`, not propagated exceptions.
+  if (payload === null || typeof payload !== 'object') return undefined;
   // A Proxy can throw from its `getOwnPropertyDescriptor` trap (or be revoked)
   // before any descriptor is read, and the descriptor object itself may be a
   // Proxy whose traps throw on the `'value' in desc` membership test; both are
   // refusals with the typed `undefined`, not propagated exceptions.
   let desc: PropertyDescriptor | undefined;
   try {
+    // `Array.isArray` throws on a revoked Proxy, so it sits inside the guard.
+    if (Array.isArray(payload)) return undefined;
     desc = Object.getOwnPropertyDescriptor(payload, key);
     if (desc === undefined || !('value' in desc)) return undefined;
   } catch {

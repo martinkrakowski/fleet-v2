@@ -1121,7 +1121,12 @@ function fixingFailureSourceOf(
           continue;
         }
         if (record.reasonCode === 'gate-failed' && passedGateHeads.has(parsed.round + ':' + parsed.head12)) {
-          supersededRound = parsed.round;
+          // Walking backward, the FIRST superseded failure met is the most
+          // recent one: keep its round as the bound. An older superseded
+          // failure must never widen the bound to an earlier round.
+          if (supersededRound === null) {
+            supersededRound = parsed.round;
+          }
           continue;
         }
       }
@@ -1429,8 +1434,15 @@ async function fixPreparePriorSourceStep(shared: FixPrepareWired): Promise<FixPr
   if (head === null) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-no-head') };
   }
-  const entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
-  const failure = fixingFailureSourceOf(entries, shared.record.runId);
+  // Hostile input: awaiting a revoked Proxy listing reads its `then` and
+  // throws; any throw from the listing or the walk refuses, never escapes.
+  let failure: FixingSource | null;
+  try {
+    const entries = await shared.ctx.deps.runJournal.listForRun(shared.record.runId);
+    failure = fixingFailureSourceOf(entries, shared.record.runId);
+  } catch {
+    failure = null;
+  }
   if (failure === null) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-no-failure-source') };
   }

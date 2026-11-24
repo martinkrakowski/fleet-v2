@@ -851,6 +851,30 @@ describe('AdvanceLaneRunUseCase fix prepare after a retried gate pass (CB9)', ()
     });
   });
 
+  it('refuses prepare-no-failure-source when two rounds each had a superseded gate failure and only round 0 has a review failure', async () => {
+    // Walking backward meets the round-1 superseded failure first; the bound
+    // must stay at round 1, so the round-0 review failure is NOT accepted.
+    const harness = await makeHarness(runRecord(), [collectedAttempt(COMMIT_A)]);
+    await appendResult(harness, collectKey(), 'completed', 'collected', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    await appendIntent(harness, briefKey, null, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-failed', NOW);
+    await appendResult(harness, gateKey(HEAD12_A, null, 0), 'completed', 'gate-failed', NOW);
+    await appendResult(harness, gateKey(HEAD12_A, 1, 0), 'completed', 'gate-passed', NOW);
+    await appendResult(harness, gateKey(HEAD12_A, null, 1), 'completed', 'gate-failed', NOW);
+    await appendResult(harness, gateKey(HEAD12_A, 1, 1), 'completed', 'gate-passed', NOW);
+    await conduct(harness, 'fixing', NOW);
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'prepare-refused' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter(
+      (entry) => entry.kind === 'result' && entry.key === (result as { key: string }).key,
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ detail: 'prepare-no-failure-source' });
+  });
+
   it('omits the output tail when the evidence archive is absent or throws while keeping the failing predicate', async () => {
     const evidenceRef = 'evidence://dir/file@' + 'a'.repeat(64);
     const buildHarness = async (): Promise<Harness> => {

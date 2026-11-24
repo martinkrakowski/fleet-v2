@@ -9,9 +9,90 @@ import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js'
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunStopEffect } from '../../../domain/lane-run-transitions.js';
 import type { RunStopEffect, RunStopOutcome } from '../../../domain/lane-run-transitions.js';
+import type { AttemptRecord } from '../../../domain/execution-records.js';
 import { refreshGatheredJournalFacts } from './facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, performPark, refusedResult, releaseWorkOrderAtEnd } from './step-context.js';
+import { conductedRunnerOf } from './conducted-host.js';
+import { worktreeRecoveryPatchInputsValid } from './prepare-dispatch.js';
+
+/** CB3: the suffix that distinguishes a stop-timeout patch from a park or GB3 patch. */
+export const STOP_TIMEOUT_PATCH_SUFFIX = '.stop-timeout.patch';
+
+/** CB3: the journal detail prefix a stop-timeout patch is recorded under. */
+export const STOP_TIMEOUT_PRESERVE_DETAIL = 'stop-timeout worktree preserved: ';
+
+/** GB3's own marker: its presence means a recovery already owns this worktree. */
+const GB3_DETAIL = 'preserved uncommitted edits:';
+
+/**
+ * CB3: after a `stop-timeout`, the killed seat's worktree may still hold
+ * uncommitted tracked edits no commit carries and no next seat has yet been
+ * handed. This preserves them as a patch beside the worktree and journals
+ * where it went, mirroring F198's park preserve. Deliberately NON-DESTRUCTIVE:
+ * nothing is reset, cancelled or deleted, so the worktree a later fix seat
+ * receives under `allowUncommittedHandover` is unchanged and the patch is
+ * additive evidence. Never throws and never fails or alters the already
+ * recorded `stop-timeout` result: every refusal (unwired port, an invalid
+ * patch path, no runner host, a clean tree, an unreadable host) is silent.
+ */
+export async function preserveStoppedWorktree(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord | null,
+  nowIso: string,
+): Promise<void> {
+  if (latest === null) {
+    return;
+  }
+  const preserve = ctx.deps.worktreeRecovery?.preserveWorktreeEdits?.bind(ctx.deps.worktreeRecovery);
+  const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
+  if (preserve === undefined || append === undefined) {
+    return;
+  }
+  if (latest.worktreePath === null || !worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+    return;
+  }
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return;
+  }
+  try {
+    const patchPath = latest.worktreePath + '.' + latest.id + STOP_TIMEOUT_PATCH_SUFFIX;
+    const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
+    // Idempotent: a re-reconciled stop of the same attempt must not write a
+    // second entry, and `destination-exists` below would refuse the write anyway.
+    const owned = priorEntries.some((entry) => {
+      const detail = entry.detail ?? '';
+      return detail.startsWith(STOP_TIMEOUT_PRESERVE_DETAIL) || detail.startsWith(GB3_DETAIL);
+    });
+    if (owned) {
+      return;
+    }
+    const preserved = await preserve({ worktreePath: latest.worktreePath, patchPath, recordedHost });
+    // `nothing-to-preserve` is the common, healthy case: a clean worktree. Only
+    // a patch that now exists is worth a journal entry.
+    const saved =
+      preserved.outcome === 'preserved' ||
+      (preserved.outcome === 'refused' && preserved.reason === 'destination-exists');
+    if (!saved) {
+      return;
+    }
+    await append({
+      id: latest.id + ':dispatch:' + String(priorEntries.length + 1),
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: nowIso,
+      status: 'completed',
+      sessionId: null,
+      detail: STOP_TIMEOUT_PRESERVE_DETAIL + patchPath,
+    });
+  } catch {
+    // A stop-timeout result is never failed by its evidence step.
+  }
+}
 
 export type AbandonAmbiguousStopOutcome =
   | { readonly kind: 'unchanged' }
@@ -132,6 +213,9 @@ export async function performStop(ctx: AdvanceStepContext,
     if (resultRefusal !== null) {
       return refusedResult(resultRefusal);
     }
+    // CB3: preserve the killed seat's uncommitted tracked edits as a patch
+    // before handing the worktree on; silent, never alters this result.
+    await preserveStoppedWorktree(ctx, record, latest, request.nowIso);
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
   }
   if (mapped.outcome === 'still-running' || mapped.outcome === 'unknown') {

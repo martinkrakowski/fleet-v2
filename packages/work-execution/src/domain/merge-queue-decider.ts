@@ -64,6 +64,11 @@ export type MergeContextState = (typeof MERGE_CONTEXT_STATES)[number];
 export interface MergeContextFact {
   readonly state: MergeContextState;
   readonly creatorLogin?: string | null;
+  /**
+   * The deciding status's own creation time (the rollup node's `createdAt`).
+   * Absent or null is unobservable: only the shadow retro check reads it.
+   */
+  readonly createdAtIso?: string | null;
 }
 
 export type MergePrFact =
@@ -117,6 +122,12 @@ export interface MergeStepFacts {
   readonly lastForgeOutcome?: MergeLastForgeOutcomeFact | null;
   /** The base branch the forge read the pull request against; absent means unobserved. */
   readonly observedBaseBranch?: unknown;
+  /**
+   * The merge-commit time the forge read observed; null or absent means the
+   * merge time was not observable on that read. Only the shadow retro
+   * check (EV2) reads it.
+   */
+  readonly mergedAtIso?: string | null;
 }
 
 export interface MergeRepoPolicy {
@@ -716,24 +727,63 @@ function classifyContext(
   return 'failed';
 }
 
+/**
+ * Own data value, or `undefined` when the key is absent. An accessor is
+ * refused and never invoked: `[[Get]]` is not used.
+ */
+function readOwnData(record: Record<string, unknown>, key: string): Read<unknown> {
+  const descriptor = Reflect.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    return { ok: false };
+  }
+  return { ok: true, value: descriptor.value };
+}
+
 /** Reads the own enumerable descriptor so a hostile getter never runs. */
 function readContextFact(container: Record<string, unknown>, name: string): Read<MergeContextFact> {
   const descriptor = Reflect.getOwnPropertyDescriptor(container, name);
   if (descriptor === undefined) {
     return { ok: true, value: { state: 'missing' } };
   }
-  if (!descriptor.enumerable || !isPlainObject(descriptor.value)) {
+  if (
+    descriptor.get !== undefined || descriptor.set !== undefined ||
+    !descriptor.enumerable || !isPlainObject(descriptor.value)
+  ) {
     return { ok: false };
   }
   const value = descriptor.value as Record<string, unknown>;
-  if (!isKnownStatus(value.state, MERGE_CONTEXT_STATES)) {
+  const state = readOwnData(value, 'state');
+  if (!state.ok || !isKnownStatus(state.value, MERGE_CONTEXT_STATES)) {
     return { ok: false };
   }
-  const creator = value.creatorLogin;
-  if (creator !== undefined && creator !== null && typeof creator !== 'string') {
+  const creator = readOwnData(value, 'creatorLogin');
+  if (!creator.ok) {
     return { ok: false };
   }
-  return { ok: true, value: { state: value.state as MergeContextState, creatorLogin: creator as string | null | undefined } };
+  if (creator.value !== undefined && creator.value !== null && typeof creator.value !== 'string') {
+    return { ok: false };
+  }
+  // The retro timestamp is optional; a present one must be a zoned instant.
+  // A garbage value, or a getter, fails closed here so no row can read it as
+  // observable. The merge state at merge time stays unobservable.
+  const created = readOwnData(value, 'createdAtIso');
+  if (!created.ok) {
+    return { ok: false };
+  }
+  if (created.value !== undefined && created.value !== null && !isZonedIsoDateTime(created.value)) {
+    return { ok: false };
+  }
+  return {
+    ok: true,
+    value: {
+      state: state.value as MergeContextState,
+      creatorLogin: creator.value as string | null | undefined,
+      createdAtIso: created.value as string | null | undefined,
+    },
+  };
 }
 
 interface ChecksOutcome {
@@ -1150,5 +1200,193 @@ export function decideMergeStep(
     return decideRows(record, validated.value, policy, nowIso);
   } catch {
     return FACTS_INCONSISTENT;
+  }
+}
+
+/** Bounds of the retro preflight accessor walk; past either bound the walk fails closed. */
+const RETRO_ACCESSOR_SCAN_MAX_DEPTH = 6;
+const RETRO_ACCESSOR_SCAN_MAX_KEYS = 4096;
+
+/**
+ * True when any own property, at any depth up to the bound, of `raw` is an
+ * accessor, is symbol-keyed, or is a prototype-polluting key (`__proto__`,
+ * `constructor`, `prototype`), or when the walk exceeds its depth or key
+ * budget. Reads own descriptors only, so no getter is ever invoked.
+ * Cost bound: O(RETRO_ACCESSOR_SCAN_MAX_KEYS).
+ */
+function hasAccessorDeep(raw: unknown): boolean {
+  let budget = RETRO_ACCESSOR_SCAN_MAX_KEYS;
+  const walk = (value: unknown, depth: number): boolean => {
+    if (value === null || typeof value !== 'object') {
+      return false;
+    }
+    if (depth > RETRO_ACCESSOR_SCAN_MAX_DEPTH) {
+      return true;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      budget -= 1;
+      if (budget < 0) {
+        return true;
+      }
+      // A symbol-keyed own property (e.g. a data-valued `Symbol.iterator`
+      // that yields forever) or a prototype-polluting key at ANY depth is
+      // refused: JSON-shaped facts and policy never carry either.
+      if (typeof key === 'symbol' || key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        return true;
+      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined) {
+        continue;
+      }
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return true;
+      }
+      if (walk(descriptor.value, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return walk(raw, 0);
+}
+
+type RetroRecord = Extract<ReturnType<typeof readMergeQueueEntryRecord>, { ok: true }>['record'];
+type RetroFacts = Extract<ReturnType<typeof validateFacts>, { ok: true }>['value'];
+type RetroPolicy = NonNullable<ReturnType<typeof normalizeRepoPolicy>>;
+
+/**
+ * True when a raw record has an own numeric or accessor `length` (an
+ * array-like) or a prototype-polluting own key. Reads own descriptors only;
+ * cost O(1).
+ */
+function isArrayLikeOrPolluting(raw: Record<string, unknown>): boolean {
+  const length = Reflect.getOwnPropertyDescriptor(raw, 'length');
+  if (length !== undefined && (length.get !== undefined || length.set !== undefined || typeof length.value === 'number')) {
+    return true;
+  }
+  return ['__proto__', 'constructor', 'prototype'].some((key) => Reflect.getOwnPropertyDescriptor(raw, key) !== undefined);
+}
+
+/**
+ * The retro preflight over the raw inputs, before anything is normalized or
+ * validated: an array-like or prototype-polluting policy or facts record, or
+ * an accessor ANYWHERE in either (every own key at every depth, bounded by
+ * RETRO_ACCESSOR_SCAN_MAX_DEPTH / _MAX_KEYS, failing closed past a bound), is
+ * refused, so no getter is ever invoked. Cost O(RETRO_ACCESSOR_SCAN_MAX_KEYS).
+ */
+function retroInputsHostile(repoPolicy: unknown, facts: unknown): boolean {
+  if (isPlainObject(repoPolicy) && isArrayLikeOrPolluting(repoPolicy as Record<string, unknown>)) {
+    return true;
+  }
+  if (isPlainObject(facts) && isArrayLikeOrPolluting(facts as Record<string, unknown>)) {
+    return true;
+  }
+  return hasAccessorDeep(repoPolicy) || hasAccessorDeep(facts);
+}
+
+/**
+ * The live path's decider predicates on the merged head: the entry head is
+ * the merged head (and the re-read agrees), every required context is green
+ * with the premerge posted by the configured poster, threads are known and
+ * zero, no veto holds, the observed base matches, and no macOS procedure is
+ * owed. Cost O(|policy.requiredContexts|).
+ */
+function retroDeciderWouldMerge(record: RetroRecord, facts: RetroFacts, policy: RetroPolicy, nowIso: string): boolean {
+  // A parked entry is eligible only when its park reason was `checks` —
+  // the one park the retro re-enters through the live predicates.
+  if (record.state === 'parked' && record.reason !== 'checks') {
+    return false;
+  }
+  const pr = facts.pr;
+  if (pr.status !== 'merged' || !isMergeHex40(pr.headOid) || pr.headOid !== record.headOid) {
+    return false;
+  }
+  const reRead = facts.reReadHeadOid;
+  if (reRead !== undefined && (!isMergeHex40(reRead) || reRead !== record.headOid)) {
+    return false;
+  }
+  const checks = checksStep(record, facts, policy, nowIso, Date.parse(nowIso));
+  if (checks.decision !== null || checks.deferCarry || threadsStep(record, facts) !== null) {
+    return false;
+  }
+  const resolvedVeto = resolveVeto(record, facts);
+  if (resolvedVeto === VETO_UNREADABLE) {
+    return false;
+  }
+  const verdict = evaluateMergeVeto(resolvedVeto, { mode: policy.vetoMode, holdConfidence: policy.holdConfidence });
+  if (verdict === 'act-veto' || verdict === 'park-hold' || verdict === 'would-hold') {
+    return false;
+  }
+  // A macOS procedure row exists on the live path; a retro head that owes
+  // one cannot be estimated from the facts gathered, so it refuses.
+  return observedBaseStep(record, facts) === null && policy.macosProcedure === null;
+}
+
+/**
+ * The merge state at merge time is unobservable (owner-accepted residual for
+ * `detail: 'retro'` rows, 2026-11-24). The retro estimate needs the
+ * merge-commit time and every required context's own creation time, each at
+ * or before the merge: a missing or unparsable timestamp refuses.
+ * Cost O(|policy.requiredContexts|).
+ */
+function retroChecksPredateMerge(facts: RetroFacts, policy: RetroPolicy): boolean {
+  const mergedAt = facts.mergedAtIso;
+  if (typeof mergedAt !== 'string' || !isZonedIsoDateTime(mergedAt)) {
+    return false;
+  }
+  const mergedAtMs = Date.parse(mergedAt);
+  const contexts = facts.contexts;
+  if (!isPlainObject(contexts)) {
+    return false;
+  }
+  return policy.requiredContexts.every((name) => {
+    const fact = readContextFact(contexts as Record<string, unknown>, name);
+    if (!fact.ok) {
+      return false;
+    }
+    const createdAt = fact.value.createdAtIso;
+    return typeof createdAt === 'string' && isZonedIsoDateTime(createdAt) && Date.parse(createdAt) < mergedAtMs;
+  });
+}
+
+/**
+ * EV2: the shadow retro `would-merge` for a head the pass first sees as
+ * already merged. Re-evaluates the live path's decider predicates on the
+ * facts already gathered for that merged head, plus the facts the live path
+ * cannot have observed at all: the merge-commit time and each required
+ * context's own creation time, so the merge state at merge time stays
+ * unobservable and the retro verdict is an estimate, never a record of it.
+ * Fails closed: every hostile input reads as ineligible (`false`), and a
+ * getter is never invoked.
+ *
+ * Cost bound: O(|policy.requiredContexts|) where
+ * `requiredContexts.length <= 32` (enforced by `readRequiredContexts`);
+ * every other check is O(1) (the own-descriptor getter probes are constant
+ * reads, and the timestamp comparisons are two parses per required
+ * context, part of the same linear term).
+ */
+export function isMergedHeadRetroMergeEligible(
+  entry: unknown,
+  facts: unknown,
+  repoPolicy: MergeRepoPolicy | null,
+  nowIso: string,
+): boolean {
+  try {
+    const read = readMergeQueueEntryRecord(entry);
+    if (!read.ok || !isZonedIsoDateTime(nowIso) || retroInputsHostile(repoPolicy, facts)) {
+      return false;
+    }
+    const validated = validateFacts(facts);
+    const policy = normalizeRepoPolicy(repoPolicy);
+    // The shadow retro is a shadow-only estimate; a live policy never acts.
+    if (!validated.ok || policy === null || policy.shadow !== true) {
+      return false;
+    }
+    return (
+      retroDeciderWouldMerge(read.record, validated.value, policy, nowIso) &&
+      retroChecksPredateMerge(validated.value, policy)
+    );
+  } catch {
+    return false;
   }
 }

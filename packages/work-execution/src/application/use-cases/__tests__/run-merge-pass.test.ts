@@ -333,6 +333,7 @@ const greenForge: ReadForgeMergeResult = {
   prState: 'open',
   liveHeadSha: HEAD,
   mergeState: 'clean',
+  mergedAtIso: null,
   contexts: greenContexts(),
   unresolvedThreads: 0,
 };

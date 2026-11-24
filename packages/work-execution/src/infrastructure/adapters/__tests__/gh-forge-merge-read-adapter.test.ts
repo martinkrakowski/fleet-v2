@@ -30,6 +30,7 @@ interface PageOverrides {
   headRefOid?: string;
   mergeStateStatus?: string | null;
   baseRefName?: unknown;
+  mergedAt?: unknown;
   contextsNodes?: unknown[];
   contextsHasNextPage?: boolean;
   contextsEndCursor?: string | null;
@@ -47,6 +48,7 @@ function page(overrides: PageOverrides = {}): string {
           headRefOid: overrides.headRefOid ?? VALID_SHA,
           mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
           baseRefName: 'baseRefName' in overrides ? overrides.baseRefName : 'main',
+          mergedAt: 'mergedAt' in overrides ? overrides.mergedAt : null,
           statusCheckRollup: {
             contexts: {
               pageInfo: {
@@ -69,21 +71,33 @@ function page(overrides: PageOverrides = {}): string {
   });
 }
 
-function checkRun(name: string, conclusion: string, login: string | null = null): Record<string, unknown> {
+function checkRun(
+  name: string,
+  conclusion: string,
+  login: string | null = null,
+  createdAt: unknown = null,
+): Record<string, unknown> {
   return {
     __typename: 'CheckRun',
     name,
     status: 'COMPLETED',
     conclusion,
+    completedAt: createdAt,
     creator: login === null ? null : { login },
   };
 }
 
-function statusContext(context: string, state: string, login: string | null = null): Record<string, unknown> {
+function statusContext(
+  context: string,
+  state: string,
+  login: string | null = null,
+  createdAt: unknown = null,
+): Record<string, unknown> {
   return {
     __typename: 'StatusContext',
     context,
     state,
+    createdAt,
     creator: login === null ? null : { login },
   };
 }
@@ -140,6 +154,14 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(queryArg).toContain('$threadsAfter');
     expect(queryArg).toContain('statusCheckRollup');
     expect(queryArg).toContain('reviewThreads');
+    // Schema pin: GitHub's CheckRun has no `createdAt` (selecting it makes the
+    // whole query fail); it is read from `completedAt`. StatusContext keeps `createdAt`.
+    const checkRunSelection = /\.\.\. on CheckRun \{([^}]*)\}/.exec(queryArg ?? '')?.[1] ?? '';
+    const statusSelection = /\.\.\. on StatusContext \{([^}]*creator[^}]*\}[^}]*)\}/.exec(queryArg ?? '')?.[1] ?? '';
+    expect(checkRunSelection).toContain('completedAt');
+    expect(checkRunSelection).not.toMatch(/\bcreatedAt\b/);
+    expect(checkRunSelection).not.toMatch(/\bstartedAt\b/);
+    expect(statusSelection).toMatch(/\bcreatedAt\b/);
     expect(queryArg).toContain('creator { login }');
     expect(queryArg).not.toMatch(/\.\.\.\s*on\s*CheckRun\s*\{[^}]*creator/);
   });
@@ -170,9 +192,10 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'clean',
       baseRef: 'main',
+      mergedAtIso: null,
       contexts: [
-        { name: 'gate', state: 'SUCCESS', isGreen: true, creatorLogin: null },
-        { name: 'premerge', state: 'missing', isGreen: false, creatorLogin: null },
+        { name: 'gate', state: 'SUCCESS', isGreen: true, creatorLogin: null, createdAtIso: null },
+        { name: 'premerge', state: 'missing', isGreen: false, creatorLogin: null, createdAtIso: null },
       ],
       unresolvedThreads: 0,
     });
@@ -733,6 +756,46 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'premerge', isGreen: false }] });
   });
 
+  it('keeps the LATEST createdAt when one creator reports a context SUCCESS twice, in either order', async () => {
+    const early = '2026-11-01T10:00:00.000Z';
+    const late = '2026-11-01T12:00:00.000Z';
+    for (const nodes of [
+      [checkRun('gate', 'SUCCESS', 'runner', early), checkRun('gate', 'SUCCESS', 'runner', late)],
+      [checkRun('gate', 'SUCCESS', 'runner', late), checkRun('gate', 'SUCCESS', 'runner', early)],
+    ]) {
+      const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ contextsNodes: nodes }), stderr: '' });
+      const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+      expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'gate', isGreen: true, createdAtIso: late }] });
+    }
+  });
+
+  it('reports a null createdAt when either duplicate SUCCESS lacks a parseable createdAt', async () => {
+    const at = '2026-11-01T10:00:00.000Z';
+    for (const nodes of [
+      [checkRun('gate', 'SUCCESS', 'runner', at), checkRun('gate', 'SUCCESS', 'runner', null)],
+      [checkRun('gate', 'SUCCESS', 'runner', null), checkRun('gate', 'SUCCESS', 'runner', at)],
+      [checkRun('gate', 'SUCCESS', 'runner', at), checkRun('gate', 'SUCCESS', 'runner', 'not-a-time')],
+    ]) {
+      const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ contextsNodes: nodes }), stderr: '' });
+      const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+      expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'gate', createdAtIso: null }] });
+    }
+  });
+
+  it('keeps the LATEST createdAt and drops the creator when two creators report a context SUCCESS', async () => {
+    const early = '2026-11-01T10:00:00.000Z';
+    const late = '2026-11-01T12:00:00.000Z';
+    const stdout = page({
+      contextsNodes: [statusContext('gate', 'SUCCESS', 'a', early), statusContext('gate', 'SUCCESS', 'b', late)],
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      contexts: [{ name: 'gate', creatorLogin: null, createdAtIso: late }],
+    });
+  });
+
   it('fails as unknown when a finished contexts connection changes in a replay', async () => {
     const responses = [
       page({
@@ -976,8 +1039,8 @@ describe('pure GraphQL parsers', () => {
     expect(result).toEqual({
       kind: 'page',
       nodes: [
-        { name: 'gate', state: 'SUCCESS', creatorLogin: 'runner' },
-        { name: 'premerge', state: 'PENDING', creatorLogin: null },
+        { name: 'gate', state: 'SUCCESS', creatorLogin: 'runner', createdAtIso: null },
+        { name: 'premerge', state: 'PENDING', creatorLogin: null, createdAtIso: null },
       ],
       hasNextPage: false,
       endCursor: null,
@@ -1004,6 +1067,7 @@ describe('pure GraphQL parsers', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'blocked',
       baseRef: 'main',
+      mergedAtIso: null,
     });
   });
 
@@ -1019,6 +1083,37 @@ describe('pure GraphQL parsers', () => {
       liveHeadSha: VALID_SHA,
       mergeState: 'clean',
       baseRef: 'chain/example',
+      mergedAtIso: null,
+    });
+  });
+
+  // EV2: the merge-commit time and each node's own creation time are read
+  // as zoned instants; a missing or unparsable value is null (the retro
+  // check refuses an unobservable merge time).
+  it('parseMergePrMeta reads mergedAt as a zoned instant and null when absent or unparsable', () => {
+    const parsed = parseMergePrMeta(page({ mergedAt: '2026-11-01T11:00:00.000Z' }));
+    expect(parsed).toMatchObject({ kind: 'ok', mergedAtIso: '2026-11-01T11:00:00.000Z' });
+    const unparsable = parseMergePrMeta(page({ mergedAt: 'not-a-timestamp' }));
+    expect(unparsable.kind === 'ok' ? unparsable.mergedAtIso : null).toBeNull();
+  });
+
+  it('parseMergeContextsPage reads each node createdAt as a zoned instant and null when unparsable', () => {
+    const result = parseMergeContextsPage(
+      page({
+        contextsNodes: [
+          checkRun('gate', 'SUCCESS', null, '2026-11-01T10:30:00.000Z'),
+          statusContext('premerge', 'SUCCESS', null, 'garbage'),
+        ],
+      }),
+    );
+    expect(result).toEqual({
+      kind: 'page',
+      nodes: [
+        { name: 'gate', state: 'SUCCESS', creatorLogin: null, createdAtIso: '2026-11-01T10:30:00.000Z' },
+        { name: 'premerge', state: 'SUCCESS', creatorLogin: null, createdAtIso: null },
+      ],
+      hasNextPage: false,
+      endCursor: null,
     });
   });
 

@@ -520,6 +520,7 @@ function copyRead(read: unknown): unknown {
     prState: read['prState'],
     liveHeadSha: read['liveHeadSha'],
     mergeState: read['mergeState'],
+    mergedAtIso: read['mergedAtIso'],
     unresolvedThreads: read['unresolvedThreads'],
     contexts: Array.isArray(contexts)
       ? Array.from(contexts as readonly unknown[], (context) =>
@@ -529,6 +530,7 @@ function copyRead(read: unknown): unknown {
                 state: context['state'],
                 isGreen: context['isGreen'],
                 creatorLogin: context['creatorLogin'],
+                createdAtIso: context['createdAtIso'],
               }
             : context,
         )
@@ -543,12 +545,14 @@ function snapshotRead(read: ReadForgeMergeResult): ReadForgeMergeResult {
       prState: read.prState,
       liveHeadSha: read.liveHeadSha,
       mergeState: read.mergeState,
+      mergedAtIso: read.mergedAtIso,
       unresolvedThreads: read.unresolvedThreads,
       contexts: read.contexts.map((context) => ({
         name: context.name,
         state: context.state,
         isGreen: context.isGreen,
         creatorLogin: context.creatorLogin,
+        createdAtIso: context.createdAtIso,
       })),
     };
   }

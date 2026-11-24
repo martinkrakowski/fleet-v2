@@ -31,7 +31,7 @@ import type {
   MergeStepDecision,
   MergeStepFacts,
 } from '../../domain/merge-queue-decider.js';
-import { decideMergeStep, premergeLoginsMatch } from '../../domain/merge-queue-decider.js';
+import { decideMergeStep, isMergedHeadRetroMergeEligible, premergeLoginsMatch } from '../../domain/merge-queue-decider.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
@@ -229,19 +229,20 @@ function isQueueDeadlineError(error: unknown): boolean {
 
 /** Raw check-rollup token → the decider's context state; anything else fails closed. */
 function contextStateOf(snapshot: MergeContextSnapshot): MergeContextFact {
+  const createdAtIso = snapshot.createdAtIso;
   if (snapshot.state === 'missing') {
-    return { state: 'missing', creatorLogin: snapshot.creatorLogin };
+    return { state: 'missing', creatorLogin: snapshot.creatorLogin, createdAtIso };
   }
   if (CONTEXT_SUCCESS_TOKENS.has(snapshot.state)) {
-    return { state: 'success', creatorLogin: snapshot.creatorLogin };
+    return { state: 'success', creatorLogin: snapshot.creatorLogin, createdAtIso };
   }
   if (CONTEXT_PENDING_TOKENS.has(snapshot.state)) {
-    return { state: 'pending', creatorLogin: snapshot.creatorLogin };
+    return { state: 'pending', creatorLogin: snapshot.creatorLogin, createdAtIso };
   }
   if (CONTEXT_FAILED_TOKENS.has(snapshot.state)) {
-    return { state: 'failure', creatorLogin: snapshot.creatorLogin };
+    return { state: 'failure', creatorLogin: snapshot.creatorLogin, createdAtIso };
   }
-  return { state: 'failure', creatorLogin: snapshot.creatorLogin };
+  return { state: 'failure', creatorLogin: snapshot.creatorLogin, createdAtIso };
 }
 
 /** The observed-base fact: the key exists only when the forge read carried a base (OG-7). */
@@ -443,7 +444,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
         await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
       }
     }
-    return this.actOnDecision(request, current, decision);
+    return this.actOnDecision(request, current, decision, facts);
   }
 
   /** The shadow action this decision journals now, if any (its own open intent is completed, not closed). */
@@ -480,11 +481,75 @@ export class RunMergePassUseCase implements RunMergePassPort {
     );
   }
 
+  /**
+   * Shadow `already-merged` (SH24a + EV2): journal the dry-run so
+   * shadow-effective liveness can exclude the entry, preceded on the first
+   * observation by the retro `would-merge` when the decider would have merged
+   * that exact head with every required check created before the merge.
+   */
+  private async actOnShadowAlreadyMerged(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    facts: MergeStepFacts,
+  ): Promise<MergePassEntryReport> {
+    // SH24a: the forge says the PR is merged; journal the dry-run so
+    // shadow-effective liveness can exclude the entry without a write.
+    // EV2: on the FIRST already-merged observation for this head12
+    // (no `would-already-merged` result yet), re-evaluate the live
+    // path's decider predicates on the facts already gathered; if they
+    // all pass, the retro `would-merge` is journaled first, keyed with
+    // the merged head as its linkedId, before `would-already-merged`.
+    const head12 = head12Of(entry.headOid);
+    const built = buildMergeKey({
+      repoDigest: request.repoDigest,
+      pullRequest: entry.pullRequest,
+      head12: head12 ?? '',
+      action: 'would-already-merged',
+      attemptOrdinal: null,
+      retry: null,
+    });
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'key-refused', null);
+    }
+    this.ensureBudget(request); // D-DT9: guard before the journal read
+    const existing = await this.deps.journal.listForKey(built.key);
+    if (existing.some((candidate) => candidate.kind === 'result')) {
+      return this.report(entry, 'no-action', 'already-journalled', null);
+    }
+    if (isMergedHeadRetroMergeEligible(entry, facts, request.policy, this.deps.nowIso())) {
+      // A refused retro append must not be followed by `would-already-merged`:
+      // that result is the first-observation mark, and writing it would
+      // make the retro unrecoverable. An already-journalled `would-merge`
+      // (a prior pass wrote it, then stopped) still continues, so the
+      // already-merged pair can be completed.
+      const retro = await this.journalShadowAct(
+        request,
+        entry,
+        {
+          kind: 'act',
+          action: 'merge-pr',
+          execution: 'shadow',
+          shadowReason: 'would-merge',
+          expectedHeadOid: entry.headOid,
+          receiptHeadOid: null,
+          procedure: null,
+          vetoShadow: null,
+        },
+        'retro',
+      );
+      if (retro.decision !== 'journalled' && retro.reasonCode !== 'already-journalled') {
+        return retro;
+      }
+    }
+    return this.journalShadowOutcome(request, entry, 'would-already-merged', null);
+  }
+
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
   private async actOnDecision(
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
     decision: MergeStepDecision,
+    facts: MergeStepFacts,
   ): Promise<MergePassEntryReport> {
     if (decision.kind === 'act') {
       if (decision.action === 'macos-verify') {
@@ -504,9 +569,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
     if (decision.kind === 'wait') {
       if (request.policy.shadow === true && decision.reason === 'already-merged') {
-        // SH24a: the forge says the PR is merged; journal the dry-run so
-        // shadow-effective liveness can exclude the entry without a write.
-        return this.journalShadowOutcome(request, entry, 'would-already-merged', null);
+        return this.actOnShadowAlreadyMerged(request, entry, facts);
       }
       return this.report(entry, 'no-action', decision.reason, null);
     }
@@ -594,7 +657,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       };
       next = decideMergeStep(acting, unrecorded, request.policy, this.deps.nowIso());
     }
-    return this.actOnDecision(request, acting, next);
+    return this.actOnDecision(request, acting, next, successorFacts);
   }
 
   /**
@@ -864,11 +927,12 @@ export class RunMergePassUseCase implements RunMergePassPort {
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
     decision: Extract<MergeStepDecision, { kind: 'act' }>,
+    detail: string | null = null,
   ): Promise<MergePassEntryReport> {
     const action: MergeKeyAction = decision.action === 'premerge-carry' ? 'post-status' : decision.action;
     // SH24a (S1): a `would-merge` result names the head it would merge, so
     // the head12 of an unpersisted in-memory successor stays resolvable.
-    return this.journalWould(request, entry, action, decision.shadowReason, null,
+    return this.journalWould(request, entry, action, decision.shadowReason, detail,
       decision.action === 'merge-pr' ? entry.headOid : undefined);
   }
 
@@ -1174,6 +1238,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
       veto,
       lastForgeOutcome: undefined,
       ...observedBaseFact(read),
+      // EV2: the merge-commit time the forge read observed (null when the
+      // forge did not report one); only the shadow retro check reads it.
+      ...('mergedAtIso' in read ? { mergedAtIso: read.mergedAtIso } : {}),
     };
   }
 

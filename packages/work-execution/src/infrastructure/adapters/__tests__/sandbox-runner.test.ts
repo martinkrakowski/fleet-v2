@@ -366,6 +366,8 @@ describe('SandboxRunnerAdapter', () => {
     });
 
     it('returns unknown when a confirmed driver result carries an unusable sessionId', async () => {
+      // Control: a clean confirmed result starts, so a constant `unknown` fails this test.
+      await expectStarted(makeAdapter().adapter);
       const { adapter, driver } = makeAdapter();
       driver.createResult = { outcome: 'confirmed', sessionId: 'x'.repeat(129) };
       const result = await adapter.startSession(startRequest());
@@ -414,6 +416,8 @@ describe('SandboxRunnerAdapter', () => {
     });
 
     it('always refuses when the adapter filesystemScope is unknown', async () => {
+      // Control: the same request on a clean adapter starts, so a constant `refused` fails this test.
+      await expectStarted(makeAdapter().adapter);
       const { adapter, driver } = makeAdapter({
         capabilities: {
           ...DECLARED_CAPS,

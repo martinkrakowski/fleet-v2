@@ -1411,15 +1411,24 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
-  it('a park intent while the state is merged, stopped or parked yields fail/stray-one-way-action', () => {
+  it('a park intent while the state is merged or stopped yields fail/stray-one-way-action', () => {
     const base = added();
     const key = oneWayKey(base.run.runId, 'park', null, null);
-    for (const state of ['merged', 'stopped', 'parked']) {
+    for (const state of ['merged', 'stopped']) {
       const broken = extendJournal(base, [conductAt(state, at), intentAt(key, at)]);
       expect(evaluate(onTop(broken))).toEqual(
         scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
       );
     }
+  });
+
+  it('a park intent while the state is parked conforms', () => {
+    // CE1w: the commit-pending escalation journals its one-way park intent
+    // from `parked`. That intent is in the park row, so it is not stray.
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null);
+    const run = extendJournal(base, [conductAt('parked', at), intentAt(key, at)]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
   });
 
   it('an entry with an unparseable key is ignored', () => {
@@ -1466,10 +1475,11 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect([...SHADOW_ONE_WAY_STEP_STATES['open-pr']]).toEqual(['opening-pr']);
     expect([...SHADOW_ONE_WAY_STEP_STATES.push]).toEqual(['pushing']);
     expect([...SHADOW_ONE_WAY_STEP_STATES.merge]).toEqual(['merging']);
-    const blocked = ['merged', 'stopped', 'parked'];
+    const blocked = ['merged', 'stopped'];
     const park = [...SHADOW_ONE_WAY_STEP_STATES.park];
     expect(park).toEqual(LANE_RUN_STATES.filter((state) => !blocked.includes(state)));
     expect(park).toHaveLength(LANE_RUN_STATES.length - blocked.length);
+    expect(park).toContain('parked');
     for (const state of blocked) expect(park).not.toContain(state);
   });
 });

@@ -25,6 +25,7 @@ import {
   admissionClassCap,
   changesOverlap,
   classifyChange,
+  validateBatchPolicy,
   type AdmissionClass,
   type BatchPolicy,
 } from './admission-policy.js';
@@ -60,6 +61,8 @@ export interface BatchFormationInput {
 /**
  * The formation decision. File compatibility inside a batch is a scheduling
  * heuristic, never proof; the validation gate still decides what lands.
+ * `none` with reason `walk-budget-exceeded` is the typed refusal when the
+ * admission walk spends its total visit budget.
  */
 export type BatchFormationDecision =
   | {
@@ -79,21 +82,41 @@ export type BatchFormationDecision =
   | { readonly kind: 'none'; readonly reason: string; readonly skipped?: readonly SkippedCandidate[] };
 
 /**
- * Walk bound for a caller-supplied list. This function has no clock and no
- * I/O, so a proxy or sparse array that reports an enormous length is refused
- * before the loop. That length cap is the cost bound.
+ * Per-list walk bound. This function has no clock and no I/O, so a proxy or
+ * sparse array that reports an enormous length is refused before the loop.
  */
 const MAX_WALK = 100_000;
 
+/**
+ * Cost bound for one admission walk: one charge per candidate and one charge
+ * per changedPaths element, taken before that element is read. MAX_WALK caps
+ * each array alone, so 100_000 candidates sharing one 100_000-element path
+ * list would otherwise copy that list once per candidate. 200_000 charges
+ * cover one full candidate list and one full path list, and not a second full
+ * copy. The next element is not read, and formBatch returns
+ * `{ kind: 'none', reason: 'walk-budget-exceeded' }`.
+ */
+const MAX_TOTAL_WALK = 200_000;
+
 const PREMERGE_PENDING = 'premerge-pending';
 const PREMERGE_UNKNOWN = 'premerge-unknown';
+const WALK_BUDGET_EXCEEDED = 'walk-budget-exceeded';
 
 type ReadResult = { readonly ok: true; readonly value: unknown } | { readonly ok: false };
 
 type CandidateOutcome =
   | { readonly kind: 'admit'; readonly candidate: AdmissionCandidate }
   | { readonly kind: 'silent' }
-  | { readonly kind: 'skip'; readonly record: SkippedCandidate };
+  | { readonly kind: 'skip'; readonly record: SkippedCandidate }
+  | { readonly kind: 'budget' };
+
+type PathsRead =
+  | { readonly ok: true; readonly paths: readonly string[] }
+  | { readonly ok: false; readonly reason: 'invalid' | 'budget' };
+
+interface WalkBudget {
+  readonly charge: () => boolean;
+}
 
 interface ParsedFormation {
   readonly candidates: readonly unknown[];
@@ -196,26 +219,66 @@ function readPolicy(value: unknown): BatchPolicy | undefined {
     return undefined;
   }
   // Fresh object: later reads cannot re-enter a throwing getter, and no caller key is copied.
-  return { maxBatchSize, minBatchSize, collectionWaitMs, speculativeDepth };
+  // The same constraints as every other policy intake: integers, positive sizes,
+  // a non-negative collection wait, and minBatchSize <= maxBatchSize.
+  const validated = validateBatchPolicy({
+    maxBatchSize,
+    minBatchSize,
+    collectionWaitMs,
+    speculativeDepth,
+  });
+  if (!validated.ok) {
+    return undefined;
+  }
+  return validated.value;
 }
 
-function readChangedPaths(candidate: object): readonly string[] | undefined {
+function createWalkBudget(limit: number): WalkBudget {
+  let remaining = limit;
+  return {
+    charge: (): boolean => {
+      if (remaining <= 0) {
+        return false;
+      }
+      remaining -= 1;
+      return true;
+    },
+  };
+}
+
+/**
+ * Copy changedPaths, charging one visit per element before that element is
+ * read. Spending the budget refuses the whole admission walk. A bad element
+ * refuses only this candidate, as an unreadable path list already did.
+ */
+function readChangedPaths(candidate: object, budget: WalkBudget): PathsRead {
   const read = readProperty(candidate, 'changedPaths');
-  if (!read.ok) {
-    return undefined;
+  if (!read.ok || !isArray(read.value)) {
+    return { ok: false, reason: 'invalid' };
   }
-  const list = readList(read.value);
-  if (list === undefined) {
-    return undefined;
+  const length = readWalkLength(read.value);
+  if (length === undefined) {
+    return { ok: false, reason: 'invalid' };
   }
+  const list = read.value;
   const paths: string[] = [];
-  for (const item of list) {
+  for (let index = 0; index < length; index += 1) {
+    if (!budget.charge()) {
+      return { ok: false, reason: 'budget' };
+    }
+    let item: unknown;
+    try {
+      item = list[index];
+    } catch {
+      // An unreadable element is a bad path list, not an escape.
+      return { ok: false, reason: 'invalid' };
+    }
     if (typeof item !== 'string') {
-      return undefined;
+      return { ok: false, reason: 'invalid' };
     }
     paths.push(item);
   }
-  return paths;
+  return { ok: true, paths };
 }
 
 function readSkipIdentity(entry: object): { readonly prNumber: number; readonly headSha: string } | undefined {
@@ -248,7 +311,7 @@ function skipOrOmit(entry: object, reason: string): CandidateOutcome {
  * The copy is what later steps read, so a getter cannot throw on a second access
  * and the caller's object is never written.
  */
-function considerCandidate(value: unknown): CandidateOutcome {
+function considerCandidate(value: unknown, budget: WalkBudget): CandidateOutcome {
   if (!isRecord(value)) {
     return { kind: 'silent' };
   }
@@ -293,9 +356,16 @@ function considerCandidate(value: unknown): CandidateOutcome {
   if (!isSha40(identity.headSha)) {
     return { kind: 'skip', record: { prNumber: identity.prNumber, headSha: identity.headSha, reason: PREMERGE_UNKNOWN } };
   }
-  const changedPaths = readChangedPaths(value);
+  const pathsRead = readChangedPaths(value, budget);
+  if (!pathsRead.ok) {
+    if (pathsRead.reason === 'budget') {
+      return { kind: 'budget' };
+    }
+    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+  }
+  const changedPaths = pathsRead.paths;
   const enqueuedAtMs = readFiniteNumber(value, 'enqueuedAtMs');
-  if (changedPaths === undefined || enqueuedAtMs === undefined) {
+  if (enqueuedAtMs === undefined) {
     return skipOrOmit(entry, PREMERGE_UNKNOWN);
   }
 
@@ -316,15 +386,27 @@ function considerCandidate(value: unknown): CandidateOutcome {
   return { kind: 'admit', candidate: admitted };
 }
 
+type PoolBuild =
+  | {
+      readonly ok: true;
+      readonly pool: readonly AdmissionCandidate[];
+      readonly skipped: readonly SkippedCandidate[];
+    }
+  | { readonly ok: false };
+
 /** Dedupe by prNumber (earlier enqueue wins, then input order) and sort FIFO. */
-function buildPool(candidates: readonly unknown[]): {
-  readonly pool: readonly AdmissionCandidate[];
-  readonly skipped: readonly SkippedCandidate[];
-} {
+function buildPool(candidates: readonly unknown[]): PoolBuild {
+  const budget = createWalkBudget(MAX_TOTAL_WALK);
   const byPr = new Map<number, AdmissionCandidate>();
   const skipped: SkippedCandidate[] = [];
   for (const candidate of candidates) {
-    const outcome = considerCandidate(candidate);
+    if (!budget.charge()) {
+      return { ok: false };
+    }
+    const outcome = considerCandidate(candidate, budget);
+    if (outcome.kind === 'budget') {
+      return { ok: false };
+    }
     if (outcome.kind === 'silent') {
       continue;
     }
@@ -344,7 +426,7 @@ function buildPool(candidates: readonly unknown[]): {
     }
     return left.entry.prNumber - right.entry.prNumber;
   });
-  return { pool, skipped };
+  return { ok: true, pool, skipped };
 }
 
 function batchCap(policy: BatchPolicy, classes: readonly AdmissionClass[]): number {
@@ -410,9 +492,11 @@ function parseFormation(input: BatchFormationInput): FormationParse {
 
 /**
  * Decide the next batch. Premerge skips are removed before the walk, so a
- * pull request waiting on its premerge check cannot wedge the queue. The
- * walk over what remains is strict first-in first-out: the first entry that
- * cannot join stops it, and no later entry may skip past it.
+ * pull request waiting on its premerge check cannot wedge the queue. That
+ * admission walk's cost bound is MAX_TOTAL_WALK; spending it returns
+ * `walk-budget-exceeded` and does not read the next element. The walk over
+ * what remains is strict first-in first-out: the first entry that cannot
+ * join stops it, and no later entry may skip past it.
  */
 function decideBatch(input: BatchFormationInput): BatchFormationDecision {
   const parsed = parseFormation(input);
@@ -426,7 +510,11 @@ function decideBatch(input: BatchFormationInput): BatchFormationDecision {
       reason: `speculative depth of ${policy.speculativeDepth} is reached with ${inFlightBatches} batches in flight`,
     };
   }
-  const { pool, skipped } = buildPool(candidates);
+  const built = buildPool(candidates);
+  if (!built.ok) {
+    return { kind: 'none', reason: WALK_BUDGET_EXCEEDED };
+  }
+  const { pool, skipped } = built;
   if (pool.length === 0) {
     return attachSkipped({ kind: 'none', reason: 'no eligible entries' }, skipped);
   }

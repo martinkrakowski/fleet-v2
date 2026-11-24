@@ -548,3 +548,77 @@ describe('formBatch — premerge status', () => {
     expect(formBatch({ ...base, inFlightBatches: undefined as unknown as number })).toEqual(NONE_INPUT);
   });
 });
+
+describe('formBatch — policy constraints', () => {
+  it('refuses maxBatchSize 0 and minBatchSize 1 for one eligible candidate', () => {
+    const result = formBatch(
+      input([candidate(1, NORMAL, 10)], {
+        policy: { maxBatchSize: 0, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(result).toEqual(NONE_INPUT);
+  });
+
+  it('refuses non-integer, non-positive, and inverted policy fields', () => {
+    const eligible = [candidate(1, NORMAL, 10)];
+    const policies: Array<BatchFormationInput['policy']> = [
+      { maxBatchSize: -1, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 0, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 1, minBatchSize: 2, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4.5, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1.5, collectionWaitMs: 0, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: -1, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 1.5, speculativeDepth: 1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 0 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: -1 },
+      { maxBatchSize: 4, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1.5 },
+    ];
+    for (const policy of policies) {
+      expect(formBatch(input(eligible, { policy }))).toEqual(NONE_INPUT);
+    }
+  });
+});
+
+describe('formBatch — walk budget', () => {
+  it('forms the head when 100_000 one-path candidates land on the walk budget', () => {
+    const onePath = ['src/shared.ts'];
+    const many = Array.from({ length: 100_000 }, (_, index) => candidate(index + 1, onePath, index + 1));
+    // Getter-free counter: one visit per candidate and one per changedPaths element.
+    let visits = 0;
+    for (const item of many) {
+      visits += 1 + item.changedPaths.length;
+    }
+    expect(many.every((item) => item.changedPaths === onePath)).toBe(true);
+    expect(visits).toBe(200_000);
+
+    const result = formBatch(input(many));
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    expect(result.members.map((member) => member.prNumber)).toEqual([1]);
+    expect(many).toHaveLength(100_000);
+  });
+
+  it('refuses 100_000 candidates sharing one 100_000-element changedPaths array', () => {
+    const sharedPaths = new Array<string>(100_000).fill('src/app.ts');
+    const candidates = Array.from({ length: 100_000 }, (_, index) => candidate(index + 1, sharedPaths, index + 1));
+    // Getter-free counter of a finished walk. It is above the 200_000 admission
+    // budget, so the typed refusal is the walk stopping inside that budget.
+    // A finished walk would form the eligible head, because nothing is in flight.
+    let unboundedVisits = 0;
+    for (const item of candidates) {
+      unboundedVisits += 1 + item.changedPaths.length;
+    }
+    expect(candidates.every((item) => item.changedPaths === sharedPaths)).toBe(true);
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(candidates).toHaveLength(100_000);
+    expect(unboundedVisits).toBe(100_000 * (1 + 100_000));
+    expect(unboundedVisits).toBeGreaterThan(200_000);
+
+    const result = formBatch(input(candidates));
+    expect(result).toEqual({ kind: 'none', reason: 'walk-budget-exceeded' });
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(sharedPaths[0]).toBe('src/app.ts');
+    expect(sharedPaths[99_999]).toBe('src/app.ts');
+    expect(candidates).toHaveLength(100_000);
+  });
+});

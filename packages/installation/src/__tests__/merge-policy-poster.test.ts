@@ -116,7 +116,10 @@ function parseRefusalNamesFieldWithoutEchoing(
   }
   const joined = parsed.errors.join('\n');
   const echoed = JSON.stringify(rejected) ?? String(rejected);
-  return parsed.errors.length > 0 && joined.includes('premergePosterLogin') && !joined.includes(echoed);
+  // Also probe the raw text, but only when it is distinctive enough not to
+  // collide with ordinary message prose (blank or one-character values).
+  const rawEchoed = typeof rejected === 'string' && rejected.trim().length >= 4 && joined.includes(rejected);
+  return parsed.errors.length > 0 && joined.includes('premergePosterLogin') && !joined.includes(echoed) && !rawEchoed;
 }
 
 describe('parseInstallation premergePosterLogin', () => {
@@ -328,7 +331,7 @@ describe('parseInstallation premergePosterLogin', () => {
 });
 
 describe('resolveMergePolicy premergePosterLogin', () => {
-  it('resolves an absent premergePosterLogin to an entry the adapter answers known, with the pinned pre-EV1a canonical JSON and revision', () => {
+  it('resolves an absent premergePosterLogin to an entry carrying exactly the pre-EV1a own keys (the shape the adapter requires), with the pinned pre-EV1a canonical JSON and revision', () => {
     const resolved = expectResolved(resolveMergePolicy(reposWith({ projectId: 'p' })));
     expect(resolved.repositories).toHaveLength(1);
     const repo = resolved.repositories[0];

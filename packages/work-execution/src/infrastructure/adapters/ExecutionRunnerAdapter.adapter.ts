@@ -61,6 +61,29 @@ const RUNNER_START_TIMEOUT_GRACE_MS = 60_000;
 /** Bound on the --status lookup that follows an ambiguous start. */
 const RUNNER_STATUS_LOOKUP_TIMEOUT_MS = 30_000;
 
+/**
+ * Default pause between the two `--status` reads that confirm "nothing runs"
+ * (the runner's own `OCM_WAIT_CONFIRM`, 5 s). One momentary idle read must
+ * never end a session on its own.
+ */
+const DEFAULT_STATUS_CONFIRM_DELAY_MS = 5_000;
+
+/** Hard ceiling on the confirming pause, whatever an option tries to set. */
+const MAX_STATUS_CONFIRM_DELAY_MS = 60_000;
+
+/**
+ * The runner's own `OCM_WAIT_CONFIRM` (whole seconds, 0 to 60, as `bin/ocm-run`
+ * documents it) is the default pause when no option is given, so an operator or
+ * a stub-runner test sets one knob for both. Anything else reads as the 5 s
+ * default. O(1): one environment read and a two-digit pattern.
+ */
+function envStatusConfirmDelayMs(): number {
+  const raw = process.env['OCM_WAIT_CONFIRM'];
+  if (typeof raw !== 'string' || !/^\d{1,2}$/.test(raw)) return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+  const seconds = Number(raw);
+  return seconds <= MAX_STATUS_CONFIRM_DELAY_MS / 1000 ? seconds * 1000 : DEFAULT_STATUS_CONFIRM_DELAY_MS;
+}
+
 /** Bundled runner script at the repository's `bin/ocm-run`. */
 function resolveBundledOcmRunPath(): string {
   // Works from both the compiled dist tree and vitest's src tree.
@@ -148,6 +171,19 @@ export interface ExecutionRunnerAdapterOptions {
    * (`OCM_START_MAX`); default 60. Non-integers and values ≤ 0 fall back to 60.
    */
   readonly startBudgetSeconds?: number;
+  /**
+   * Milliseconds between the two `--status` reads that confirm "nothing
+   * runs there" before an ended receipt is authoritative; default 5000.
+   * Bounded by `resolveStatusConfirmDelayMs()`: missing, non-number, NaN,
+   * non-finite, non-integer, negative or over 60_000 falls back to 5000.
+   */
+  readonly statusConfirmDelayMs?: number;
+  /**
+   * Delay between the two confirming status reads; default a real
+   * `setTimeout`. Omitted or not a function falls back to the default, so a
+   * test can inject an instant sleep instead of waiting 5 s.
+   */
+  readonly sleep?: (ms: number) => Promise<void>;
   /** Optional resolver for cross-process lookup of an attempt's worktree path when not cached in memory. */
   readonly resolveWorktreePath?: (attemptId: string) => Promise<string | null> | string | null;
   /** Optional resolver for attempt record (used to verify recorded runner port/host). */
@@ -777,21 +813,57 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     if (result.exitCode === 0) {
       // "Nothing running" is authoritative ONLY when attempt has recorded sessionId,
       // port and host match, and status was asked for recorded worktree directory.
+      // And even then never on a single read: the runner's own contract (bin/ocm-run
+      // --wait) confirms "nothing runs" only after two status reads
+      // OCM_WAIT_CONFIRM seconds apart. One momentary idle read between two
+      // steps would otherwise end the session and park the lane.
       if (!session.sessionId || session.sessionId.trim() === '') {
+        return unknownRunnerStatus();
+      }
+
+      // A throwing or rejecting injected sleep is a refusal like any other:
+      // it must never escape inspectSession as an exception.
+      try {
+        await this.sleepBetweenStatusReads(this.resolveStatusConfirmDelayMs());
+      } catch {
+        return unknownRunnerStatus();
+      }
+
+      let confirmResult: SubprocessResult;
+      try {
+        confirmResult = await this.run(
+          this.binPath(),
+          ['--status', '--dir', dir],
+          this.remotePortEnv(guarded.remotePort, guarded.recordedRunner.host ?? undefined),
+        );
+      } catch {
+        return unknownRunnerStatus();
+      }
+
+      // The confirming read says a session is running again (any session id:
+      // a replacement session is still live work), so the first idle read
+      // was a momentary gap, not an end.
+      if (confirmResult.exitCode === 3) {
         return {
-          runnerReachable: 'unknown',
-          workspacePreparation: 'unprepared',
-          workerCommand: 'not-started',
+          runnerReachable: 'reachable',
+          workspacePreparation: 'prepared',
+          workerCommand: 'active',
           completionReceipt: null,
           artifactsCollected: false,
         };
       }
+      // A confirming read that is neither 0 nor 3 proves nothing: never an
+      // ended receipt on it.
+      if (confirmResult.exitCode !== 0) {
+        return unknownRunnerStatus();
+      }
 
+      // Two exit-0 reads, OCM_WAIT_CONFIRM apart: ended, authoritatively.
       let parsedExitStatus: number | null = null;
       let parsedEndedAtIso: string = new Date().toISOString();
       let parsedArtifactsCollected = false;
 
-      const trimmed = result.stdout.trim();
+      const trimmed = confirmResult.stdout.trim();
       let parsed: unknown = null;
       try {
         parsed = JSON.parse(trimmed);
@@ -1030,6 +1102,60 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       (process.env.FLEET_OCM_RUN_BIN?.trim() || undefined) ??
       DEFAULT_OCM_RUN_PATH
     );
+  }
+
+  /**
+   * The pause between the two confirming `--status` reads. The option value
+   * is read exactly once and never through an accessor: a getter on the
+   * options object is refused (its body is never run), a Proxy trap that
+   * throws is refused the same way, and every hostile shape — missing,
+   * non-number, NaN, non-finite, non-integer, negative, over 60 000 — falls
+   * back to the runner's own default 5 s. O(1), no allocation.
+   */
+  private resolveStatusConfirmDelayMs(): number {
+    try {
+      const options: unknown = this.options;
+      if (options === null || typeof options !== 'object') {
+        return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+      }
+      // `getOwnPropertyDescriptor` inspects the property without invoking it,
+      // so a getter's body never executes here.
+      const descriptor = Object.getOwnPropertyDescriptor(options, 'statusConfirmDelayMs');
+      if (descriptor === undefined) return envStatusConfirmDelayMs();
+      if (descriptor.get !== undefined) return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+      const raw: unknown = descriptor.value;
+      if (typeof raw !== 'number') return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+      if (!Number.isInteger(raw) || raw < 0 || raw > MAX_STATUS_CONFIRM_DELAY_MS) {
+        return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+      }
+      return raw;
+    } catch {
+      return DEFAULT_STATUS_CONFIRM_DELAY_MS;
+    }
+  }
+
+  /**
+   * The confirming pause itself: the injected sleep when one is a data
+   * property holding a function, otherwise a real `setTimeout`. Never runs a
+   * getter as the sleep (an accessor is refused, not executed) and never
+   * lets a Proxy trap throw escape; a non-function value falls back to the
+   * default.
+   */
+  private sleepBetweenStatusReads(ms: number): Promise<void> {
+    let injected: unknown;
+    try {
+      const options: unknown = this.options;
+      injected =
+        options === null || typeof options !== 'object'
+          ? undefined
+          : Object.getOwnPropertyDescriptor(options, 'sleep')?.value;
+    } catch {
+      injected = undefined;
+    }
+    if (typeof injected === 'function') {
+      return injected(ms);
+    }
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**

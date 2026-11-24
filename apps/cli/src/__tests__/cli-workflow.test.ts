@@ -138,6 +138,7 @@ describe('Fleet CLI workflow', () => {
   let testOwnerPublicKey: string;
   let testOwnerPrivateKey: KeyObject;
   let originalOcmRemotePort: string | undefined;
+  let originalOcmWaitConfirm: string | undefined;
 
   function signDecisionForWorkflow(fields: {
     requestId: string;
@@ -156,6 +157,9 @@ describe('Fleet CLI workflow', () => {
     // longer plants it; every runtime composes from its pinned key.
     originalOcmRemotePort = process.env.OCM_REMOTE_PORT;
     process.env.OCM_REMOTE_PORT = String(RUNNER_PORT);
+    // The stub runner reports a settled session; the adapter's confirming second read need not wait 5 s.
+    originalOcmWaitConfirm = process.env.OCM_WAIT_CONFIRM;
+    process.env.OCM_WAIT_CONFIRM = '0';
   });
 
   afterEach(() => {
@@ -163,6 +167,11 @@ describe('Fleet CLI workflow', () => {
       process.env.OCM_REMOTE_PORT = originalOcmRemotePort;
     } else {
       delete process.env.OCM_REMOTE_PORT;
+    }
+    if (originalOcmWaitConfirm !== undefined) {
+      process.env.OCM_WAIT_CONFIRM = originalOcmWaitConfirm;
+    } else {
+      delete process.env.OCM_WAIT_CONFIRM;
     }
   });
 

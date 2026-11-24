@@ -361,6 +361,8 @@ describe('RunMergePassUseCase over the forwarded policy (end to end)', () => {
     const pass = await runEndToEndPass('Martin-K', 'martin-k');
     expect(pass.decision).toBe('journalled');
     expect(pass.reasonCode).toBe('would-merge');
+    // The receipt recorded on the ready entry uses the same match as the decider.
+    expect(pass.persisted?.premergeReceiptHeadOid).toBe(HEAD);
   });
 
   it('a mismatched premerge poster persists the entry as parked on checks and journals no merge key', async () => {

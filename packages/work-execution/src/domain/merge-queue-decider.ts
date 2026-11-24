@@ -665,9 +665,16 @@ function isPremergeGreen(fact: MergeContextFact, name: string, policy: Normalize
   // ASCII-lowercase on both sides while the stored value stays verbatim. ASCII-only
   // folding: `toLowerCase()` also applies Unicode mappings, so a Kelvin sign U+212A in
   // the creator would wrongly match an ASCII "k" poster.
-  const creator = fact.creatorLogin;
-  const poster = policy.premergePosterLogin;
-  if (creator === null || creator === undefined || poster === null || poster === undefined) {
+  return premergeLoginsMatch(fact.creatorLogin, policy.premergePosterLogin);
+}
+
+/**
+ * Whether the creator of the `premerge` context is the configured poster: an ASCII
+ * case-insensitive match, false when either side is absent. One definition, shared by the
+ * decider and the receipt recorded in the merge pass, so the two can never disagree.
+ */
+export function premergeLoginsMatch(creator: string | null | undefined, poster: string | null | undefined): boolean {
+  if (typeof creator !== 'string' || typeof poster !== 'string') {
     return false;
   }
   return asciiLowerLogin(creator) === asciiLowerLogin(poster);

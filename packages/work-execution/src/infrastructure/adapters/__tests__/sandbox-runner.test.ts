@@ -58,9 +58,26 @@ class FakeDriver implements SandboxDriver {
   createResult: SandboxCreateResult | Error = { outcome: 'confirmed', sessionId: SESSION_ID };
   inspectResult: SandboxInspectResult | Error = INSPECTED;
   destroyResult: SandboxDestroyResult | Error = { outcome: 'destroyed' };
+  /**
+   * When set, the next create awaits it and then clears it. Only that call
+   * waits, so a missed reservation cannot hang the test.
+   */
+  createHold: Promise<void> | null = null;
+  /** Returned as-is, before `instanceof`, so a Proxy is not probed by the fake. */
+  rawCreateResult: { readonly value: unknown } | null = null;
+  rawInspectResult: { readonly value: unknown } | null = null;
+  rawDestroyResult: { readonly value: unknown } | null = null;
 
   async create(payload: SandboxCreatePayload): Promise<SandboxCreateResult> {
     this.createCalls.push(payload);
+    const hold = this.createHold;
+    if (hold !== null) {
+      this.createHold = null;
+      await hold;
+    }
+    if (this.rawCreateResult !== null) {
+      return this.rawCreateResult.value as SandboxCreateResult;
+    }
     if (this.createResult instanceof Error) {
       throw this.createResult;
     }
@@ -69,6 +86,9 @@ class FakeDriver implements SandboxDriver {
 
   async inspect(sessionId: string): Promise<SandboxInspectResult> {
     this.inspectCalls.push(sessionId);
+    if (this.rawInspectResult !== null) {
+      return this.rawInspectResult.value as SandboxInspectResult;
+    }
     if (this.inspectResult instanceof Error) {
       throw this.inspectResult;
     }
@@ -77,6 +97,9 @@ class FakeDriver implements SandboxDriver {
 
   async destroy(sessionId: string): Promise<SandboxDestroyResult> {
     this.destroyCalls.push(sessionId);
+    if (this.rawDestroyResult !== null) {
+      return this.rawDestroyResult.value as SandboxDestroyResult;
+    }
     if (this.destroyResult instanceof Error) {
       throw this.destroyResult;
     }
@@ -138,6 +161,38 @@ function withGetter(
     enumerable: true,
   });
   return copy as unknown as StartRunnerSessionRequest;
+}
+
+/** Own data on a custom prototype, plus one inherited getter the adapter must not run. */
+function withInheritedGetter(
+  fields: Record<string, unknown>,
+  inheritedKey: string,
+  flag: { read: boolean },
+): Record<string, unknown> {
+  const proto = {};
+  Object.defineProperty(proto, inheritedKey, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      flag.read = true;
+      return 'inherited-' + 'value';
+    },
+  });
+  const record = Object.create(proto) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(fields)) {
+    Object.defineProperty(record, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return record;
+}
+
+/** Property names a Promise reads while adopting a returned Proxy. */
+function unexpectedTraps(seen: readonly string[]): string[] {
+  return seen.filter((name) => name !== 'then' && !name.startsWith('Symbol('));
 }
 
 describe('SandboxRunnerAdapter', () => {
@@ -251,19 +306,13 @@ describe('SandboxRunnerAdapter', () => {
 
     it('returns refused when driver create reports an error and records no live environment', async () => {
       const { adapter, driver } = makeAdapter();
-      driver.createResult = {
-        outcome: 'refused',
-        detail: 'driver detail mentioning ' + SESSION_ID,
-      } as unknown as SandboxCreateResult;
+      driver.createResult = { outcome: 'refused' };
       const result = await adapter.startSession(startRequest());
       expect(result.outcome).toBe('refused');
       expect(driver.createCalls).toHaveLength(1);
-      expect(
-        String((result as { reason?: string }).reason ?? '').includes(SESSION_ID),
-      ).toBe(false);
-      expect(
-        String((result as { reason?: string }).reason ?? '').includes('driver detail'),
-      ).toBe(false);
+      expect(String((result as { reason?: string }).reason ?? '').includes(SESSION_ID)).toBe(
+        false,
+      );
       driver.createResult = { outcome: 'confirmed', sessionId: SESSION_ID };
       const retried = await adapter.startSession(startRequest());
       expect(retried.outcome).toBe('started');
@@ -785,6 +834,624 @@ describe('SandboxRunnerAdapter', () => {
       ]) {
         expect(SOURCE.includes(forbidden), forbidden).toBe(false);
       }
+    });
+  });
+
+  describe('guarded results and concurrent starts', () => {
+    it('fail-closes a capability getter or Proxy without invoking it, while a plain profile stays declared', () => {
+      const plain = makeAdapter();
+      expect(plain.adapter.describeCapabilities().source).toBe('declared');
+      expect(plain.adapter.describeCapabilities().networkEgressRestricted).toBe(true);
+
+      const flag = { read: false };
+      const capabilities: Record<string, unknown> = { ...DECLARED_CAPS };
+      Object.defineProperty(capabilities, 'networkEgressRestricted', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return true;
+        },
+      });
+      const getterAdapter = makeAdapter({
+        capabilities: capabilities as RunnerIsolationCapabilities,
+      });
+      const getterProfile = getterAdapter.adapter.describeCapabilities();
+      expect(flag.read).toBe(false);
+      expect(getterProfile).toStrictEqual({
+        filesystemScope: 'unknown',
+        networkEgressRestricted: false,
+        cpuAndMemoryLimited: false,
+        processTreeTermination: false,
+        authoritativeCompletion: false,
+        artifactPersistence: false,
+        source: 'undeclared',
+      });
+
+      const seen: string[] = [];
+      const proxy = new Proxy(DECLARED_CAPS, {
+        get(_target, property) {
+          seen.push(String(property));
+          return true;
+        },
+      });
+      const proxyAdapter = makeAdapter({
+        capabilities: proxy as RunnerIsolationCapabilities,
+      });
+      const proxyProfile = proxyAdapter.adapter.describeCapabilities();
+      expect(unexpectedTraps(seen)).toEqual([]);
+      expect(proxyProfile.filesystemScope).toBe('unknown');
+      expect(proxyProfile.source).toBe('undeclared');
+    });
+
+    it('refuses startSession when the capability profile is a Proxy and does not call create', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      expect(clean.driver.createCalls).toHaveLength(1);
+
+      const seen: string[] = [];
+      const { adapter, driver } = makeAdapter({
+        capabilities: new Proxy(DECLARED_CAPS, {
+          get(_target, property) {
+            seen.push(String(property));
+            return true;
+          },
+        }) as RunnerIsolationCapabilities,
+      });
+      const result = await adapter.startSession(startRequest());
+      expect(result).toMatchObject({ outcome: 'refused' });
+      expect(unexpectedTraps(seen)).toEqual([]);
+      expect(driver.createCalls).toHaveLength(0);
+    });
+
+    it('keeps a runtime-built token-shaped value out of the driver.create payload', async () => {
+      const credentialShape = ['tok', 'en', 'Q'.repeat(10)].join('-');
+      const clean = makeAdapter();
+      const cleanResult = await clean.adapter.startSession(startRequest());
+      expect(cleanResult.outcome).toBe('started');
+      expect(clean.driver.createCalls).toHaveLength(1);
+      expect(JSON.stringify(clean.driver.createCalls[0]).includes(credentialShape)).toBe(false);
+
+      const { adapter, driver } = makeAdapter();
+      const result = await adapter.startSession(
+        startRequest({
+          seatOverride: {
+            model: 'override-model-1',
+            reason: credentialShape,
+            setBy: 'operator',
+            expiresAtIso: ENDED_AT,
+          },
+          modelAssignment: {
+            model: 'assignment-model-1',
+            fallbackModel: credentialShape,
+          },
+        }),
+      );
+      expect(result.outcome).toBe('started');
+      expect(driver.createCalls).toHaveLength(1);
+      expect(driver.createCalls[0]).toStrictEqual({
+        attemptId: ATTEMPT_ID,
+        worktreePath: '/worktrees/attempt-1',
+        briefPackagePath: '/briefs/attempt-1.json',
+        baseCommit: 'c0ffee0',
+        stepLimit: 100,
+        timeLimitSeconds: 600,
+        model: 'override-model-1',
+        agent: 'build-agent',
+        variant: 'variant-1',
+      });
+      expect(JSON.stringify(driver.createCalls[0]).includes(credentialShape)).toBe(false);
+    });
+
+    it('reserves the attempt before awaiting create so a concurrent startSession is blocked with one create call', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      expect(clean.driver.createCalls).toHaveLength(1);
+
+      const { adapter, driver } = makeAdapter();
+      let release: () => void = () => {};
+      driver.createHold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const first = adapter.startSession(startRequest());
+      const second = adapter.startSession(startRequest());
+      const secondResult = await second;
+      expect(secondResult.outcome).toBe('blocked');
+      expect('runner' in secondResult).toBe(false);
+      if (secondResult.outcome === 'blocked') {
+        expect(secondResult.reason.includes(ATTEMPT_ID)).toBe(false);
+      }
+      expect(driver.createCalls).toHaveLength(1);
+      release();
+      const firstResult = await first;
+      expect(firstResult).toStrictEqual({ outcome: 'started', sessionId: SESSION_ID });
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('maps a Proxy create result to unknown without reading outcome and blocks the next start', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      const seen: string[] = [];
+      const { adapter, driver } = makeAdapter();
+      driver.rawCreateResult = {
+        value: new Proxy(
+          { outcome: 'confirmed', sessionId: SESSION_ID },
+          {
+            get(_target, property) {
+              seen.push(String(property));
+              return undefined;
+            },
+          },
+        ),
+      };
+      const result = await adapter.startSession(startRequest());
+      expect(result.outcome).toBe('unknown');
+      expect(unexpectedTraps(seen)).toEqual([]);
+      const next = await adapter.startSession(startRequest());
+      expect(next.outcome).toBe('blocked');
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('maps a create result whose outcome is a getter to unknown without invoking the getter', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      const flag = { read: false };
+      const value: Record<string, unknown> = { sessionId: SESSION_ID };
+      Object.defineProperty(value, 'outcome', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return 'confirmed';
+        },
+      });
+      const { adapter, driver } = makeAdapter();
+      driver.rawCreateResult = { value };
+      const result = await adapter.startSession(startRequest());
+      expect(result.outcome).toBe('unknown');
+      expect(flag.read).toBe(false);
+      const next = await adapter.startSession(startRequest());
+      expect(next.outcome).toBe('blocked');
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('maps a create result with a custom prototype to unknown without invoking an inherited getter', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      const flag = { read: false };
+      const { adapter, driver } = makeAdapter();
+      driver.rawCreateResult = {
+        value: withInheritedGetter(
+          { outcome: 'confirmed', sessionId: SESSION_ID },
+          'detail',
+          flag,
+        ),
+      };
+      const result = await adapter.startSession(startRequest());
+      expect(result.outcome).toBe('unknown');
+      expect(flag.read).toBe(false);
+      const next = await adapter.startSession(startRequest());
+      expect(next.outcome).toBe('blocked');
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('maps a create result with an extra field to unknown and does not forward that field', async () => {
+      const credentialShape = ['drv', 'text', 'M'.repeat(8)].join('-');
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      const { adapter, driver } = makeAdapter();
+      driver.rawCreateResult = {
+        value: { outcome: 'refused', detail: credentialShape },
+      };
+      const result = await adapter.startSession(startRequest());
+      expect(result.outcome).toBe('unknown');
+      if (result.outcome === 'unknown' || result.outcome === 'refused' || result.outcome === 'blocked') {
+        expect(result.reason.includes(credentialShape)).toBe(false);
+      }
+      const next = await adapter.startSession(startRequest());
+      expect(next.outcome).toBe('blocked');
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('refuses a start request whose prototype is not Object.prototype without invoking an inherited getter', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const flag = { read: false };
+      const request = withInheritedGetter(
+        { ...startRequest() } as unknown as Record<string, unknown>,
+        'inheritedField',
+        flag,
+      );
+      const result = await adapter.startSession(request as unknown as StartRunnerSessionRequest);
+      expect(result).toMatchObject({ outcome: 'refused' });
+      expect(flag.read).toBe(false);
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('starts a null-prototype request whose fields are own data properties', async () => {
+      const { adapter, driver } = makeAdapter();
+      const request = Object.create(null) as Record<string, unknown>;
+      for (const [key, value] of Object.entries({ ...startRequest() })) {
+        Object.defineProperty(request, key, {
+          value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
+      const result = await adapter.startSession(request as unknown as StartRunnerSessionRequest);
+      expect(result).toStrictEqual({ outcome: 'started', sessionId: SESSION_ID });
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('refuses getters on seatOverride.model and modelAssignment.model without invoking them or calling create', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const seatFlag = { read: false };
+      const assignmentFlag = { read: false };
+      const seat: Record<string, unknown> = {
+        reason: 'operator request',
+        setBy: 'operator',
+        expiresAtIso: ENDED_AT,
+      };
+      Object.defineProperty(seat, 'model', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          seatFlag.read = true;
+          return 'override-model-1';
+        },
+      });
+      const assignment: Record<string, unknown> = {};
+      Object.defineProperty(assignment, 'model', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          assignmentFlag.read = true;
+          return 'assignment-model-1';
+        },
+      });
+      const seatResult = await adapter.startSession(
+        startRequest({
+          seatOverride: seat as unknown as StartRunnerSessionRequest['seatOverride'],
+        }),
+      );
+      expect(seatResult).toMatchObject({ outcome: 'refused' });
+      expect(seatFlag.read).toBe(false);
+      const assignmentResult = await adapter.startSession(
+        startRequest({
+          modelAssignment: assignment as unknown as StartRunnerSessionRequest['modelAssignment'],
+        }),
+      );
+      expect(assignmentResult).toMatchObject({ outcome: 'refused' });
+      expect(assignmentFlag.read).toBe(false);
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('refuses prototype-polluting keys on nested requiredCapabilities and seatOverride without calling create', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
+        const capabilities = { ...DECLARED_CAPS } as Record<string, unknown>;
+        Object.defineProperty(capabilities, key, {
+          value: {},
+          enumerable: true,
+          configurable: true,
+        });
+        const result = await adapter.startSession(
+          startRequest({
+            requiredCapabilities: capabilities as StartRunnerSessionRequest['requiredCapabilities'],
+          }),
+        );
+        expect(result, key).toMatchObject({ outcome: 'refused' });
+      }
+      const seat = {
+        model: 'override-model-1',
+        reason: 'operator request',
+        setBy: 'operator',
+        expiresAtIso: ENDED_AT,
+      } as Record<string, unknown>;
+      Object.defineProperty(seat, 'constructor', {
+        value: {},
+        enumerable: true,
+        configurable: true,
+      });
+      const seatResult = await adapter.startSession(
+        startRequest({
+          seatOverride: seat as unknown as StartRunnerSessionRequest['seatOverride'],
+        }),
+      );
+      expect(seatResult).toMatchObject({ outcome: 'refused' });
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('refuses stopSession for an indeterminate attempt and never calls destroy with the caller sessionId', async () => {
+      const clean = makeAdapter();
+      await expectStarted(clean.adapter);
+      const terminated = await clean.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(terminated.outcome).toBe('terminated');
+      expect(clean.driver.destroyCalls).toStrictEqual([SESSION_ID]);
+
+      const callerSessionId = 'caller-' + 'session';
+      const { adapter, driver } = makeAdapter();
+      driver.createResult = { outcome: 'unconfirmed' };
+      const started = await adapter.startSession(startRequest());
+      expect(started.outcome).toBe('unknown');
+      const stopped = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: callerSessionId,
+        gracePeriodSeconds: 5,
+      });
+      expect(stopped).toMatchObject({ outcome: 'refused' });
+      expect(driver.destroyCalls).toStrictEqual([]);
+      const again = await adapter.startSession(startRequest());
+      expect(again.outcome).toBe('blocked');
+      expect(driver.createCalls).toHaveLength(1);
+    });
+
+    it('maps a Proxy destroy result to unknown without reading outcome and terminates on a later plain destroy', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const seen: string[] = [];
+      driver.rawDestroyResult = {
+        value: new Proxy(
+          { outcome: 'destroyed' },
+          {
+            get(_target, property) {
+              seen.push(String(property));
+              return undefined;
+            },
+          },
+        ),
+      };
+      const first = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(first.outcome).toBe('unknown');
+      expect(unexpectedTraps(seen)).toEqual([]);
+      driver.rawDestroyResult = null;
+      const second = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(second.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toStrictEqual([SESSION_ID, SESSION_ID]);
+    });
+
+    it('maps a destroy result whose outcome is a getter to unknown without invoking the getter', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const flag = { read: false };
+      const value: Record<string, unknown> = {};
+      Object.defineProperty(value, 'outcome', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return 'destroyed';
+        },
+      });
+      driver.rawDestroyResult = { value };
+      const first = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(first.outcome).toBe('unknown');
+      expect(flag.read).toBe(false);
+      driver.rawDestroyResult = null;
+      const second = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(second.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toHaveLength(2);
+    });
+
+    it('maps a destroy result with an extra field or a custom prototype to unknown and does not terminate', async () => {
+      const extra = makeAdapter();
+      await expectStarted(extra.adapter);
+      extra.driver.rawDestroyResult = { value: { outcome: 'destroyed', extra: true } };
+      const extraResult = await extra.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(extraResult.outcome).toBe('unknown');
+      extra.driver.rawDestroyResult = null;
+      const extraTerminated = await extra.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(extraTerminated.outcome).toBe('terminated');
+      expect(extra.driver.destroyCalls).toHaveLength(2);
+
+      const flag = { read: false };
+      const custom = makeAdapter();
+      await expectStarted(custom.adapter);
+      custom.driver.rawDestroyResult = {
+        value: withInheritedGetter({ outcome: 'destroyed' }, 'detail', flag),
+      };
+      const customResult = await custom.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(customResult.outcome).toBe('unknown');
+      expect(flag.read).toBe(false);
+      custom.driver.rawDestroyResult = null;
+      const customTerminated = await custom.adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(customTerminated.outcome).toBe('terminated');
+    });
+
+    it('reports a hostile completionReceipt as null without invoking its getter and keeps the other status fields', async () => {
+      const { adapter, driver } = makeAdapter();
+      const clean = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+      });
+      expect(clean.completionReceipt).toStrictEqual(INSPECTED.completionReceipt);
+      expect(clean.workspacePreparation).toBe('prepared');
+
+      const flag = { read: false };
+      const receipt: Record<string, unknown> = {
+        sessionId: SESSION_ID,
+        endedAtIso: ENDED_AT,
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      };
+      Object.defineProperty(receipt, 'attemptId', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return ATTEMPT_ID;
+        },
+      });
+      driver.inspectResult = {
+        ...INSPECTED,
+        completionReceipt: receipt,
+      } as unknown as SandboxInspectResult;
+      const status = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+      });
+      expect(flag.read).toBe(false);
+      expect(status.completionReceipt).toBe(null);
+      expect(status.runnerReachable).toBe('reachable');
+      expect(status.workspacePreparation).toBe('prepared');
+      expect(status.workerCommand).toBe('active');
+      expect(status.artifactsCollected).toBe(true);
+    });
+
+    it('reports unreachable when inspectSession runner has a nested getter and does not invoke it', async () => {
+      const { adapter, driver } = makeAdapter();
+      const clean = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+      });
+      expect(clean.runnerReachable).toBe('reachable');
+      const flag = { read: false };
+      const runner: Record<string, unknown> = {
+        kind: 'agy',
+        remotePort: null,
+        host: null,
+        agent: null,
+        variant: null,
+      };
+      Object.defineProperty(runner, 'model', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return null;
+        },
+      });
+      const status = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        runner: runner as never,
+      });
+      expect(status).toStrictEqual({
+        runnerReachable: 'unreachable',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      });
+      expect(flag.read).toBe(false);
+      expect(driver.inspectCalls).toHaveLength(1);
+    });
+
+    it('refuses stopSession when runner has a nested getter without invoking it or calling destroy', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const flag = { read: false };
+      const runner: Record<string, unknown> = {
+        kind: 'agy',
+        remotePort: null,
+        host: null,
+        agent: null,
+        variant: null,
+      };
+      Object.defineProperty(runner, 'model', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return null;
+        },
+      });
+      const refused = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+        runner: runner as never,
+      });
+      expect(refused).toMatchObject({ outcome: 'refused' });
+      expect(flag.read).toBe(false);
+      expect(driver.destroyCalls).toHaveLength(0);
+      const terminated = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(terminated.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toStrictEqual([SESSION_ID]);
+    });
+
+    it('reports unreachable for a prototype-polluting inspect key and refuses that key on stop', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const clean = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+      });
+      expect(clean.runnerReachable).toBe('reachable');
+      const inspectBody: Record<string, unknown> = {
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+      };
+      Object.defineProperty(inspectBody, 'prototype', {
+        value: {},
+        enumerable: true,
+        configurable: true,
+      });
+      const status = await adapter.inspectSession(
+        inspectBody as Parameters<SandboxRunnerAdapter['inspectSession']>[0],
+      );
+      expect(status.runnerReachable).toBe('unreachable');
+      expect(driver.inspectCalls).toHaveLength(1);
+
+      const stopBody: Record<string, unknown> = {
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      };
+      Object.defineProperty(stopBody, '__proto__', {
+        value: {},
+        enumerable: true,
+        configurable: true,
+      });
+      const stopped = await adapter.stopSession(
+        stopBody as Parameters<SandboxRunnerAdapter['stopSession']>[0],
+      );
+      expect(stopped).toMatchObject({ outcome: 'refused' });
+      expect(driver.destroyCalls).toHaveLength(0);
     });
   });
 });

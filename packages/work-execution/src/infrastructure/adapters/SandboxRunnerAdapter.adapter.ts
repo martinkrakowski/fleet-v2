@@ -13,22 +13,30 @@
  * Behaviour rules this adapter enforces:
  *
  *  - **Fail-closed starts.** Only a typed driver `{ outcome: 'refused' }`
- *    result maps to `refused`. A throw, a rejection, an unconfirmed answer or
- *    a malformed result maps to `unknown` and marks the attempt
- *    indeterminate; a later `startSession` for the same `attemptId` answers
- *    `blocked` with zero further `create` calls.
- *  - **Driver results are untrusted.** They pass the same hostile-input guard
- *    as requests: a `sessionId` that is not a non-empty string of at most 128
- *    characters makes the result `unknown`, and a `completionReceipt` whose
- *    `attemptId` or `sessionId` differs from the session's is reported as
- *    `null`. Every `reason` is an adapter-fixed constant; driver error text
- *    is never forwarded, so no supplied value of 8 or more characters is ever
- *    echoed.
+ *    result with that exact key maps to `refused`. A throw, a rejection, an
+ *    unconfirmed answer, a proxy, a getter or any other shape maps to
+ *    `unknown` and marks the attempt indeterminate; a later `startSession`
+ *    for the same `attemptId` answers `blocked` with zero further `create`
+ *    calls. The attempt is reserved synchronously before `create` is awaited,
+ *    so two overlapping starts cannot both create.
+ *  - **Driver results are untrusted.** Create, destroy and inspect answers
+ *    pass the same guard as requests: own data descriptors only, a prototype
+ *    of `Object.prototype` or `null`, and the exact key set. A `sessionId`
+ *    that is not a non-empty string of at most 128 characters makes a create
+ *    result `unknown`. A nested `completionReceipt` is guarded before its
+ *    ids are read; a mismatch or a hostile receipt is reported as `null`.
+ *    Every `reason` is an adapter-fixed constant; driver error text is never
+ *    forwarded, so no supplied value of 8 or more characters is ever echoed.
+ *  - **No confirmed session, no destroy.** `destroy` runs only for a live
+ *    environment whose stored `sessionId` matches the request. An unknown,
+ *    in-flight or indeterminate attempt is refused, and `destroy` is not
+ *    called with a session id the driver never confirmed.
  *  - **Capability is declared, never inferred.** The six fixed capability
- *    keys are read through the hostile-input guard at construction time, not
- *    spread: a non-boolean becomes `false`, an invalid `filesystemScope`
- *    becomes `'unknown'` with `source: 'undeclared'`, and an adapter scope of
- *    `'unknown'` always refuses.
+ *    keys are read through the hostile-input guard, not spread and not from
+ *    inherited accessors. A non-boolean data value becomes `false`. A getter,
+ *    a proxy or any other non-plain profile becomes `filesystemScope:
+ *    'unknown'` with `source: 'undeclared'`. An adapter scope of `'unknown'`
+ *    always refuses.
  *  - **No side doors.** No filesystem, subprocess, network or environment
  *    access appears in this file; `worktreePath`, `briefPackagePath` and
  *    `baseCommit` are opaque references, validated and passed unchanged,
@@ -202,60 +210,142 @@ const RUNNER_RECORD_KEYS: ReadonlySet<string> = new Set([
   'useFreeSeats',
 ]);
 
-/** Why a hostile-input guard refused a value. */
-type GuardFailure =
+/** Own-key cap. Every guarded record's declared key set is at most this big. */
+const MAX_OWN_KEYS = 16;
+
+type ReadFailure =
   | 'not-an-object'
   | 'proxy'
+  | 'bad-prototype'
   | 'array-like'
   | 'getter'
   | 'prototype-polluting-key'
   | 'unknown-key'
   | 'symbol-key';
 
+type ReadResult =
+  | { readonly ok: true; readonly data: Record<string, unknown> }
+  | { readonly ok: false; readonly failure: ReadFailure };
+
 /**
- * Guard one supposedly plain object: refuse non-objects, `Proxy` values,
- * array-likes, own getters (inspected with `Object.getOwnPropertyDescriptor`,
- * never invoked), prototype-polluting own keys, symbol keys and any own key
- * outside the declared set. `O(k)` over the object's own keys.
+ * Copy one supposedly plain object into a null-prototype record.
+ *
+ * Refuses non-objects, `Proxy` values (checked before any trap can run),
+ * prototypes other than `Object.prototype` or `null`, array-likes, own
+ * getters (the descriptor is inspected, never invoked), prototype-polluting
+ * own keys, symbol keys and any own key outside `allowedKeys`. Values are
+ * taken only from those own data descriptors. Own-key inspection stops at
+ * `MAX_OWN_KEYS`.
  */
-function guardObject(value: unknown, allowedKeys: ReadonlySet<string>): GuardFailure | 'ok' {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return 'not-an-object';
-  }
-  if (types.isProxy(value)) {
-    return 'proxy';
-  }
-  const length = Object.getOwnPropertyDescriptor(value, 'length');
-  if (length !== undefined && typeof length.value === 'number') {
-    return 'array-like';
-  }
-  for (const name of Object.getOwnPropertyNames(value)) {
-    if (PROTO_POLLUTING_KEYS.has(name)) {
-      return 'prototype-polluting-key';
+function readPlain(value: unknown, allowedKeys: ReadonlySet<string>): ReadResult {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { ok: false, failure: 'not-an-object' };
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (descriptor !== undefined && descriptor.get !== undefined) {
-      return 'getter';
+    if (types.isProxy(value)) {
+      return { ok: false, failure: 'proxy' };
     }
-    if (!allowedKeys.has(name)) {
-      return 'unknown-key';
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, failure: 'bad-prototype' };
     }
+    const length = Object.getOwnPropertyDescriptor(value, 'length');
+    if (
+      length !== undefined &&
+      length.get === undefined &&
+      length.set === undefined &&
+      typeof length.value === 'number'
+    ) {
+      return { ok: false, failure: 'array-like' };
+    }
+    const names = Object.getOwnPropertyNames(value);
+    if (names.length > MAX_OWN_KEYS || names.length > allowedKeys.size) {
+      return { ok: false, failure: 'unknown-key' };
+    }
+    const data: Record<string, unknown> = Object.create(null);
+    for (const name of names) {
+      if (PROTO_POLLUTING_KEYS.has(name)) {
+        return { ok: false, failure: 'prototype-polluting-key' };
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined ||
+        !('value' in descriptor)
+      ) {
+        return { ok: false, failure: 'getter' };
+      }
+      if (!allowedKeys.has(name)) {
+        return { ok: false, failure: 'unknown-key' };
+      }
+      Object.defineProperty(data, name, {
+        value: descriptor.value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      return { ok: false, failure: 'symbol-key' };
+    }
+    return { ok: true, data };
+  } catch {
+    return { ok: false, failure: 'not-an-object' };
   }
-  if (Object.getOwnPropertySymbols(value).length > 0) {
-    return 'symbol-key';
-  }
-  return 'ok';
 }
 
-/** True when a reference string is unusable. Length first: `O(min(n, 4096))`. */
-function isInvalidReference(value: unknown): boolean {
+function hasExactOwnKeys(data: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Object.keys(data);
+  if (own.length !== keys.length) {
+    return false;
+  }
+  for (const key of keys) {
+    if (!Object.hasOwn(data, key)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Read an optional nested record from an already-copied parent.
+ * `null` is absent when `nullIsAbsent` and hostile otherwise.
+ */
+function readNested(
+  data: Record<string, unknown>,
+  key: string,
+  allowedKeys: ReadonlySet<string>,
+  nullIsAbsent: boolean,
+): { readonly ok: true; readonly value: Record<string, unknown> | undefined } | { readonly ok: false } {
+  if (!Object.hasOwn(data, key) || data[key] === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (data[key] === null) {
+    return nullIsAbsent ? { ok: true, value: undefined } : { ok: false };
+  }
+  const read = readPlain(data[key], allowedKeys);
+  if (!read.ok) {
+    return { ok: false };
+  }
+  return { ok: true, value: read.data };
+}
+
+/**
+ * An opaque path or commit reference, or `null` when it is unusable.
+ * Length is checked before any scan: `O(min(n, 4096))`.
+ */
+function asReference(value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 4096) {
-    return true;
+    return null;
   }
   if (value.includes('\0') || value.includes('\r') || value.includes('\n')) {
-    return true;
+    return null;
   }
-  return value.split(/[\\/]/).some((segment) => segment === '..');
+  if (value.split(/[\\/]/).some((segment) => segment === '..')) {
+    return null;
+  }
+  return value;
 }
 
 /** An optional plain seat value: short, printable, never flag-shaped. */
@@ -272,12 +362,32 @@ function isValidSeatValue(value: unknown): value is string {
   );
 }
 
+/** A present seat string, `undefined` when absent, or `null` when present but unusable. */
+function optionalSeat(value: unknown): string | undefined | null {
+  if (value === undefined) {
+    return undefined;
+  }
+  return isValidSeatValue(value) ? value : null;
+}
+
 function isFinitePositive(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
 function isValidAttemptId(value: unknown): value is string {
-  return typeof value === 'string' && ATTEMPT_ID_PATTERN.test(value);
+  if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
+    return false;
+  }
+  return ATTEMPT_ID_PATTERN.test(value);
+}
+
+function firstPresent(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function isValidSessionId(value: unknown): value is string {
@@ -295,46 +405,250 @@ function unreachableStatus(): RunnerSessionStatus {
   };
 }
 
-/** Read the driver's declared capability profile through the guard, not a spread. */
-function declaredCapabilities(capabilities: RunnerIsolationCapabilities): RunnerIsolationCapabilities {
-  const scope =
-    capabilities.filesystemScope === 'scoped-worktree' ||
-    capabilities.filesystemScope === 'inherited-directory'
-      ? capabilities.filesystemScope
-      : 'unknown';
-  const booleans = {} as Record<(typeof CAPABILITY_BOOLEAN_KEYS)[number], boolean>;
-  for (const key of CAPABILITY_BOOLEAN_KEYS) {
-    booleans[key] = capabilities[key] === true;
-  }
-  if (scope === 'unknown') {
-    return { filesystemScope: 'unknown', ...booleans, source: 'undeclared' };
-  }
-  return { filesystemScope: scope, ...booleans, source: 'declared' };
+function failClosedCapabilities(): RunnerIsolationCapabilities {
+  return {
+    filesystemScope: 'unknown',
+    networkEgressRestricted: false,
+    cpuAndMemoryLimited: false,
+    processTreeTermination: false,
+    authoritativeCompletion: false,
+    artifactPersistence: false,
+    source: 'undeclared',
+  };
 }
 
-/** Runtime shape check for a driver inspect result; anything else is unreachable. */
-function isTrustedInspectResult(value: unknown): value is SandboxInspectResult {
-  if (guardObject(value, new Set(Object.keys({
-    runnerReachable: true,
-    workspacePreparation: true,
-    workerCommand: true,
-    completionReceipt: true,
-    artifactsCollected: true,
-  }))) !== 'ok') {
+/** Read the driver's declared capability profile through the guard, not a spread. */
+function declaredCapabilities(capabilities: unknown): RunnerIsolationCapabilities {
+  const read = readPlain(capabilities, CAPABILITY_KEYS);
+  if (!read.ok) {
+    return failClosedCapabilities();
+  }
+  const scopeValue = read.data.filesystemScope;
+  let scope: 'scoped-worktree' | 'inherited-directory' | 'unknown' = 'unknown';
+  if (scopeValue === 'scoped-worktree' || scopeValue === 'inherited-directory') {
+    scope = scopeValue;
+  }
+  const networkEgressRestricted = read.data.networkEgressRestricted === true;
+  const cpuAndMemoryLimited = read.data.cpuAndMemoryLimited === true;
+  const processTreeTermination = read.data.processTreeTermination === true;
+  const authoritativeCompletion = read.data.authoritativeCompletion === true;
+  const artifactPersistence = read.data.artifactPersistence === true;
+  if (scope === 'unknown') {
+    return {
+      filesystemScope: 'unknown',
+      networkEgressRestricted,
+      cpuAndMemoryLimited,
+      processTreeTermination,
+      authoritativeCompletion,
+      artifactPersistence,
+      source: 'undeclared',
+    };
+  }
+  return {
+    filesystemScope: scope,
+    networkEgressRestricted,
+    cpuAndMemoryLimited,
+    processTreeTermination,
+    authoritativeCompletion,
+    artifactPersistence,
+    source: 'declared',
+  };
+}
+
+function isWellTypedRequired(data: Record<string, unknown>): boolean {
+  const scope = data.filesystemScope;
+  if (scope !== 'scoped-worktree' && scope !== 'inherited-directory' && scope !== 'unknown') {
     return false;
   }
-  const result = value as SandboxInspectResult;
-  return (
-    (result.runnerReachable === 'reachable' || result.runnerReachable === 'unreachable') &&
-    ['unprepared', 'preparing', 'prepared', 'failed'].includes(result.workspacePreparation) &&
-    ['not-started', 'active', 'ended'].includes(result.workerCommand) &&
-    (result.completionReceipt === null || typeof result.completionReceipt === 'object') &&
-    typeof result.artifactsCollected === 'boolean'
-  );
+  for (const key of CAPABILITY_BOOLEAN_KEYS) {
+    if (typeof data[key] !== 'boolean') {
+      return false;
+    }
+  }
+  if (!Object.hasOwn(data, 'source')) {
+    return true;
+  }
+  return data.source === 'declared' || data.source === 'undeclared' || data.source === 'legacy-asserted';
+}
+
+const CREATE_ALLOWED_KEYS: ReadonlySet<string> = new Set(['outcome', 'sessionId']);
+const CREATE_CONFIRMED_KEYS = ['outcome', 'sessionId'] as const;
+const CREATE_REFUSED_KEYS = ['outcome'] as const;
+const DESTROY_KEYS = ['outcome'] as const;
+const DESTROY_ALLOWED_KEYS: ReadonlySet<string> = new Set(DESTROY_KEYS);
+const INSPECT_KEY_LIST = [
+  'runnerReachable',
+  'workspacePreparation',
+  'workerCommand',
+  'completionReceipt',
+  'artifactsCollected',
+] as const;
+const INSPECT_KEYS: ReadonlySet<string> = new Set(INSPECT_KEY_LIST);
+const RECEIPT_KEY_LIST = [
+  'attemptId',
+  'sessionId',
+  'endedAtIso',
+  'authoritative',
+  'exitStatus',
+  'stoppedByRequest',
+] as const;
+const RECEIPT_KEYS: ReadonlySet<string> = new Set(RECEIPT_KEY_LIST);
+
+type ClassifiedCreate =
+  | { readonly kind: 'started'; readonly sessionId: string }
+  | { readonly kind: 'refused' }
+  | { readonly kind: 'unknown' };
+
+/** Exact create shapes only. Anything else, including a throw, is unconfirmed. */
+function classifyCreate(value: unknown): ClassifiedCreate {
+  try {
+    const read = readPlain(value, CREATE_ALLOWED_KEYS);
+    if (!read.ok) {
+      return { kind: 'unknown' };
+    }
+    if (
+      read.data.outcome === 'confirmed' &&
+      hasExactOwnKeys(read.data, CREATE_CONFIRMED_KEYS) &&
+      isValidSessionId(read.data.sessionId)
+    ) {
+      return { kind: 'started', sessionId: read.data.sessionId };
+    }
+    if (read.data.outcome === 'refused' && hasExactOwnKeys(read.data, CREATE_REFUSED_KEYS)) {
+      return { kind: 'refused' };
+    }
+    return { kind: 'unknown' };
+  } catch {
+    return { kind: 'unknown' };
+  }
+}
+
+function classifyDestroy(value: unknown): 'destroyed' | 'still-present' | 'unknown' {
+  try {
+    const read = readPlain(value, DESTROY_ALLOWED_KEYS);
+    if (!read.ok || !hasExactOwnKeys(read.data, DESTROY_KEYS)) {
+      return 'unknown';
+    }
+    if (read.data.outcome === 'destroyed') {
+      return 'destroyed';
+    }
+    if (read.data.outcome === 'still-present') {
+      return 'still-present';
+    }
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function isWorkspaceState(value: unknown): value is WorkspacePreparationState {
+  return value === 'unprepared' || value === 'preparing' || value === 'prepared' || value === 'failed';
+}
+
+function isWorkerPhase(value: unknown): value is WorkerCommandPhase {
+  return value === 'not-started' || value === 'active' || value === 'ended';
+}
+
+/**
+ * A receipt is trusted only when its own data matches this session.
+ * A mismatch or a hostile value is `null` and never throws.
+ */
+function trustedReceipt(
+  value: unknown,
+  attemptId: string,
+  sessionId: string,
+): CommandCompletionReceipt | null {
+  if (value === null) {
+    return null;
+  }
+  try {
+    const read = readPlain(value, RECEIPT_KEYS);
+    if (!read.ok || !hasExactOwnKeys(read.data, RECEIPT_KEY_LIST)) {
+      return null;
+    }
+    if (read.data.attemptId !== attemptId || read.data.sessionId !== sessionId) {
+      return null;
+    }
+    const endedAtIso = read.data.endedAtIso;
+    const authoritative = read.data.authoritative;
+    const exitStatus = read.data.exitStatus;
+    const stoppedByRequest = read.data.stoppedByRequest;
+    if (typeof endedAtIso !== 'string' || endedAtIso.length === 0 || endedAtIso.length > 128) {
+      return null;
+    }
+    if (endedAtIso.includes('\0') || endedAtIso.includes('\r') || endedAtIso.includes('\n')) {
+      return null;
+    }
+    if (typeof authoritative !== 'boolean' || typeof stoppedByRequest !== 'boolean') {
+      return null;
+    }
+    let exit: number | null;
+    if (exitStatus === null) {
+      exit = null;
+    } else if (typeof exitStatus === 'number' && Number.isFinite(exitStatus)) {
+      exit = exitStatus;
+    } else {
+      return null;
+    }
+    return {
+      attemptId,
+      sessionId,
+      endedAtIso,
+      authoritative,
+      exitStatus: exit,
+      stoppedByRequest,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** A driver inspect answer, or `null` when the answer itself is unusable. */
+function parseInspect(value: unknown, attemptId: string, sessionId: string): RunnerSessionStatus | null {
+  try {
+    const read = readPlain(value, INSPECT_KEYS);
+    if (!read.ok || !hasExactOwnKeys(read.data, INSPECT_KEY_LIST)) {
+      return null;
+    }
+    const runnerReachable = read.data.runnerReachable;
+    const workspacePreparation = read.data.workspacePreparation;
+    const workerCommand = read.data.workerCommand;
+    const artifactsCollected = read.data.artifactsCollected;
+    if (runnerReachable !== 'reachable' && runnerReachable !== 'unreachable') {
+      return null;
+    }
+    if (!isWorkspaceState(workspacePreparation) || !isWorkerPhase(workerCommand)) {
+      return null;
+    }
+    if (typeof artifactsCollected !== 'boolean') {
+      return null;
+    }
+    return {
+      runnerReachable,
+      workspacePreparation,
+      workerCommand,
+      completionReceipt: trustedReceipt(read.data.completionReceipt, attemptId, sessionId),
+      artifactsCollected,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function completionInstant(now: (() => Date) | undefined): string | null {
+  try {
+    const instant = (now ?? (() => new Date()))();
+    if (!(instant instanceof Date) || Number.isNaN(instant.getTime())) {
+      return null;
+    }
+    return instant.toISOString();
+  } catch {
+    return null;
+  }
 }
 
 /** One attempt's sandbox bookkeeping inside this adapter. */
 type EnvironmentRecord =
+  | { readonly state: 'in-flight' }
   | { readonly state: 'live'; readonly sessionId: string }
   | { readonly state: 'indeterminate' };
 
@@ -344,207 +658,186 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
   constructor(private readonly options: SandboxRunnerAdapterOptions) {}
 
   describeCapabilities(): RunnerIsolationCapabilities {
-    return declaredCapabilities(this.options.capabilities);
+    try {
+      return declaredCapabilities(this.options.capabilities);
+    } catch {
+      return failClosedCapabilities();
+    }
   }
 
   async startSession(request: StartRunnerSessionRequest): Promise<StartRunnerSessionResult> {
-    if (guardObject(request, START_REQUEST_KEYS) !== 'ok') {
+    const guarded = readPlain(request, START_REQUEST_KEYS);
+    if (!guarded.ok) {
       return { outcome: 'refused', reason: REASON_MALFORMED_START };
     }
-    if (
-      guardObject(request.requiredCapabilities, CAPABILITY_KEYS) !== 'ok' ||
-      (request.seatOverride !== undefined &&
-        guardObject(request.seatOverride, SEAT_OVERRIDE_KEYS) !== 'ok') ||
-      (request.modelAssignment !== undefined &&
-        guardObject(request.modelAssignment, MODEL_ASSIGNMENT_KEYS) !== 'ok')
-    ) {
+    const data = guarded.data;
+    const requiredRead = readPlain(data.requiredCapabilities, CAPABILITY_KEYS);
+    if (!requiredRead.ok || !isWellTypedRequired(requiredRead.data)) {
       return { outcome: 'refused', reason: REASON_MALFORMED_NESTED };
     }
-    const required = request.requiredCapabilities;
-    if (
-      !['scoped-worktree', 'inherited-directory', 'unknown'].includes(required.filesystemScope) ||
-      CAPABILITY_BOOLEAN_KEYS.some((key) => typeof required[key] !== 'boolean') ||
-      (required.source !== undefined &&
-        required.source !== 'declared' &&
-        required.source !== 'undeclared' &&
-        required.source !== 'legacy-asserted')
-    ) {
+    const seatRead = readNested(data, 'seatOverride', SEAT_OVERRIDE_KEYS, false);
+    const assignmentRead = readNested(data, 'modelAssignment', MODEL_ASSIGNMENT_KEYS, false);
+    if (!seatRead.ok || !assignmentRead.ok) {
       return { outcome: 'refused', reason: REASON_MALFORMED_NESTED };
     }
-    if (
-      !isValidAttemptId(request.attemptId) ||
-      isInvalidReference(request.worktreePath) ||
-      isInvalidReference(request.briefPackagePath) ||
-      isInvalidReference(request.baseCommit)
-    ) {
+    const required = requiredRead.data;
+    const seat = seatRead.value;
+    const assignment = assignmentRead.value;
+
+    const attemptId = data.attemptId;
+    const worktreePath = asReference(data.worktreePath);
+    const briefPackagePath = asReference(data.briefPackagePath);
+    const baseCommit = asReference(data.baseCommit);
+    if (!isValidAttemptId(attemptId) || worktreePath === null || briefPackagePath === null || baseCommit === null) {
       return { outcome: 'refused', reason: REASON_INVALID_REFERENCE };
     }
-    if (!isFinitePositive(request.stepLimit) || !isFinitePositive(request.timeLimitSeconds)) {
+    const stepLimit = data.stepLimit;
+    const timeLimitSeconds = data.timeLimitSeconds;
+    if (!isFinitePositive(stepLimit) || !isFinitePositive(timeLimitSeconds)) {
       return { outcome: 'refused', reason: REASON_INVALID_LIMITS };
     }
-    const seatOverride = request.seatOverride;
-    const model = seatOverride?.model ?? request.model ?? request.modelAssignment?.model;
+    const model = firstPresent(seat?.model, data.model, assignment?.model);
     if (!isValidSeatValue(model) || !AGY_MODEL_PATTERN.test(model)) {
       return { outcome: 'refused', reason: REASON_INVALID_MODEL };
     }
-    const agent = seatOverride?.agent ?? request.agent ?? request.modelAssignment?.agent;
-    const variant = seatOverride?.variant ?? request.variant ?? request.modelAssignment?.variant;
-    if ((agent !== undefined && !isValidSeatValue(agent)) || (variant !== undefined && !isValidSeatValue(variant))) {
+    const agent = optionalSeat(firstPresent(seat?.agent, data.agent, assignment?.agent));
+    const variant = optionalSeat(firstPresent(seat?.variant, data.variant, assignment?.variant));
+    if (agent === null || variant === null) {
       return { outcome: 'refused', reason: REASON_INVALID_SEAT_VALUE };
     }
+
     const capabilities = this.describeCapabilities();
     if (
       capabilities.filesystemScope === 'unknown' ||
       required.filesystemScope !== capabilities.filesystemScope ||
-      CAPABILITY_BOOLEAN_KEYS.some(
-        (key) => required[key] === true && capabilities[key] === false,
-      )
+      CAPABILITY_BOOLEAN_KEYS.some((key) => required[key] === true && capabilities[key] === false)
     ) {
       return { outcome: 'refused', reason: REASON_CAPABILITIES };
     }
-    if (this.environments.has(request.attemptId)) {
+    if (this.environments.has(attemptId)) {
       return { outcome: 'blocked', reason: REASON_LIVE };
     }
 
     const payload: SandboxCreatePayload = {
-      attemptId: request.attemptId,
-      worktreePath: request.worktreePath,
-      briefPackagePath: request.briefPackagePath,
-      baseCommit: request.baseCommit,
-      stepLimit: request.stepLimit,
-      timeLimitSeconds: request.timeLimitSeconds,
+      attemptId,
+      worktreePath,
+      briefPackagePath,
+      baseCommit,
+      stepLimit,
+      timeLimitSeconds,
       model,
       ...(agent !== undefined ? { agent } : {}),
       ...(variant !== undefined ? { variant } : {}),
     };
+    // Reserve before the first await. A second start cannot pass the check above
+    // until this call has recorded a confirmed refusal or a terminal state.
+    this.environments.set(attemptId, { state: 'in-flight' });
 
-    let result: unknown;
+    let raw: unknown;
     try {
-      result = await this.options.driver.create(payload);
+      raw = await this.options.driver.create(payload);
     } catch {
-      this.environments.set(request.attemptId, { state: 'indeterminate' });
+      this.environments.set(attemptId, { state: 'indeterminate' });
       return { outcome: 'unknown', reason: REASON_CREATE_UNKNOWN };
     }
 
-    if (
-      typeof result === 'object' &&
-      result !== null &&
-      !Array.isArray(result) &&
-      (result as { outcome?: unknown }).outcome === 'confirmed'
-    ) {
-      const sessionId = (result as { sessionId?: unknown }).sessionId;
-      if (isValidSessionId(sessionId)) {
-        this.environments.set(request.attemptId, { state: 'live', sessionId });
-        return { outcome: 'started', sessionId };
-      }
+    const classified = classifyCreate(raw);
+    if (classified.kind === 'started') {
+      this.environments.set(attemptId, { state: 'live', sessionId: classified.sessionId });
+      return { outcome: 'started', sessionId: classified.sessionId };
     }
-    if (
-      typeof result === 'object' &&
-      result !== null &&
-      !Array.isArray(result) &&
-      (result as { outcome?: unknown }).outcome === 'refused'
-    ) {
+    if (classified.kind === 'refused') {
+      this.environments.delete(attemptId);
       return { outcome: 'refused', reason: REASON_CREATE_REFUSED };
     }
-
-    this.environments.set(request.attemptId, { state: 'indeterminate' });
+    this.environments.set(attemptId, { state: 'indeterminate' });
     return { outcome: 'unknown', reason: REASON_CREATE_UNKNOWN };
   }
 
   async inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus> {
-    if (
-      guardObject(session, SESSION_REF_KEYS) !== 'ok' ||
-      !isValidAttemptId(session.attemptId) ||
-      !isValidSessionId(session.sessionId) ||
-      (session.worktreePath !== undefined && isInvalidReference(session.worktreePath)) ||
-      (session.runner !== undefined &&
-        session.runner !== null &&
-        guardObject(session.runner, RUNNER_RECORD_KEYS) !== 'ok')
-    ) {
+    const guarded = readPlain(session, SESSION_REF_KEYS);
+    if (!guarded.ok) {
+      return unreachableStatus();
+    }
+    const data = guarded.data;
+    const attemptId = data.attemptId;
+    const sessionId = data.sessionId;
+    if (!isValidAttemptId(attemptId) || !isValidSessionId(sessionId)) {
+      return unreachableStatus();
+    }
+    if (Object.hasOwn(data, 'worktreePath') && data.worktreePath !== undefined && asReference(data.worktreePath) === null) {
+      return unreachableStatus();
+    }
+    const runner = readNested(data, 'runner', RUNNER_RECORD_KEYS, true);
+    if (!runner.ok) {
       return unreachableStatus();
     }
 
-    let result: unknown;
+    let raw: unknown;
     try {
-      result = await this.options.driver.inspect(session.sessionId);
+      raw = await this.options.driver.inspect(sessionId);
     } catch {
       return unreachableStatus();
     }
-    if (!isTrustedInspectResult(result)) {
-      return unreachableStatus();
-    }
-
-    const receipt = result.completionReceipt;
-    const trustedReceipt =
-      receipt !== null &&
-      typeof receipt === 'object' &&
-      !Array.isArray(receipt) &&
-      (receipt as CommandCompletionReceipt).attemptId === session.attemptId &&
-      (receipt as CommandCompletionReceipt).sessionId === session.sessionId
-        ? (receipt as CommandCompletionReceipt)
-        : null;
-
-    return {
-      runnerReachable: result.runnerReachable,
-      workspacePreparation: result.workspacePreparation,
-      workerCommand: result.workerCommand,
-      completionReceipt: trustedReceipt,
-      artifactsCollected: result.artifactsCollected,
-    };
+    return parseInspect(raw, attemptId, sessionId) ?? unreachableStatus();
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {
+    const guarded = readPlain(request, STOP_REQUEST_KEYS);
+    if (!guarded.ok) {
+      return { outcome: 'refused', reason: REASON_MALFORMED_STOP };
+    }
+    const data = guarded.data;
+    const attemptId = data.attemptId;
+    const sessionId = data.sessionId;
     if (
-      guardObject(request, STOP_REQUEST_KEYS) !== 'ok' ||
-      !isValidAttemptId(request.attemptId) ||
-      !isValidSessionId(request.sessionId) ||
-      !isFiniteNonNegative(request.gracePeriodSeconds) ||
-      (request.worktreePath !== undefined && isInvalidReference(request.worktreePath)) ||
-      (request.runner !== undefined &&
-        request.runner !== null &&
-        guardObject(request.runner, RUNNER_RECORD_KEYS) !== 'ok')
+      !isValidAttemptId(attemptId) ||
+      !isValidSessionId(sessionId) ||
+      !isFiniteNonNegative(data.gracePeriodSeconds)
     ) {
       return { outcome: 'refused', reason: REASON_MALFORMED_STOP };
     }
-
-    const record = this.environments.get(request.attemptId);
-    if (record === undefined || (record.state === 'live' && record.sessionId !== request.sessionId)) {
-      return { outcome: 'refused', reason: REASON_UNKNOWN_SESSION };
+    if (Object.hasOwn(data, 'worktreePath') && data.worktreePath !== undefined && asReference(data.worktreePath) === null) {
+      return { outcome: 'refused', reason: REASON_MALFORMED_STOP };
+    }
+    const runner = readNested(data, 'runner', RUNNER_RECORD_KEYS, true);
+    if (!runner.ok) {
+      return { outcome: 'refused', reason: REASON_MALFORMED_STOP };
     }
 
-    let result: unknown;
+    const record = this.environments.get(attemptId);
+    if (record === undefined || record.state !== 'live' || record.sessionId !== sessionId) {
+      return { outcome: 'refused', reason: REASON_UNKNOWN_SESSION };
+    }
+    const confirmedSessionId = record.sessionId;
+
+    let raw: unknown;
     try {
-      result = await this.options.driver.destroy(request.sessionId);
+      raw = await this.options.driver.destroy(confirmedSessionId);
     } catch {
       return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
     }
 
-    if (
-      typeof result === 'object' &&
-      result !== null &&
-      !Array.isArray(result) &&
-      (result as { outcome?: unknown }).outcome === 'destroyed'
-    ) {
-      this.environments.delete(request.attemptId);
-      const endedAt = (this.options.now ?? (() => new Date()))().toISOString();
+    const kind = classifyDestroy(raw);
+    if (kind === 'destroyed') {
+      const endedAtIso = completionInstant(this.options.now);
+      if (endedAtIso === null) {
+        return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+      }
+      this.environments.delete(attemptId);
       return {
         outcome: 'terminated',
         receipt: {
-          attemptId: request.attemptId,
-          sessionId: request.sessionId,
-          endedAtIso: endedAt,
+          attemptId,
+          sessionId: confirmedSessionId,
+          endedAtIso,
           authoritative: true,
           exitStatus: null,
           stoppedByRequest: true,
         },
       };
     }
-    if (
-      typeof result === 'object' &&
-      result !== null &&
-      !Array.isArray(result) &&
-      (result as { outcome?: unknown }).outcome === 'still-present'
-    ) {
+    if (kind === 'still-present') {
       return { outcome: 'still-running', reason: REASON_STILL_PRESENT };
     }
     return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };

@@ -178,11 +178,14 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
       return STAY_MALFORMED_DIRTY;
     }
     // Optional `headAdvanced`: absent means unknown (treated as `false`). A
-    // present value that is not a boolean is malformed.
-    const headAdvanced = fact.headAdvanced;
-    if (headAdvanced !== undefined && typeof headAdvanced !== 'boolean') {
+    // present key that is not a boolean is malformed — presence is an own-key
+    // test, not an `undefined` comparison, because `readPlainRecordWithOptionalKeys`
+    // copies an enumerable accessor's value as `undefined` without invoking it:
+    // an own `headAdvanced: undefined` must be refused, never read as absent.
+    if (Object.hasOwn(fact, 'headAdvanced') && typeof fact.headAdvanced !== 'boolean') {
       return STAY_MALFORMED_DIRTY;
     }
+    const headAdvanced = fact.headAdvanced;
     if (trackedFilesChanged === 0) {
       // A clean worktree is only "nothing to do" when the head has not moved.
       // A clean worktree whose HEAD advanced past the attempt's recorded head

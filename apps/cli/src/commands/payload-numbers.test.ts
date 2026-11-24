@@ -182,6 +182,52 @@ describe('num and optNum never run a throwing getter on payload[key]', () => {
   });
 });
 
+describe('num and optNum refuse a throwing or revoked Proxy with the typed result', () => {
+  it('returns the fallback / undefined for a revoked Proxy payload', () => {
+    const handle = Proxy.revocable({ revision: 7 }, {});
+    handle.revoke();
+    const proxy = handle.proxy as unknown as Payload;
+    expect(num(proxy, 'revision', 42)).toBe(42);
+    expect(num(proxy, 'revision', -99)).toBe(-99);
+    expect(optNum(proxy, 'revision')).toBeUndefined();
+  });
+
+  it('returns the fallback / undefined when the payload Proxy throws from its getOwnPropertyDescriptor trap', () => {
+    const payload = new Proxy(
+      { revision: 7 },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('boom');
+        },
+      },
+    ) as Payload;
+    expect(num(payload, 'revision', 42)).toBe(42);
+    expect(num(payload, 'revision', -99)).toBe(-99);
+    expect(optNum(payload, 'revision')).toBeUndefined();
+  });
+
+  it('returns the fallback / undefined when the descriptor itself is a Proxy whose traps throw', () => {
+    const payload = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          return new Proxy(
+            { value: 7 },
+            {
+              has() {
+                throw new Error('boom');
+              },
+            },
+          );
+        },
+      },
+    ) as Payload;
+    expect(num(payload, 'revision', 42)).toBe(42);
+    expect(num(payload, 'revision', -99)).toBe(-99);
+    expect(optNum(payload, 'revision')).toBeUndefined();
+  });
+});
+
 describe('questions answer refuses a bare --revision at the CLI boundary', () => {
   it('exits 2, writes the usage message to stderr, nothing to stdout, and calls the use case zero times', async () => {
     const calls: unknown[] = [];

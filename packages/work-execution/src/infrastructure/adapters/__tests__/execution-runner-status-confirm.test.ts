@@ -118,6 +118,24 @@ describe('ExecutionRunnerAdapter inspectSession confirms an exit-0 status with a
     }
   });
 
+  it('returns unknown without sleeping when reading the sessionId throws', async () => {
+    const { runner, calls } = scriptedRunner([{ exitCode: 0, stdout: startedJson, stderr: '' }]);
+    const { sleep, delays } = spySleep();
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166, sleep });
+    const hostileSession = {
+      attemptId: 'att-1',
+      worktreePath: worktree,
+      runner: runnerRecord,
+      get sessionId(): string {
+        throw new Error('sessionId getter must be contained');
+      },
+    };
+    const status = await adapter.inspectSession(hostileSession as never);
+    expect(status).toEqual(unknownStatus);
+    expect(delays).toEqual([]);
+    expect(calls.length).toBeLessThanOrEqual(1);
+  });
+
   it('returns unknown with one spawn when the first status read throws or exits non-0/non-3', async () => {
     for (const first of [new Error('connection refused'), { exitCode: 1, stdout: '', stderr: 'down' } as SubprocessResult]) {
       const { runner, calls } = scriptedRunner([first]);
@@ -331,7 +349,7 @@ describe('ExecutionRunnerAdapter inspectSession confirms an exit-0 status with a
   it('reads the runner\u2019s own OCM_WAIT_CONFIRM seconds as the default pause, and falls back to 5000 ms for any other value', async () => {
     const original = process.env['OCM_WAIT_CONFIRM'];
     try {
-      for (const [value, expected] of [['0', 0], ['2', 2000], ['60', 60_000], ['61', 5000], ['-1', 5000], ['1.5', 5000], ['abc', 5000], ['', 5000], ['100', 5000]] as const) {
+      for (const [value, expected] of [['1', 1000], ['2', 2000], ['60', 60_000], ['0', 5000], ['61', 5000], ['-1', 5000], ['1.5', 5000], ['abc', 5000], ['', 5000], ['100', 5000]] as const) {
         process.env['OCM_WAIT_CONFIRM'] = value;
         const { runner } = scriptedRunner([
           { exitCode: 0, stdout: startedJson, stderr: '' },

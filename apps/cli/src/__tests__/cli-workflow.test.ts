@@ -159,7 +159,7 @@ describe('Fleet CLI workflow', () => {
     process.env.OCM_REMOTE_PORT = String(RUNNER_PORT);
     // The stub runner reports a settled session; the adapter's confirming second read need not wait 5 s.
     originalOcmWaitConfirm = process.env.OCM_WAIT_CONFIRM;
-    process.env.OCM_WAIT_CONFIRM = '0';
+    process.env.OCM_WAIT_CONFIRM = '1';
   });
 
   afterEach(() => {

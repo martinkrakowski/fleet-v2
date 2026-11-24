@@ -72,7 +72,7 @@ const DEFAULT_STATUS_CONFIRM_DELAY_MS = 5_000;
 const MAX_STATUS_CONFIRM_DELAY_MS = 60_000;
 
 /**
- * The runner's own `OCM_WAIT_CONFIRM` (whole seconds, 0 to 60, as `bin/ocm-run`
+ * The runner's own `OCM_WAIT_CONFIRM` (whole seconds, 1 to 60, as `bin/ocm-run`
  * documents it) is the default pause when no option is given, so an operator or
  * a stub-runner test sets one knob for both. Anything else reads as the 5 s
  * default. O(1): one environment read and a two-digit pattern.
@@ -81,7 +81,8 @@ function envStatusConfirmDelayMs(): number {
   const raw = process.env['OCM_WAIT_CONFIRM'];
   if (typeof raw !== 'string' || !/^\d{1,2}$/.test(raw)) return DEFAULT_STATUS_CONFIRM_DELAY_MS;
   const seconds = Number(raw);
-  return seconds <= MAX_STATUS_CONFIRM_DELAY_MS / 1000 ? seconds * 1000 : DEFAULT_STATUS_CONFIRM_DELAY_MS;
+  // `bin/ocm-run` rejects 0: the confirming read is at least one second after the first.
+  return seconds >= 1 && seconds <= MAX_STATUS_CONFIRM_DELAY_MS / 1000 ? seconds * 1000 : DEFAULT_STATUS_CONFIRM_DELAY_MS;
 }
 
 /** Bundled runner script at the repository's `bin/ocm-run`. */
@@ -817,7 +818,14 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       // --wait) confirms "nothing runs" only after two status reads
       // OCM_WAIT_CONFIRM seconds apart. One momentary idle read between two
       // steps would otherwise end the session and park the lane.
-      if (typeof session.sessionId !== 'string' || session.sessionId.trim() === '') {
+      // Read once, inside a guard: a getter that throws is a refusal, never an exception.
+      let readSessionId: unknown;
+      try {
+        readSessionId = session.sessionId;
+      } catch {
+        return unknownRunnerStatus();
+      }
+      if (typeof readSessionId !== 'string' || readSessionId.trim() === '') {
         return unknownRunnerStatus();
       }
 

@@ -39,7 +39,30 @@ export type LaneDiffCheckResult =
   /** The change set could not be collected; the check fails closed. */
   | { readonly outcome: "error"; readonly reason: string };
 
+/**
+ * SN2: the request of the per-commit range scan. Every commit in
+ * `baseCommit..headCommit` is scanned on its own diff against its first
+ * parent, so a secret added by one commit and removed by a later one cannot
+ * hide behind a clean final tree.
+ */
+export interface LaneDiffCommitRangeRequest extends LaneDiffCheckRequest {
+  /** The head the range ends at (a full 40- or 64-hex commit id). */
+  readonly headCommit: string;
+}
+
+/** The per-commit range verdict: the diff-check outcomes plus a typed size refusal. */
+export type LaneDiffCommitRangeResult =
+  | LaneDiffCheckResult
+  /** The range exceeds the commit-count or byte budget; nothing was adopted. */
+  | { readonly outcome: 'range-too-large'; readonly limit: 'commits' | 'bytes' };
+
 export interface LaneDiffCheckPort {
   /** Check one worktree's change set against the frozen brief's prefixes. */
   checkLaneDiff(request: LaneDiffCheckRequest): Promise<LaneDiffCheckResult>;
+  /**
+   * SN2: scan every commit of `baseCommit..headCommit` on its own diff
+   * against its first parent. Optional: an implementation without it cannot
+   * back a head adoption, and the dispatch refuses.
+   */
+  checkLaneDiffCommitRange?(request: LaneDiffCommitRangeRequest): Promise<LaneDiffCommitRangeResult>;
 }

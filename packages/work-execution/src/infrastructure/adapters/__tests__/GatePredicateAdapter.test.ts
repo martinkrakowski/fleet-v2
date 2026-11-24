@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { GatePredicateAdapter } from '../GatePredicateAdapter.adapter.js';
+import { GatePredicateAdapter, boundedRedactedOutputTail } from '../GatePredicateAdapter.adapter.js';
 import type { GatePredicateAdapterOptions } from '../GatePredicateAdapter.adapter.js';
 import type {
   EvaluateGatePredicatesRequest,
@@ -861,5 +861,251 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     const prefixed = executor.argvRecords.find((argv) => argv.includes(GATE_SLOT_PATH));
     expect(prefixed).toBeDefined();
     expect(prefixed).toContain('FLEET_V2_GATE_WAIT_MAX_SECONDS=1');
+  });
+});
+
+describe('GatePredicateAdapter failed output tail (GD2)', () => {
+  const HOST_SPEC: RunnerForAttemptHostSpec = {
+    transport: 'local',
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 4096 },
+  };
+
+  function commandResults(script: (argv: readonly string[]) => Partial<CommandRunResult>) {
+    const adapter = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? script(argv) : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    return adapter.adapter.evaluateGatePredicates(REQUEST).then(evaluatedResults);
+  }
+
+  it('attaches a bounded outputTail to a failing command with output', async () => {
+    const results = await commandResults(() => ({ exitCode: 1, stdout: 'error: build failed\n' }));
+    expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 1, outputTail: 'error: build failed' });
+  });
+
+  it('omits outputTail when both streams are empty or whitespace', async () => {
+    for (const streams of [{}, { stdout: '', stderr: '' }, { stdout: '   \n\t', stderr: '' }]) {
+      const results = await commandResults(() => ({ exitCode: 1, ...streams }));
+      expect(results[2]).not.toHaveProperty('outputTail');
+    }
+  });
+
+  it('omits outputTail on pass, skipped, timeout and congestion verdicts', async () => {
+    const passing = await commandResults(() => ({ exitCode: 0, stdout: 'all good\n' }));
+    expect(passing[2]).not.toHaveProperty('outputTail');
+    const killed = await commandResults(() => ({ exitCode: 137, signal: 'KILL', stdout: 'out of memory\n' }));
+    expect(killed[2]).toMatchObject({ verdict: 'unknown', cause: 'resource-exhausted' });
+    expect(killed[2]).not.toHaveProperty('outputTail');
+    const timedOut = await commandResults(() => ({ exitCode: 1, error: 'timed out', stdout: 'partial\n' }));
+    expect(timedOut[2].verdict === 'unknown').toBe(true);
+    expect(timedOut[2]).not.toHaveProperty('outputTail');
+  });
+
+  it('omits outputTail for the declared gate-slot wait-limit verdict (exit 75 unknown)', async () => {
+    const slotSpec: RunnerForAttemptHostSpec = {
+      transport: 'local',
+      roles: ['lane-runner'],
+      runner: { kind: 'opencode', port: 4096, gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 } },
+    };
+    const adapter = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? { exitCode: 75, stderr: 'gate-slot: no slot within the wait limit\n' }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      slotSpec,
+    );
+    const results = evaluatedResults(await adapter.adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'unknown', cause: 'gate-slot-wait-limit' });
+    expect(results[2]).not.toHaveProperty('outputTail');
+  });
+
+  it('keeps the tail at most 200 lines and 32 KiB of combined output', async () => {
+    const long = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+    const results = await commandResults(() => ({ exitCode: 1, stdout: long }));
+    const tail = results[2].kind === 'command' && typeof results[2].outputTail === 'string' ? results[2].outputTail : '';
+    expect(tail.length).toBeLessThanOrEqual(32 * 1024);
+    expect(tail.startsWith('line ')).toBe(true);
+    expect(tail).not.toContain('line 0\n');
+    expect(tail.endsWith('line 399')).toBe(true);
+  });
+
+  it('redacts secret-shaped lines line by line', async () => {
+    const results = await commandResults(() => ({
+      exitCode: 1,
+      stdout: 'starting build\ntoken: gh' + 'p_abc123def456ghi789jkl012mno345pqr678\nbuild failed\n',
+    }));
+    const tail = results[2].kind === 'command' && typeof results[2].outputTail === 'string' ? results[2].outputTail : '';
+    expect(tail).toContain('starting build');
+    expect(tail).toContain('[redacted: secret-shaped line]');
+    expect(tail).not.toContain('gh' + 'p_');
+  });
+
+  it('never throws for non-string streams (boundedRedactedOutputTail is total)', () => {
+    for (const [a, b] of [
+      [undefined, undefined],
+      [null as unknown, null as unknown],
+      [{ length: 3 } as unknown, 42 as unknown],
+    ]) {
+      expect(() => boundedRedactedOutputTail(a, b)).not.toThrow();
+      expect(boundedRedactedOutputTail(a, b)).toBeUndefined();
+    }
+    expect(boundedRedactedOutputTail('out\n', undefined)).toBe('out');
+    expect(boundedRedactedOutputTail(undefined, 'err\n')).toBe('err');
+  });
+
+  it('strips ANSI escape sequences before bounding and redacting', async () => {
+    const results = await commandResults(() => ({
+      exitCode: 1,
+      stdout: '[31merror: failed[0m\n',
+    }));
+    expect(results[2].kind === 'command' && results[2].outputTail).toBe('error: failed');
+  });
+
+  it('GD2 bounds the tail in UTF-8 bytes on a code-point boundary', () => {
+    const emojiLine = '\u{1F600}'.repeat(10);
+    const tail = boundedRedactedOutputTail(`${emojiLine}\n`.repeat(2000), undefined);
+    expect(tail).toBeDefined();
+    expect(Buffer.byteLength(tail as string, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    // The cut first line is partial and dropped: every kept line is whole.
+    for (const line of (tail as string).split('\n')) {
+      expect(line).toBe(emojiLine);
+    }
+    const cjkLine = '\u4e2d'.repeat(10);
+    const cjk = boundedRedactedOutputTail(`${cjkLine}\n`.repeat(2000), undefined) as string;
+    expect(Buffer.byteLength(cjk, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    for (const line of cjk.split('\n')) {
+      expect(line).toBe(cjkLine);
+    }
+  });
+
+  it('bounds the scan of an enormous stream to its last 200 lines and 32 KiB', () => {
+    // A stream far past the bound (several MiB, 100k+ lines): the tail must
+    // still be exactly the last 200 lines capped to 32 KiB, produced by
+    // scanning only the end of the stream — a whole-stream join/strip/split
+    // would allocate and scan every byte first.
+    const long = Array.from({ length: 120000 }, (_, i) => `line ${i}: aaaa`).join('\n');
+    const tail = boundedRedactedOutputTail(long, undefined);
+    expect(tail).toBeDefined();
+    const lines = (tail as string).split('\n');
+    expect(lines.length).toBeLessThanOrEqual(200);
+    expect((tail as string).length).toBeLessThanOrEqual(32 * 1024);
+    expect(lines[0]).toBe('line 119800: aaaa');
+    expect(lines[lines.length - 1]).toBe('line 119999: aaaa');
+    const hugeLine = 'x'.repeat(10_000_000) + '\nlast words';
+    const hugeTail = boundedRedactedOutputTail(hugeLine, undefined);
+    expect(hugeTail).toBe('last words');
+  });
+
+  it('keeps the combined stdout+stderr scan within 32 KiB, never splitting more than the combined window (fix round 2, item 2)', () => {
+    // Two streams whose individually retained slices add up to well over
+    // 32 KiB: the helper must cut the raw COMBINED text to its last 32 KiB
+    // before any strip or split, and apply the 200-line limit by locating the
+    // boundary newline instead of splitting the whole window. The assertions
+    // fail against the previous implementation, which joined both retained
+    // 32 KiB slices and split the ~64 KiB result before limiting the lines.
+    const stdout = Array.from({ length: 40000 }, (_, i) => `out ${i}`).join('\n');
+    const stderr = Array.from({ length: 300 }, (_, i) => `err ${i}`).join('\n');
+    expect(stdout.length + stderr.length).toBeGreaterThan(64 * 1024);
+    const originalSplit = String.prototype.split;
+    let longestSplit = 0;
+    (String.prototype as { split: typeof String.prototype.split }).split = function trackedSplit(
+      this: string,
+      ...args: unknown[]
+    ) {
+      longestSplit = Math.max(longestSplit, this.length);
+      return originalSplit.apply(this, args as Parameters<typeof originalSplit>);
+    };
+    try {
+      const tail = boundedRedactedOutputTail(stdout, stderr);
+      expect(tail).toBeDefined();
+      const lines = (tail as string).split('\n');
+      expect(lines.length).toBeLessThanOrEqual(200);
+      // stderr is fully inside the combined last-32-KiB window, so the last
+      // 200 lines of the combined text are exactly stderr's last 200 lines.
+      expect(lines[0]).toBe('err 100');
+      expect(lines[lines.length - 1]).toBe('err 299');
+      expect((tail as string).length).toBeLessThanOrEqual(32 * 1024);
+    } finally {
+      String.prototype.split = originalSplit;
+    }
+    expect(longestSplit).toBeLessThanOrEqual(32 * 1024 + 1);
+  });
+
+  it('returns undefined when only the unscanned head carries non-whitespace content', () => {
+    // A stream whose last 32 KiB is entirely blank: the bounded scan never
+    // reads the non-whitespace head, so the tail is whitespace-only and
+    // undefined — a whole-stream implementation would still emit a
+    // whitespace-only tail string.
+    const tail = boundedRedactedOutputTail('x\n' + ' '.repeat(50000), undefined);
+    expect(tail).toBeUndefined();
+  });
+  it('GD2 redacts a whole PEM block, not only its BEGIN line', () => {
+    const begin = '-----' + 'BEGIN ' + 'PRIVATE ' + 'KEY-----';
+    const end = '-----' + 'END ' + 'PRIVATE ' + 'KEY-----';
+    const body = ['Zm9vYmFyYmF6cXV4', 'quuxCORGEgraultGARPLY0123'].map((part) => part.repeat(4));
+    const tail = boundedRedactedOutputTail(['before', begin, ...body, end, 'after'].join('\n'), undefined) as string;
+    expect(tail).toContain('before');
+    expect(tail).toContain('after');
+    for (const hidden of [begin, end, ...body]) {
+      expect(tail).not.toContain(hidden);
+    }
+  });
+
+  it('GD2 redacts a PEM block with no END line to the end of the tail', () => {
+    const begin = '-----' + 'BEGIN ' + 'RSA ' + 'PRIVATE ' + 'KEY-----';
+    const tail = boundedRedactedOutputTail(['before', begin, 'bodyline-one', 'bodyline-two'].join('\n'), undefined) as string;
+    expect(tail).toBe(['before', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]', '[redacted: secret-shaped line]'].join('\n'));
+  });
+
+  it('GD2 redacts a long base64-ish run, but not a hex digest', () => {
+    const blob = 'aB3k9xQkL7mZ2pR4tY6uW8eI0oA1sD5fG7hJ9' + 'kLzXcV';
+    expect(blob.length).toBe(43);
+    const digest = 'abcdef0123456789'.repeat(4);
+    const tail = boundedRedactedOutputTail(`${blob}\ndigest ${digest}`, undefined) as string;
+    expect(tail).not.toContain(blob);
+    expect(tail).toContain(digest);
+    const slashed = 'aB3k9xQkL7mZ2pR4tY6/uW8eI0oA1sD5fG7hJ9kLzXcV+=';
+    expect(boundedRedactedOutputTail(slashed, undefined)).toBe('[redacted: secret-shaped line]');
+  });
+
+  it('GD2 keeps path-shaped error locations out of the base64 redaction', () => {
+    const lines = [
+      'packages/work-execution/src/infrastructure/adapters/GatePredicateAdapter.adapter.ts(12,3): error TS2322: bad',
+      'src/infrastructure/Adapters2/GatePredicateAdapter2Handler.adapter.ts(12,3): error TS2322: bad',
+      '    at file:///home/u/work/packages/work-execution/src/Gate2Adapter/GatePredicate.test.ts:12:5',
+      '/home/u/packages/work-execution/src/infrastructure/Adapters2/Gate.ts  12:3  error  no-unused-vars',
+      'at node_modules/@scope/pkg/dist/index.js:10:2 node_modules/@scope/pkg2/Dist/Index2Handler.js',
+    ];
+    expect(boundedRedactedOutputTail(lines.join('\n'), undefined)).toBe(lines.join('\n'));
+  });
+
+  it('GD2 does not leak a token split by the 32 KiB cut', () => {
+    const token = 'gh' + 'p_abc123def456ghi789jkl012mno345pqr678';
+    const total = 32 * 1024;
+    // The window is the last 32 KiB: the token starts 15 characters before the cut,
+    // so the surviving 15-character-shorter suffix must not be emitted unredacted.
+    const restLength = total + 15 - token.length;
+    const rest = `\n${'y'.repeat(restLength - 6)}\nlast`;
+    expect(rest.length).toBe(restLength);
+    const out = boundedRedactedOutputTail(`${'q'.repeat(10)}${token}${rest}`, undefined) as string;
+    expect(out).not.toContain(token.slice(15));
+    expect(out).toContain('last');
+  });
+
+  it('GD2 keeps the byte bound after redaction, even when markers are longer than the lines they replace', () => {
+    const begin = '-----' + 'BEGIN ' + 'X-----';
+    const end = '-----' + 'END ' + 'X-----';
+    const pairs = `${begin}\n${end}\n`.repeat(99);
+    const filler = 'y'.repeat(32 * 1024 - pairs.length);
+    const raw = pairs + filler;
+    expect(raw.length).toBe(32 * 1024);
+    const out = boundedRedactedOutputTail(raw, undefined) as string;
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    expect(out).not.toContain('BEGIN');
   });
 });

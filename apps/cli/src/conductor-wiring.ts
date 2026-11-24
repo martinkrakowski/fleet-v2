@@ -35,7 +35,7 @@ import {
   type WorkOrderRepositoryAdapter,
 } from '@fleet/work-execution';
 
-import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import { isSameModelFamily, underlyingModelFamily, EvidenceArchiveAdapter } from '@fleet/evidence-and-acceptance';
 
 import { createDryRunFakes } from './conductor-dry-run.js';
 import { newUlid } from './ulid.js';
@@ -220,6 +220,8 @@ export function buildLiveConductorDriver(
     dispatchAttempt: execution.dispatchAttempt,
     cancelPreparedAttempt,
     worktreeRecovery: execution.workspace,
+    // GD1: the same workspace port reads a fix attempt's worktree clean state.
+    worktreeInspect: execution.workspace,
     installationSchemaVersion: runtime.installation?.schemaVersion,
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,
@@ -251,6 +253,9 @@ export function buildLiveConductorDriver(
     autoMergeEnabled: conductor.autoMergeEnabled,
     // CO21: policy.conductor.premergeMode; absent or malformed resolves to 'human-gate'.
     premergeMode: policy.premergeMode,
+    // GD2: the runtime's evidence archive — the fix handover reads failed
+    // gate output tails from it.
+    evidenceArchive: runtime.evidence.evidenceArchive,
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
@@ -372,6 +377,8 @@ export function buildDryRunConductorDriver(
     autoMergeEnabled: true,
     // Dry-run exercises the full merging -> merged path on the fake driver:
     premergeMode: 'auto-attest',
+    // GD2: a real (disposable) archive so the dry run reads failed gate tails.
+    evidenceArchive: new EvidenceArchiveAdapter(),
   });
   return buildConductorDriver({
     driverLease: stores.driverLease,

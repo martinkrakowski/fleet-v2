@@ -107,10 +107,11 @@ function hasPollutingKey(source: object): boolean {
  */
 export function parseHostAudibleAlertRequest(request: unknown): SpdSayRequestParsing {
   try {
-    if (isHostileRequestShape(request)) {
+    const read = readRequestSentence(request);
+    if (!read.ok) {
       return { ok: false, reasonCode: 'invalid-request' };
     }
-    return validateHostAudibleAlertSentence(ownValue(request, 'sentence'));
+    return validateHostAudibleAlertSentence(read.sentence);
   } catch {
     // A revoked (or otherwise hostile) Proxy may throw on any touch; refuse it
     // rather than letting the throw map onto `spawn-failed`.
@@ -120,23 +121,31 @@ export function parseHostAudibleAlertRequest(request: unknown): SpdSayRequestPar
 
 /**
  * The request must be a plain record (prototype `Object.prototype` or `null`,
- * non-array, non-Proxy) whose own keys are exactly `['sentence']` and without
- * a prototype-polluting own key. `isProxy` observes no trap and no getter.
+ * non-array, non-Proxy) without a prototype-polluting own key, whose `sentence`
+ * own property is a plain data property (no accessor — a getter is never run).
+ * Extra own keys are tolerated and never read: no enumeration happens.
+ * `isProxy` observes no trap and no getter.
  */
-function isHostileRequestShape(request: unknown): boolean {
+function readRequestSentence(request: unknown): { readonly ok: true; readonly sentence: unknown } | { readonly ok: false } {
   // `isProxy` first: it observes no trap, while `isPlainRecordObject` reads the
   // prototype and would trigger a Proxy `getPrototypeOf` trap before the Proxy
   // is refused.
   if (types.isProxy(request)) {
-    return true;
+    return { ok: false };
   }
   if (!isPlainRecordObject(request)) {
-    return true;
+    return { ok: false };
   }
   if (hasPollutingKey(request)) {
-    return true;
+    return { ok: false };
   }
-  return Object.getOwnPropertyNames(request).some((key) => key !== 'sentence');
+  // Exactly one own-descriptor lookup: never enumerates own keys and never
+  // invokes a getter (accessors are refused without running).
+  const descriptor = Object.getOwnPropertyDescriptor(request, 'sentence');
+  if (descriptor === undefined || !('value' in descriptor) || 'get' in descriptor || 'set' in descriptor) {
+    return { ok: false };
+  }
+  return { ok: true, sentence: descriptor.value };
 }
 
 /**

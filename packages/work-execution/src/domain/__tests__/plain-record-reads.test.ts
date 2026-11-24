@@ -202,6 +202,100 @@ describe('readBoundedDenseArray', () => {
     expect(readBoundedDenseArray(proxied, 8)).toBeNull();
   });
 
+  // Cost bound: O(1) per-index descriptor check within the O(cap) loop.
+  it('refuses an index accessor (getter never runs) and an index descriptor whose Proxy reports an accessor despite value being present', () => {
+    let getterCalls = 0;
+    const value: unknown[] = ['a'];
+    Object.defineProperty(value, 0, {
+      get() {
+        getterCalls += 1;
+        return 'a';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    expect(readBoundedDenseArray(value, 8)).toBeNull();
+    expect(getterCalls).toBe(0);
+
+    // A Proxy reports a descriptor that has both `value` and a `get`, so
+    // `'value' in descriptor` alone would pass: `descriptor.get !== undefined`
+    // must refuse it, and the getter must never run.
+    const proxied = new Proxy(['a'] as unknown[], {
+      getOwnPropertyDescriptor(t, prop) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(t, prop);
+        if (prop === '0' && descriptor !== undefined) {
+          return {
+            ...descriptor,
+            get() {
+              getterCalls += 1;
+              return 'a';
+            },
+          };
+        }
+        return descriptor;
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+    expect(getterCalls).toBe(0);
+  });
+
+  // Cost bound: O(cap) — exactly one descriptor read per index, no re-read.
+  it('reads each index from a single descriptor so a Proxy spoofing the second read cannot leak a flipped accessor or value', () => {
+    let descriptorCallsForZero = 0;
+    let getterCalls = 0;
+    const target = ['safe'];
+    const proxied = new Proxy(target, {
+      getOwnPropertyDescriptor(t, prop) {
+        if (prop === '0') {
+          descriptorCallsForZero += 1;
+          if (descriptorCallsForZero === 1) {
+            return { value: 'safe', writable: true, enumerable: true, configurable: true };
+          }
+          return {
+            get() {
+              getterCalls += 1;
+              return 'evil';
+            },
+            enumerable: true,
+            configurable: true,
+          };
+        }
+        return Reflect.getOwnPropertyDescriptor(t, prop);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toEqual({ array: ['safe'], length: 1 });
+    expect(descriptorCallsForZero).toBe(1);
+    expect(getterCalls).toBe(0);
+  });
+
+  // Cost bound: O(1) pre-gate before Reflect.ownKeys.
+  it('refuses an invariant-legal sparse length of 2**32 - 1 in O(1) even when the cap equals it (ownKeys never runs)', () => {
+    let ownKeysCalls = 0;
+    const sparse = new Array(2 ** 32 - 1);
+    const proxied = new Proxy(sparse, {
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 2 ** 32 - 1)).toBeNull();
+    expect(ownKeysCalls).toBe(0);
+  });
+
+  // Cost bound: O(1) pre-gate before Reflect.ownKeys.
+  it('refuses an invariant-legal length of 1_000_000 above the cap in O(1) (ownKeys never runs)', () => {
+    let ownKeysCalls = 0;
+    const overCap = new Array(1_000_000);
+    const proxied = new Proxy(overCap, {
+      ownKeys(t) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    expect(readBoundedDenseArray(proxied, 8)).toBeNull();
+    expect(ownKeysCalls).toBe(0);
+  });
+
   it('is not a constant verdict: different inputs give different results', () => {
     const one = readBoundedDenseArray(['a'], 8);
     const two = readBoundedDenseArray(['a', 'b'], 8);

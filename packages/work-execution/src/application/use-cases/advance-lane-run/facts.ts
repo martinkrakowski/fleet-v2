@@ -14,8 +14,11 @@ import {
   laneRunCiFailureRecorded,
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
+  laneRunGateFailed,
   laneRunGateFact,
+  laneRunGateLatestRound,
   laneRunGateUnknown,
+  laneRunFixRoundGateDriven,
   laneRunMergeEnqueueFact,
   laneRunPremergePost,
   laneRunRecordedSeatAdvance,
@@ -249,6 +252,26 @@ export async function gatherFacts(ctx: AdvanceStepContext,
 
   const review = reviewFactsOf(ctx, record, state, entries, head12, attemptRecords);
 
+  // GD1: the gate facts a re-gate of a clean gate-driven fix round reads.
+  const gateLatestRound = laneRunGateLatestRound(entries, record.runId, head12);
+  const gateFailed = laneRunGateFailed(entries, record.runId, head12);
+  const fixRoundGateDriven = laneRunFixRoundGateDriven(entries, record.runId);
+  // The worktree read is made exactly once, only for a collecting fix round the
+  // gate drove at an unchanged head that has not already been re-gated this
+  // round, and only when the attempt has collected artifacts to gate.
+  const reGateCandidate =
+    state === 'collecting' &&
+    attempt !== null &&
+    attempt.round >= 1 &&
+    attempt.collection?.headUnchanged === true &&
+    fixRoundGateDriven &&
+    (gateLatestRound === null || gateLatestRound < attempt.round) &&
+    latest !== null &&
+    latest.artifacts !== null;
+  const worktreeCleanForReGate = reGateCandidate && latest !== null
+    ? await worktreeCleanForReGateOf(ctx, latest)
+    : false;
+
   const facts: LaneRunFacts = {
     state,
     halted: request.halted,
@@ -267,6 +290,10 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     gate: laneRunGateFact(entries, record.runId, head12),
     gateCongestion: laneRunGateCongestion(entries, record.runId, head12),
     gateUnknown: laneRunGateUnknown(entries, record.runId, head12),
+    gateLatestRound,
+    gateFailed,
+    fixRoundGateDriven,
+    worktreeCleanForReGate,
     briefCheck: review.briefCheck,
     codeReview: review.codeReview,
     preMergeReview: review.preMergeReview,
@@ -288,6 +315,48 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     merge: acceptance.merge,
   };
   return { facts, deadlineUnknown, latestAttempt: latest, attemptRecords };
+}
+
+/**
+ * GD1: whether the attempt's worktree is clean — no uncommitted and no
+ * untracked paths — read through the `worktreeInspect` port. Fail closed:
+ * an unwired port, a legacy attempt with no recorded host, a throwing read,
+ * a non-object answer, or a non-array or non-empty path list all read dirty,
+ * so a re-gate never fires on a guess.
+ */
+async function worktreeCleanForReGateOf(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+): Promise<boolean> {
+  const port = ctx.deps.worktreeInspect;
+  if (port?.inspectWorktree === undefined) {
+    return false;
+  }
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is
+  // not made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return false;
+  }
+  let inspection: unknown;
+  try {
+    inspection = await port.inspectWorktree({
+      worktreePath: latest.worktreePath,
+      baseCommit: latest.baseCommit,
+      expectedArtifactPaths: [],
+      recordedHost,
+    });
+  } catch {
+    return false;
+  }
+  if (typeof inspection !== 'object' || inspection === null) {
+    return false;
+  }
+  const paths = inspection as { uncommittedPaths?: unknown; untrackedPaths?: unknown };
+  return (
+    Array.isArray(paths.uncommittedPaths) && paths.uncommittedPaths.length === 0 &&
+    Array.isArray(paths.untrackedPaths) && paths.untrackedPaths.length === 0
+  );
 }
 
 /**
@@ -327,6 +396,9 @@ export function refreshGatheredJournalFacts(
       gate: laneRunGateFact(entries, record.runId, head12),
       gateCongestion: laneRunGateCongestion(entries, record.runId, head12),
       gateUnknown: laneRunGateUnknown(entries, record.runId, head12),
+      gateLatestRound: laneRunGateLatestRound(entries, record.runId, head12),
+      gateFailed: laneRunGateFailed(entries, record.runId, head12),
+      fixRoundGateDriven: laneRunFixRoundGateDriven(entries, record.runId),
       briefCheck: review.briefCheck,
       codeReview: review.codeReview,
       preMergeReview: review.preMergeReview,

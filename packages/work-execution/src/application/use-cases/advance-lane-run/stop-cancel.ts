@@ -23,10 +23,13 @@ export type AbandonAmbiguousStopOutcome =
  * on that intent forever (G3b/G3c run ahead of the stop rules). The operator's
  * stop abandons it: one final `overtaken` `intent-abandoned-by-operator` result
  * on the intent's key, then the journal-derived facts are refreshed so the
- * decider applies the stop rules. Nothing is read or written unless a stop is
- * recorded over an ambiguous non-reconcile intent; a merged PR (G3f) still
- * ends the run `merged`, and a key that already has a final result is not
- * written twice.
+ * decider applies the stop rules. FS: the same applies to an unread `premerge`
+ * intent (a `wait` hold with no result) under a force stop with no halt — the
+ * decider no longer reconciles it (G3a), so it would block the stop forever on
+ * `premerge-pending`. Nothing is read or written unless a stop is recorded over
+ * an ambiguous non-reconcile intent or over an unread premerge intent under a
+ * force stop; a merged PR (G3f) still ends the run `merged`, and a key that
+ * already has a final result is not written twice.
  */
 export async function abandonAmbiguousIntentForStop(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -35,11 +38,20 @@ export async function abandonAmbiguousIntentForStop(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
 ): Promise<AbandonAmbiguousStopOutcome> {
   const pending = gathered.facts.pendingIntent;
+  const ambiguousNonReconcile =
+    pending !== null &&
+    pending.reconciliation === 'ambiguous' &&
+    pending.step !== 'reconcile';
+  const forceStopOverUnreadPremerge =
+    pending !== null &&
+    pending.reconciliation === 'unread' &&
+    pending.step === 'premerge' &&
+    gathered.facts.stopMode === 'force' &&
+    !gathered.facts.halted;
   if (
     gathered.facts.stopMode === null ||
     pending === null ||
-    pending.reconciliation !== 'ambiguous' ||
-    pending.step === 'reconcile' ||
+    (!ambiguousNonReconcile && !forceStopOverUnreadPremerge) ||
     decision.kind === 'done' ||
     (decision.kind === 'enter' && decision.to === 'merged')
   ) {

@@ -47,7 +47,12 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord, ActionJournalEntryRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
-import { isSameModelFamily, screenFailingFile, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import {
+  isSameModelFamily,
+  screenFailingFile,
+  underlyingModelFamily,
+} from '@fleet/evidence-and-acceptance';
+import type { EvidenceArchivePort } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 import { AcceptanceSpec, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
@@ -241,12 +246,25 @@ function isCongestionCause(value: unknown): value is GatePredicateCause {
 }
 
 export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
-  if (typeof entry.detail !== 'string') {
+  // PT1a hostile-record guard: a null/undefined record, a non-object or a
+  // record whose `detail` accessor throws is ignored as null — a stored
+  // journal entry is untrusted input, never a crash. The guard itself is
+  // O(1); the JSON parse below is bounded by the stored detail's length.
+  if (entry === null || typeof entry !== 'object') {
+    return null;
+  }
+  let detail: unknown;
+  try {
+    detail = (entry as { detail?: unknown }).detail;
+  } catch {
+    return null;
+  }
+  if (typeof detail !== 'string') {
     return null;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(entry.detail);
+    parsed = JSON.parse(detail);
   } catch {
     return null;
   }
@@ -269,6 +287,14 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
   // PT1a: a stored failing file is screened again; an unusable one reads as null, never echoed.
   const failingFile =
     record.failingFile === undefined ? undefined : screenFailingFile(record.failingFile);
+  // GD2: an archived tail reference is kept only when well formed; anything
+  // else reads as absent, never a throw.
+  const outputEvidenceRef =
+    typeof record.outputEvidenceRef === 'string' &&
+    record.outputEvidenceRef.startsWith('evidence://') &&
+    record.outputEvidenceRef.length <= 512
+      ? record.outputEvidenceRef
+      : undefined;
   return {
     name: record.predicate,
     kind: record.kind,
@@ -278,6 +304,7 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     detail: record.detail,
     ...(cause === undefined ? {} : { cause }),
     ...(failingFile === undefined ? {} : { failingFile }),
+    ...(outputEvidenceRef === undefined ? {} : { outputEvidenceRef }),
   };
 }
 
@@ -294,12 +321,24 @@ export function nonPassingGatePredicatesOf(
   entries: readonly ActionJournalEntryRecord[],
   attemptId: string,
   headSha: string,
-): Array<{ name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null }> {
+): Array<{
+  name: string;
+  kind: GatePredicateKind;
+  verdict: 'fail' | 'unknown';
+  exitCode: number | null;
+  outputEvidenceRef?: string;
+}> {
   for (let run = GATE_RUN_MAX; run >= 0; run -= 1) {
     const prefix = gateRunPrefix(attemptId, headSha, run);
     const collected: Array<{
       readonly order: number;
-      readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
+      readonly value: {
+        name: string;
+        kind: GatePredicateKind;
+        verdict: 'fail' | 'unknown';
+        exitCode: number | null;
+        outputEvidenceRef?: string;
+      };
     }> = [];
     let stored = false;
     for (const entry of entries) {
@@ -324,6 +363,7 @@ export function nonPassingGatePredicatesOf(
           kind: parsed.kind,
           verdict: parsed.verdict,
           exitCode: parsed.exitCode,
+          ...(parsed.outputEvidenceRef === undefined ? {} : { outputEvidenceRef: parsed.outputEvidenceRef }),
         },
       });
     }
@@ -603,6 +643,12 @@ export interface RequestAttemptAcceptanceDependencies {
    * is a scaffold convenience, not an authority source.
    */
   readonly now?: () => string;
+  /**
+   * GD2: the evidence archive a failing predicate's bounded output tail is
+   * archived into; the journal then carries only its `evidence://` reference.
+   * Absent → failed tails are never archived and no reference is journalled.
+   */
+  readonly evidenceArchive?: EvidenceArchivePort;
 }
 
 function validateCollectedHead(
@@ -950,14 +996,30 @@ export class RequestAttemptAcceptanceUseCase
           expected,
           requestedRun - 1,
         );
-        const priorCongested =
+        // GD1: a retry run is granted over a congested prior run (KF-30c2) or
+        // over a failed prior run (the decider's single gate-failed retry).
+        // A failed prior run grants the next run only when it is the single
+        // gate-failed run among runs 0..n-1 (earlier runs being congestion
+        // retries), matching the decider; a second failure no longer
+        // authorizes the next run, so failed-run retries cannot be chained. Congestion
+        // retries keep their own chaining policy. Any other prior outcome (a
+        // pass, a non-congestion unknown, nothing stored) refuses without
+        // running anything.
+        let failedRuns = 0;
+        for (let run = 0; run < requestedRun; run += 1) {
+          const stored = readStoredGateOutcome(resolutionEntries, id, candidateHeadSha, expected, run);
+          if (stored.kind === 'completed' && stored.verdict.verdict === 'failed') {
+            failedRuns += 1;
+          }
+        }
+        const priorEligible =
           priorRun.kind === 'completed' &&
-          priorRun.verdict.verdict === 'unknown' &&
-          priorRun.verdict.congested === true;
-        if (!priorCongested) {
+          ((priorRun.verdict.verdict === 'unknown' && priorRun.verdict.congested === true) ||
+            (priorRun.verdict.verdict === 'failed' && failedRuns === 1));
+        if (!priorEligible) {
           return gateUnknown(
             'Unknown: gate run ' + String(requestedRun) +
-              ' requires a stored congested gate run ' + String(requestedRun - 1) +
+              ' requires a stored congested or failed gate run ' + String(requestedRun - 1) +
               ' for head ' + candidateHeadSha,
           );
         }
@@ -1107,8 +1169,40 @@ export class RequestAttemptAcceptanceUseCase
         return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
       }
 
+      // GD2: a failing command's bounded output tail is archived before the
+      // predicate is journalled; the journal carries only the evidence
+      // reference, never the tail. An absent archive, a malformed result or a
+      // throw leaves the predicate journalled without a reference.
+      const evidenceRefs = new Map<number, string>();
+      for (let offset = 0; offset < results.length; offset += 1) {
+        const result = results[offset];
+        if (
+          deps.evidenceArchive === undefined ||
+          result.verdict !== 'fail' ||
+          typeof result.outputTail !== 'string' ||
+          result.outputTail.length === 0
+        ) {
+          continue;
+        }
+        try {
+          const archived = await deps.evidenceArchive.archiveEvidence({
+            artifactId: `${gateRunPrefix(id, candidateHeadSha, effectiveRun)}${offset + 1}:output-tail`,
+            candidateHeadSha,
+            content: result.outputTail,
+          });
+          if (
+            typeof archived?.evidenceRef === 'string' &&
+            archived.evidenceRef.startsWith('evidence://') &&
+            archived.evidenceRef.length > 'evidence://'.length
+          ) {
+            evidenceRefs.set(offset, archived.evidenceRef);
+          }
+        } catch {
+          // Archiving never gates the verdict: journal without a reference.
+        }
+      }
       const entries = results.map((result, offset) =>
-        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result, effectiveRun),
+        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result, effectiveRun, evidenceRefs.get(offset)),
       );
       try {
         await entries.reduce(
@@ -1174,6 +1268,7 @@ export class RequestAttemptAcceptanceUseCase
     predicateIndex: number,
     result: GatePredicateResult,
     gateRun: number,
+    outputEvidenceRef?: string,
   ): ActionJournalEntryRecord {
     const detailObject: Record<string, unknown> = {
       predicate: result.name,
@@ -1191,6 +1286,9 @@ export class RequestAttemptAcceptanceUseCase
     }
     if (result.failingFile !== undefined) {
       detailObject.failingFile = result.failingFile;
+    }
+    if (outputEvidenceRef !== undefined) {
+      detailObject.outputEvidenceRef = outputEvidenceRef;
     }
     return {
       id: gateRunPrefix(id, candidateHeadSha, gateRun) + String(predicateIndex),

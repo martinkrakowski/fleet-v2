@@ -14,8 +14,16 @@
  * worktree path, a clone path or a secret value.
  */
 
-import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
+import type { BaseBranchValue } from '../../../domain/base-branch.js';
+import type { AttemptRunnerRecord, PlanRef } from '../../../domain/execution-records.js';
 import type { RelaunchApplyLaneProgress, RelaunchApplyStepStatus } from '../../../domain/relaunch-apply.js';
+import type {
+  AdoptLaneAttempt,
+  AdoptLaneBrief,
+  AdoptLaneRun,
+  AdoptLaneSource,
+  AdoptLaneWorkOrder,
+} from './AdoptLanePort.in-port.js';
 import type { RelaunchPlannedPopulation, RelaunchStepCode } from '../out/RelaunchPlanRepositoryPort.out-port.js';
 
 /**
@@ -33,6 +41,25 @@ export interface ApplyRelaunchSaveInput {
   readonly baseCommit: string;
   readonly allowedPathPrefixes: readonly string[];
   readonly policyProtectedPaths?: readonly string[];
+}
+
+/**
+ * One lane's per-lane adopt inputs (AR2c): the frozen facts `AdoptLane` needs
+ * to adopt the lane's existing worktree into a conducted run. `source` is
+ * optional: when omitted, the apply derives a `save-ref` source from the
+ * lane's completed `save` journal result (or from the `saveLaneEdits` result
+ * of the current wave).
+ */
+export interface ApplyRelaunchAdoptInput {
+  readonly laneId: string;
+  readonly projectId: string;
+  readonly planRef: PlanRef;
+  readonly baseBranch: BaseBranchValue;
+  readonly workOrder: AdoptLaneWorkOrder;
+  readonly brief: AdoptLaneBrief;
+  readonly attempt: AdoptLaneAttempt;
+  readonly run: AdoptLaneRun;
+  readonly source?: AdoptLaneSource;
 }
 
 export interface ApplyRelaunchRequest {
@@ -54,6 +81,13 @@ export interface ApplyRelaunchRequest {
    * mismatch refuses the lane (`save-input-digest-mismatch`).
    */
   readonly saveInputs?: readonly ApplyRelaunchSaveInput[];
+  /**
+   * Optional per-lane adopt inputs (AR2c); each is validated and cloned at
+   * parse time, cross-checked against the plan lane and save input before
+   * authorization, and required for every lane whose `adopt` step is not
+   * already completed.
+   */
+  readonly adoptInputs?: readonly ApplyRelaunchAdoptInput[];
   /** Zoned ISO-8601: the caller's clock reading. */
   readonly nowIso: string;
   /** Optional zoned ISO-8601: the apply's budget deadline. */
@@ -87,6 +121,12 @@ export type ApplyRelaunchRefusalReason =
   | 'authorization-unavailable'
   | 'unexpected-running-lane'
   | 'stale-plan-state'
+  | 'journal-write-failed'
+  | 'save-failed'
+  | 'abort-failed'
+  | 'active-run-cap-reached'
+  | 'adopt-not-implemented'
+  | 'adopt-failed'
   | 'live-apply-not-implemented';
 
 /** One lane's apply summary: ids, step codes and statuses only. */
@@ -104,6 +144,13 @@ export type ApplyRelaunchResult =
   | {
       readonly outcome: 'dry-run';
       readonly planDigest: string;
+      readonly lanes: readonly ApplyRelaunchLaneSummary[];
+    }
+  | {
+      /** AR2b: one live wave applied (`wave: null` when nothing was left to do). */
+      readonly outcome: 'applied';
+      readonly planDigest: string;
+      readonly wave: number | null;
       readonly lanes: readonly ApplyRelaunchLaneSummary[];
     }
   | {

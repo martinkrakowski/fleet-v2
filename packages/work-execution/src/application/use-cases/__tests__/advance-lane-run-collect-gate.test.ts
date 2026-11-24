@@ -870,7 +870,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.stopRequests).toHaveLength(0);
   });
 
-  it('test 5: collecting an ended opencode attempt collects without the commit step', async () => {
+  it('test 5: collecting an ended opencode attempt runs the commit step first (SN1) and then collects', async () => {
     const ended = endedAttempt({ runner: CONDUCTED_RUNNER });
     const harness = await makeHarness(runRecord(), [ended]);
     await conduct(harness, 'collecting', NOW);
@@ -882,7 +882,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       result: 'completed',
       reasonCode: 'collected',
     });
-    expect(harness.commitRequests).toHaveLength(0);
+    expect(harness.commitRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
     expect(harness.collectRequests).toHaveLength(1);
     expect(harness.collectRequests[0]).toEqual({
       attemptId: 'attempt-example-1',
@@ -910,7 +910,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.commitRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
   });
 
-  it('test 6b: a commit refusal refuses the collect and the next advance parks step-refused collect', async () => {
+  it('test 6b: a diff-findings commit refusal journals edits-outside-owned-paths and the next advance parks step-refused collect', async () => {
     const findings: readonly LaneDiffFinding[] = [
       { path: 'packages/example/secret.txt', line: 3, rule: 'secret-shape' },
     ];
@@ -924,7 +924,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       step: 'collect',
       key: collectKey(),
       result: 'refused',
-      reasonCode: 'edit-only-refused',
+      reasonCode: 'edits-outside-owned-paths',
     });
     expect(harness.collectRequests).toHaveLength(0);
     const parked = await advance(harness);
@@ -1025,6 +1025,23 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       outcome: 'acted',
       step: 'gate',
       key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-failed',
+    });
+    // GD1: the run's single gate-failed run retries once under /retry1; the
+    // retry's own failure is the second gate-failed at (round, head), so the
+    // advance after it takes the failure path into fixing.
+    const hFailRetryBuilt = buildLaneRunStepKey({
+      runId: RUN_ID, round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: 1,
+    });
+    expect(hFailRetryBuilt.ok).toBe(true);
+    if (!hFailRetryBuilt.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    expect(await advance(hFail)).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: hFailRetryBuilt.key,
       result: 'completed',
       reasonCode: 'gate-failed',
     });
@@ -2200,7 +2217,8 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       reasonCode: 'dispatch-refused',
     });
     expect((await harness.attemptRepo.findAttemptById(attempt2 as string))?.state).toBe('cancelled');
-    expect(dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+    // SN1: the round-0 pivot seat's first dispatch already carries the handover.
+    expect(dispatchRequests[0]?.allowUncommittedHandover).toBe(true);
     refuseDispatch = false;
 
     // Advance 3: the handover re-prepares seat 0 in the same round as a3.
@@ -2658,5 +2676,192 @@ describe('GU1: an unknown gate retries under a new key before parking', () => {
       entry.kind === 'result' && entry.key === retryKey(1) && entry.outcome === 'overtaken' && entry.reasonCode === 'intent-abandoned-by-operator',
     )).toBe(true);
     expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+  });
+});
+
+/** GD1: retry a failed gate once, and re-gate a clean gate-driven fix round. */
+describe('GD1: gate retries and the clean fix-round re-gate', () => {
+  interface InspectRequest {
+    readonly worktreePath: string;
+    readonly baseCommit: string;
+    readonly expectedArtifactPaths: readonly string[];
+    readonly recordedHost: unknown;
+  }
+
+  function fixAttempt(): AttemptRecord {
+    return attemptFixture({
+      id: 'attempt-fx-1',
+      kind: 'fix',
+      fixNumber: 1,
+      priorAttemptId: 'attempt-example-1',
+      state: 'collected',
+      artifacts: COLLECTED_ARTIFACTS,
+    });
+  }
+
+  function fixRoundRecord(): LaneRunRecord {
+    return runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fx-1'] });
+  }
+
+  async function fixRoundHarness(
+    options: { readonly inspectAnswer?: (request: InspectRequest) => unknown } = {},
+  ): Promise<Harness> {
+    const prior = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(fixRoundRecord(), [prior, fixAttempt()]);
+    harness.setManifestVerdict('sealed');
+    if (options.inspectAnswer !== undefined) {
+      const requests: InspectRequest[] = [];
+      const answer = options.inspectAnswer;
+      (harness.deps as { worktreeInspect?: unknown }).worktreeInspect = {
+        inspectWorktree: async (request: InspectRequest) => {
+          requests.push(request);
+          return answer(request);
+        },
+      };
+      (harness.deps as { __inspectRequests?: InspectRequest[] }).__inspectRequests = requests;
+    }
+    await appendIntent(harness, stepKey({ round: 1, step: 'prepare', seatIndex: 0, attemptOrdinal: 1, head12: null }), 'attempt-fx-1', NOW);
+    await appendResult(harness, stepKey({ round: 1, step: 'prepare', seatIndex: 0, attemptOrdinal: 1, head12: null }), 'completed', 'prepared', NOW);
+    await conduct(harness, 'gating', NOW);
+    await conduct(harness, 'fixing', NOW);
+    await conduct(harness, 'collecting', NOW);
+    return harness;
+  }
+
+  function inspectRequests(harness: Harness): readonly InspectRequest[] {
+    return (harness.deps as { readonly __inspectRequests?: InspectRequest[] }).__inspectRequests ?? [];
+  }
+
+  it('a clean gate-driven fix round with an unchanged head enters gating once and gates run 0 at the same head', async () => {
+    const harness = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: [], untrackedPaths: [] }),
+    });
+    const entered = await advance(harness);
+    expect(entered).toEqual({ outcome: 'entered', state: 'gating' });
+    // The read is read-only and carries the recorded host: no local fallback.
+    expect(inspectRequests(harness)).toHaveLength(1);
+    expect(inspectRequests(harness)[0]).toEqual({
+      worktreePath: WORKTREE,
+      baseCommit: COMMIT,
+      expectedArtifactPaths: [],
+      recordedHost: CONDUCTED_RUNNER,
+    });
+
+    // The re-gate is run 0 of round 1 at the unchanged head, then the replay
+    // never double-runs: a settled pass never triggers a second evaluation.
+    harness.setGateAnswer({ verdict: 'passed', results: [] });
+    const gated = await advance(harness);
+    expect(gated).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: stepKey({ round: 1, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 }),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-fx-1', candidateHeadSha: COMMIT }]);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    expect(harness.gateRequests).toHaveLength(1);
+  });
+
+  it('parks fix-no-progress when inspectWorktree reports uncommitted or untracked paths, when the port is unwired, when it throws, or when it returns non-array paths', async () => {
+    const dirty = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: ['src/x.ts'], untrackedPaths: [] }),
+    });
+    await conduct(dirty, 'gating', NOW);
+    await conduct(dirty, 'fixing', NOW);
+    await conduct(dirty, 'collecting', NOW);
+    expect(await advance(dirty)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+
+    const untracked = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: [], untrackedPaths: ['notes.txt'] }),
+    });
+    expect(await advance(untracked)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+
+    const throwing = await fixRoundHarness({
+      inspectAnswer: () => {
+        throw new Error('host unreachable');
+      },
+    });
+    expect(await advance(throwing)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+
+    const nonArray = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: 'none', untrackedPaths: [] }),
+    });
+    expect(await advance(nonArray)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+
+    const unwired = await fixRoundHarness();
+    expect(await advance(unwired)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+    expect(inspectRequests(unwired)).toHaveLength(0);
+  });
+
+  it('re-gates at most once per round: a gate intent already at this round keeps the park', async () => {
+    const harness = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: [], untrackedPaths: [] }),
+    });
+    // A gate intent of round 1 already exists at this head: the re-gate bound
+    // is spent, so even a clean worktree parks instead of a second re-gate.
+    const round1GateKey = stepKey({ round: 1, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+    await appendIntent(harness, round1GateKey, null, NOW);
+    await appendResult(harness, round1GateKey, 'completed', 'gate-failed', NOW);
+    await conduct(harness, 'fixing', NOW);
+    await conduct(harness, 'collecting', NOW);
+    expect(await advance(harness)).toEqual({
+      outcome: 'parked', reason: 'fix-no-progress', qualifier: null,
+    });
+    expect(harness.gateRequests).toHaveLength(0);
+  });
+
+  it('a failed gate at a fix round retries once under /retry1 and passes', async () => {
+    const harness = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: [], untrackedPaths: [] }),
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'gating' });
+    harness.setGateAnswer({ verdict: 'failed', reason: 'Gate predicate command 1 failed' });
+    const failed = await advance(harness);
+    expect(failed).toMatchObject({ outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-failed' });
+
+    harness.setGateAnswer({ verdict: 'passed', results: [] });
+    const retry1 = stepKey({ round: 1, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 }) + '/retry1';
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retry1,
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([
+      { attemptId: 'attempt-fx-1', candidateHeadSha: COMMIT },
+      { attemptId: 'attempt-fx-1', candidateHeadSha: COMMIT, gateRun: 1 },
+    ]);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+  });
+
+  it('a failed gate at a fix round whose /retry1 also fails enters fixing', async () => {
+    const harness = await fixRoundHarness({
+      inspectAnswer: () => ({ uncommittedPaths: [], untrackedPaths: [] }),
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'gating' });
+    harness.setGateAnswer({ verdict: 'failed', reason: 'Gate predicate command 1 failed' });
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-failed' });
+    const retry1 = stepKey({ round: 1, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 }) + '/retry1';
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retry1,
+      result: 'completed',
+      reasonCode: 'gate-failed',
+    });
+    // Two gate-failed intents at (round 1, head): the retry budget is spent.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 });

@@ -52,9 +52,13 @@ import type { ExecutionRunnerPort } from '../../ports/out/ExecutionRunnerPort.ou
 import type {
   PreserveWorktreeEditsRequest,
   PreserveWorktreeEditsResult,
+  RemoveUntrackedFilesRequest,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
 } from '../../ports/out/WorkspacePort.out-port.js';
+import type { CommitEditOnlyAttemptResult } from '../../ports/in/CommitEditOnlyAttemptPort.in-port.js';
+import type { AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import { runCollectBody } from '../advance-lane-run/collect-gate.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -716,11 +720,379 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
       reasonCode: 'dispatch-started',
     });
     expect(harness.dispatchRequests).toHaveLength(2);
-    expect(harness.dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+    // SN1: the round-0 pivot seat's FIRST dispatch already carries the
+    // dirty-handover flag, without waiting for a dirty-worktree refusal.
+    expect(harness.dispatchRequests[0]?.allowUncommittedHandover).toBe(true);
     expect(harness.dispatchRequests[1]?.allowUncommittedHandover).toBe(true);
     expect(harness.dispatchRequests[1]?.worktreePath).toBe(WORKTREE);
     expect(harness.resetRequests).toEqual([]);
     expect(harness.preserveRequests).toEqual([]);
+  });
+
+  // --- SN1: collect normalizes a dirty worktree and journals the refusal ----
+
+  function endedCollectAttempt(): AttemptRecord {
+    return {
+      ...seat1Prepared(),
+      state: 'ended',
+      outcome: 'done',
+      sessionId: 'session-example-2',
+      completionReceipt: {
+        attemptId: 'attempt-example-2',
+        sessionId: 'session-example-2',
+        endedAtIso: LATER,
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+      updatedAtIso: LATER,
+    };
+  }
+
+  function collectKey(round: number, seatIndex: number, attemptOrdinal: number): string {
+    const built = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round,
+      step: 'collect',
+      seatIndex,
+      attemptOrdinal,
+      head12: null,
+      retry: null,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a step key');
+    }
+    return built.key;
+  }
+
+  interface CollectBodyRun {
+    readonly result: AdvanceLaneRunResult;
+    readonly collectRequests: unknown[];
+    readonly cleanRequests: RemoveUntrackedFilesRequest[];
+  }
+
+  interface CollectBodyOptions {
+    /** Replaces the run journal the body appends to (e.g. one whose result append fails). */
+    readonly runJournal?: AdvanceLaneRunDependencies['runJournal'];
+    /** The intent is already journaled (a re-run of the same collect). */
+    readonly skipIntent?: boolean;
+    /** Records each recovery call, tagged with whether the refused result was journaled yet. */
+    readonly events?: string[];
+  }
+
+  /** Whether the real journal already holds the refused edits-outside-owned-paths result. */
+  async function refusedResultJournaled(harness: Harness): Promise<boolean> {
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    return entries.some(
+      (entry) => entry.kind === 'result' && entry.reasonCode === 'edits-outside-owned-paths',
+    );
+  }
+
+  /** Drive `runCollectBody` directly against the round-0 harness stores. */
+  async function collectBodyWith(
+    harness: Harness,
+    commitOutcomes: CommitEditOnlyAttemptResult[],
+    recoveryOverride?: AdvanceLaneRunDependencies['worktreeRecovery'],
+    options: CollectBodyOptions = {},
+  ): Promise<CollectBodyRun> {
+    const collectRequests: unknown[] = [];
+    const cleanRequests: RemoveUntrackedFilesRequest[] = [];
+    const commitEditOnlyAttempt = {
+      commitEditOnlyAttempt: async () => {
+        const next = commitOutcomes.shift();
+        expect(next).toBeDefined();
+        return next as CommitEditOnlyAttemptResult;
+      },
+    };
+    const baseRecovery = recoveryOverride ??
+      (harness.deps.worktreeRecovery === undefined
+        ? undefined
+        : {
+            ...harness.deps.worktreeRecovery,
+            removeUntrackedFiles: async (request: RemoveUntrackedFilesRequest) => {
+              cleanRequests.push(request);
+              return { outcome: 'removed' };
+            },
+          });
+    const events = options.events;
+    const trace = async (name: string): Promise<void> => {
+      if (events !== undefined) {
+        events.push(name + ((await refusedResultJournaled(harness)) ? ':after-journal' : ':before-journal'));
+      }
+    };
+    const tracedRecovery = baseRecovery === undefined || events === undefined
+      ? baseRecovery
+      : {
+          ...baseRecovery,
+          preserveWorktreeEdits: async (request: PreserveWorktreeEditsRequest) => {
+            await trace('preserve');
+            return baseRecovery.preserveWorktreeEdits!(request);
+          },
+          resetWorktreeToHead: async (request: ResetWorktreeToHeadRequest) => {
+            await trace('reset');
+            return baseRecovery.resetWorktreeToHead!(request);
+          },
+          removeUntrackedFiles: async (request: RemoveUntrackedFilesRequest) => {
+            await trace('clean');
+            return baseRecovery.removeUntrackedFiles!(request);
+          },
+        };
+    const ctx = {
+      deps: {
+        ...harness.deps,
+        ...(options.runJournal === undefined ? {} : { runJournal: options.runJournal }),
+        ...(tracedRecovery === undefined ? {} : { worktreeRecovery: tracedRecovery }),
+        commitEditOnlyAttempt,
+        collectAttemptArtifacts: {
+          collectAttemptArtifacts: async (request: unknown) => {
+            collectRequests.push(request);
+            return { outcome: 'refused', reason: 'unused' };
+          },
+        },
+      },
+    };
+    const attempt = await harness.attemptRepo.findAttemptById('attempt-example-2');
+    expect(attempt?.state).toBe('ended');
+    if (options.skipIntent !== true) {
+      await appendIntent(harness, collectKey(0, 1, 2), null, NOW);
+    }
+    const record = (await harness.runRepo.get(RUN_ID)) as LaneRunRecord;
+    const result = await runCollectBody(
+      ctx as never,
+      record,
+      { latestAttempt: attempt } as never,
+      { kind: 'reconcile', step: 'collect' } as never,
+      { runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER },
+      collectKey(0, 1, 2),
+    );
+    return { result, collectRequests, cleanRequests };
+  }
+
+  it('4. a diff-findings commit refusal journals first, then preserves, resets and cleans in that order', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const events: string[] = [];
+    const run = await collectBodyWith(
+      harness,
+      [{ outcome: 'refused', reason: 'diff-findings', findings: [] }],
+      undefined,
+      { events },
+    );
+    expect(run.result).toMatchObject({
+      outcome: 'acted',
+      step: 'collect',
+      result: 'refused',
+      reasonCode: 'edits-outside-owned-paths',
+    });
+    // Ordering: the refused result is journaled before anything is preserved,
+    // reset or cleaned, and the preserve comes before the reset and the clean.
+    expect(events).toEqual(['preserve:after-journal', 'reset:after-journal', 'clean:after-journal']);
+    expect(harness.preserveRequests).toHaveLength(1);
+    expect(harness.preserveRequests[0]!.patchPath).toBe(WORKTREE + '.attempt-example-2.outside-owned.patch');
+    expect(harness.preserveRequests[0]!.worktreePath).toBe(WORKTREE);
+    expect(harness.preserveRequests[0]!.recordedHost).toEqual(CONDUCTED_RUNNER);
+    expect(harness.resetRequests).toHaveLength(1);
+    expect(harness.resetRequests[0]!.worktreePath).toBe(WORKTREE);
+    expect(run.cleanRequests).toHaveLength(1);
+    expect(run.cleanRequests[0]!.worktreePath).toBe(WORKTREE);
+    expect(run.collectRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'result', outcome: 'refused', reasonCode: 'edits-outside-owned-paths' }),
+    );
+  });
+
+  it('4b. a staged-content-findings refusal is normalized the same way', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'staged-content-findings', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(harness.preserveRequests).toHaveLength(1);
+    expect(harness.resetRequests).toHaveLength(1);
+    expect(run.cleanRequests).toHaveLength(1);
+  });
+
+  it('4c. a merge-state-present refusal parks as edit-only-refused and touches no recovery port', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'merge-state-present', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-refused' });
+    expect(harness.preserveRequests).toEqual([]);
+    expect(harness.resetRequests).toEqual([]);
+    expect(run.cleanRequests).toEqual([]);
+  });
+
+  it('4d. a preserve that fails skips the reset and the clean, and the refusal is still journaled', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'git-refused' }));
+    const events: string[] = [];
+    const run = await collectBodyWith(
+      harness,
+      [{ outcome: 'refused', reason: 'diff-findings', findings: [] }],
+      undefined,
+      { events },
+    );
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(events).toEqual(['preserve:after-journal']);
+    expect(harness.resetRequests).toEqual([]);
+    expect(run.cleanRequests).toEqual([]);
+    expect(run.collectRequests).toEqual([]);
+  });
+
+  it('4e. a failed reset skips the clean', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    harness.setResetAnswer(async () => ({ outcome: 'refused', reason: 'untracked-obstructs' }));
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'diff-findings', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(harness.preserveRequests).toHaveLength(1);
+    expect(run.cleanRequests).toEqual([]);
+  });
+
+  it('4f. a failed journal append resets and cleans nothing, and the re-run parks without collecting', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const failingJournal = {
+      ...harness.runJournal,
+      append: async (entry: { kind: string }) =>
+        entry.kind === 'result'
+          ? ({ outcome: 'refused', reason: 'store-unavailable', detail: 'append failed' } as never)
+          : harness.runJournal.append(entry as never),
+      listForKey: harness.runJournal.listForKey.bind(harness.runJournal),
+      listForRun: harness.runJournal.listForRun.bind(harness.runJournal),
+    } as unknown as AdvanceLaneRunDependencies['runJournal'];
+    const first = await collectBodyWith(
+      harness,
+      [{ outcome: 'refused', reason: 'diff-findings', findings: [] }],
+      undefined,
+      { runJournal: failingJournal },
+    );
+    expect(first.result.outcome).not.toBe('acted');
+    // The worktree was not touched: nothing preserved, reset or cleaned.
+    expect(harness.preserveRequests).toEqual([]);
+    expect(harness.resetRequests).toEqual([]);
+    expect(first.cleanRequests).toEqual([]);
+    expect(first.collectRequests).toEqual([]);
+
+    // The re-run sees the same dirty worktree (the commit step refuses again),
+    // journals the refusal and parks: it never proceeds to collect.
+    const second = await collectBodyWith(
+      harness,
+      [{ outcome: 'refused', reason: 'diff-findings', findings: [] }],
+      undefined,
+      { skipIntent: true },
+    );
+    expect(second.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(second.collectRequests).toEqual([]);
+  });
+
+  it('5. an outside-allowed-paths refusal is normalized the same way', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'outside-allowed-paths', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(harness.preserveRequests).toHaveLength(1);
+    expect(harness.resetRequests).toHaveLength(1);
+    expect(run.cleanRequests).toHaveLength(1);
+    expect(run.cleanRequests[0]!.worktreePath).toBe(WORKTREE);
+    expect(run.cleanRequests[0]!.recordedHost).toEqual(CONDUCTED_RUNNER);
+  });
+
+  it('6. another commit refusal keeps edit-only-refused and touches no recovery port', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'head-moved', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-refused' });
+    expect(harness.preserveRequests).toEqual([]);
+    expect(harness.resetRequests).toEqual([]);
+    expect(run.cleanRequests).toEqual([]);
+  });
+
+  it('7. a commit unknown keeps edit-only-unknown (ambiguous)', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'unknown', reason: 'the lane diff check could not run' },
+    ]);
+    expect(run.result).toMatchObject({ result: 'ambiguous', reasonCode: 'edit-only-unknown' });
+    expect(harness.preserveRequests).toEqual([]);
+  });
+
+  it('8. a missing worktreeRecovery still journals edits-outside-owned-paths (the park happens)', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: false },
+    );
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'diff-findings', findings: [] },
+    ]);
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+  });
+
+  it('9. a missing removeUntrackedFiles still journals edits-outside-owned-paths after preserve and reset, in order', async () => {
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [seat0Cancelled(), endedCollectAttempt()],
+      { wireRecovery: true },
+    );
+    const events: string[] = [];
+    const run = await collectBodyWith(harness, [
+      { outcome: 'refused', reason: 'diff-findings', findings: [] },
+    ], {
+      preserveWorktreeEdits: async (request: PreserveWorktreeEditsRequest) => {
+        events.push('preserve:' + ((await refusedResultJournaled(harness)) ? 'after' : 'before') + '-journal');
+        return { outcome: 'preserved', patchPath: request.patchPath, patchBytes: 7 };
+      },
+      resetWorktreeToHead: async () => {
+        events.push('reset:' + ((await refusedResultJournaled(harness)) ? 'after' : 'before') + '-journal');
+        return { outcome: 'reset', headCommit: COMMIT_A };
+      },
+    });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(events).toEqual(['preserve:after-journal', 'reset:after-journal']);
+    expect(run.cleanRequests).toEqual([]); // no removeUntrackedFiles was wired
+    expect(harness.resetRequests).toEqual([]); // the override recovery ran, not the harness fake
+    expect(run.collectRequests).toEqual([]);
   });
 
   it('4. a cancel that does not land parks the run at dispatch without preserve/reset', async () => {

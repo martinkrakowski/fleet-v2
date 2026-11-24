@@ -84,16 +84,48 @@ export function strOrNull(payload: Payload, key: string): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/**
+ * Reads `payload[key]` as a finite number without ever coercing through
+ * `Number(value)` on untrusted values: only a finite own data-property number,
+ * or a non-blank string whose `Number()` is finite, is accepted. Booleans,
+ * `null`/`undefined`, blank or non-numeric strings, arrays, objects (including
+ * `valueOf`/`toString` holders), symbols, bigints and functions are refused, so
+ * no getter or conversion hook of untrusted input ever runs. Returns
+ * `undefined` for every refusal. Cost: O(1) for non-strings; O(n) in string
+ * length for `trim()`/`Number()`, with no regex backtracking.
+ */
+function parseFiniteNumber(payload: Payload, key: string): number | undefined {
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') return undefined;
+  if (payload === null || typeof payload !== 'object') return undefined;
+  // A Proxy can throw from its `getOwnPropertyDescriptor` trap (or be revoked)
+  // before any descriptor is read, and the descriptor object itself may be a
+  // Proxy whose traps throw on the `'value' in desc` membership test; both are
+  // refusals with the typed `undefined`, not propagated exceptions.
+  let desc: PropertyDescriptor | undefined;
+  try {
+    // `Array.isArray` throws on a revoked Proxy, so it sits inside the guard.
+    if (Array.isArray(payload)) return undefined;
+    desc = Object.getOwnPropertyDescriptor(payload, key);
+    if (desc === undefined || !('value' in desc)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const value = desc.value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'string') {
+    if (value.trim() === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
 export function num(payload: Payload, key: string, fallback: number): number {
-  const value = payload[key];
-  const parsed = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  return parseFiniteNumber(payload, key) ?? fallback;
 }
 
 export function optNum(payload: Payload, key: string): number | undefined {
-  const value = payload[key];
-  const parsed = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return parseFiniteNumber(payload, key);
 }
 
 export function strArr(payload: Payload, key: string): string[] {
@@ -130,8 +162,8 @@ export function requiredNested<T>(payload: Payload, key: string, label: string):
 
 /** A closed enum value the request shape requires; a usage error when absent. */
 export function enumOf<T extends string>(payload: Payload, key: string, allowed: readonly T[], label: string): T {
-  const value = str(payload, key);
-  if ((allowed as readonly string[]).includes(value)) {
+  const value = payload[key];
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) {
     return value as T;
   }
   throw new CliUsageError(`${label} must be one of: ${allowed.join(', ')}`);

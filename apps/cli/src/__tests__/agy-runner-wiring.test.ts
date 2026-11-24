@@ -244,7 +244,7 @@ describe('AG-5: agy runner wiring in the CLI root', () => {
     }
   });
 
-  it('commitEditOnlyAttempt is not applicable to a full agy host', async () => {
+  it('commitEditOnlyAttempt is unknown for a full agy host whose worktree cannot be inspected', async () => {
     const runtime = createFleetCliRuntime({ installation: makeInstallationWithAgy('full') });
     await runtime.execution.attemptRepository.saveAttempt(
       storedAttempt({
@@ -266,7 +266,10 @@ describe('AG-5: agy runner wiring in the CLI root', () => {
     const result = await runtime.execution.commitEditOnlyAttempt.commitEditOnlyAttempt({
       attemptId: 'attempt-full-1',
     });
-    expect(result.outcome).toBe('not-applicable');
+    // SN1: a not-edit-only seat is inspected for a dirty worktree first; the
+    // unbacked /tmp/... worktree cannot be inspected, so the step is unknown
+    // (never a silent pass).
+    expect(result.outcome).toBe('unknown');
   });
 
   it('the installation still validates with both hosts', () => {

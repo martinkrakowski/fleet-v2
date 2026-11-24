@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { SHADOW_IMPORT_ACTION_SCOPE, SHADOW_IMPORT_GRANT_MAX_TTL_DAYS } from '../../domain/coordination-records.js';
+import { RELAUNCH_APPLY_ACTION_SCOPE, RELAUNCH_APPLY_DIGEST_PREFIX, relaunchApplyDigestPayload, SHADOW_IMPORT_ACTION_SCOPE, SHADOW_IMPORT_GRANT_MAX_TTL_DAYS } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type {
@@ -799,5 +799,56 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
       const result = await useCaseWith(repo).execute(request);
       expect(result).toEqual({ outcome: 'rejected', reason: 'release-grant-invalid-nonce' });
     }
+  });
+});
+
+describe('RequestScopedDecisionUseCase relaunch-apply grants (AR3a)', () => {
+  const PLAN_DIGEST = 'a'.repeat(64);
+  const idFor = (createdAtIso: string, proposalDigest = PLAN_DIGEST): string =>
+    `${RELAUNCH_APPLY_DIGEST_PREFIX}${digest(
+      relaunchApplyDigestPayload({ projectId: 'relaunch', proposalDigest, createdAtIso }),
+    )}`;
+  const relaunchRequest = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    requestId: idFor(NOW_ISO),
+    projectId: 'relaunch',
+    kind: 'action-decision',
+    actionScope: RELAUNCH_APPLY_ACTION_SCOPE,
+    expectedHeadSha: null,
+    proposalDigest: PLAN_DIGEST,
+    policyRevision: 'pol-rev-1',
+    nowIso: NOW_ISO,
+    ...overrides,
+  });
+
+  it('records createdAtIso inside the digest-bound window and binds the id to it', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(relaunchRequest() as never);
+    expect(result.outcome).toBe('requested');
+    expect(repo.requests.get(idFor(NOW_ISO))?.createdAtIso).toBe(NOW_ISO);
+  });
+
+  it('never lets a client-supplied far-future nowIso set createdAtIso (2099 is refused, nothing recorded)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const future = '2099-01-01T00:00:00Z';
+    const result = await useCaseWith(repo).execute(
+      relaunchRequest({ nowIso: future, requestId: idFor(future) }) as never,
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'relaunch-apply-created-at-out-of-window' });
+    expect(repo.requests.size).toBe(0);
+  });
+
+  it('refuses a request id that is not the digest of its plan digest and creation instant', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(
+      relaunchRequest({ requestId: idFor(NOW_ISO, 'b'.repeat(64)) }) as never,
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'relaunch-apply-request-digest-mismatch' });
+  });
+
+  it('refuses a relaunch request without the injected clock', async () => {
+    const result = await useCaseWith(new InMemoryCoordinationRequestRepo(), digest, null).execute(
+      relaunchRequest() as never,
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'relaunch-apply-clock-unavailable' });
   });
 });

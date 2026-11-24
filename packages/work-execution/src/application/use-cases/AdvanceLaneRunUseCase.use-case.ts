@@ -57,6 +57,7 @@ import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthor
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type { EvidenceArchivePort } from '@fleet/evidence-and-acceptance';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
@@ -143,7 +144,8 @@ export interface AdvanceLaneRunDependencies {
    * outside the worktree and reset the worktree to its head; absent → today's
    * park (the recovery is never attempted).
    */
-  readonly worktreeRecovery?: Pick<WorkspacePort, 'preserveWorktreeEdits' | 'resetWorktreeToHead'>;
+  readonly worktreeRecovery?: Pick<WorkspacePort, 'preserveWorktreeEdits' | 'resetWorktreeToHead'> &
+    Partial<Pick<WorkspacePort, 'removeUntrackedFiles'>>;
   /** Stop a running attempt (K4-6); absent → `not-wired stop`. */
   readonly stopAttempt?: StopAttemptPort;
   /** Collect an ended attempt's artifacts (K4-6); absent → `not-wired collect`. */
@@ -211,6 +213,18 @@ export interface AdvanceLaneRunDependencies {
   readonly gateReceipts?: GateReceiptPort;
   /** PT1a: read the file the failing gate check named, to class a gate park; absent → a gate park classes `other`. */
   readonly gateFailingFile?: GateFailingFilePort;
+  /**
+   * GD1: read a fix attempt's worktree clean/dirty state (read-only) so a
+   * clean gate-driven fix round may be re-gated once; absent → the fix round
+   * is never clean and keeps today's `fix-no-progress` park.
+   */
+  readonly worktreeInspect?: Pick<WorkspacePort, 'inspectWorktree'>;
+  /**
+   * GD2: the evidence archive a fix handover reads a failed gate's archived
+   * output tail from (read-only); absent → the handover renders without the
+   * tail and keeps the predicate name and exit code.
+   */
+  readonly evidenceArchive?: EvidenceArchivePort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

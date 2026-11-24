@@ -18,6 +18,7 @@ import {
   ConductorPassTraceAdapter,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  LaneDiffCheckAdapter,
   LocalExecutor,
   OwnerDecisionAdapter,
   AttemptOwnerDecisionAdapter,
@@ -628,6 +629,12 @@ export function createConfiguredWorkComposition(
       artifactPort,
       computeDigest: sha256HexDigest,
       allowedSeats,
+      // SN2: the lane diff check for a clean strict-descendant head adoption
+      // runs on the dispatching runner's recorded host.
+      laneDiffCheckFor: (recorded) => {
+        const resolved = executorForHost.executorForRecordedHost(recorded);
+        return resolved.ok ? new LaneDiffCheckAdapter(resolved.executor) : null;
+      },
     }),
     reconcileAttempt: new ReconcileAttemptUseCase({
       attemptRepo,

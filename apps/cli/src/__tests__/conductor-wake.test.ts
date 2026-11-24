@@ -38,6 +38,64 @@ describe('parseWakeSignal (K9)', () => {
       parseWakeSignal('{"stream":"s_1","seq":8,"kind":"resync","id":null,"at":"2026-11-05T10:00:01.000Z"}'),
     ).toEqual({ kind: 'resync', seq: 8 });
   });
+
+  it('returns null for JSON primitives, arrays and a missing or non-string kind', () => {
+    expect(parseWakeSignal('null')).toBeNull();
+    expect(parseWakeSignal('123')).toBeNull();
+    expect(parseWakeSignal('true')).toBeNull();
+    expect(parseWakeSignal('[]')).toBeNull();
+    expect(parseWakeSignal('{"seq":1}')).toBeNull();
+    expect(parseWakeSignal('{"seq":1,"kind":42}')).toBeNull();
+  });
+
+  it('parses a __proto__ JSON key without polluting Object.prototype', () => {
+    expect(parseWakeSignal('{"__proto__":{"polluted":true},"seq":1,"kind":"attempt"}')).toEqual({
+      kind: 'attempt',
+      seq: 1,
+    });
+    expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('returns null for hostile runtime inputs instead of throwing', () => {
+    // JSON.parse coerces its argument with ToString, so each hostile input is
+    // coerced first; the results never parse into a valid wake signal, so the
+    // outcome is null either way.
+    expect(parseWakeSignal(null as unknown as string)).toBeNull();
+    expect(parseWakeSignal(undefined as unknown as string)).toBeNull();
+    expect(parseWakeSignal(123 as unknown as string)).toBeNull();
+    expect(parseWakeSignal({} as unknown as string)).toBeNull();
+  });
+
+  it('returns null for a throwing-getter object and a lying Proxy, even though JSON.parse coercion throws', () => {
+    // DEFECT REPORTED (not fixed here): JSON.parse coerces non-string
+    // arguments with ToString, so a throwing `toString` getter or a lying
+    // Proxy trap IS reached before JSON.parse rejects. The production code
+    // lacks an O(1) `typeof line !== 'string'` guard, unlike readWakeToken and
+    // normalizeWakeBaseUrl. The outcome is still safe (null), so this test
+    // only asserts the result, never the getter count.
+    const evil = {
+      get toString(): string {
+        throw new Error('boom');
+      },
+    };
+    expect(parseWakeSignal(evil as unknown as string)).toBeNull();
+
+    const lying = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error('boom');
+        },
+        has: () => {
+          throw new Error('boom');
+        },
+        getOwnPropertyDescriptor: () => {
+          throw new Error('boom');
+        },
+      },
+    );
+    expect(parseWakeSignal(lying as unknown as string)).toBeNull();
+  });
 });
 
 describe('readWakeToken (K9)', () => {
@@ -84,6 +142,67 @@ describe('readWakeToken (K9)', () => {
     const path = writeToken(dir, `  ${TOKEN}  \nignored second line\n`, 0o600);
     expect(readWakeToken(path)).toBe(TOKEN);
   });
+
+  it('returns null for a directory path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-wake-test-'));
+    expect(readWakeToken(dir)).toBeNull();
+  });
+
+  it('returns null for an empty and a whitespace-only path', () => {
+    expect(readWakeToken('')).toBeNull();
+    expect(readWakeToken('   ')).toBeNull();
+  });
+
+  it('returns null for an empty file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-wake-test-'));
+    const path = writeToken(dir, '', 0o600);
+    expect(readWakeToken(path)).toBeNull();
+  });
+
+  it('reads the token from a \\r\\n first line', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-wake-test-'));
+    const path = writeToken(dir, `${TOKEN}\r\nsecond line\r\n`, 0o600);
+    expect(readWakeToken(path)).toBe(TOKEN);
+  });
+
+  it('returns null for hostile runtime inputs without invoking any getter or trap', () => {
+    // Cost bound: the `typeof raw !== 'string'` guard is O(1) and runs before
+    // any fs call, so no coercion (toString/valueOf/get traps) is ever reached.
+    expect(readWakeToken(null as unknown as string)).toBeNull();
+    expect(readWakeToken(undefined as unknown as string)).toBeNull();
+    expect(readWakeToken(123 as unknown as string)).toBeNull();
+
+    let getterCalls = 0;
+    const evil = {
+      get toString(): string {
+        getterCalls += 1;
+        throw new Error('boom');
+      },
+    };
+    expect(readWakeToken(evil as unknown as string)).toBeNull();
+    expect(getterCalls).toBe(0);
+
+    let trapCalls = 0;
+    const lying = new Proxy(
+      {},
+      {
+        get: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+        has: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+        getOwnPropertyDescriptor: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+      },
+    );
+    expect(readWakeToken(lying as unknown as string)).toBeNull();
+    expect(trapCalls).toBe(0);
+  });
 });
 
 describe('normalizeWakeBaseUrl (K9)', () => {
@@ -102,6 +221,53 @@ describe('normalizeWakeBaseUrl (K9)', () => {
     expect(normalizeWakeBaseUrl('http://127.0.0.1:3001')).toBe('http://127.0.0.1:3001');
     expect(normalizeWakeBaseUrl('http://localhost:3001/')).toBe('http://localhost:3001');
     expect(normalizeWakeBaseUrl('https://api.example')).toBe('https://api.example');
+    expect(normalizeWakeBaseUrl('http://[::1]:3001')).toBe('http://[::1]:3001');
+    expect(normalizeWakeBaseUrl('http://[::1]:3001/')).toBe('http://[::1]:3001');
+  });
+
+  it('refuses undefined, empty, whitespace-only and username-only inputs', () => {
+    expect(normalizeWakeBaseUrl(undefined)).toBeNull();
+    expect(normalizeWakeBaseUrl('')).toBeNull();
+    expect(normalizeWakeBaseUrl('   ')).toBeNull();
+    expect(normalizeWakeBaseUrl('http://user@127.0.0.1:3001')).toBeNull();
+  });
+
+  it('returns null for hostile runtime inputs without invoking any getter or trap', () => {
+    // Cost bound: the `typeof raw !== 'string'` guard is O(1) and runs before
+    // URL parsing, so no coercion (toString/valueOf/get traps) is ever reached.
+    expect(normalizeWakeBaseUrl(null as unknown as string)).toBeNull();
+    expect(normalizeWakeBaseUrl(123 as unknown as string)).toBeNull();
+
+    let getterCalls = 0;
+    const evil = {
+      get toString(): string {
+        getterCalls += 1;
+        throw new Error('boom');
+      },
+    };
+    expect(normalizeWakeBaseUrl(evil as unknown as string)).toBeNull();
+    expect(getterCalls).toBe(0);
+
+    let trapCalls = 0;
+    const lying = new Proxy(
+      {},
+      {
+        get: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+        has: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+        getOwnPropertyDescriptor: () => {
+          trapCalls += 1;
+          throw new Error('boom');
+        },
+      },
+    );
+    expect(normalizeWakeBaseUrl(lying as unknown as string)).toBeNull();
+    expect(trapCalls).toBe(0);
   });
 });
 
@@ -143,6 +309,20 @@ describe('resolveWakeConfig (K9)', () => {
     expect(resolveWakeConfig(process.env)).toBeNull();
     process.env.FLEET_CONDUCTOR_WAKE_TOKEN_FILE = tokenFile;
     delete process.env.FLEET_API_URL;
+    expect(resolveWakeConfig(process.env)).toBeNull();
+  });
+
+  it('returns null for a whitespace-only FLEET_API_URL', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-wake-test-'));
+    const tokenFile = writeToken(dir, `${TOKEN}\n`);
+    process.env.FLEET_API_URL = '   ';
+    process.env.FLEET_CONDUCTOR_WAKE_TOKEN_FILE = tokenFile;
+    expect(resolveWakeConfig(process.env)).toBeNull();
+  });
+
+  it('returns null for a whitespace-only FLEET_CONDUCTOR_WAKE_TOKEN_FILE', () => {
+    process.env.FLEET_API_URL = BASE_URL;
+    process.env.FLEET_CONDUCTOR_WAKE_TOKEN_FILE = '   ';
     expect(resolveWakeConfig(process.env)).toBeNull();
   });
 
@@ -297,5 +477,239 @@ describe('openChangeWakeReader (K9)', () => {
     reader!.close();
     reader!.close();
     await expect(wait).resolves.toBe(false);
+  });
+
+  it('returns null when options.signal is already aborted, without calling fetchImpl', async () => {
+    let fetchCalls = 0;
+    const spyFetch = (async () => {
+      fetchCalls += 1;
+      return new Response(openStream(() => undefined), { status: 200 });
+    }) as typeof fetch;
+    const external = new AbortController();
+    external.abort();
+    const reader = await openChangeWakeReader({
+      baseUrl: BASE_URL,
+      token: TOKEN,
+      fetchImpl: spyFetch,
+      signal: external.signal,
+    });
+    expect(reader).toBeNull();
+    expect(fetchCalls).toBe(0);
+  });
+
+  it('aborts the fetch signal when options.signal fires mid-fetch, resolving null', async () => {
+    let capturedInit: RequestInit | undefined;
+    const pendingFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedInit = init;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('fetch aborted')), { once: true });
+      });
+    }) as typeof fetch;
+    const external = new AbortController();
+    const opening = openChangeWakeReader({
+      baseUrl: BASE_URL,
+      token: TOKEN,
+      fetchImpl: pendingFetch,
+      signal: external.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    external.abort();
+    await expect(opening).resolves.toBeNull();
+    expect(capturedInit?.signal?.aborted).toBe(true);
+  });
+
+  it('returns null when fetchImpl throws synchronously', async () => {
+    const throwingFetch = (() => {
+      throw new Error('sync boom');
+    }) as typeof fetch;
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: throwingFetch });
+    expect(reader).toBeNull();
+  });
+
+  it('returns null for a 200 response with a null body', async () => {
+    const nullBodyFetch = (async () => new Response(null, { status: 200 })) as typeof fetch;
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: nullBodyFetch });
+    expect(reader).toBeNull();
+  });
+
+  it('returns null when response.body.getReader() throws (already-locked stream)', async () => {
+    const lockedBody = {
+      getReader(): ReadableStreamDefaultReader<Uint8Array> {
+        throw new Error('stream is locked');
+      },
+    };
+    const lockedFetch = (async () => ({ status: 200, body: lockedBody }) as unknown as Response) as typeof fetch;
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: lockedFetch });
+    expect(reader).toBeNull();
+  });
+
+  it('resolves waitForSignal false when the given AbortSignal is already aborted', async () => {
+    const stream = openStream(() => undefined);
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    const abort = new AbortController();
+    abort.abort();
+    await expect(reader!.waitForSignal(abort.signal)).resolves.toBe(false);
+    reader!.close();
+  });
+
+  it('resolves waitForSignal false when called after close', async () => {
+    const stream = openStream(() => undefined);
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    reader!.close();
+    await expect(reader!.waitForSignal(new AbortController().signal)).resolves.toBe(false);
+  });
+
+  it('a mid-wait abort resolves only that waiter while a concurrent waiter still wakes', async () => {
+    let push!: (text: string) => void;
+    const stream = openStream((emit) => {
+      push = emit;
+    });
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    const abortA = new AbortController();
+    const abortB = new AbortController();
+    const waitA = reader!.waitForSignal(abortA.signal);
+    const waitB = reader!.waitForSignal(abortB.signal);
+    abortA.abort();
+    await expect(waitA).resolves.toBe(false);
+    push(signalLine(11, 'attempt'));
+    await expect(waitB).resolves.toBe(true);
+    reader!.close();
+  });
+
+  it('one signal wakes every concurrent waiter', async () => {
+    let push!: (text: string) => void;
+    const stream = openStream((emit) => {
+      push = emit;
+    });
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    const waitA = reader!.waitForSignal(new AbortController().signal);
+    const waitB = reader!.waitForSignal(new AbortController().signal);
+    const waitC = reader!.waitForSignal(new AbortController().signal);
+    push(signalLine(12, 'attempt'));
+    await expect(waitA).resolves.toBe(true);
+    await expect(waitB).resolves.toBe(true);
+    await expect(waitC).resolves.toBe(true);
+    reader!.close();
+  });
+
+  it('a signal arriving before the wait is consumed once while the stream stays open', async () => {
+    let push!: (text: string) => void;
+    const stream = openStream((emit) => {
+      push = emit;
+    });
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    push(signalLine(13, 'attempt'));
+    const abort = new AbortController().signal;
+    await expect(reader!.waitForSignal(abort)).resolves.toBe(true);
+    let secondResolved = false;
+    const second = reader!.waitForSignal(abort).then((value) => {
+      secondResolved = true;
+      return value;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(secondResolved).toBe(false);
+    push(signalLine(14, 'attempt'));
+    await expect(second).resolves.toBe(true);
+    reader!.close();
+  });
+
+  it('a signal split across chunks is parsed, and a trailing buffer without \\n is flushed on close', async () => {
+    const encoder = new TextEncoder();
+    const chunkedStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"stream":"s_1","seq":7,'));
+        controller.enqueue(encoder.encode('"kind":"attempt","id":"a_1"}'));
+        controller.enqueue(encoder.encode('\n'));
+        controller.close();
+      },
+    });
+    const reader = await openChangeWakeReader({
+      baseUrl: BASE_URL,
+      token: TOKEN,
+      fetchImpl: fetchFromStream(chunkedStream),
+    });
+    expect(reader).not.toBeNull();
+    await expect(reader!.waitForSignal(new AbortController().signal)).resolves.toBe(true);
+    reader!.close();
+
+    const unterminatedStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(signalLine(8, 'resync')));
+        controller.close();
+      },
+    });
+    const reader2 = await openChangeWakeReader({
+      baseUrl: BASE_URL,
+      token: TOKEN,
+      fetchImpl: fetchFromStream(unterminatedStream),
+    });
+    expect(reader2).not.toBeNull();
+    await expect(reader2!.waitForSignal(new AbortController().signal)).resolves.toBe(true);
+    reader2!.close();
+  });
+
+  it('a malformed JSON line in the stream does not wake a wait, but a later valid signal does', async () => {
+    let push!: (text: string) => void;
+    const stream = openStream((emit) => {
+      push = emit;
+    });
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    let resolved = false;
+    const wait = reader!.waitForSignal(new AbortController().signal).then((value) => {
+      resolved = true;
+      return value;
+    });
+    push('not json');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(resolved).toBe(false);
+    push(signalLine(15, 'attempt'));
+    await expect(wait).resolves.toBe(true);
+    reader!.close();
+  });
+
+  it('a reader.read() rejection ends the reader and settles pending waits with false', async () => {
+    const failingStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error('read failed'));
+      },
+    });
+    const reader = await openChangeWakeReader({
+      baseUrl: BASE_URL,
+      token: TOKEN,
+      fetchImpl: fetchFromStream(failingStream),
+    });
+    expect(reader).not.toBeNull();
+    const wait = reader!.waitForSignal(new AbortController().signal);
+    await expect(wait).resolves.toBe(false);
+    await expect(reader!.waitForSignal(new AbortController().signal)).resolves.toBe(false);
+    reader!.close();
+  });
+
+  it('close aborts the fetch signal and swallows a rejecting reader.cancel()', async () => {
+    let capturedInit: RequestInit | undefined;
+    const capturingFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedInit = init;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            return Promise.reject(new Error('cancel boom'));
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: capturingFetch });
+    expect(reader).not.toBeNull();
+    reader!.close();
+    expect(capturedInit?.signal?.aborted).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
   });
 });

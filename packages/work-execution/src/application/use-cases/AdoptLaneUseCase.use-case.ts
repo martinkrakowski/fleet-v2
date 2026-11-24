@@ -51,7 +51,8 @@ const MAX_COMMITS_SINCE_BASE = 512;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ATTEMPT_ID = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
 const PLAN_DIGEST = /^[0-9a-f]{64}$/;
-const COMMIT = /^[0-9a-f]{40,64}$/;
+/** A git object id; shared with the relaunch apply parse so the two cannot drift. */
+export const COMMIT = /^[0-9a-f]{40,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 const NONE = Symbol('none');
@@ -346,6 +347,95 @@ function sameList(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
+/** A pure input fault: a refusal or an unknown, exactly as `adoptLane` would answer it. */
+export type AdoptLaneInputFault =
+  | { readonly outcome: 'refused'; readonly reason: AdoptLaneRefusalReason }
+  | { readonly outcome: 'unknown'; readonly reason: AdoptLaneUnknownReason };
+
+/** The lane-id grammar `adoptLane` enforces (AR2c uses this same pattern, never a looser copy). */
+export function isAdoptLaneId(value: unknown): value is string {
+  return id(value) !== null;
+}
+
+/**
+ * The brief faults that need no store: the digest of the brief text, the
+ * acceptance spec and the frozen-brief package (which owns the path rules,
+ * NUL and the like). Pure: it reads only its arguments.
+ */
+export function adoptBriefFault(
+  request: Pick<AdoptLaneRequest, 'brief' | 'attempt' | 'workOrder'>,
+  computeDigest: (content: string) => string,
+): AdoptLaneRefusalReason | null {
+  const { brief } = request;
+  let digest: string;
+  try {
+    digest = computeDigest(brief.briefText);
+  } catch {
+    return 'brief-digest-mismatch';
+  }
+  if (digest !== brief.expectedBriefDigest) return 'brief-digest-mismatch';
+  const spec = AcceptanceSpec.create(brief.acceptanceSpec);
+  if (!spec.success || spec.value === undefined) return 'invalid-brief';
+  const pkg = BriefPackage.create({
+    attemptId: request.attempt.attemptId,
+    briefDigest: brief.expectedBriefDigest,
+    prosePath: brief.prosePath,
+    manifestPath: brief.manifestPath,
+    baseCommit: request.workOrder.baseCommit,
+    policyRevision: request.workOrder.policyRevision,
+    independentReviewer: brief.reviewerModel,
+    ownedPaths: request.workOrder.ownedPaths,
+    acceptanceSpec: spec.value,
+  });
+  return pkg.success ? null : 'invalid-brief';
+}
+
+/**
+ * The clean-commit faults decidable from the caller's own facts (dirty count,
+ * branch fact, branch name, commit list): nothing here reads a repository.
+ * A `save-ref` source is never faulted here; it is checked against the
+ * journal, which is the one post-side-effect refusal class left.
+ */
+export function cleanCommitSourceFault(
+  source: AdoptLaneSource,
+  request: Pick<AdoptLaneRequest, 'run' | 'workOrder'>,
+): AdoptLaneInputFault | null {
+  if (source.kind !== 'clean-commit') return null;
+  if (source.dirtyCount === 'unknown') return { outcome: 'unknown', reason: 'dirty-state-unknown' };
+  if (source.commitOnBranch === 'unknown') return { outcome: 'unknown', reason: 'branch-fact-unknown' };
+  if (source.dirtyCount !== 0) return { outcome: 'refused', reason: 'worktree-dirty' };
+  const since = source.commitsSinceBase;
+  // The commit must be on THIS run's branch, not on some other branch of the repository.
+  const laneBranch = request.run.branchName ?? `fleet/${request.run.runId}`;
+  if (
+    source.branchName !== laneBranch ||
+    source.commitOnBranch !== true || source.commitOid === request.workOrder.baseCommit ||
+    (since !== undefined && (since.length === 0 || !since.includes(source.commitOid)))
+  ) {
+    return { outcome: 'refused', reason: 'commit-not-on-branch' };
+  }
+  return null;
+}
+
+/**
+ * Every adopt fault that depends on the input alone: the lane-id grammar, the
+ * brief checks and the clean-commit source facts. `ApplyRelaunchUseCase` runs
+ * this SAME function in its preflight, before the grant, the save or the
+ * abort, so an input `adoptLane` would refuse for these reasons never spends
+ * either. `source` is optional because a relaunch may derive it later.
+ */
+export function adoptLaneInputFault(
+  request: Pick<AdoptLaneRequest, 'laneId' | 'brief' | 'attempt' | 'workOrder' | 'run'> & {
+    readonly source?: AdoptLaneSource;
+  },
+  computeDigest: (content: string) => string,
+): AdoptLaneInputFault | null {
+  if (!isAdoptLaneId(request.laneId)) return { outcome: 'refused', reason: 'invalid-request' };
+  const brief = adoptBriefFault(request, computeDigest);
+  if (brief !== null) return { outcome: 'refused', reason: brief };
+  return request.source === undefined ? null : cleanCommitSourceFault(request.source, request);
+}
+
 export class AdoptLaneUseCase implements AdoptLanePort {
   constructor(private readonly deps: AdoptLaneDependencies) {}
 
@@ -373,28 +463,8 @@ export class AdoptLaneUseCase implements AdoptLanePort {
 
   /** The digest is only verified, never recomputed into a replacement; the package must be valid. */
   private verifyBrief(request: AdoptLaneRequest): void {
-    const { brief } = request;
-    let digest: string;
-    try {
-      digest = this.deps.computeDigest(brief.briefText);
-    } catch {
-      throw refuse('brief-digest-mismatch');
-    }
-    if (digest !== brief.expectedBriefDigest) throw refuse('brief-digest-mismatch');
-    const spec = AcceptanceSpec.create(brief.acceptanceSpec);
-    if (!spec.success || spec.value === undefined) throw refuse('invalid-brief');
-    const pkg = BriefPackage.create({
-      attemptId: request.attempt.attemptId,
-      briefDigest: brief.expectedBriefDigest,
-      prosePath: brief.prosePath,
-      manifestPath: brief.manifestPath,
-      baseCommit: request.workOrder.baseCommit,
-      policyRevision: request.workOrder.policyRevision,
-      independentReviewer: brief.reviewerModel,
-      ownedPaths: request.workOrder.ownedPaths,
-      acceptanceSpec: spec.value,
-    });
-    if (!pkg.success) throw refuse('invalid-brief');
+    const fault = adoptBriefFault(request, this.deps.computeDigest);
+    if (fault !== null) throw refuse(fault);
   }
 
   /** Before every outbound operation: past the deadline, stop with the steps done so far. */
@@ -529,19 +599,8 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   private checkSource(request: AdoptLaneRequest, journal: Journal): void {
     const { source } = request;
     if (source.kind === 'clean-commit') {
-      if (source.dirtyCount === 'unknown') throw unknown('dirty-state-unknown');
-      if (source.commitOnBranch === 'unknown') throw unknown('branch-fact-unknown');
-      if (source.dirtyCount !== 0) throw refuse('worktree-dirty');
-      const since = source.commitsSinceBase;
-      // The commit must be on THIS run's branch, not on some other branch of the repository.
-      const laneBranch = request.run.branchName ?? `fleet/${request.run.runId}`;
-      if (
-        source.branchName !== laneBranch ||
-        source.commitOnBranch !== true || source.commitOid === request.workOrder.baseCommit ||
-        (since !== undefined && (since.length === 0 || !since.includes(source.commitOid)))
-      ) {
-        throw refuse('commit-not-on-branch');
-      }
+      const fault = cleanCommitSourceFault(source, request);
+      if (fault !== null) throw new Halt(fault);
       return;
     }
     const entries = journal.get(adoptLaneSaveKey(request.planDigest, request.laneId)) ?? [];

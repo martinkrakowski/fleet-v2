@@ -338,6 +338,26 @@ export interface LaneRunFacts {
    * whether an operator abandoned it. Non-null only when `gate === 'unknown'`.
    */
   readonly gateUnknown?: { readonly retry: number; readonly operatorAbandoned: boolean } | null;
+  /**
+   * GD1: the round of the gate intent at `head12` with the highest round, then
+   * highest retry (0 = run 0); null when there is no gate intent at the head.
+   * Absent reads as unknown (the re-gate bound is not applied).
+   */
+  readonly gateLatestRound?: number | null;
+  /**
+   * GD1: the failed gate run at `head12` — its retry (0 = run 0) and how many
+   * distinct gate intents in the same `(round, head12)` ended `gate-failed`.
+   * Non-null only when `gate === 'failed'`; absent reads as no retry.
+   */
+  readonly gateFailed?: { readonly retry: number; readonly failedCount: number } | null;
+  /** GD1: whether the latest `fixing` conduct was driven by a `gating` failure; absent reads as false. */
+  readonly fixRoundGateDriven?: boolean;
+  /**
+   * GD1: whether the fix attempt's worktree has no uncommitted and no
+   * untracked paths (a read-only `inspectWorktree`); absent reads as
+   * not-clean, so a re-gate never fires on a guess.
+   */
+  readonly worktreeCleanForReGate?: boolean;
   /** Receipts per (reviewer, kind) at `head12` (RW1) (PC/K5). */
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
@@ -897,7 +917,22 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return enter('seat-failed');
       }
       if (attempt.collection.headUnchanged) {
-        return park('fix-no-progress', null);
+        // GD1: an unsealed collection still parks first even on an unchanged
+        // head — the manifest verdict is about the artifacts, not the head.
+        if (attempt.collection.manifest === 'missing' || attempt.collection.manifest === 'mismatch') {
+          return park('artifacts-unsealed', null);
+        }
+        // GD1: a clean fix round that the gate itself drove (the fixing conduct
+        // immediately followed a gating failure) and that has not already been
+        // re-gated in this round gets exactly one more gate at the same head:
+        // the fix made no commits, so the only progress to verify is the gate
+        // itself. Anything else stays today's fix-no-progress park.
+        const reGateAllowed =
+          attempt.round >= 1 &&
+          facts.fixRoundGateDriven === true &&
+          facts.worktreeCleanForReGate === true &&
+          (facts.gateLatestRound === undefined || facts.gateLatestRound === null || facts.gateLatestRound < attempt.round);
+        return reGateAllowed ? enter('gating') : park('fix-no-progress', null);
       }
       if (attempt.collection.manifest === 'missing' || attempt.collection.manifest === 'mismatch') {
         return park('artifacts-unsealed', null);
@@ -906,7 +941,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const gatingRules = (): LaneRunDecision => {
-      if (facts.gate === 'none') {
+      // GD1: a fresh gate acts when there is no gate intent at the head at all,
+      // or when the latest gate intent at the head belongs to an earlier round
+      // (a re-gate of a clean gate-driven fix round runs this round's own run 0;
+      // gateLatestRound bounds the re-gate to at most once per round).
+      if (facts.gate === 'none' || (facts.gateLatestRound !== undefined && facts.gateLatestRound !== null && facts.gateLatestRound < (facts.attempt?.round ?? -1))) {
         const attempt = facts.attempt;
         if (attempt === null) {
           return WAIT_FACTS_INCONSISTENT;
@@ -992,6 +1031,29 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (facts.gate === 'passed') {
         return enter('brief-check');
+      }
+      // GD1: a failed gate gets exactly one retry while it is the round's only
+      // failure — a failure that arrived after congestion retries still
+      // receives its own first retry, but a second `gate-failed` at the same
+      // `(round, head12)` (or a retry past LANE_RUN_MAX_RETRY) is terminal and
+      // takes the failure path. Malformed facts fall through, never guess.
+      const gateFailed = facts.gateFailed ?? null;
+      if (
+        gateFailed !== null &&
+        Number.isSafeInteger(gateFailed.retry) &&
+        gateFailed.retry >= 0 &&
+        gateFailed.failedCount === 1 &&
+        facts.attempt !== null &&
+        gateFailed.retry + 1 <= LANE_RUN_MAX_RETRY
+      ) {
+        return act({
+          step: 'gate',
+          round: facts.attempt.round,
+          seatIndex: facts.attempt.seatIndex,
+          head12: facts.head12,
+          retry: gateFailed.retry + 1,
+          attemptOrdinal: null,
+        });
       }
       return afterFailure(record.round, 'gate');
     };
@@ -1283,7 +1345,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           const requested = mergingPreMergeRequest();
           return requested !== null && requested.kind !== 'wait';
         })();
-      if (!premergeNeedsReview) {
+      // FS: a force stop wins over an unread `premerge` intent (a `wait` hold
+      // the operator never read): it falls through to G3d/G4a instead of
+      // reconciling, so the run ends without waiting on the review. A graceful
+      // stop keeps reconciling the premerge hold.
+      const forceStopOverPremerge =
+        facts.pendingIntent.step === 'premerge' && facts.stopMode === 'force';
+      if (!premergeNeedsReview && !forceStopOverPremerge) {
         return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
       }
     }

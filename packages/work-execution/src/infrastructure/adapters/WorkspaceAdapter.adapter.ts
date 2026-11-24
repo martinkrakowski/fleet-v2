@@ -19,10 +19,15 @@
  * of the transport decision (documented, tested change).
  */
 
+import { GIT_CONFIG_ARGS } from './LaneDiffCheckAdapter.adapter.js';
 import * as path from 'node:path';
 
 import {
   WorktreePathRefusedError,
+  type IsStrictDescendantRequest,
+  type IsStrictDescendantResult,
+  type RemoveUntrackedFilesRequest,
+  type RemoveUntrackedFilesResult,
   type ResolveBaseTipRequest,
   type ResolveBaseTipResult,
   type WorktreeInspection,
@@ -453,6 +458,157 @@ function snapshotRemoveWorktreeRequest(request: unknown): RemoveWorktreeRequest 
     return null;
   }
   return snap as unknown as RemoveWorktreeRequest;
+}
+
+/**
+ * SN1: a descriptor-safe snapshot of one `removeUntrackedFiles` request. A
+ * null, a non-object or a request with a throwing getter reads as null; the
+ * caller answers `invalid-request` and never throws. `recordedHost` must be
+ * absent, null or a plain record.
+ */
+function snapshotRemoveUntrackedRequest(request: unknown): RemoveUntrackedFilesRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  const host = snap['recordedHost'];
+  if (host !== undefined && host !== null && typeof host !== 'object') {
+    return null;
+  }
+  const worktreePath = snap['worktreePath'];
+  if (typeof worktreePath !== 'string' || worktreeRootRefusal(worktreePath) !== null) {
+    return null;
+  }
+  return snap as unknown as RemoveUntrackedFilesRequest;
+}
+
+/**
+ * SN2: a bound, typed git commit SHA: 40 or 64 lowercase hex, never all
+ * zeros. Anything else cannot name a commit object.
+ */
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function isCommitSha(value: unknown): value is string {
+  return typeof value === 'string' && COMMIT_SHA_PATTERN.test(value) && !/^0+$/.test(value);
+}
+
+/** Sentinel: the recorded host block was not a plain, bounded data record. */
+const INVALID_RECORDED_HOST = Symbol('invalid-recorded-host');
+
+const RECORDED_HOST_STRING_KEYS = ['host', 'hostName', 'agent', 'model', 'variant'] as const;
+const RECORDED_HOST_MAX_STRING = 512;
+const RECORDED_HOST_KEYS: ReadonlySet<string> = new Set([
+  'kind',
+  'remotePort',
+  'useFreeSeats',
+  ...RECORDED_HOST_STRING_KEYS,
+]);
+
+/** A bounded string or null (or undefined when `allowAbsent`). */
+function isBoundedStringOrNull(value: unknown, allowAbsent: boolean): boolean {
+  if (value === undefined) {
+    return allowAbsent;
+  }
+  return value === null || (typeof value === 'string' && value.length <= RECORDED_HOST_MAX_STRING);
+}
+
+/** Whether the snapshot's non-string fields (`kind`, `remotePort`, `useFreeSeats`) are well formed. */
+function hasValidRecordedHostScalars(snap: Record<string, unknown>): boolean {
+  const port = snap['remotePort'];
+  const portOk = port === undefined || port === null || (typeof port === 'number' && Number.isSafeInteger(port));
+  const free = snap['useFreeSeats'];
+  const freeOk = free === undefined || typeof free === 'boolean';
+  return portOk && freeOk && (snap['kind'] === 'opencode' || snap['kind'] === 'agy');
+}
+
+/**
+ * SN2: a data-only snapshot of the recorded host block before it reaches the
+ * executor resolver. Absent and null pass through; anything else must be a
+ * plain object whose own keys are enumerable data properties from the known
+ * set (no getter ever runs, `snapshotPlainDataRecord`), with bounded string
+ * fields. Cost: `O(K)` own keys plus `O(1)` field checks.
+ */
+function snapshotRecordedHost(value: unknown): AttemptRunnerRecord | null | undefined | typeof INVALID_RECORDED_HOST {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(value);
+  } catch {
+    return INVALID_RECORDED_HOST;
+  }
+  if (snap === null || Object.keys(snap).some((key) => !RECORDED_HOST_KEYS.has(key))) {
+    return INVALID_RECORDED_HOST;
+  }
+  if (!hasValidRecordedHostScalars(snap)) {
+    return INVALID_RECORDED_HOST;
+  }
+  if (!RECORDED_HOST_STRING_KEYS.every((key) => isBoundedStringOrNull(snap[key], true))) {
+    return INVALID_RECORDED_HOST;
+  }
+  return { ...snap } as unknown as AttemptRunnerRecord;
+}
+
+/**
+ * SN2: the hardened git prefix of the ancestry probe, the same replace-ref
+ * and grafts override the lane diff check uses (`env GIT_NO_REPLACE_OBJECTS=1
+ * GIT_GRAFT_FILE=<never-existing path> git --no-replace-objects`). The
+ * overrides travel in the argv so they reach a remote git over ssh too.
+ */
+const ANCESTRY_GIT_PREFIX = [
+  'env',
+  // Ambient config injected through the environment is cleared, like the
+  // lane diff check's pinned `-c` overrides that follow `-C <worktree>`.
+  '-u',
+  'GIT_CONFIG_COUNT',
+  '-u',
+  'GIT_CONFIG_PARAMETERS',
+  'GIT_NO_REPLACE_OBJECTS=1',
+  'GIT_GRAFT_FILE=/nonexistent/fleet-v2-ancestry-probe-no-grafts',
+  'git',
+  '--no-replace-objects',
+] as const;
+
+/** The full hardened argv of one ancestry-probe git command. */
+function ancestryGitArgv(worktreePath: string, argv: readonly string[]): string[] {
+  return [...ANCESTRY_GIT_PREFIX, '-C', worktreePath, ...GIT_CONFIG_ARGS, ...argv];
+}
+
+/**
+ * SN2: a descriptor-safe snapshot of one `isStrictDescendant` request. A
+ * null, a non-object, a request with a throwing getter, a non-enumerable or
+ * accessor key, or a prototype-polluting key reads as null; the caller
+ * answers `invalid-request` and never throws. Cost: `O(K)` own-key count
+ * plus `O(1)` field checks.
+ */
+function snapshotStrictDescendantRequest(request: unknown): IsStrictDescendantRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  if (!isBoundedAbsolutePath(snap['worktreePath'])) {
+    return null;
+  }
+  if (!isCommitSha(snap['ancestorCommit']) || !isCommitSha(snap['descendantCommit'])) {
+    return null;
+  }
+  const host = snapshotRecordedHost(snap['recordedHost']);
+  if (host === INVALID_RECORDED_HOST) {
+    return null;
+  }
+  snap['recordedHost'] = host;
+  return snap as unknown as IsStrictDescendantRequest;
 }
 
 /**
@@ -951,22 +1107,51 @@ export async function writeAndVerifyPatch(
     return 'git-refused';
   }
   const tempPath = mkTemp.stdout.trim();
-  const diffRun = await executor.run(
-    [
-      'git',
-      '-C',
-      worktreePath,
-      ...RECOVERY_GIT_CONFIG,
-      'diff',
-      '--binary',
-      '--no-ext-diff',
-      '--no-textconv',
-      '--no-color',
-      'HEAD',
-      `--output=${tempPath}`,
-    ],
+  // SN1: untracked files are part of the preserved change set. They are
+  // staged into a TEMPORARY index (the worktree's own index is never touched)
+  // and diffed against HEAD from there, so the patch holds the tracked edits
+  // and the new files alike before anything resets or cleans the worktree.
+  const tempIndexMk = await executor.run(
+    ['mktemp', path.join(physicalParent, '.fleet-index.XXXXXX')],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
+  if (tempIndexMk.exitCode !== 0 || tempIndexMk.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  const tempIndex = tempIndexMk.stdout.trim();
+  const cleanupTemps = async (): Promise<void> => {
+    await executor.run(['rm', '-f', tempPath, tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
+  };
+  // git needs the index file absent (an empty file is a corrupt index).
+  await executor.run(['rm', '-f', tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
+  const filterOverrides = await collectFilterDriverOverrides(executor, worktreePath);
+  if (filterOverrides === null) {
+    await cleanupTemps();
+    return 'git-refused';
+  }
+  const indexGit = (...args: readonly string[]): string[] => [
+    'env',
+    `GIT_INDEX_FILE=${tempIndex}`,
+    'git',
+    '-C',
+    worktreePath,
+    ...RECOVERY_GIT_CONFIG,
+    ...filterOverrides,
+    ...args,
+  ];
+  for (const stage of [['read-tree', 'HEAD'], ['add', '-A', '--', '.']]) {
+    const run = await executor.run(indexGit(...stage), { timeoutMs: GIT_TIMEOUT_MS });
+    if (run.exitCode !== 0 || run.error !== undefined) {
+      await cleanupTemps();
+      return 'git-refused';
+    }
+  }
+  const diffRun = await executor.run(
+    indexGit('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD', `--output=${tempPath}`),
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  await executor.run(['rm', '-f', tempIndex], { timeoutMs: GIT_TIMEOUT_MS });
   if (diffRun.exitCode !== 0 || diffRun.error !== undefined) {
     await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
     return 'git-refused';
@@ -1353,6 +1538,104 @@ export class WorkspaceAdapter implements WorkspacePort {
     return result.stdout;
   }
 
+  /**
+   * SN2: `git cat-file -t` on both commits, then `git merge-base
+   * --is-ancestor`. Every command runs through the recorded host's executor
+   * with the shared git budget. `exit 0` on the merge-base is the only pass;
+   * `exit 1` is a real negative; a command that never answered (`exitCode`
+   * null, an error or a timeout), a thrown executor rejection, a failed
+   * `cat-file`, or an empty type output is `unknown` — never a pass.
+   */
+  async isStrictDescendant(request: IsStrictDescendantRequest): Promise<IsStrictDescendantResult> {
+    const snap = snapshotStrictDescendantRequest(request);
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const { worktreePath } = snap;
+    const ancestorCommit = snap['ancestorCommit'] as string;
+    const descendantCommit = snap['descendantCommit'] as string;
+    if (ancestorCommit === descendantCommit) {
+      return { outcome: 'not-descendant' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(snap['recordedHost'] as AttemptRunnerRecord | null | undefined);
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the probe's executor could not be resolved: ${String(error)}` };
+    }
+    try {
+      for (const commit of [ancestorCommit, descendantCommit]) {
+        const type = await executor.run(ancestryGitArgv(worktreePath, ['cat-file', '-t', commit]), {
+          timeoutMs: GIT_TIMEOUT_MS,
+        });
+        if (type.exitCode === null || type.error !== undefined) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} never answered` };
+        }
+        if (type.exitCode !== 0) {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} failed with exit ${String(type.exitCode)}` };
+        }
+        if (type.stdout.trim() === '') {
+          return { outcome: 'unknown', reason: `git cat-file -t ${commit} answered with no type` };
+        }
+        if (type.stdout.trim() !== 'commit') {
+          return { outcome: 'not-descendant' };
+        }
+      }
+      const ancestor = await executor.run(
+        ancestryGitArgv(worktreePath, ['merge-base', '--is-ancestor', ancestorCommit, descendantCommit]),
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (ancestor.exitCode === null || ancestor.error !== undefined) {
+        return { outcome: 'unknown', reason: 'git merge-base --is-ancestor never answered' };
+      }
+      if (ancestor.exitCode === 0) {
+        return this.refuseForeignParents(executor, worktreePath, ancestorCommit, descendantCommit);
+      }
+      if (ancestor.exitCode === 1) {
+        return { outcome: 'not-descendant' };
+      }
+      return {
+        outcome: 'unknown',
+        reason: `git merge-base --is-ancestor failed with exit ${String(ancestor.exitCode)}`,
+      };
+    } catch (error) {
+      return { outcome: 'unknown', reason: `the strict-descendant probe threw: ${String(error)}` };
+    }
+  }
+
+  /**
+   * SN2: after a passing ancestry answer, any merge commit in
+   * `ancestor..descendant` (a second parent the lane brought in) makes the
+   * range not adoptable. `rev-list --min-parents=2 --max-count=1` prints at
+   * most one line; an unanswered or failed probe is `unknown`, never a pass.
+   */
+  private async refuseForeignParents(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    ancestorCommit: string,
+    descendantCommit: string,
+  ): Promise<IsStrictDescendantResult> {
+    const merges = await executor.run(
+      ancestryGitArgv(worktreePath, [
+        'rev-list',
+        '--min-parents=2',
+        '--max-count=1',
+        `${ancestorCommit}..${descendantCommit}`,
+      ]),
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (merges.exitCode === null || merges.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-list --min-parents=2 never answered' };
+    }
+    if (merges.exitCode !== 0) {
+      return {
+        outcome: 'unknown',
+        reason: `git rev-list --min-parents=2 failed with exit ${String(merges.exitCode)}`,
+      };
+    }
+    return merges.stdout.trim() === '' ? { outcome: 'strict-descendant' } : { outcome: 'not-descendant' };
+  }
+
   /** Existence of one absolute path in the worktree's filesystem. */
   private async pathExists(
     worktreePath: string,
@@ -1479,6 +1762,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     worktreePath: string,
     expectedHead: string,
     allowedPathPrefixes: readonly string[],
+    verifyStagedContent?: CommitLaneOutputRequest['verifyStagedContent'],
   ): Promise<LaneCommitStep<{ tree: string }>> {
     // 6–7. Stage the change set, write the staged tree and compare it with
     // HEAD's tree (the shared comparison helper).
@@ -1502,7 +1786,52 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (stagedTreeOutsideAllowedPaths(diffTreeRun.stdout, allowedPathPrefixes)) {
       return { failure: { outcome: 'refused', reason: 'outside-allowed-paths' } };
     }
+
+    // 7c. SN1: the paths passed; the staged CONTENT is scanned for secrets
+    // too, so a secret written between the diff check and staging is never
+    // committed. Nothing is committed and no ref moves.
+    if (verifyStagedContent !== undefined) {
+      let verdict: 'clean' | 'findings' | 'error';
+      try {
+        verdict = await verifyStagedContent();
+      } catch {
+        verdict = 'error';
+      }
+      if (verdict === 'findings') {
+        return { failure: { outcome: 'refused', reason: 'staged-content-findings' } };
+      }
+      if (verdict !== 'clean') {
+        return { failure: { outcome: 'error', reason: 'the staged content re-scan could not run' } };
+      }
+    }
     return { data: { tree } };
+  }
+
+  /**
+   * SN1: refuse while `MERGE_HEAD`, `REBASE_HEAD` or `CHERRY_PICK_HEAD`
+   * exists (exit 0 of `rev-parse --verify -q`; exit 1 is absent; anything
+   * else is an error). `null` means none exists.
+   */
+  private async laneCommitMergeState(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<CommitLaneOutputResult | null> {
+    for (const ref of ['MERGE_HEAD', 'REBASE_HEAD', 'CHERRY_PICK_HEAD']) {
+      const probe = await executor.run(
+        ['git', '-C', worktreePath, ...COMMIT_GIT_CONFIG, 'rev-parse', '--verify', '-q', ref],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (probe.error !== undefined || probe.exitCode === null) {
+        return { outcome: 'error', reason: 'git rev-parse failed' };
+      }
+      if (probe.exitCode === 0) {
+        return { outcome: 'refused', reason: 'merge-state-present' };
+      }
+      if (probe.exitCode !== 1) {
+        return { outcome: 'error', reason: 'git rev-parse failed' };
+      }
+    }
+    return null;
   }
 
   /**
@@ -1578,6 +1907,11 @@ export class WorkspaceAdapter implements WorkspacePort {
       return this.alreadyCommittedOutcome(executor, request, worktreePath, head, branchRef);
     }
 
+    // 5b. SN1: a merge, rebase or cherry-pick in progress is never staged
+    // or committed over.
+    const mergeState = await this.laneCommitMergeState(executor, worktreePath);
+    if (mergeState !== null) return mergeState;
+
     // 6–7b. Stage the change set, compare the staged tree with HEAD's tree
     // and re-check the allowed-path prefixes on the committed tree.
     const stagedTree = await this.laneCommitStagedTree(
@@ -1585,6 +1919,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       worktreePath,
       request.expectedHead,
       request.allowedPathPrefixes,
+      request.verifyStagedContent,
     );
     if ('failure' in stagedTree) return stagedTree.failure;
 
@@ -1973,6 +2308,50 @@ export class WorkspaceAdapter implements WorkspacePort {
     } catch {
       return { outcome: 'refused', reason: 'git-refused' };
     }
+  }
+
+  /**
+   * SN1: remove untracked files (`git clean -fd`) from one worktree after its
+   * tracked edits were preserved elsewhere. Tracked paths are never touched.
+   * The request is snapshotted through its property descriptors, so no getter
+   * ever runs; a malformed request is refused before any command. A non-zero
+   * git exit is a refusal; a run that ends without an exit code or reports an
+   * error (a timeout included) is an error — nothing is known about what was
+   * removed.
+   */
+  async removeUntrackedFiles(request: RemoveUntrackedFilesRequest): Promise<RemoveUntrackedFilesResult> {
+    // 1. Snapshot without running getters, then validate before any command.
+    const snap = snapshotRemoveUntrackedRequest(request);
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    // 2. The clean runs on the recorded host's executor; an unresolvable host
+    //    is a transport failure, like the other workspace writes.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(snap.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+    // Fix round 1 item 2: a rejected `executor.run` (an abort or an executor
+    // fault) is an error outcome, never an escape — during collect cleanup an
+    // escape aborts normalization before the untracked files are removed.
+    let result: Awaited<ReturnType<CommandExecutorPort['run']>>;
+    try {
+      result = await executor.run(
+        ['git', '-C', snap.worktreePath, ...RECOVERY_GIT_CONFIG, 'clean', '-fd'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+    } catch {
+      return { outcome: 'error', reason: 'git clean did not complete' };
+    }
+    if (result.exitCode === null || result.error !== undefined) {
+      return { outcome: 'error', reason: 'git clean did not complete' };
+    }
+    if (result.exitCode !== 0) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    return { outcome: 'removed' };
   }
 
   /**

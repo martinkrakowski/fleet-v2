@@ -349,6 +349,14 @@ export interface AttemptRecord {
    */
   readonly dispatchedTimeLimitSeconds?: number;
   /**
+   * SN2: the clean strict-descendant head this dispatch adopted (a commit the
+   * lane made on top of the expected checkout, scanned commit by commit before
+   * adoption). Collection treats it as the expected head, so uncommitted
+   * output left after the adoption is normalised through the SN1 scan path.
+   * Absent when the dispatch adopted nothing; a re-dispatch clears it.
+   */
+  readonly adoptedHeadCommit?: string;
+  /**
    * Owner decision references the product froze into the brief package, read
    * from that frozen package at dispatch and never from a worktree file at
    * acceptance time. An absent field on records written before dispatch
@@ -475,11 +483,23 @@ export function readJournalPullRequestRef(
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return { kind: 'invalid' };
   }
-  const prototype = Object.getPrototypeOf(value);
+  // A Proxy may sabotage any of these meta-operations with a throwing trap;
+  // each failure is an `invalid` read, never an escaping throw.
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    return { kind: 'invalid' };
+  }
   if (prototype !== Object.prototype && prototype !== null) {
     return { kind: 'invalid' };
   }
-  const keys = Reflect.ownKeys(value);
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return { kind: 'invalid' };
+  }
   if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.size) {
     return { kind: 'invalid' };
   }
@@ -489,7 +509,12 @@ export function readJournalPullRequestRef(
     if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.has(key)) {
       return { kind: 'invalid' };
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return { kind: 'invalid' };
+    }
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
       return { kind: 'invalid' };
     }

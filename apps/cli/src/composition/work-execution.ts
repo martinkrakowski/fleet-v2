@@ -485,6 +485,23 @@ export function composeExecution(input: ComposeExecutionInput) {
       }
       return { outcome: result.outcome, reason: result.reason };
     },
+    // AR3a: the relaunch-apply grant's head-free resolve, answered by the
+    // coordination use case behind the composition root. Head-free: the
+    // request carries the empty head and the plan digest it is bound to.
+    // `grantId` is a non-secret handle; no secret-shaped value is ever echoed.
+    authorizeRelaunchApply: async (request) => {
+      const result = await coordination.resolveActionAuthorization.resolveActionAuthorization({
+        projectId: 'relaunch',
+        actionScope: 'relaunch:apply',
+        expectedHeadSha: '',
+        authorizationGrantId: request.grantId,
+        proposalDigest: request.planDigest,
+      });
+      if (result.outcome === 'authorized') {
+        return { outcome: 'authorized', grantId: result.grantId };
+      }
+      return { outcome: result.outcome, reason: result.reason };
+    },
   });
 
   const executionObservation = new ExecutionObservationAdapter({
@@ -543,6 +560,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     }),
     journal: executionJournal,
     computeDigest: sha256HexDigest,
+    // GD2: the CLI evidence archive — failed gate output tails are archived
+    // and the journal carries only their evidence references.
+    evidenceArchive: evidence.evidenceArchive,
   });
   const attemptGate = options?.attemptGate ?? composedAttemptGate;
   // PK-1: stop, the dispatch conflict stops and collect kill the attempt's
@@ -562,6 +582,14 @@ export function composeExecution(input: ComposeExecutionInput) {
     stateDir !== undefined && stateDir.trim().length > 0
       ? new CutoverJournalAdapter({ stateDir, fileName: 'shadow-intake-journal.json' })
       : new CutoverJournalAdapter();
+  // SW2a2: the shadow-park journal — a third CutoverJournalAdapter instance in
+  // shadowPark mode, storing to its own `shadow-park-journal.json` (schemaVersion
+  // 3); in-memory without a durable state directory. `cutover-journal.json` and
+  // `shadow-intake-journal.json` stay untouched at schemaVersion 2.
+  const shadowParkJournal =
+    stateDir !== undefined && stateDir.trim().length > 0
+      ? new CutoverJournalAdapter({ stateDir, fileName: 'shadow-park-journal.json', shadowPark: true })
+      : new CutoverJournalAdapter({ shadowPark: true });
   const importTrainState = new ImportTrainStateUseCase({
     legacyState: legacyTrainState,
     queue: mergeQueueRepository,
@@ -599,6 +627,8 @@ export function composeExecution(input: ComposeExecutionInput) {
     // The runner entry's lane budget (D4/D6 plan item 4); undefined without a
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
+    // AR3c1: the single process-tree termination adapter, reused by relaunch live apply.
+    processTreeTermination,
     attemptArtifact,
     opencodeUsage,
     briefAuthoring,
@@ -678,6 +708,12 @@ export function composeExecution(input: ComposeExecutionInput) {
       computeDigest: sha256HexDigest,
       allowedSeats,
       processTreeTermination,
+      // SN2: the lane diff check for a clean strict-descendant head adoption
+      // runs on the dispatching runner's recorded host.
+      laneDiffCheckFor: (recorded) => {
+        const resolved = executorForHost.executorForRecordedHost(recorded);
+        return resolved.ok ? new LaneDiffCheckAdapter(resolved.executor) : null;
+      },
     }),
     commitEditOnlyAttempt: new CommitEditOnlyAttemptUseCase({
       attemptRepo: attemptRepository,
@@ -723,6 +759,8 @@ export function composeExecution(input: ComposeExecutionInput) {
     listMergeQueue,
     importTrainState,
     legacyTrainState,
+    // SW2a2: the shadow-park journal (`shadow-park-journal.json`, schemaVersion 3).
+    shadowParkJournal,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

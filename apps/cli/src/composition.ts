@@ -82,6 +82,12 @@ import {
   InspectWorkOrderUseCase,
   InventoryRelaunchUseCase,
   PlanRelaunchUseCase,
+  AdoptLaneUseCase,
+  ApplyRelaunchUseCase,
+  LaneDiffCheckAdapter,
+  LaneEditSaveAdapter,
+  ProcessTreeTerminationAdapter,
+  SaveLaneEditsUseCase,
   RelaunchPlanRepositoryAdapter,
   ReleaseStoreAdapter,
   LaneRunParkNoticeAdapter,
@@ -163,6 +169,7 @@ import {
   type TelemetryResourceInput,
   type RunTelemetryMarkPort,
   type HostAudibleAlertPort,
+  type CutoverJournalPort,
 } from '@fleet/work-execution';
 import { readCurrentReleaseSha } from './shadow-release-sha.js';
 
@@ -891,6 +898,8 @@ export interface FleetCliRuntime {
     readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
     /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
     readonly cutoverJournal: CutoverJournalAdapter;
+    /** SW2a2: the shadow-park journal (`shadow-park-journal.json`, schemaVersion 3), a `CutoverJournalPort`. */
+    readonly shadowParkJournal: CutoverJournalPort;
     /** CO30a: the killall train-pause record `cutover rollback` lifts when the cutover set it. */
     readonly killallTrainPause: KillallTrainPauseAdapter;
     /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
@@ -903,6 +912,10 @@ export interface FleetCliRuntime {
     readonly shadowRunsRead?: Pick<LaneRunRepositoryPort, 'list'>;
     /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
     readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
+    /** AR3c1: the single process-tree termination adapter, shared with relaunch live apply. */
+    readonly processTreeTermination: ProcessTreeTerminationAdapter;
+    /** AR3c1: `relaunch apply` live execution; wired with all twelve ports. */
+    readonly applyRelaunch: ApplyRelaunchUseCase;
     /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
     readonly reviewThreadHelper: ReviewThreadHelperPort;
   };
@@ -1554,9 +1567,54 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const durableCutover = stateDir !== undefined && stateDir.trim().length > 0;
   const cutoverRecordRepository = new CutoverRecordRepositoryAdapter({ stateDir, nowIso: daemon.now });
   const cutoverJournal = new CutoverJournalAdapter({ stateDir });
+  // AR3c1: relaunch live apply. AdoptLaneUseCase and SaveLaneEditsUseCase are
+  // the per-step services ApplyRelaunchUseCase drives; each is wired once here,
+  // with fakes nowhere — the same durable stores and executors the commands use.
+  const adoptLaneUseCase = new AdoptLaneUseCase({
+    workOrderRepo: workOrderRepository,
+    attemptRepo: attemptRepository,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+    cutoverJournal,
+    computeDigest: sha256HexDigest,
+    mintEntryId: daemon.newUlid,
+    now: daemon.now,
+  });
+  const saveLaneEditsUseCase = new SaveLaneEditsUseCase({
+    diffCheck: new LaneDiffCheckAdapter(roleExecutors.worktree),
+    runner,
+    laneSave: new LaneEditSaveAdapter(roleExecutors.worktree, {
+      executorForRecordedHost: (recorded) => {
+        const r = executorForHost.executorForRecordedHost(recorded);
+        return r.ok ? r.executor : null;
+      },
+    }),
+    journal: cutoverJournal,
+    mintEntryId: daemon.newUlid,
+  });
+  const applyRelaunch = new ApplyRelaunchUseCase({
+    planRepo: relaunchPlanRepository,
+    cutoverJournal,
+    computeDigest: sha256HexDigest,
+    authorization: execution.actionAuthorization,
+    clock: daemon.now,
+    saveLaneEdits: (request) => saveLaneEditsUseCase.execute(request),
+    runner,
+    processTreeTermination: execution.processTreeTermination,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+    adoptLane: (request) => adoptLaneUseCase.adoptLane(request),
+    mintEntryId: daemon.newUlid,
+  });
   const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  // SW2b2: `cutover switch` lists the merge queue through a read-only handle
+  // over durable state so a corrupt queue file is never quarantined by a
+  // switch read; in memory mode the one writable instance is shared.
+  const mergeQueueRead = durableCutover
+    ? new MergeQueueRepositoryAdapter({ stateDir, readOnly: true })
+    : execution.mergeQueueRepository;
   // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
   // ledger, so the reader stays undefined and the use case refuses. CO30c
   // wires `countUnrecordedLanes` beside it (below); the shadow daemon still
@@ -1702,6 +1760,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     daemonPause: daemon.pause,
     trainPauseRead,
     trainPause: killallTrainPause,
+    // SW2b2: the shadow parks a switch plans, journals and releases. The
+    // shadow-park journal is the separate `shadow-park-journal.json` store
+    // (SW2a2), never the cutover journal.
+    mergeQueueRead,
+    mergeQueue: execution.mergeQueueRepository,
+    mergePolicy: daemon.mergePolicy,
+    shadowParkJournal: execution.shadowParkJournal,
     computeDigest: sha256HexDigest,
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,
@@ -1955,6 +2020,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       killallTrainPause,
       manageCutover,
       preparePullRequestFeedbackFix,
+      /** AR3c1: the shared process-tree termination adapter and live relaunch apply. */
+      processTreeTermination: execution.processTreeTermination,
+      applyRelaunch,
       /** SH8a: `cutover shadow record-day`; undefined without a durable state directory. */
       ...(recordShadowDay !== undefined ? { recordShadowDay } : {}),
       /** AT1: `cutover shadow attest`; undefined without a durable state directory. */

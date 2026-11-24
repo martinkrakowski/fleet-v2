@@ -577,6 +577,28 @@ describe('formBatch — policy constraints', () => {
       expect(formBatch(input(eligible, { policy }))).toEqual(NONE_INPUT);
     }
   });
+
+  it('refuses a policy whose maxBatchSize is above 64', () => {
+    const eligible = [candidate(1, NORMAL, 10)];
+    const atLimit = formBatch(
+      input(eligible, {
+        policy: { maxBatchSize: 64, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(atLimit.kind).toBe('form');
+    if (atLimit.kind !== 'form') throw new Error('unreachable');
+    expect(atLimit.members.map((member) => member.prNumber)).toEqual([1]);
+
+    for (const maxBatchSize of [65, 100_000]) {
+      expect(
+        formBatch(
+          input(eligible, {
+            policy: { maxBatchSize, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+          }),
+        ),
+      ).toEqual(NONE_INPUT);
+    }
+  });
 });
 
 describe('formBatch — walk budget', () => {
@@ -620,5 +642,60 @@ describe('formBatch — walk budget', () => {
     expect(sharedPaths[0]).toBe('src/app.ts');
     expect(sharedPaths[99_999]).toBe('src/app.ts');
     expect(candidates).toHaveLength(100_000);
+  });
+
+  it('keeps recorded premerge-pending skips when the walk budget is then exceeded', () => {
+    const sharedPaths = new Array<string>(100_000).fill('src/app.ts');
+    const pending = withPremerge(1, ['src/pending.ts'], 1, 'pending');
+    const candidates = [pending, candidate(2, sharedPaths, 2), candidate(3, sharedPaths, 3)];
+    // A finished walk visits one slot per candidate and every changedPaths element.
+    // That total is above the 200_000 admission budget, so the walk stops inside it
+    // after the pending skip has already been recorded.
+    let finishedWalk = 0;
+    for (const item of candidates) {
+      finishedWalk += 1 + item.changedPaths.length;
+    }
+    expect(finishedWalk).toBe(1 + pending.changedPaths.length + (1 + 100_000) + (1 + 100_000));
+    expect(finishedWalk).toBeGreaterThan(200_000);
+
+    const result = formBatch(input(candidates));
+    expect(result).toEqual({
+      kind: 'none',
+      reason: 'walk-budget-exceeded',
+      skipped: [{ prNumber: 1, headSha: SHA(1), reason: 'premerge-pending' }],
+    });
+    expect(sharedPaths).toHaveLength(100_000);
+    expect(candidates).toHaveLength(3);
+  });
+});
+
+describe('formBatch — eligible pool cap', () => {
+  it('forms only from the first 512 eligible entries when the pool is larger', () => {
+    const poolCap = 512;
+    const total = poolCap + 1;
+    // Input order is not FIFO. The last row has the earliest enqueue time, so
+    // after admission it is the head. A cap taken before that sort would drop it.
+    const candidates = Array.from({ length: total }, (_, index) => {
+      const prNumber = index + 1;
+      const enqueuedAtMs = prNumber === total ? 1 : 1_000 + prNumber;
+      return candidate(prNumber, [`packages/p${prNumber}/src/x.ts`], enqueuedAtMs);
+    });
+    const fifo = [total, ...Array.from({ length: total - 1 }, (_, index) => index + 1)];
+    expect(fifo).toHaveLength(total);
+    expect(fifo[0]).toBe(total);
+    expect(fifo[poolCap]).toBe(poolCap);
+
+    const result = formBatch(
+      input(candidates, {
+        policy: { maxBatchSize: 64, minBatchSize: 1, collectionWaitMs: 0, speculativeDepth: 1 },
+      }),
+    );
+    expect(result.kind).toBe('form');
+    if (result.kind !== 'form') throw new Error('unreachable');
+    const memberPrs = result.members.map((member) => member.prNumber);
+    expect(memberPrs).toEqual(fifo.slice(0, 64));
+    expect(memberPrs.every((prNumber) => fifo.indexOf(prNumber) < poolCap)).toBe(true);
+    expect(memberPrs).not.toContain(fifo[poolCap]);
+    expect(result.skipped).toBeUndefined();
   });
 });

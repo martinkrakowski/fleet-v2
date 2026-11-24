@@ -23,8 +23,8 @@ import {
 } from './entities/index.js';
 import {
   admissionClassCap,
-  changesOverlap,
   classifyChange,
+  normalizeChangedPath,
   validateBatchPolicy,
   type AdmissionClass,
   type BatchPolicy,
@@ -97,6 +97,19 @@ const MAX_WALK = 100_000;
  * `{ kind: 'none', reason: 'walk-budget-exceeded' }`.
  */
 const MAX_TOTAL_WALK = 200_000;
+
+/**
+ * Largest `maxBatchSize` a policy may name. Anything larger is refused in
+ * `readPolicy` with the same typed refusal as every other unusable policy.
+ * This caps how large a batch the join walk is allowed to grow.
+ */
+const MAX_BATCH_SIZE_LIMIT = 64;
+
+/**
+ * Eligible candidates the join walk considers after admission. Further
+ * eligible entries stay queued and are not classified or joined.
+ */
+const MAX_ELIGIBLE_POOL = 512;
 
 const PREMERGE_PENDING = 'premerge-pending';
 const PREMERGE_UNKNOWN = 'premerge-unknown';
@@ -230,6 +243,11 @@ function readPolicy(value: unknown): BatchPolicy | undefined {
   if (!validated.ok) {
     return undefined;
   }
+  // Same typed refusal as the constraints above. A batch this large makes the
+  // join walk quadratic, so the policy is not usable.
+  if (validated.value.maxBatchSize > MAX_BATCH_SIZE_LIMIT) {
+    return undefined;
+  }
   return validated.value;
 }
 
@@ -305,6 +323,103 @@ function skipOrOmit(entry: object, reason: string): CandidateOutcome {
   };
 }
 
+/** Blocked stays silent. Eligible continues. Every other kind is not ready. */
+function classifyEligibilityKind(entry: object): 'blocked' | 'eligible' | 'unknown' {
+  const eligibilityRead = readProperty(entry, 'eligibility');
+  if (!eligibilityRead.ok || !isRecord(eligibilityRead.value)) {
+    return 'unknown';
+  }
+  const kindRead = readProperty(eligibilityRead.value, 'kind');
+  if (!kindRead.ok) {
+    return 'unknown';
+  }
+  if (kindRead.value === 'blocked') {
+    return 'blocked';
+  }
+  if (kindRead.value === 'eligible') {
+    return 'eligible';
+  }
+  return 'unknown';
+}
+
+function eligibilityOutcome(entry: object): CandidateOutcome | undefined {
+  const kind = classifyEligibilityKind(entry);
+  if (kind === 'eligible') {
+    return undefined;
+  }
+  if (kind === 'blocked') {
+    return { kind: 'silent' };
+  }
+  return skipOrOmit(entry, PREMERGE_UNKNOWN);
+}
+
+/** Omitted and ready may be admitted. Pending and every other present value may not. */
+function classifyPremerge(status: unknown): 'omitted' | 'pending' | 'ready' | 'unknown' {
+  if (status === 'pending') {
+    return 'pending';
+  }
+  if (status === 'ready') {
+    return 'ready';
+  }
+  if (status === undefined) {
+    return 'omitted';
+  }
+  return 'unknown';
+}
+
+function premergeOutcome(candidate: object, entry: object): CandidateOutcome | 'omitted' | 'ready' {
+  const statusRead = readProperty(candidate, 'premergeStatus');
+  if (!statusRead.ok) {
+    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+  }
+  const premerge = classifyPremerge(statusRead.value);
+  if (premerge === 'pending') {
+    return skipOrOmit(entry, PREMERGE_PENDING);
+  }
+  if (premerge === 'unknown') {
+    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+  }
+  return premerge;
+}
+
+type ChangedPathsTaken = { readonly kind: 'paths'; readonly paths: readonly string[] } | CandidateOutcome;
+
+/** Copy changedPaths, or the budget refusal when this candidate spends the walk. */
+function takeChangedPaths(candidate: object, entry: object, budget: WalkBudget): ChangedPathsTaken {
+  const pathsRead = readChangedPaths(candidate, budget);
+  if (pathsRead.ok) {
+    return { kind: 'paths', paths: pathsRead.paths };
+  }
+  if (pathsRead.reason === 'budget') {
+    return { kind: 'budget' };
+  }
+  return skipOrOmit(entry, PREMERGE_UNKNOWN);
+}
+
+function admitCandidate(
+  entry: object,
+  identity: { readonly prNumber: number; readonly headSha: string },
+  changedPaths: readonly string[],
+  enqueuedAtMs: number,
+  premerge: 'omitted' | 'ready',
+): CandidateOutcome {
+  const idRead = readProperty(entry, 'id');
+  const id = idRead.ok && typeof idRead.value === 'string' && idRead.value.length > 0 ? idRead.value : 'unreadable';
+  const admitted: AdmissionCandidate = {
+    entry: {
+      id,
+      schemaVersion: 1,
+      prNumber: identity.prNumber,
+      headSha: identity.headSha,
+      eligibility: { kind: 'eligible' },
+    },
+    changedPaths,
+    enqueuedAtMs,
+    ...(premerge === 'ready' ? { premergeStatus: 'ready' as const } : {}),
+  };
+  return { kind: 'admit', candidate: admitted };
+}
+
 /**
  * Admit a safe copy, or skip. Blocked entries stay silent so an all-blocked
  * queue still returns exactly `{ kind: 'none', reason: 'no eligible entries' }`.
@@ -321,32 +436,14 @@ function considerCandidate(value: unknown, budget: WalkBudget): CandidateOutcome
   }
   const entry = entryRead.value;
 
-  const eligibilityRead = readProperty(entry, 'eligibility');
-  if (!eligibilityRead.ok || !isRecord(eligibilityRead.value)) {
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
-  }
-  const kindRead = readProperty(eligibilityRead.value, 'kind');
-  if (!kindRead.ok) {
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
-  }
-  if (kindRead.value === 'blocked') {
-    return { kind: 'silent' };
-  }
-  if (kindRead.value !== 'eligible') {
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+  const eligibility = eligibilityOutcome(entry);
+  if (eligibility !== undefined) {
+    return eligibility;
   }
 
-  const statusRead = readProperty(value, 'premergeStatus');
-  if (!statusRead.ok) {
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
-  }
-  const status = statusRead.value;
-  if (status === 'pending') {
-    return skipOrOmit(entry, PREMERGE_PENDING);
-  }
-  // Present and not ready: unknown, failed, null, a non-string, or any other value.
-  if (status !== undefined && status !== 'ready') {
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+  const premerge = premergeOutcome(value, entry);
+  if (typeof premerge !== 'string') {
+    return premerge;
   }
 
   const identity = readSkipIdentity(entry);
@@ -356,34 +453,16 @@ function considerCandidate(value: unknown, budget: WalkBudget): CandidateOutcome
   if (!isSha40(identity.headSha)) {
     return { kind: 'skip', record: { prNumber: identity.prNumber, headSha: identity.headSha, reason: PREMERGE_UNKNOWN } };
   }
-  const pathsRead = readChangedPaths(value, budget);
-  if (!pathsRead.ok) {
-    if (pathsRead.reason === 'budget') {
-      return { kind: 'budget' };
-    }
-    return skipOrOmit(entry, PREMERGE_UNKNOWN);
+
+  const pathsOutcome = takeChangedPaths(value, entry, budget);
+  if (pathsOutcome.kind !== 'paths') {
+    return pathsOutcome;
   }
-  const changedPaths = pathsRead.paths;
   const enqueuedAtMs = readFiniteNumber(value, 'enqueuedAtMs');
   if (enqueuedAtMs === undefined) {
     return skipOrOmit(entry, PREMERGE_UNKNOWN);
   }
-
-  const idRead = readProperty(entry, 'id');
-  const id = idRead.ok && typeof idRead.value === 'string' && idRead.value.length > 0 ? idRead.value : 'unreadable';
-  const admitted: AdmissionCandidate = {
-    entry: {
-      id,
-      schemaVersion: 1,
-      prNumber: identity.prNumber,
-      headSha: identity.headSha,
-      eligibility: { kind: 'eligible' },
-    },
-    changedPaths,
-    enqueuedAtMs,
-    ...(status === 'ready' ? { premergeStatus: 'ready' as const } : {}),
-  };
-  return { kind: 'admit', candidate: admitted };
+  return admitCandidate(entry, identity, pathsOutcome.paths, enqueuedAtMs, premerge);
 }
 
 type PoolBuild =
@@ -392,7 +471,7 @@ type PoolBuild =
       readonly pool: readonly AdmissionCandidate[];
       readonly skipped: readonly SkippedCandidate[];
     }
-  | { readonly ok: false };
+  | { readonly ok: false; readonly skipped: readonly SkippedCandidate[] };
 
 /** Dedupe by prNumber (earlier enqueue wins, then input order) and sort FIFO. */
 function buildPool(candidates: readonly unknown[]): PoolBuild {
@@ -401,11 +480,11 @@ function buildPool(candidates: readonly unknown[]): PoolBuild {
   const skipped: SkippedCandidate[] = [];
   for (const candidate of candidates) {
     if (!budget.charge()) {
-      return { ok: false };
+      return { ok: false, skipped };
     }
     const outcome = considerCandidate(candidate, budget);
     if (outcome.kind === 'budget') {
-      return { ok: false };
+      return { ok: false, skipped };
     }
     if (outcome.kind === 'silent') {
       continue;
@@ -431,6 +510,77 @@ function buildPool(candidates: readonly unknown[]): PoolBuild {
 
 function batchCap(policy: BatchPolicy, classes: readonly AdmissionClass[]): number {
   return Math.min(policy.maxBatchSize, ...classes.map((cls) => admissionClassCap(cls, policy.maxBatchSize)));
+}
+
+function addMemberPaths(seen: Set<string>, paths: readonly string[]): void {
+  for (const path of paths) {
+    seen.add(normalizeChangedPath(path));
+  }
+}
+
+/** True when any normalized path is already in the batch. Same rule as changesOverlap. */
+function overlapsMemberPaths(seen: Set<string>, paths: readonly string[]): boolean {
+  for (const path of paths) {
+    if (seen.has(normalizeChangedPath(path))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+interface JoinedBatch {
+  readonly members: readonly AdmissionCandidate[];
+  readonly memberClasses: readonly AdmissionClass[];
+  readonly stoppedAtBlocker: boolean;
+}
+
+/**
+ * Strict FIFO join. Member PR numbers and normalized paths are Sets, so this
+ * walk does not scan the growing member list.
+ *
+ * The caller classifies at most MAX_ELIGIBLE_POOL (512) eligible candidates,
+ * and a batch holds at most MAX_BATCH_SIZE_LIMIT (64) members. Worst case is
+ * O(MAX_ELIGIBLE_POOL * paths) to classify plus O(MAX_BATCH_SIZE_LIMIT * paths)
+ * set updates. The walk stops at the first candidate that cannot join.
+ */
+function joinFifo(
+  pool: readonly AdmissionCandidate[],
+  classes: readonly AdmissionClass[],
+  policy: BatchPolicy,
+  head: AdmissionCandidate,
+  headClass: AdmissionClass,
+): JoinedBatch {
+  const members: AdmissionCandidate[] = [head];
+  const memberClasses: AdmissionClass[] = [headClass];
+  const memberPrs = new Set<number>([head.entry.prNumber]);
+  const memberPaths = new Set<string>();
+  addMemberPaths(memberPaths, head.changedPaths);
+  let joinCap = batchCap(policy, memberClasses);
+  let stoppedAtBlocker = false;
+  for (let index = 1; index < pool.length; index += 1) {
+    const candidate = pool[index];
+    const cls = classes[index];
+    if (candidate === undefined || cls === undefined) {
+      stoppedAtBlocker = true;
+      break;
+    }
+    const nextCap = Math.min(joinCap, admissionClassCap(cls, policy.maxBatchSize));
+    const cannotJoin =
+      cls === 'alone' ||
+      memberPrs.has(candidate.entry.prNumber) ||
+      overlapsMemberPaths(memberPaths, candidate.changedPaths) ||
+      members.length + 1 > nextCap;
+    if (cannotJoin) {
+      stoppedAtBlocker = true;
+      break;
+    }
+    members.push(candidate);
+    memberClasses.push(cls);
+    memberPrs.add(candidate.entry.prNumber);
+    addMemberPaths(memberPaths, candidate.changedPaths);
+    joinCap = nextCap;
+  }
+  return { members, memberClasses, stoppedAtBlocker };
 }
 
 function attachSkipped(
@@ -494,9 +644,10 @@ function parseFormation(input: BatchFormationInput): FormationParse {
  * Decide the next batch. Premerge skips are removed before the walk, so a
  * pull request waiting on its premerge check cannot wedge the queue. That
  * admission walk's cost bound is MAX_TOTAL_WALK; spending it returns
- * `walk-budget-exceeded` and does not read the next element. The walk over
- * what remains is strict first-in first-out: the first entry that cannot
- * join stops it, and no later entry may skip past it.
+ * `walk-budget-exceeded` and does not read the next element. Skips already
+ * recorded stay on that refusal. The walk over what remains is strict
+ * first-in first-out, capped at MAX_ELIGIBLE_POOL: the first entry that
+ * cannot join stops it, and no later entry may skip past it.
  */
 function decideBatch(input: BatchFormationInput): BatchFormationDecision {
   const parsed = parseFormation(input);
@@ -512,12 +663,13 @@ function decideBatch(input: BatchFormationInput): BatchFormationDecision {
   }
   const built = buildPool(candidates);
   if (!built.ok) {
-    return { kind: 'none', reason: WALK_BUDGET_EXCEEDED };
+    return attachSkipped({ kind: 'none', reason: WALK_BUDGET_EXCEEDED }, built.skipped);
   }
-  const { pool, skipped } = built;
-  if (pool.length === 0) {
+  const { pool: admitted, skipped } = built;
+  if (admitted.length === 0) {
     return attachSkipped({ kind: 'none', reason: 'no eligible entries' }, skipped);
   }
+  const pool = admitted.slice(0, MAX_ELIGIBLE_POOL);
 
   const head = pool[0];
   if (head === undefined) {
@@ -541,27 +693,8 @@ function decideBatch(input: BatchFormationInput): BatchFormationDecision {
     );
   }
 
-  const members: AdmissionCandidate[] = [head];
-  const memberClasses: AdmissionClass[] = [headClass];
-  let stoppedAtBlocker = false;
-  for (let index = 1; index < pool.length; index += 1) {
-    const candidate = pool[index];
-    const cls = classes[index];
-    if (candidate === undefined || cls === undefined) {
-      stoppedAtBlocker = true;
-      break;
-    }
-    const cannotJoin =
-      cls === 'alone' ||
-      members.some((member) => changesOverlap(member.changedPaths, candidate.changedPaths)) ||
-      members.length + 1 > batchCap(policy, [...memberClasses, cls]);
-    if (cannotJoin) {
-      stoppedAtBlocker = true;
-      break;
-    }
-    members.push(candidate);
-    memberClasses.push(cls);
-  }
+  const joined = joinFifo(pool, classes, policy, head, headClass);
+  const { members, memberClasses, stoppedAtBlocker } = joined;
 
   const cap = batchCap(policy, memberClasses);
   const headAge = nowMs - head.enqueuedAtMs;

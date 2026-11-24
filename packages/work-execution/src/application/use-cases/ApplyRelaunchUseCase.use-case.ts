@@ -21,7 +21,7 @@ import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { readLaneRunRecord } from '../../domain/entities/LaneRun.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { parseWorkOrderRisk } from '../../domain/execution-records.js';
+import { parseWorkOrderRisk, type AttemptRecord } from '../../domain/execution-records.js';
 import { SHA256_HEX_PATTERN } from '../../domain/lane-plan-records.js';
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
@@ -64,6 +64,11 @@ import type {
 } from '../ports/in/ApplyRelaunchPort.in-port.js';
 import type { SaveLaneEditsPort } from '../ports/in/SaveLaneEditsPort.in-port.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
+import {
+  AttemptRevisionConflictError,
+  nextAttemptRevision,
+  type AttemptRepositoryPort,
+} from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -96,6 +101,13 @@ export interface ApplyRelaunchDependencies {
   /** The run journals of the runs the preflight reconciles; `listForRun` required, `listForRuns` optional. */
   readonly runJournal?: RunJournalRunReads;
   readonly adoptLane?: Pick<AdoptLanePort, 'adoptLane'>['adoptLane'];
+  /**
+   * AR3d: the attempt store, required for an `attempt-recorded` lane whose
+   * `adopt` is still incomplete: its `running` attempt record must be
+   * transitioned to `ended`/`partial` before `adoptLane` will accept it.
+   * Optional so dry-run and `unrecorded`-lane callers never need it.
+   */
+  readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById' | 'saveAttempt'>;
   readonly mintEntryId?: () => string;
 }
 
@@ -1507,6 +1519,18 @@ async function preflightLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult |
         if (adoptStatus !== 'completed' && adoptInput === undefined) {
           return refusedLane('stale-plan-state', lane.laneId);
         }
+        // AR3d: an `attempt-recorded` lane whose adopt is still incomplete
+        // needs its `running` attempt transitioned through the attempt store;
+        // without that port the lane could only fail after the grant and the
+        // save were spent, so it refuses here, before any side effect.
+        if (
+          lane.population === 'attempt-recorded' &&
+          adoptStatus !== 'completed' &&
+          (typeof deps.attemptRepo?.findAttemptById !== 'function' ||
+            typeof deps.attemptRepo?.saveAttempt !== 'function')
+        ) {
+          return refusedLane('stale-plan-state', lane.laneId);
+        }
         if (adoptInput !== undefined) {
           const saveInput = saveInputs.get(lane.laneId);
           if (saveInput !== undefined && adoptInputMismatch(adoptInput, lane, saveInput)) {
@@ -1593,6 +1617,12 @@ interface WaveContext {
   readonly adoptInputs: ReadonlyMap<string, ApplyRelaunchAdoptInput>;
   /** Per-lane `save-ref` sources: derived from the journal, updated by the wave's saves. */
   readonly savedSources: Map<string, AdoptLaneSource>;
+  /**
+   * AR3d: the lanes whose abort succeeded in this wave (or whose abort was
+   * already completed in the journal). An `end-attempt` transition may run
+   * only after a completed abort, whatever the preflight snapshot says.
+   */
+  readonly abortedInWave: Set<string>;
 }
 
 /** Journal one entry; any non-`appended` result or throw is a write failure. */
@@ -1604,6 +1634,8 @@ async function appendEntry(
     readonly digest?: string;
     readonly outcome?: 'completed' | 'refused';
     readonly reasonCode?: string;
+    /** AR3d: the save commit an `end-attempt` result records. */
+    readonly commitId?: string;
   },
 ): Promise<boolean> {
   const { deps } = ctx;
@@ -1614,6 +1646,7 @@ async function appendEntry(
       entryId: deps.mintEntryId!(),
       recordedAtIso: ctx.nowIso,
       ...(request.digest !== undefined ? { digest: request.digest } : {}),
+      ...(request.commitId !== undefined ? { commitId: request.commitId } : {}),
       ...(request.outcome !== undefined ? { outcome: request.outcome, reasonCode: request.reasonCode ?? null } : {}),
     });
     return own(appended, 'outcome') === 'appended';
@@ -1823,9 +1856,16 @@ async function abortStepOfLane(
     return refusedLane('abort-failed', lane.laneId);
   }
   if (abortStatus === 'intent-only' || abortStatus === 'ambiguous') {
-    return reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    const reconciled = await reconcileAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    if (reconciled === null) ctx.abortedInWave.add(lane.laneId);
+    return reconciled;
   }
-  if (abortStatus === 'absent') return performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+  if (abortStatus === 'absent') {
+    const aborted = await performAbort(ctx, lane, abortStep.idempotencyKey, saveInput);
+    if (aborted === null) ctx.abortedInWave.add(lane.laneId);
+    return aborted;
+  }
+  ctx.abortedInWave.add(lane.laneId);
   return null;
 }
 
@@ -1853,6 +1893,263 @@ async function saveAndAbortLane(
 }
 
 /**
+ * AR3d: read an untrusted `AttemptRecord` from `attemptRepo.findAttemptById`
+ * as a plain validated snapshot, or `null` when it is not one. Every own key
+ * is read through its property descriptor, so no getter ever runs; the cost
+ * is O(own keys, bounded at 32). A hostile record — an accessor on any own
+ * key, a polluting own key, a non-plain prototype, a wrong type, a wrong id,
+ * a non-integer revision — is refused, never passed.
+ */
+const MAX_ATTEMPT_OWN_KEYS = 32;
+const POLLUTING_ATTEMPT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** An optional own data property: absent reads as undefined, anything unreadable stays hostile (BAD). */
+function optionalOwn(value: unknown, key: string): unknown {
+  const read = own(value, key);
+  return read === ABSENT ? undefined : read;
+}
+
+function validatedAttemptSnapshot(value: unknown, attemptId: string): AttemptRecord | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  try {
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return null;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > MAX_ATTEMPT_OWN_KEYS) return null;
+    for (const key of keys) {
+      if (typeof key !== 'string' || POLLUTING_ATTEMPT_KEYS.has(key)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined ||
+        !('value' in descriptor)
+      ) {
+        return null;
+      }
+    }
+  } catch {
+    return null;
+  }
+  const id = own(value, 'id');
+  if (id !== attemptId) return null;
+  const readString = (key: string): string | null => {
+    const read = own(value, key);
+    return typeof read === 'string' && read !== '' ? read : null;
+  };
+  const workOrderId = readString('workOrderId');
+  const worktreePath = readString('worktreePath');
+  const baseCommit = readString('baseCommit');
+  const createdAtIso = readString('createdAtIso');
+  const updatedAtIso = readString('updatedAtIso');
+  const kind = own(value, 'kind');
+  const fixNumber = own(value, 'fixNumber');
+  const state = own(value, 'state');
+  const outcome = own(value, 'outcome');
+  const briefDigest = own(value, 'briefDigest');
+  const briefPackagePath = optionalOwn(value, 'briefPackagePath');
+  const priorAttemptId = optionalOwn(value, 'priorAttemptId');
+  const revision = optionalOwn(value, 'revision');
+  const sessionId = optionalOwn(value, 'sessionId');
+  const artifacts = own(value, 'artifacts');
+  if (
+    workOrderId === null ||
+    worktreePath === null ||
+    baseCommit === null ||
+    createdAtIso === null ||
+    updatedAtIso === null ||
+    kind !== 'initial' ||
+    fixNumber !== 0 ||
+    (state !== 'running' && state !== 'ended') ||
+    (outcome !== null && typeof outcome !== 'string') ||
+    (briefDigest !== null && typeof briefDigest !== 'string') ||
+    (briefPackagePath !== undefined && briefPackagePath !== null && typeof briefPackagePath !== 'string') ||
+    (priorAttemptId !== undefined && priorAttemptId !== null && typeof priorAttemptId !== 'string') ||
+    (sessionId !== undefined && sessionId !== null && typeof sessionId !== 'string')
+  ) {
+    return null;
+  }
+  if (revision !== undefined && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) {
+    return null;
+  }
+  // The artifacts are read for the replay's `headCommit` check; they must be
+  // a plain record with a string `headCommit` own data property.
+  if (artifacts === null || artifacts === undefined) return null;
+  const headCommit = own(artifacts, 'headCommit');
+  if (typeof headCommit !== 'string' || headCommit === '') return null;
+  return {
+    id,
+    workOrderId,
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: priorAttemptId === undefined ? null : priorAttemptId,
+    worktreePath,
+    baseCommit,
+    state: state as AttemptRecord['state'],
+    ...(revision === undefined ? {} : { revision }),
+    outcome: outcome as AttemptRecord['outcome'],
+    briefDigest,
+    briefPackagePath: briefPackagePath === undefined ? null : briefPackagePath,
+    sessionId: sessionId === undefined ? null : sessionId,
+    completionReceipt: null,
+    artifacts: { headCommit, commitsSinceBase: [headCommit], collectedArtifactPaths: [], notes: 'missing' },
+    createdAtIso,
+    updatedAtIso,
+  };
+}
+
+/**
+ * AR3d: before `adoptLane` runs on an `attempt-recorded` lane, the runner's
+ * still-`running` attempt record is transitioned to `ended`/`partial` at the
+ * apply's own save commit, through a journaled `end-attempt` step
+ * (intent-before-action, idempotent on replay). The write happens only after
+ * the Fable brief-check proves the record belongs to this lane and this
+ * apply: the lane's own attempt id, the save input's worktree path, and every
+ * identity check `AdoptLaneUseCase.sameAttempt` makes. Returns `null` when
+ * the attempt may proceed to `adoptLane`.
+ */
+async function endRunningAttemptBeforeAdopt(
+  ctx: WaveContext,
+  lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
+  adoptInput: ApplyRelaunchAdoptInput,
+  source: AdoptLaneSource,
+): Promise<ApplyRelaunchResult | null> {
+  const laneId = lane.laneId;
+  // Guard 1: the abort must be this plan's step and already completed —
+  // either journaled so before the wave or succeeded in this wave — and an
+  // idle lane has no abort step and never transitions a running attempt.
+  if (
+    !lane.steps.some((entry) => entry.step === 'abort') ||
+    (ctx.statusOf(laneId, 'abort') !== 'completed' && !ctx.abortedInWave.has(laneId))
+  ) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  // Guard 2: the source must be the apply's own save result, never an
+  // unverified caller value.
+  const savedSource = ctx.savedSources.get(laneId);
+  if (
+    savedSource === undefined ||
+    savedSource.kind !== 'save-ref' ||
+    source.kind !== 'save-ref' ||
+    source.commitOid !== savedSource.commitOid
+  ) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  // Guard 3: the lane's own attempt id, the save input's and the adopt
+  // input's must all name the same attempt — `saveInput.attemptId` alone is
+  // caller-only and could name a foreign running attempt.
+  if (lane.attemptId !== saveInput.attemptId || adoptInput.attempt.attemptId !== saveInput.attemptId) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  let existing: unknown;
+  try {
+    existing = await ctx.deps.attemptRepo!.findAttemptById(saveInput.attemptId);
+  } catch {
+    return refusedLane('adopt-failed', laneId);
+  }
+  if (existing === null) return null;
+  const snapshot = validatedAttemptSnapshot(existing, saveInput.attemptId);
+  if (snapshot === null) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  // Guard 4: the Fable brief-check — the worktree path and every other check
+  // `sameAttempt` makes, before ANY write.
+  if (
+    snapshot.worktreePath !== saveInput.worktreePath ||
+    snapshot.workOrderId !== adoptInput.workOrder.workOrderId ||
+    snapshot.briefDigest !== adoptInput.brief.expectedBriefDigest ||
+    snapshot.baseCommit !== adoptInput.workOrder.baseCommit ||
+    snapshot.baseCommit !== saveInput.baseCommit
+  ) {
+    return refusedLane('adopt-failed', laneId);
+  }
+  const endKey = `relaunch/${ctx.planDigest}/${laneId}/end-attempt`;
+  const journal = await loadJournalSnapshot(ctx.deps, ctx.planDigest);
+  if (!journal.ok) return journal.result;
+  const endStatus = relaunchStepStatus(journal.value, endKey);
+  // Idempotent replay: the transition is already stored; never write twice.
+  if (snapshot.state === 'ended') {
+    if (snapshot.outcome !== 'partial' || snapshot.artifacts?.headCommit !== savedSource.commitOid) {
+      return refusedLane('adopt-failed', laneId);
+    }
+    if (endStatus === 'refused' || endStatus === 'ambiguous') return refusedLane('adopt-failed', laneId);
+    if (endStatus === 'inconsistent') return refusedLane('step-inconsistent', laneId);
+    if (endStatus === 'absent') {
+      if (!(await appendEntry(ctx, { key: endKey, kind: 'intent', digest: savedSource.commitOid }))) {
+        return refusedLane('journal-write-failed', laneId);
+      }
+    }
+    if (endStatus === 'absent' || endStatus === 'intent-only') {
+      if (
+        !(await appendEntry(ctx, {
+          key: endKey,
+          kind: 'result',
+          outcome: 'completed',
+          reasonCode: 'already-ended',
+          commitId: savedSource.commitOid,
+        }))
+      ) {
+        return refusedLane('journal-write-failed', laneId);
+      }
+    }
+    return null;
+  }
+  // Normal transition: only a `running` record is written.
+  if (snapshot.state !== 'running') return refusedLane('adopt-failed', laneId);
+  if (endStatus === 'refused' || endStatus === 'ambiguous') return refusedLane('adopt-failed', laneId);
+  if (endStatus === 'inconsistent') return refusedLane('step-inconsistent', laneId);
+  if (endStatus === 'absent') {
+    if (!(await appendEntry(ctx, { key: endKey, kind: 'intent', digest: savedSource.commitOid }))) {
+      return refusedLane('journal-write-failed', laneId);
+    }
+  }
+  if (!withinBudget(ctx.deps, ctx.deadlineMs)) return refusal('budget-exhausted');
+  // Spread the validated plain record, not the snapshot: the snapshot keeps only the
+  // fields checked above, and the write must not drop the runner, seat or usage fields.
+  const endedRecord: AttemptRecord = {
+    ...(existing as AttemptRecord),
+    state: 'ended',
+    outcome: 'partial',
+    revision: nextAttemptRevision(snapshot),
+    artifacts: {
+      headCommit: savedSource.commitOid,
+      commitsSinceBase: [savedSource.commitOid],
+      collectedArtifactPaths: [],
+      notes: 'missing',
+    },
+    updatedAtIso: ctx.nowIso,
+  };
+  try {
+    await ctx.deps.attemptRepo!.saveAttempt(endedRecord);
+  } catch (error) {
+    // Optimistic-concurrency refusal: journal the failure if possible, never
+    // clobber the concurrent record.
+    const conflict =
+      error instanceof AttemptRevisionConflictError ||
+      (error !== null && typeof error === 'object' && (error as { name?: unknown }).name === 'AttemptRevisionConflictError');
+    if (conflict) {
+      await appendEntry(ctx, { key: endKey, kind: 'result', outcome: 'refused', reasonCode: 'attempt-revision-conflict' });
+    }
+    return refusedLane('adopt-failed', laneId);
+  }
+  if (endStatus === 'absent' || endStatus === 'intent-only') {
+    if (
+      !(await appendEntry(ctx, {
+        key: endKey,
+        kind: 'result',
+        outcome: 'completed',
+        reasonCode: 'attempt-ended',
+        commitId: savedSource.commitOid,
+      }))
+    ) {
+      return refusedLane('journal-write-failed', laneId);
+    }
+  }
+  return null;
+}
+
+/**
  * AR2c: adopt the lane's existing worktree into a conducted run through
  * `AdoptLanePort` (idempotent on replay — a completed adopt is never
  * re-called), then append the redispatch intent only. A lane with no adopt
@@ -1865,6 +2162,7 @@ async function saveAndAbortLane(
 async function adoptAndRedispatchLane(
   ctx: WaveContext,
   lane: PlanLane,
+  saveInput: ApplyRelaunchSaveInput,
   adoptInput: ApplyRelaunchAdoptInput | undefined,
 ): Promise<ApplyRelaunchResult | null> {
   const hasAdoptStep = lane.steps.some((entry) => entry.step === 'adopt');
@@ -1881,6 +2179,12 @@ async function adoptAndRedispatchLane(
       const source = adoptInput?.source ?? ctx.savedSources.get(lane.laneId);
       if (adoptInput === undefined || source === undefined) {
         return refusedLane('stale-plan-state', lane.laneId);
+      }
+      // AR3d: an attempt-recorded lane's still-running attempt is transitioned
+      // to ended/partial at the apply's own save commit before the adopt.
+      if (lane.population === 'attempt-recorded') {
+        const endRefusal = await endRunningAttemptBeforeAdopt(ctx, lane, saveInput, adoptInput, source);
+        if (endRefusal !== null) return endRefusal;
       }
       // The parse proved the clone is a plain snapshot (the descriptor-only
       // scan refused every accessor before the `structuredClone`), so its
@@ -1982,7 +2286,7 @@ async function executeWave(
     const saveInput = saveInputs.get(lane.laneId) as ApplyRelaunchSaveInput;
     const refused =
       (await saveAndAbortLane(ctx, lane, saveInput)) ??
-      (await adoptAndRedispatchLane(ctx, lane, ctx.adoptInputs.get(lane.laneId)));
+      (await adoptAndRedispatchLane(ctx, lane, saveInput, ctx.adoptInputs.get(lane.laneId)));
     if (refused !== null) return refused;
   }
   return null;
@@ -2046,6 +2350,7 @@ async function applyLive(args: LiveApplyArgs): Promise<ApplyRelaunchResult> {
     counts,
     adoptInputs,
     savedSources: new Map(savedSources),
+    abortedInWave: new Set<string>(),
   };
   const handoffRefusal = await journalHandoffs(ctx, storedPlan, preflight.handedOff);
   if (handoffRefusal !== null) return handoffRefusal;

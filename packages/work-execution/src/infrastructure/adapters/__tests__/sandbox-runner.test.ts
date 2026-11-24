@@ -67,6 +67,12 @@ class FakeDriver implements SandboxDriver {
   rawCreateResult: { readonly value: unknown } | null = null;
   rawInspectResult: { readonly value: unknown } | null = null;
   rawDestroyResult: { readonly value: unknown } | null = null;
+  /** When true, create never settles. Only the adapter's deadline can finish the call. */
+  neverSettleCreate = false;
+  neverSettleDestroy = false;
+  /** Returned as the create/destroy promise so a test can settle it after the deadline. */
+  holdCreate: Promise<SandboxCreateResult> | null = null;
+  holdDestroy: Promise<SandboxDestroyResult> | null = null;
 
   async create(payload: SandboxCreatePayload): Promise<SandboxCreateResult> {
     this.createCalls.push(payload);
@@ -74,6 +80,14 @@ class FakeDriver implements SandboxDriver {
     if (hold !== null) {
       this.createHold = null;
       await hold;
+    }
+    if (this.neverSettleCreate) {
+      return new Promise<SandboxCreateResult>(() => {});
+    }
+    if (this.holdCreate !== null) {
+      const pending = this.holdCreate;
+      this.holdCreate = null;
+      return pending;
     }
     if (this.rawCreateResult !== null) {
       return this.rawCreateResult.value as SandboxCreateResult;
@@ -97,6 +111,14 @@ class FakeDriver implements SandboxDriver {
 
   async destroy(sessionId: string): Promise<SandboxDestroyResult> {
     this.destroyCalls.push(sessionId);
+    if (this.neverSettleDestroy) {
+      return new Promise<SandboxDestroyResult>(() => {});
+    }
+    if (this.holdDestroy !== null) {
+      const pending = this.holdDestroy;
+      this.holdDestroy = null;
+      return pending;
+    }
     if (this.rawDestroyResult !== null) {
       return this.rawDestroyResult.value as SandboxDestroyResult;
     }
@@ -1468,4 +1490,314 @@ describe('SandboxRunnerAdapter', () => {
       expect(driver.destroyCalls).toHaveLength(0);
     });
   });
+
+  describe('driver call deadlines', () => {
+    const STOP = {
+      attemptId: ATTEMPT_ID,
+      sessionId: SESSION_ID,
+      gracePeriodSeconds: 5,
+    };
+
+    async function expectCleanDeadline(timeoutMs: number): Promise<void> {
+      const clock = manualClock();
+      const { adapter, driver } = makeAdapter({
+        driverTimeoutMs: timeoutMs,
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+      });
+      const started = await adapter.startSession(startRequest());
+      expect(started).toStrictEqual({ outcome: 'started', sessionId: SESSION_ID });
+      expect(driver.createCalls).toHaveLength(1);
+      expect(clock.delays).toEqual([timeoutMs]);
+      expect(clock.fired).toBe(0);
+      expect(clock.cleared).toHaveLength(1);
+      const stopped = await adapter.stopSession(STOP);
+      expect(stopped.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toStrictEqual([SESSION_ID]);
+      expect(clock.fired).toBe(0);
+      expect(clock.cleared).toHaveLength(2);
+      expect(clock.delays).toEqual([timeoutMs, timeoutMs]);
+    }
+
+    it('completes a confirmed start and destroy before driverTimeoutMs and clears the timer without firing it', async () => {
+      const clock = manualClock();
+      const { adapter, driver } = makeAdapter({
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+      });
+      const started = await adapter.startSession(startRequest());
+      expect(started).toStrictEqual({ outcome: 'started', sessionId: SESSION_ID });
+      expect(driver.createCalls).toHaveLength(1);
+      expect(clock.delays).toEqual([120_000]);
+      expect(clock.fired).toBe(0);
+      expect(clock.cleared).toHaveLength(1);
+      // The cleared timer must not rewrite a start that already settled.
+      clock.fire();
+      const stopped = await adapter.stopSession(STOP);
+      expect(stopped.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toStrictEqual([SESSION_ID]);
+      expect(clock.fired).toBe(0);
+      expect(clock.delays).toEqual([120_000, 120_000]);
+      expect(clock.cleared).toHaveLength(2);
+    }, 2_000);
+
+    it(
+      'returns unknown when create never settles within driverTimeoutMs and blocks the next start with zero further create calls',
+      async () => {
+        // Positive control: the same deadline, with a driver that settles, starts once.
+        await expectCleanDeadline(40_000);
+        const clock = manualClock();
+        const { adapter, driver } = makeAdapter({
+          driverTimeoutMs: 40_000,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+        });
+        driver.neverSettleCreate = true;
+        const pending = adapter.startSession(startRequest());
+        expect(driver.createCalls).toHaveLength(1);
+        expect(clock.delays).toEqual([40_000]);
+        expect(clock.fired).toBe(0);
+        clock.fire();
+        const result = await pending;
+        expect(result.outcome).toBe('unknown');
+        if (result.outcome === 'unknown') {
+          expect(result.reason.includes(ATTEMPT_ID)).toBe(false);
+        }
+        expect(clock.fired).toBe(1);
+        expect(clock.cleared).toHaveLength(1);
+        const next = await adapter.startSession(startRequest());
+        expect(next.outcome).toBe('blocked');
+        expect(driver.createCalls).toHaveLength(1);
+        const stop = await adapter.stopSession(STOP);
+        expect(stop.outcome).toBe('refused');
+        expect(driver.destroyCalls).toHaveLength(0);
+      },
+      // Removing the race leaves `pending` forever. This testTimeout fails the
+      // test instead of hanging the suite.
+      2_000,
+    );
+
+    it(
+      'returns still-running when destroy never settles within driverTimeoutMs and the next stop calls destroy again',
+      async () => {
+        await expectCleanDeadline(40_000);
+        const clock = manualClock();
+        const { adapter, driver } = makeAdapter({
+          driverTimeoutMs: 40_000,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+        });
+        const started = await adapter.startSession(startRequest());
+        expect(started.outcome).toBe('started');
+        expect(clock.fired).toBe(0);
+        expect(clock.cleared).toHaveLength(1);
+        driver.neverSettleDestroy = true;
+        const pending = adapter.stopSession(STOP);
+        expect(driver.destroyCalls).toStrictEqual([SESSION_ID]);
+        clock.fire();
+        const first = await pending;
+        expect(first.outcome).toBe('still-running');
+        if (first.outcome === 'still-running') {
+          expect(first.reason.includes(ATTEMPT_ID)).toBe(false);
+          expect(first.reason.includes(SESSION_ID)).toBe(false);
+        }
+        // Only the destroy deadline was still armed. A leaked create timer would fire too.
+        expect(clock.fired).toBe(1);
+        driver.neverSettleDestroy = false;
+        const second = await adapter.stopSession(STOP);
+        expect(second.outcome).toBe('terminated');
+        expect(driver.destroyCalls).toStrictEqual([SESSION_ID, SESSION_ID]);
+      },
+      2_000,
+    );
+
+    it(
+      'ignores a create result that settles after the timeout and does not change the recorded outcome',
+      async () => {
+        await expectCleanDeadline(15_000);
+        const clock = manualClock();
+        const { adapter, driver } = makeAdapter({
+          driverTimeoutMs: 15_000,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+        });
+        let resolveCreate: (value: SandboxCreateResult) => void = () => {};
+        driver.holdCreate = new Promise<SandboxCreateResult>((resolve) => {
+          resolveCreate = resolve;
+        });
+        const pending = adapter.startSession(startRequest());
+        expect(driver.createCalls).toHaveLength(1);
+        clock.fire();
+        const result = await pending;
+        expect(result.outcome).toBe('unknown');
+        resolveCreate({ outcome: 'confirmed', sessionId: SESSION_ID });
+        await Promise.resolve();
+        await Promise.resolve();
+        const next = await adapter.startSession(startRequest());
+        expect(next.outcome).toBe('blocked');
+        expect(driver.createCalls).toHaveLength(1);
+        const stop = await adapter.stopSession(STOP);
+        expect(stop.outcome).toBe('refused');
+        expect(driver.destroyCalls).toHaveLength(0);
+
+        const refusedClock = manualClock();
+        const refusedCase = makeAdapter({
+          driverTimeoutMs: 15_000,
+          setTimer: refusedClock.setTimer,
+          clearTimer: refusedClock.clearTimer,
+        });
+        let resolveRefused: (value: SandboxCreateResult) => void = () => {};
+        refusedCase.driver.holdCreate = new Promise<SandboxCreateResult>((resolve) => {
+          resolveRefused = resolve;
+        });
+        const refusedPending = refusedCase.adapter.startSession(startRequest());
+        refusedClock.fire();
+        const refusedResult = await refusedPending;
+        expect(refusedResult.outcome).toBe('unknown');
+        resolveRefused({ outcome: 'refused' });
+        await Promise.resolve();
+        await Promise.resolve();
+        const afterRefused = await refusedCase.adapter.startSession(startRequest());
+        expect(afterRefused.outcome).toBe('blocked');
+        expect(refusedCase.driver.createCalls).toHaveLength(1);
+      },
+      2_000,
+    );
+
+    it(
+      'ignores a destroy result that settles after the timeout and calls destroy again on the next stop',
+      async () => {
+        await expectCleanDeadline(15_000);
+        const clock = manualClock();
+        const { adapter, driver } = makeAdapter({
+          driverTimeoutMs: 15_000,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+        });
+        const started = await adapter.startSession(startRequest());
+        expect(started.outcome).toBe('started');
+        expect(driver.createCalls).toHaveLength(1);
+        expect(clock.fired).toBe(0);
+        let resolveDestroy: (value: SandboxDestroyResult) => void = () => {};
+        driver.holdDestroy = new Promise<SandboxDestroyResult>((resolve) => {
+          resolveDestroy = resolve;
+        });
+        const pending = adapter.stopSession(STOP);
+        expect(driver.destroyCalls).toStrictEqual([SESSION_ID]);
+        clock.fire();
+        const first = await pending;
+        expect(first.outcome).toBe('still-running');
+        resolveDestroy({ outcome: 'destroyed' });
+        await Promise.resolve();
+        await Promise.resolve();
+        const second = await adapter.stopSession(STOP);
+        expect(second.outcome).toBe('terminated');
+        expect(driver.destroyCalls).toStrictEqual([SESSION_ID, SESSION_ID]);
+      },
+      2_000,
+    );
+
+    it('refuses construction unless driverTimeoutMs is a positive integer of at most 600000', async () => {
+      const accepted = manualClock();
+      const { adapter, driver } = makeAdapter({
+        driverTimeoutMs: 600_000,
+        setTimer: accepted.setTimer,
+        clearTimer: accepted.clearTimer,
+      });
+      const started = await adapter.startSession(startRequest());
+      expect(started.outcome).toBe('started');
+      expect(driver.createCalls).toHaveLength(1);
+      expect(accepted.delays).toEqual([600_000]);
+      expect(accepted.fired).toBe(0);
+
+      const minimum = manualClock();
+      const small = makeAdapter({
+        driverTimeoutMs: 1,
+        setTimer: minimum.setTimer,
+        clearTimer: minimum.clearTimer,
+      });
+      const smallStarted = await small.adapter.startSession(startRequest());
+      expect(smallStarted.outcome).toBe('started');
+      expect(minimum.delays).toEqual([1]);
+
+      for (const driverTimeoutMs of [0, -1, 600_001, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(() => makeAdapter({ driverTimeoutMs })).toThrow(/positive integer of at most 600000/);
+      }
+      expect(() => makeAdapter({ driverTimeoutMs: '120000' as never })).toThrow(
+        /positive integer of at most 600000/,
+      );
+
+      const flag = { read: false };
+      const hostile = {
+        driver: new FakeDriver(),
+        capabilities: DECLARED_CAPS,
+      };
+      Object.defineProperty(hostile, 'driverTimeoutMs', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          flag.read = true;
+          return 1;
+        },
+      });
+      expect(() => new SandboxRunnerAdapter(hostile)).toThrow(/positive integer of at most 600000/);
+      expect(flag.read).toBe(false);
+
+      const timerFlag = { read: false };
+      const half = {
+        driver: new FakeDriver(),
+        capabilities: DECLARED_CAPS,
+        clearTimer: () => {},
+      };
+      Object.defineProperty(half, 'setTimer', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          timerFlag.read = true;
+          return () => 0;
+        },
+      });
+      expect(() => new SandboxRunnerAdapter(half)).toThrow(/setTimer and clearTimer/);
+      expect(timerFlag.read).toBe(false);
+      expect(() => makeAdapter({ setTimer: () => 0 })).toThrow(/setTimer and clearTimer/);
+    });
+  });
 });
+
+/** A clock the adapter arms and the test fires. Clearing drops the callback. */
+function manualClock(): {
+  readonly delays: number[];
+  readonly cleared: number[];
+  fired: number;
+  setTimer: (callback: () => void, delayMs: number) => number;
+  clearTimer: (handle: number) => void;
+  fire: () => void;
+} {
+  let nextHandle = 1;
+  const callbacks = new Map<number, () => void>();
+  const clock = {
+    delays: [] as number[],
+    cleared: [] as number[],
+    fired: 0,
+    setTimer(callback: () => void, delayMs: number): number {
+      const handle = nextHandle;
+      nextHandle += 1;
+      clock.delays.push(delayMs);
+      callbacks.set(handle, callback);
+      return handle;
+    },
+    clearTimer(handle: number): void {
+      clock.cleared.push(handle);
+      callbacks.delete(handle);
+    },
+    fire(): void {
+      const pending = [...callbacks.entries()];
+      for (const [handle, callback] of pending) {
+        callbacks.delete(handle);
+        clock.fired += 1;
+        callback();
+      }
+    },
+  };
+  return clock;
+}

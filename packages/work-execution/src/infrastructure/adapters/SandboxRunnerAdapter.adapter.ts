@@ -31,6 +31,15 @@
  *    environment whose stored `sessionId` matches the request. An unknown,
  *    in-flight or indeterminate attempt is refused, and `destroy` is not
  *    called with a session id the driver never confirmed.
+ *  - **Driver calls are bounded.** `create` and `destroy` race an injected
+ *    deadline (`driverTimeoutMs`, default 120000, a positive integer of at
+ *    most 600000). The clock is `setTimer` / `clearTimer`, so a test can
+ *    settle the deadline without waiting. A `create` that does not settle
+ *    is `unknown` and leaves the attempt indeterminate, so a later start
+ *    is `blocked` with zero further `create` calls. A `destroy` that does
+ *    not settle is `still-running`, and a later stop calls `destroy` again.
+ *    The timer is cleared when the call settles. A result that arrives
+ *    after the deadline does not rewrite the recorded outcome.
  *  - **Capability is declared, never inferred.** The six fixed capability
  *    keys are read through the hostile-input guard, not spread and not from
  *    inherited accessors. A non-boolean data value becomes `false`. A getter,
@@ -113,6 +122,15 @@ export interface SandboxRunnerAdapterOptions {
   readonly capabilities: RunnerIsolationCapabilities;
   /** Clock for completion receipts; injectable so tests stay deterministic. */
   readonly now?: () => Date;
+  /**
+   * How long `create` and `destroy` may stay pending, in milliseconds.
+   * Omitted means 120000. Any other value must be a positive integer of at
+   * most 600000; construction throws when it is not. Pair with `setTimer`
+   * and `clearTimer` in tests so the deadline does not wait on the wall clock.
+   */
+  readonly driverTimeoutMs?: number;
+  readonly setTimer?: (callback: () => void, delayMs: number) => unknown;
+  readonly clearTimer?: (handle: unknown) => void;
 }
 
 /** Fixed refusal reasons: adapter-owned constants, never driver text. */
@@ -130,6 +148,12 @@ const REASON_MALFORMED_STOP = 'Stop request is malformed or hostile';
 const REASON_UNKNOWN_SESSION = 'Session is not known to this sandbox runner';
 const REASON_DESTROY_UNKNOWN = 'Sandbox driver did not answer the destroy request';
 const REASON_STILL_PRESENT = 'Sandbox driver reports the environment still present';
+const REASON_DESTROY_TIMEOUT = 'Sandbox driver destroy did not settle before the deadline';
+
+const DEFAULT_DRIVER_TIMEOUT_MS = 120_000;
+const MAX_DRIVER_TIMEOUT_MS = 600_000;
+const BAD_DRIVER_TIMEOUT = 'driverTimeoutMs must be a positive integer of at most 600000';
+const BAD_DRIVER_TIMERS = 'setTimer and clearTimer must both be functions or both be omitted';
 
 const ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -652,10 +676,320 @@ type EnvironmentRecord =
   | { readonly state: 'live'; readonly sessionId: string }
   | { readonly state: 'indeterminate' };
 
+type StartRefusal = { readonly ok: false; readonly result: StartRunnerSessionResult };
+
+type PreparedStart = {
+  readonly ok: true;
+  readonly attemptId: string;
+  readonly payload: SandboxCreatePayload;
+};
+
+type StartShape = {
+  readonly ok: true;
+  readonly data: Record<string, unknown>;
+  readonly required: Record<string, unknown>;
+  readonly seat: Record<string, unknown> | undefined;
+  readonly assignment: Record<string, unknown> | undefined;
+};
+
+type StartReferences = {
+  readonly ok: true;
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  readonly briefPackagePath: string;
+  readonly baseCommit: string;
+  readonly stepLimit: number;
+  readonly timeLimitSeconds: number;
+};
+
+type StartSeat = {
+  readonly ok: true;
+  readonly model: string;
+  readonly agent: string | undefined;
+  readonly variant: string | undefined;
+};
+
+type ArmTimer = (callback: () => void, delayMs: number) => unknown;
+type DisarmTimer = (handle: unknown) => void;
+
+type DriverCall<T> =
+  | { readonly kind: 'value'; readonly value: T }
+  | { readonly kind: 'threw' }
+  | { readonly kind: 'timeout' };
+
+/** Construction refuses a timeout or a clock that is not a plain positive contract. */
+class SandboxRunnerConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SandboxRunnerConfigurationError';
+  }
+}
+
+function refusedStart(reason: string): StartRefusal {
+  return { ok: false, result: { outcome: 'refused', reason } };
+}
+
+function isDriverTimeoutMs(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value > 0 &&
+    value <= MAX_DRIVER_TIMEOUT_MS
+  );
+}
+
+function isHostileOptions(options: object): boolean {
+  return typeof options !== 'object' || options === null || types.isProxy(options);
+}
+
+/** Own data only. A getter is a refusal and is never invoked. Absent means the default. */
+function readDriverTimeoutMs(options: object): number {
+  if (isHostileOptions(options)) {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMEOUT);
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(options, 'driverTimeoutMs');
+  if (descriptor === undefined) {
+    return DEFAULT_DRIVER_TIMEOUT_MS;
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMEOUT);
+  }
+  if (descriptor.value === undefined) {
+    return DEFAULT_DRIVER_TIMEOUT_MS;
+  }
+  if (!isDriverTimeoutMs(descriptor.value)) {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMEOUT);
+  }
+  return descriptor.value;
+}
+
+/** Own data value, or undefined when the key is absent. A getter throws and is never run. */
+function readOwnData(options: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(options, key);
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined || !('value' in descriptor)) {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMERS);
+  }
+  return descriptor.value;
+}
+
+function defaultSetTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
+  return setTimeout(callback, delayMs);
+}
+
+function defaultClearTimer(handle: unknown): void {
+  clearTimeout(handle as ReturnType<typeof setTimeout>);
+}
+
+function readTimerPair(options: object): { readonly setTimer: ArmTimer; readonly clearTimer: DisarmTimer } {
+  if (isHostileOptions(options)) {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMERS);
+  }
+  const setTimer = readOwnData(options, 'setTimer');
+  const clearTimer = readOwnData(options, 'clearTimer');
+  if (setTimer === undefined && clearTimer === undefined) {
+    return { setTimer: defaultSetTimer, clearTimer: defaultClearTimer };
+  }
+  if (typeof setTimer !== 'function' || typeof clearTimer !== 'function') {
+    throw new SandboxRunnerConfigurationError(BAD_DRIVER_TIMERS);
+  }
+  return {
+    setTimer: setTimer as ArmTimer,
+    clearTimer: clearTimer as DisarmTimer,
+  };
+}
+
+function clearArmedTimer(clearTimer: DisarmTimer, handle: unknown): void {
+  try {
+    clearTimer(handle);
+  } catch {
+    return;
+  }
+}
+
+/**
+ * The first settler wins. A later value or rejection finds the gate closed
+ * and becomes a discarded timeout, so it cannot rewrite the caller's record.
+ */
+function adoptDriverCall<T>(gate: { open: boolean }, next: DriverCall<T>): DriverCall<T> {
+  if (!gate.open) {
+    return { kind: 'timeout' };
+  }
+  gate.open = false;
+  return next;
+}
+
+/**
+ * Race one driver call against the injected clock and always clear that clock.
+ * Removing this race leaves a never-settling driver pending for good.
+ */
+function raceDriverCall<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  setTimer: ArmTimer,
+  clearTimer: DisarmTimer,
+): Promise<DriverCall<T>> {
+  let handle: unknown;
+  const gate = { open: true };
+  try {
+    const deadline = new Promise<DriverCall<T>>((resolve) => {
+      handle = setTimer(() => {
+        resolve(adoptDriverCall(gate, { kind: 'timeout' }));
+      }, timeoutMs);
+    });
+    const operation = Promise.resolve(promise).then(
+      (value): DriverCall<T> => adoptDriverCall(gate, { kind: 'value', value }),
+      (): DriverCall<T> => adoptDriverCall(gate, { kind: 'threw' }),
+    );
+    return Promise.race([operation, deadline]).finally(() => {
+      if (handle !== undefined) {
+        clearArmedTimer(clearTimer, handle);
+      }
+    });
+  } catch (error) {
+    if (handle !== undefined) {
+      clearArmedTimer(clearTimer, handle);
+    }
+    return Promise.reject(error);
+  }
+}
+
+function readStartShape(request: unknown): StartShape | StartRefusal {
+  const guarded = readPlain(request, START_REQUEST_KEYS);
+  if (!guarded.ok) {
+    return refusedStart(REASON_MALFORMED_START);
+  }
+  const requiredRead = readPlain(guarded.data.requiredCapabilities, CAPABILITY_KEYS);
+  if (!requiredRead.ok || !isWellTypedRequired(requiredRead.data)) {
+    return refusedStart(REASON_MALFORMED_NESTED);
+  }
+  const seatRead = readNested(guarded.data, 'seatOverride', SEAT_OVERRIDE_KEYS, false);
+  const assignmentRead = readNested(guarded.data, 'modelAssignment', MODEL_ASSIGNMENT_KEYS, false);
+  if (!seatRead.ok || !assignmentRead.ok) {
+    return refusedStart(REASON_MALFORMED_NESTED);
+  }
+  return {
+    ok: true,
+    data: guarded.data,
+    required: requiredRead.data,
+    seat: seatRead.value,
+    assignment: assignmentRead.value,
+  };
+}
+
+function readStartReferences(data: Record<string, unknown>): StartReferences | StartRefusal {
+  const attemptId = data.attemptId;
+  const worktreePath = asReference(data.worktreePath);
+  const briefPackagePath = asReference(data.briefPackagePath);
+  const baseCommit = asReference(data.baseCommit);
+  if (!isValidAttemptId(attemptId)) {
+    return refusedStart(REASON_INVALID_REFERENCE);
+  }
+  if (worktreePath === null || briefPackagePath === null || baseCommit === null) {
+    return refusedStart(REASON_INVALID_REFERENCE);
+  }
+  const stepLimit = data.stepLimit;
+  const timeLimitSeconds = data.timeLimitSeconds;
+  if (!isFinitePositive(stepLimit) || !isFinitePositive(timeLimitSeconds)) {
+    return refusedStart(REASON_INVALID_LIMITS);
+  }
+  return {
+    ok: true,
+    attemptId,
+    worktreePath,
+    briefPackagePath,
+    baseCommit,
+    stepLimit,
+    timeLimitSeconds,
+  };
+}
+
+function readStartSeat(
+  data: Record<string, unknown>,
+  seat: Record<string, unknown> | undefined,
+  assignment: Record<string, unknown> | undefined,
+): StartSeat | StartRefusal {
+  const model = firstPresent(seat?.model, data.model, assignment?.model);
+  if (!isValidSeatValue(model) || !AGY_MODEL_PATTERN.test(model)) {
+    return refusedStart(REASON_INVALID_MODEL);
+  }
+  const agent = optionalSeat(firstPresent(seat?.agent, data.agent, assignment?.agent));
+  const variant = optionalSeat(firstPresent(seat?.variant, data.variant, assignment?.variant));
+  if (agent === null || variant === null) {
+    return refusedStart(REASON_INVALID_SEAT_VALUE);
+  }
+  return { ok: true, model, agent, variant };
+}
+
+function capabilitiesSatisfied(
+  required: Record<string, unknown>,
+  capabilities: RunnerIsolationCapabilities,
+): boolean {
+  if (capabilities.filesystemScope === 'unknown') {
+    return false;
+  }
+  if (required.filesystemScope !== capabilities.filesystemScope) {
+    return false;
+  }
+  for (const key of CAPABILITY_BOOLEAN_KEYS) {
+    if (required[key] === true && capabilities[key] === false) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Validate the port request and build the exact create payload. No driver call. */
+function prepareStart(
+  request: unknown,
+  describe: () => RunnerIsolationCapabilities,
+): PreparedStart | StartRefusal {
+  const shape = readStartShape(request);
+  if (!shape.ok) {
+    return shape;
+  }
+  const references = readStartReferences(shape.data);
+  if (!references.ok) {
+    return references;
+  }
+  const seat = readStartSeat(shape.data, shape.seat, shape.assignment);
+  if (!seat.ok) {
+    return seat;
+  }
+  if (!capabilitiesSatisfied(shape.required, describe())) {
+    return refusedStart(REASON_CAPABILITIES);
+  }
+  return {
+    ok: true,
+    attemptId: references.attemptId,
+    payload: {
+      attemptId: references.attemptId,
+      worktreePath: references.worktreePath,
+      briefPackagePath: references.briefPackagePath,
+      baseCommit: references.baseCommit,
+      stepLimit: references.stepLimit,
+      timeLimitSeconds: references.timeLimitSeconds,
+      model: seat.model,
+      ...(seat.agent !== undefined ? { agent: seat.agent } : {}),
+      ...(seat.variant !== undefined ? { variant: seat.variant } : {}),
+    },
+  };
+}
+
 export class SandboxRunnerAdapter implements ExecutionRunnerPort {
   private readonly environments = new Map<string, EnvironmentRecord>();
+  private readonly driverTimeoutMs: number;
+  private readonly setTimer: ArmTimer;
+  private readonly clearTimer: DisarmTimer;
 
-  constructor(private readonly options: SandboxRunnerAdapterOptions) {}
+  constructor(private readonly options: SandboxRunnerAdapterOptions) {
+    this.driverTimeoutMs = readDriverTimeoutMs(options);
+    const timers = readTimerPair(options);
+    this.setTimer = timers.setTimer;
+    this.clearTimer = timers.clearTimer;
+  }
 
   describeCapabilities(): RunnerIsolationCapabilities {
     try {
@@ -666,82 +1000,40 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async startSession(request: StartRunnerSessionRequest): Promise<StartRunnerSessionResult> {
-    const guarded = readPlain(request, START_REQUEST_KEYS);
-    if (!guarded.ok) {
-      return { outcome: 'refused', reason: REASON_MALFORMED_START };
+    // Validation lives in prepareStart so this method stays under the
+    // cognitive-complexity cap. Behaviour of those checks is unchanged.
+    const prepared = prepareStart(request, () => this.describeCapabilities());
+    if (!prepared.ok) {
+      return prepared.result;
     }
-    const data = guarded.data;
-    const requiredRead = readPlain(data.requiredCapabilities, CAPABILITY_KEYS);
-    if (!requiredRead.ok || !isWellTypedRequired(requiredRead.data)) {
-      return { outcome: 'refused', reason: REASON_MALFORMED_NESTED };
-    }
-    const seatRead = readNested(data, 'seatOverride', SEAT_OVERRIDE_KEYS, false);
-    const assignmentRead = readNested(data, 'modelAssignment', MODEL_ASSIGNMENT_KEYS, false);
-    if (!seatRead.ok || !assignmentRead.ok) {
-      return { outcome: 'refused', reason: REASON_MALFORMED_NESTED };
-    }
-    const required = requiredRead.data;
-    const seat = seatRead.value;
-    const assignment = assignmentRead.value;
-
-    const attemptId = data.attemptId;
-    const worktreePath = asReference(data.worktreePath);
-    const briefPackagePath = asReference(data.briefPackagePath);
-    const baseCommit = asReference(data.baseCommit);
-    if (!isValidAttemptId(attemptId) || worktreePath === null || briefPackagePath === null || baseCommit === null) {
-      return { outcome: 'refused', reason: REASON_INVALID_REFERENCE };
-    }
-    const stepLimit = data.stepLimit;
-    const timeLimitSeconds = data.timeLimitSeconds;
-    if (!isFinitePositive(stepLimit) || !isFinitePositive(timeLimitSeconds)) {
-      return { outcome: 'refused', reason: REASON_INVALID_LIMITS };
-    }
-    const model = firstPresent(seat?.model, data.model, assignment?.model);
-    if (!isValidSeatValue(model) || !AGY_MODEL_PATTERN.test(model)) {
-      return { outcome: 'refused', reason: REASON_INVALID_MODEL };
-    }
-    const agent = optionalSeat(firstPresent(seat?.agent, data.agent, assignment?.agent));
-    const variant = optionalSeat(firstPresent(seat?.variant, data.variant, assignment?.variant));
-    if (agent === null || variant === null) {
-      return { outcome: 'refused', reason: REASON_INVALID_SEAT_VALUE };
-    }
-
-    const capabilities = this.describeCapabilities();
-    if (
-      capabilities.filesystemScope === 'unknown' ||
-      required.filesystemScope !== capabilities.filesystemScope ||
-      CAPABILITY_BOOLEAN_KEYS.some((key) => required[key] === true && capabilities[key] === false)
-    ) {
-      return { outcome: 'refused', reason: REASON_CAPABILITIES };
-    }
-    if (this.environments.has(attemptId)) {
+    if (this.environments.has(prepared.attemptId)) {
       return { outcome: 'blocked', reason: REASON_LIVE };
     }
-
-    const payload: SandboxCreatePayload = {
-      attemptId,
-      worktreePath,
-      briefPackagePath,
-      baseCommit,
-      stepLimit,
-      timeLimitSeconds,
-      model,
-      ...(agent !== undefined ? { agent } : {}),
-      ...(variant !== undefined ? { variant } : {}),
-    };
-    // Reserve before the first await. A second start cannot pass the check above
-    // until this call has recorded a confirmed refusal or a terminal state.
-    this.environments.set(attemptId, { state: 'in-flight' });
-
-    let raw: unknown;
+    // Reserve before the first await. A second start cannot pass the check
+    // above until this call has recorded a confirmed refusal or a terminal state.
+    this.environments.set(prepared.attemptId, { state: 'in-flight' });
+    let raced: DriverCall<unknown>;
     try {
-      raw = await this.options.driver.create(payload);
+      raced = await raceDriverCall<unknown>(
+        this.options.driver.create(prepared.payload),
+        this.driverTimeoutMs,
+        this.setTimer,
+        this.clearTimer,
+      );
     } catch {
+      this.environments.set(prepared.attemptId, { state: 'indeterminate' });
+      return { outcome: 'unknown', reason: REASON_CREATE_UNKNOWN };
+    }
+    return this.recordCreate(prepared.attemptId, raced);
+  }
+
+  /** Write the attempt from the first settled create outcome and nothing later. */
+  private recordCreate(attemptId: string, raced: DriverCall<unknown>): StartRunnerSessionResult {
+    if (raced.kind !== 'value') {
       this.environments.set(attemptId, { state: 'indeterminate' });
       return { outcome: 'unknown', reason: REASON_CREATE_UNKNOWN };
     }
-
-    const classified = classifyCreate(raw);
+    const classified = classifyCreate(raced.value);
     if (classified.kind === 'started') {
       this.environments.set(attemptId, { state: 'live', sessionId: classified.sessionId });
       return { outcome: 'started', sessionId: classified.sessionId };
@@ -811,36 +1103,59 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
     }
     const confirmedSessionId = record.sessionId;
 
-    let raw: unknown;
+    let raced: DriverCall<unknown>;
     try {
-      raw = await this.options.driver.destroy(confirmedSessionId);
+      raced = await raceDriverCall<unknown>(
+        this.options.driver.destroy(confirmedSessionId),
+        this.driverTimeoutMs,
+        this.setTimer,
+        this.clearTimer,
+      );
     } catch {
       return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
     }
+    return this.applyDestroyResult(attemptId, confirmedSessionId, raced);
+  }
 
-    const kind = classifyDestroy(raw);
+  /** A timeout leaves the live record in place so a later stop calls destroy again. */
+  private applyDestroyResult(
+    attemptId: string,
+    sessionId: string,
+    raced: DriverCall<unknown>,
+  ): StopRunnerSessionResult {
+    if (raced.kind === 'timeout') {
+      return { outcome: 'still-running', reason: REASON_DESTROY_TIMEOUT };
+    }
+    if (raced.kind !== 'value') {
+      return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+    }
+    const kind = classifyDestroy(raced.value);
     if (kind === 'destroyed') {
-      const endedAtIso = completionInstant(this.options.now);
-      if (endedAtIso === null) {
-        return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
-      }
-      this.environments.delete(attemptId);
-      return {
-        outcome: 'terminated',
-        receipt: {
-          attemptId,
-          sessionId: confirmedSessionId,
-          endedAtIso,
-          authoritative: true,
-          exitStatus: null,
-          stoppedByRequest: true,
-        },
-      };
+      return this.terminated(attemptId, sessionId);
     }
     if (kind === 'still-present') {
       return { outcome: 'still-running', reason: REASON_STILL_PRESENT };
     }
     return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+  }
+
+  private terminated(attemptId: string, sessionId: string): StopRunnerSessionResult {
+    const endedAtIso = completionInstant(this.options.now);
+    if (endedAtIso === null) {
+      return { outcome: 'unknown', reason: REASON_DESTROY_UNKNOWN };
+    }
+    this.environments.delete(attemptId);
+    return {
+      outcome: 'terminated',
+      receipt: {
+        attemptId,
+        sessionId,
+        endedAtIso,
+        authoritative: true,
+        exitStatus: null,
+        stoppedByRequest: true,
+      },
+    };
   }
 }
 

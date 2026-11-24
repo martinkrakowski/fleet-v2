@@ -48,6 +48,14 @@ import type {
   TerminateWorktreeProcessesResult,
 } from '../../ports/out/ProcessTreeTerminationPort.out-port.js';
 import { ApplyRelaunchUseCase } from '../ApplyRelaunchUseCase.use-case.js';
+import { AdoptLaneUseCase } from '../AdoptLaneUseCase.use-case.js';
+import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
+import { WorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/WorkOrderRepositoryAdapter.adapter.js';
+import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
+import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
+import { CutoverJournalAdapter } from '../../../infrastructure/adapters/CutoverJournalAdapter.adapter.js';
+import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 
 const NOW = '2026-11-23T10:00:00Z';
 const CLOCK_NOW = '2026-11-23T09:59:00Z';
@@ -2714,5 +2722,593 @@ describe('ApplyRelaunchUseCase (AR2a2)', () => {
       ),
     ).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
     expect(deps.saveLaneEdits).not.toHaveBeenCalled();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// AR3d — the end-attempt transition. An `attempt-recorded` running lane whose
+// `AttemptRecord` is still `running` must be transitioned to `ended`/`partial`
+// at the apply's own save commit, through a journaled `relaunch/<digest>/
+// <lane>/end-attempt` step, before `adoptLane` will accept it. These tests use
+// the real `AdoptLaneUseCase` with in-memory `AttemptRepositoryAdapter`,
+// `WorkOrderRepositoryAdapter`, `LaneRunRepositoryAdapter`,
+// `LaneRunJournalAdapter` and `CutoverJournalAdapter` — no direct store writes
+// in a test body after the initial fixture setup — so the transition is proved
+// end to end. Hostile `AttemptRecord` answers are read through their own
+// property descriptors only: a counting getter must never run (reads === 0).
+// Each case would fail against a constant or an identity implementation: the
+// refusals differ per reason, the record revisions differ per scenario and the
+// journal ledger states differ per crash point.
+// ---------------------------------------------------------------------------
+
+describe('AR3d — end-attempt transition on relaunch adopt', () => {
+  const COMMIT = 'c'.repeat(64);
+  const TREE = 'd'.repeat(64);
+  const BASE = 'b'.repeat(64);
+  const BRIEF_DIGEST = hex('do the thing');
+  const SAVE_REF = 'refs/fleet/saved/lane-2';
+  const endKeyOf = (digest: string): string => `relaunch/${digest}/lane-2/end-attempt`;
+  const saveKeyOf = (digest: string): string => `relaunch/${digest}/lane-2/save`;
+  const abortKeyOf = (digest: string): string => `relaunch/${digest}/lane-2/abort`;
+
+  /** A ULID-shaped entry id: 26 chars over the Crockford base32 alphabet. */
+  const ulid = (index: number): string => `01${'A'.repeat(21)}${String(index).padStart(3, '0')}`;
+
+  /** A fresh `running` attempt record matching the lane's save input. */
+  const runningAttemptRecord = (over: Record<string, unknown> = {}): AttemptRecord =>
+    ({
+      id: 'attempt-1',
+      workOrderId: 'wo-9',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: '/wt/lane-2',
+      baseCommit: BASE,
+      state: 'running',
+      outcome: null,
+      briefDigest: BRIEF_DIGEST,
+      briefPackagePath: 'brief/manifest.json',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: { headCommit: BASE, commitsSinceBase: [], collectedArtifactPaths: [], notes: 'missing' },
+      reviewerSeat: null,
+      createdAtIso: BEFORE_DEADLINE,
+      updatedAtIso: BEFORE_DEADLINE,
+      ...over,
+    }) as unknown as AttemptRecord;
+
+  const attemptRecordedLane = (laneId = 'lane-2', attemptId = 'attempt-1'): FixtureLane => ({
+    ...runningLane('ar3d-seed', laneId),
+    population: 'attempt-recorded' as unknown as FixtureLane['population'],
+    attemptId,
+    workOrderId: 'wo-9',
+  });
+
+  interface RealHarness {
+    plan: RelaunchPlanRecord;
+    digest: string;
+    deps: Deps & { attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById' | 'saveAttempt'> };
+    cutover: CutoverJournalAdapter;
+    attemptRepo: AttemptRepositoryAdapter;
+    saveSpy: { calls: number };
+  }
+
+  /**
+   * The AR3d environment: one real in-memory adapter set shared by the apply
+   * and the real `AdoptLaneUseCase`, a fake save port that journals the save
+   * result into the shared journal (as the real `SaveLaneEditsUseCase` does),
+   * and a counting `saveAttempt` wrapper. Fixture writes (the seeded record
+   * and any crash seeding) happen here, never in a test body.
+   */
+  const makeRealHarness = async (over: {
+    plan?: RelaunchPlanRecord;
+    live?: LiveOver;
+    record?: Record<string, unknown> | null;
+    conflict?: boolean;
+    stubAdopt?: boolean;
+    clock?: () => string;
+  } = {}): Promise<RealHarness> => {
+    const plan = over.plan ?? buildPlan([conductedLaneWithRun(), attemptRecordedLane()]);
+    const live = over.live ?? {};
+    const cutover = new CutoverJournalAdapter();
+    const attemptRepo = new AttemptRepositoryAdapter();
+    const workOrderRepo = new WorkOrderRepositoryAdapter();
+    const runRepo = new LaneRunRepositoryAdapter();
+    const runJournal = new LaneRunJournalAdapter();
+    let entryCounter = 0;
+    const nextEntryId = (): string => ulid((entryCounter += 1));
+    const adoptLaneUseCase = new AdoptLaneUseCase({
+      workOrderRepo,
+      attemptRepo,
+      runRepo,
+      runJournal,
+      cutoverJournal: cutover,
+      computeDigest,
+      mintEntryId: nextEntryId,
+      now: () => CLOCK_NOW,
+    });
+    const deps = makeDeps({
+      plan,
+      ...(over.clock === undefined ? {} : { clock: over.clock }),
+      live: { ...live, noAppend: true, noMint: true },
+    }) as unknown as RealHarness['deps'];
+    const holder = deps as unknown as Record<string, unknown>;
+    // One shared journal: the apply, the fake save port and the real adopt
+    // all read and append through the same in-memory `CutoverJournalAdapter`.
+    holder['cutoverJournal'] = cutover;
+    holder['mintEntryId'] = nextEntryId;
+    holder['adoptLane'] =
+      over.stubAdopt === true
+        ? vi.fn(async () => ({ outcome: 'refused', reason: 'invalid-request' }))
+        : adoptLaneUseCase.adoptLane.bind(adoptLaneUseCase);
+    const saveSpy = { calls: 0 };
+    holder['attemptRepo'] = {
+      findAttemptById: (id: string) => attemptRepo.findAttemptById(id),
+      saveAttempt: async (record: AttemptRecord) => {
+        saveSpy.calls += 1;
+        if (over.conflict === true) {
+          // A concurrent writer wins the compare-and-swap first with a
+          // legitimate ended record, so this writer's next revision is stale.
+          await attemptRepo.saveAttempt({
+            ...record,
+            state: 'ended',
+            outcome: 'partial',
+            revision: record.revision ?? 1,
+            artifacts: { headCommit: BASE, commitsSinceBase: [], collectedArtifactPaths: [], notes: 'missing' },
+          });
+        }
+        await attemptRepo.saveAttempt(record);
+      },
+    };
+    holder['saveLaneEdits'] = vi.fn(async (request: unknown) => {
+      if (live.saveThrows) throw new Error('save down');
+      if (live.save !== undefined) return live.save;
+      const req = request as { planDigest?: string; laneId?: string };
+      const append = await cutover.append({
+        key: `relaunch/${req.planDigest}/${req.laneId}/save`,
+        kind: 'result',
+        entryId: nextEntryId(),
+        recordedAtIso: CLOCK_NOW,
+        outcome: 'completed',
+        reasonCode: 'saved',
+        digest: TREE,
+        commitId: COMMIT,
+        saveRef: SAVE_REF,
+      });
+      if (append.outcome !== 'appended') return { outcome: 'refused', reason: 'journal-write-failed' };
+      return { outcome: 'saved', saveRef: SAVE_REF, commitId: COMMIT, treeDigest: TREE };
+    }) as unknown as Deps['saveLaneEdits'];
+    if (over.record !== null) {
+      // Fixture setup only: seed the running attempt the lane relaunched from.
+      await attemptRepo.saveAttempt(runningAttemptRecord(over.record ?? {}));
+    }
+    return { plan, digest: plan.planDigest, deps, cutover, attemptRepo, saveSpy };
+  };
+
+
+  const journalEntries = async (
+    harness: RealHarness,
+  ): Promise<
+    readonly { key: string; kind: string; outcome?: unknown; reasonCode?: unknown; commitId?: unknown }[]
+  > => {
+    const listed = await harness.cutover.listByKeyPrefix('');
+    return listed.outcome === 'listed' ? listed.entries : [];
+  };
+
+  const storedRecord = async (harness: RealHarness): Promise<unknown> =>
+    harness.attemptRepo.findAttemptById('attempt-1');
+
+  it('AR3d-happy-path: an attempt-recorded running lane is transitioned to ended/partial at the apply\u2019s own save commit and adopted — the apply applies, the record is revision 1 with headCommit === saveCommit, and the journal holds the end-attempt intent and completed result', async () => {
+    const harness = await makeRealHarness();
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect(record.state).toBe('ended');
+    expect(record.outcome).toBe('partial');
+    expect(record.revision).toBe(1);
+    expect(record.artifacts?.headCommit).toBe(COMMIT);
+    expect(harness.saveSpy.calls).toBe(1);
+    const endEntries = (await journalEntries(harness)).filter((entry) => entry.key === endKeyOf(harness.digest));
+    expect(endEntries.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', undefined, undefined],
+      ['result', 'completed', 'attempt-ended'],
+    ]);
+    expect(endEntries[1]?.commitId).toBe(COMMIT);
+  });
+
+  it('AR3d-preserves-unchecked-fields: the transition keeps the stored sessionId and dispatchRevision of the running record while ending it', async () => {
+    const harness = await makeRealHarness({ record: runningAttemptRecord({ sessionId: 'ses-keep-1', dispatchRevision: 3 }) as unknown as Record<string, unknown> });
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect(record.state).toBe('ended');
+    expect(record.sessionId).toBe('ses-keep-1');
+    expect(record.dispatchRevision).toBe(3);
+  });
+
+  it('AR3d-running-record-without-artifacts: a running attempt whose collected artifacts are null is transitioned and adopted, not refused', async () => {
+    const harness = await makeRealHarness({ record: { artifacts: null } });
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect([record.state, record.revision, record.artifacts?.headCommit]).toEqual(['ended', 1, COMMIT]);
+  });
+
+  it('AR3d-revision-at-ceiling: a stored revision of Number.MAX_SAFE_INTEGER refuses adopt-failed and writes nothing', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, record: { revision: Number.MAX_SAFE_INTEGER } });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('AR3d-hostile-save-error: a saveAttempt that rejects with a throwing-name object or a revoked Proxy refuses adopt-failed instead of throwing', async () => {
+    const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const throwingName = Object.defineProperty({}, 'name', {
+      get() {
+        throw new Error('name getter must be contained');
+      },
+    });
+    for (const hostile of [revoked, throwingName]) {
+      const harness = await makeRealHarness({ stubAdopt: true });
+      harness.deps.attemptRepo = {
+        findAttemptById: (id: string) => harness.attemptRepo.findAttemptById(id),
+        saveAttempt: async () => {
+          throw hostile;
+        },
+      };
+      const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+      expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    }
+  });
+
+  it('AR3d-missing-record-refused-ledger: no stored record with a refused end-attempt ledger refuses adopt-failed and never reaches adoptLane', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, record: null });
+    const key = endKeyOf(harness.digest);
+    const entries = [
+      { key, kind: 'intent', entryId: ulid(77), recordedAtIso: CLOCK_NOW },
+      { key, kind: 'result', entryId: ulid(78), recordedAtIso: CLOCK_NOW, outcome: 'refused', reasonCode: 'simulated-refusal' },
+    ];
+    for (const entry of entries) {
+      expect(await harness.cutover.append(entry as never)).toMatchObject({ outcome: 'appended' });
+    }
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.deps.adoptLane).not.toHaveBeenCalled();
+  });
+
+  it('AR3d-happy-path-replay: re-applying a fully completed lane runs saveAttempt exactly once across both calls and stays applied', async () => {
+    const harness = await makeRealHarness();
+    const useCase = new ApplyRelaunchUseCase(harness.deps);
+    expect((await useCase.applyRelaunch(applyRequest(harness.digest))).outcome).toBe('applied');
+    const second = await useCase.applyRelaunch(applyRequest(harness.digest));
+    expect(second.outcome).toBe('applied');
+    expect((second as { wave?: unknown }).wave).toBe(null);
+    expect(harness.saveSpy.calls).toBe(1);
+    expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(1);
+  });
+
+  it('AR3d-crash-replay-result-append-failed: a journaled end-attempt intent whose result append failed after the write is replayed — the apply completes with saveAttempt run exactly once across both calls', async () => {
+    const harness = await makeRealHarness();
+    // Crash simulation: the first apply fails when the end-attempt result
+    // append refuses, after the intent and the record write landed.
+    const real = harness.cutover.append.bind(harness.cutover);
+    harness.deps.cutoverJournal.append = (async (entry: Record<string, unknown>) => {
+      if (entry.key === endKeyOf(harness.digest) && entry.kind === 'result') {
+        return { outcome: 'refused', reason: 'store-unreadable' } as never;
+      }
+      return real(entry as never);
+    }) as unknown as Deps['cutoverJournal']['append'];
+    const first = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(first).toEqual({ outcome: 'refused', reason: 'journal-write-failed', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(1);
+    // The retry: the ledger holds intent-only, the record is already ended at
+    // the save commit, so the wave completes without a second write.
+    harness.deps.cutoverJournal.append = real as unknown as Deps['cutoverJournal']['append'];
+    const second = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(second.outcome).toBe('applied');
+    expect(harness.saveSpy.calls).toBe(1);
+    expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(1);
+  });
+
+  it('AR3d-crash-replay-after-write: an attempt already ended/partial at the save commit is never written again — the apply completes from the stored record with an already-ended result', async () => {
+    const harness = await makeRealHarness({
+      record: {
+        state: 'ended',
+        outcome: 'partial',
+        revision: 3,
+        artifacts: { headCommit: COMMIT, commitsSinceBase: [COMMIT], collectedArtifactPaths: [], notes: 'missing' },
+      },
+    });
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).revision).toBe(3);
+    const endEntries = (await journalEntries(harness)).filter((entry) => entry.key === endKeyOf(harness.digest));
+    expect(endEntries.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', undefined, undefined],
+      ['result', 'completed', 'already-ended'],
+    ]);
+  });
+
+  it('AR3d-different-attempt-id: an adopt input naming another attempt refuses stale-plan-state and leaves the running record untouched', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(
+      applyRequest(harness.digest, {
+        adoptInputs: [adoptInput({ attempt: { attemptId: 'attempt-9', endedAtIso: CLOCK_NOW, sessionId: null } })],
+      }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-foreign-lane-attempt-id: a lane whose own attemptId differs from the save input refuses stale-plan-state in the preflight, before the save, the abort or any write', async () => {
+    const harness = await makeRealHarness({
+      stubAdopt: true,
+      plan: buildPlan([conductedLaneWithRun(), attemptRecordedLane('lane-2', 'attempt-foreign')]),
+    });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(harness.deps.saveLaneEdits).not.toHaveBeenCalled();
+    expect(harness.deps.runner!.abortWorktreeRun).not.toHaveBeenCalled();
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-mismatched-worktree-path: a stored record whose worktreePath differs from the save input refuses adopt-failed in the preflight, before the save, the abort or any write', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, record: { worktreePath: '/wt/somewhere-else' } });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.deps.saveLaneEdits).not.toHaveBeenCalled();
+    expect(harness.deps.runner!.abortWorktreeRun).not.toHaveBeenCalled();
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-abort-failure-leaves-running: a failed abort refuses abort-failed and the attempt stays running with its original revision', async () => {
+    const harness = await makeRealHarness({
+      stubAdopt: true,
+      live: { abortThrows: true, terminate: { outcome: 'refused' } },
+    });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'abort-failed', laneId: 'lane-2' });
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect(record.state).toBe('running');
+    expect(record.revision).toBe(0);
+    expect(harness.saveSpy.calls).toBe(0);
+  });
+
+  it('AR3d-revision-conflict: a concurrent saveAttempt between the read and the write refuses adopt-failed, journals a refused end-attempt result and never clobbers the concurrent record', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, conflict: true });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    // The concurrent writer's record stands, not the stale write's.
+    expect(record.revision).toBe(1);
+    expect(record.artifacts?.headCommit).toBe(BASE);
+    const endEntries = (await journalEntries(harness)).filter((entry) => entry.key === endKeyOf(harness.digest));
+    expect(endEntries.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', undefined, undefined],
+      ['result', 'refused', 'attempt-revision-conflict'],
+    ]);
+  });
+
+  it('AR3d-hostile-attempt-record: an undefined, primitive, accessor-bearing, polluting-key, Proxy-throwing, bad-revision or wrong-id attempt record refuses adopt-failed with zero getter invocations and no write', async () => {
+    const getterCalls = { count: 0 };
+    const withGetter = getterOn(runningAttemptRecord() as unknown as object, 'workOrderId', getterCalls);
+    // An own `__proto__` data key (a literal would set the prototype instead).
+    const polluting = JSON.parse('{"__proto__": {"hijacked": true}, "id": "attempt-1"}') as Record<string, unknown>;
+    // The `ownKeys` trap throws; `then` stays readable so the await itself succeeds.
+    const throwingProxy = new Proxy(runningAttemptRecord(), {
+      ownKeys() {
+        throw new Error('proxy trap');
+      },
+    });
+    const { proxy: revokedProxy, revoke } = Proxy.revocable(runningAttemptRecord(), {});
+    revoke();
+    const cases: Record<string, () => unknown> = {
+      undefined: () => undefined,
+      primitive: () => 7,
+      'accessor-bearing': () => withGetter,
+      'polluting-key': () => polluting,
+      'throwing-proxy': () => throwingProxy,
+      'revoked-proxy': () => revokedProxy,
+      'bad-revision': () => runningAttemptRecord({ revision: 1.5 }),
+      'wrong-id': () => runningAttemptRecord({ id: 'attempt-2' }),
+    };
+    for (const [name, answer] of Object.entries(cases)) {
+      const harness = await makeRealHarness({ stubAdopt: true });
+      harness.deps.attemptRepo = {
+        findAttemptById: async () => answer() as unknown,
+        saveAttempt: async () => {
+          harness.saveSpy.calls += 1;
+        },
+      } as unknown as Pick<AttemptRepositoryPort, 'findAttemptById' | 'saveAttempt'>;
+      const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+      expect(refused, name).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+      expect(harness.saveSpy.calls, name).toBe(0);
+      expect(harness.deps.adoptLane, name).not.toHaveBeenCalled();
+    }
+    expect(getterCalls.count).toBe(0);
+    expect((Object.prototype as Record<string, unknown>)['hijacked']).toBeUndefined();
+  });
+
+  it('AR3d-save-mismatch-no-transition: an adopt input whose source commit differs from the apply\u2019s own save result refuses adopt-failed without transitioning the attempt', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true });
+    const mismatched = adoptInput({
+      source: { kind: 'save-ref', saveRef: SAVE_REF, commitOid: 'e'.repeat(64), treeDigest: TREE },
+    });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(
+      applyRequest(harness.digest, { adoptInputs: [mismatched] }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-non-running-or-mismatch-refuses: an ended/failed record, an ended/partial record at another commit, and a record with a mismatched brief digest or work order refuse adopt-failed without overwriting', async () => {
+    const cases: Record<string, Record<string, unknown>> = {
+      'ended-failed': { state: 'ended', outcome: 'failed', revision: 2 },
+      'ended-partial-other-commit': {
+        state: 'ended',
+        outcome: 'partial',
+        revision: 2,
+        artifacts: { headCommit: '9'.repeat(64), commitsSinceBase: [], collectedArtifactPaths: [], notes: 'missing' },
+      },
+      'brief-mismatch': { briefDigest: hex('a different brief') },
+      'work-order-mismatch': { workOrderId: 'wo-elsewhere' },
+    };
+    for (const [name, over] of Object.entries(cases)) {
+      const harness = await makeRealHarness({ stubAdopt: true, record: over });
+      const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+      expect(refused, name).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+      expect(harness.saveSpy.calls, name).toBe(0);
+      expect(((await storedRecord(harness)) as AttemptRecord).revision, name).toBe(over.revision ?? 0);
+    }
+  });
+
+  it('AR3d-refusal-missing-attempt-repo: an attempt-recorded lane without an attempt repo refuses stale-plan-state before the grant is spent', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true });
+    delete (harness.deps as unknown as Record<string, unknown>)['attemptRepo'];
+    const authorize = harness.deps.authorization?.authorizeRelaunchApply as unknown as ReturnType<typeof vi.fn>;
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'lane-2' });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(harness.saveSpy.calls).toBe(0);
+  });
+
+  it('AR3d-crash-replay-before-write: an end-attempt intent journaled before a failed write leaves the record running, and the retry writes it exactly once', async () => {
+    const harness = await makeRealHarness();
+    let attempts = 0;
+    harness.deps.attemptRepo = {
+      findAttemptById: (id: string) => harness.attemptRepo.findAttemptById(id),
+      saveAttempt: async (record: AttemptRecord) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('store down');
+        harness.saveSpy.calls += 1;
+        await harness.attemptRepo.saveAttempt(record);
+      },
+    };
+    const first = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(first).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' });
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+    const ledger = (await journalEntries(harness)).filter((entry) => entry.key === endKeyOf(harness.digest));
+    expect(ledger.map((entry) => entry.kind)).toEqual(['intent']);
+    const second = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(second.outcome).toBe('applied');
+    expect(harness.saveSpy.calls).toBe(1);
+    const record = (await storedRecord(harness)) as AttemptRecord;
+    expect([record.state, record.revision]).toEqual(['ended', 1]);
+  });
+
+  it('AR3d-budget-spent-during-transition: a deadline that expires while the attempt is being written refuses budget-exhausted and never reaches adoptLane', async () => {
+    const spent = { afterWrite: false };
+    const harness = await makeRealHarness({ stubAdopt: true, clock: () => (spent.afterWrite ? PAST_DEADLINE : CLOCK_NOW) });
+    const inner = harness.deps.attemptRepo!;
+    harness.deps.attemptRepo = {
+      findAttemptById: (id: string) => inner.findAttemptById(id),
+      saveAttempt: async (record: AttemptRecord) => {
+        await inner.saveAttempt(record);
+        spent.afterWrite = true;
+      },
+    };
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(
+      applyRequest(harness.digest, { deadlineIso: DEADLINE }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(harness.saveSpy.calls).toBe(1);
+    expect(harness.deps.adoptLane).not.toHaveBeenCalled();
+  });
+
+  it('AR3d-budget-exhausted: an expired deadline refuses budget-exhausted before any attempt write or grant use', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true, clock: () => PAST_DEADLINE });
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(
+      applyRequest(harness.digest, { deadlineIso: DEADLINE }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-journal-write-failed: a refused end-attempt intent append refuses journal-write-failed with the record untouched', async () => {
+    const harness = await makeRealHarness({ stubAdopt: true });
+    const real = harness.cutover.append.bind(harness.cutover);
+    harness.deps.cutoverJournal.append = (async (entry: Record<string, unknown>) => {
+      if (entry.key === endKeyOf(harness.digest) && entry.kind === 'intent') {
+        return { outcome: 'refused', reason: 'duplicate-intent' } as never;
+      }
+      return real(entry as never);
+    }) as unknown as Deps['cutoverJournal']['append'];
+    const refused = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(refused).toEqual({ outcome: 'refused', reason: 'journal-write-failed', laneId: 'lane-2' });
+    expect(harness.saveSpy.calls).toBe(0);
+    expect(((await storedRecord(harness)) as AttemptRecord).state).toBe('running');
+  });
+
+  it('AR3d-end-attempt-ledger-refusal: an end-attempt ledger already refused refuses adopt-failed, and a result recorded without its intent refuses step-inconsistent — neither writes', async () => {
+    const plan = buildPlan([conductedLaneWithRun(), attemptRecordedLane()]);
+    const digest = plan.planDigest;
+    const cases: Record<string, { entries: unknown[]; expected: Record<string, unknown> }> = {
+      refused: {
+        entries: [intent(endKeyOf(digest)), { ...result(endKeyOf(digest), 'refused'), reasonCode: 'simulated-refusal' }],
+        expected: { outcome: 'refused', reason: 'adopt-failed', laneId: 'lane-2' },
+      },
+      inconsistent: {
+        entries: [{ ...result(endKeyOf(digest), 'completed'), commitId: COMMIT }],
+        expected: { outcome: 'refused', reason: 'step-inconsistent', laneId: 'lane-2' },
+      },
+    };
+    for (const [name, testCase] of Object.entries(cases)) {
+      const seeded = [
+        intent(saveKeyOf(digest), saveInputDigest(digest, saveInput())),
+        {
+          ...result(saveKeyOf(digest), 'completed'),
+          digest: TREE,
+          commitId: COMMIT,
+          saveRef: SAVE_REF,
+        },
+        intent(abortKeyOf(digest)),
+        result(abortKeyOf(digest), 'completed'),
+        ...testCase.entries,
+      ];
+      const deps = makeDeps({
+        plan,
+        entries: seeded,
+        live: { noMint: true },
+      }) as unknown as RealHarness['deps'];
+      const saveSpy = { calls: 0 };
+      (deps as unknown as Record<string, unknown>)['attemptRepo'] = {
+        findAttemptById: async () => runningAttemptRecord(),
+        saveAttempt: async () => {
+          saveSpy.calls += 1;
+        },
+      };
+      (deps as unknown as Record<string, unknown>)['adoptLane'] = vi.fn(async () => ({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      }));
+      (deps as unknown as Record<string, unknown>)['mintEntryId'] = () => ulid(1);
+      const refused = await new ApplyRelaunchUseCase(deps).applyRelaunch(applyRequest(digest));
+      expect(refused, name).toEqual(testCase.expected);
+      expect(saveSpy.calls, name).toBe(0);
+    }
+  });
+
+  it('AR3d-unrecorded-lane: an unrecorded running lane over the same real adapters still applies on a valid save — the empty attempt store is a no-op and the adopt records its own attempt', async () => {
+    const harness = await makeRealHarness({
+      plan: buildPlan([conductedLaneWithRun(), runningLane(hex('AR3d unrecorded plan'))]),
+      record: null,
+    });
+    const applied = await new ApplyRelaunchUseCase(harness.deps).applyRelaunch(applyRequest(harness.digest));
+    expect(applied.outcome).toBe('applied');
+    expect(harness.saveSpy.calls).toBe(0);
+    // The adopt created its own ended/partial attempt record at the save commit.
+    const adopted = (await harness.attemptRepo.findAttemptById('attempt-1')) as AttemptRecord | null;
+    expect(adopted?.state).toBe('ended');
+    expect(adopted?.outcome).toBe('partial');
+    expect(adopted?.artifacts?.headCommit).toBe(COMMIT);
   });
 });

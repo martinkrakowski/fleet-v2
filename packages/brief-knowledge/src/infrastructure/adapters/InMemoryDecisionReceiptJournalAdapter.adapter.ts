@@ -13,6 +13,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { types } from "node:util";
 import { budgetAllows, containsSecretShape } from "@fleet/shared";
 import type {
   AppendDecisionOutcome,
@@ -75,6 +76,176 @@ function isBoundedText(value: unknown, maxChars: number): value is string {
   );
 }
 
+/** Own keys that would let a hostile input reach the prototype chain. */
+const POLLUTING_KEYS: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+/** A canonical array index: no sign, no leading zero, no fraction. */
+const CANONICAL_INDEX = /^(?:0|[1-9][0-9]*)$/;
+
+/** The declared fields each adapter method reads from its input. */
+const NO_FIELDS: readonly string[] = [];
+const RESERVE_SCALARS: readonly string[] = [
+  "consumer",
+  "assumedCostUsd",
+  "monthlyBudgetUsd",
+  "consumerBudgetUsd",
+  "stateSha256",
+];
+const READ_SCALARS: readonly string[] = ["consumer"];
+const RECEIPT_SCALARS: readonly string[] = [
+  "consumer",
+  "contextRef",
+  "provider",
+  "model",
+  "requestId",
+  "costUsd",
+  "minConfidenceObserved",
+  "latencyMs",
+  "unknownReason",
+];
+const RECEIPT_ARRAYS: readonly string[] = [
+  "questionKinds",
+  "lexicalOrder",
+  "decidedOrder",
+];
+const OUTCOME_SCALARS: readonly string[] = [
+  "consumer",
+  "contextRef",
+  "kind",
+  "at",
+];
+const OUTCOME_ARRAYS: readonly string[] = ["value"];
+
+/** True for a Proxy, and for anything whose proxy-ness cannot be told. */
+function isProxyOrUnknown(value: unknown): boolean {
+  try {
+    return types.isProxy(value);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Copy a dense array of strings without invoking a getter or a Proxy trap.
+ * Returns null for a Proxy, an array-like, a subclassed array, a sparse array,
+ * an accessor or non-enumerable element, an extra own key or a non-string element.
+ */
+function copyDenseStringArray(value: object): string[] | null {
+  if (
+    isProxyOrUnknown(value) ||
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined
+  ) {
+    return null;
+  }
+  const length: unknown = lengthDescriptor.value;
+  if (typeof length !== "number" || !Number.isInteger(length) || length < 0) {
+    return null;
+  }
+  // Exactly `length` canonical indices plus `length` itself: no hole, no extra key.
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== length + 1) {
+    return null;
+  }
+  for (const key of keys) {
+    if (key === "length") {
+      continue;
+    }
+    if (
+      typeof key !== "string" ||
+      !CANONICAL_INDEX.test(key) ||
+      Number(key) >= length
+    ) {
+      return null;
+    }
+  }
+  const copy: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      descriptor.enumerable !== true ||
+      typeof descriptor.value !== "string"
+    ) {
+      return null;
+    }
+    copy.push(descriptor.value);
+  }
+  return copy;
+}
+
+/**
+ * Snapshot the declared own data fields of a plain object. Refuses (null) a
+ * Proxy, an array, a non-plain prototype, a symbol or prototype-polluting
+ * key, and any accessor or non-enumerable property, all by descriptor and
+ * never by reading a value, so no getter or trap runs. Undeclared keys are
+ * checked but their values are never read into the snapshot.
+ */
+function snapshotDeclaredFields<T>(
+  value: object,
+  scalarFields: readonly string[],
+  arrayFields: readonly string[],
+): T | null {
+  if (isProxyOrUnknown(value) || Array.isArray(value)) {
+    return null;
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return null;
+  }
+  const snapshot: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string" || POLLUTING_KEYS.has(key)) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      descriptor.enumerable !== true
+    ) {
+      return null;
+    }
+    const field: unknown = descriptor.value;
+    if (arrayFields.includes(key)) {
+      if (typeof field === "object" && field !== null) {
+        const copy = copyDenseStringArray(field);
+        if (copy === null) {
+          return null;
+        }
+        snapshot[key] = copy;
+      } else {
+        snapshot[key] = field;
+      }
+    } else if (scalarFields.includes(key)) {
+      if (
+        (typeof field === "object" && field !== null) ||
+        typeof field === "function" ||
+        typeof field === "symbol"
+      ) {
+        return null;
+      }
+      snapshot[key] = field;
+    }
+  }
+  return snapshot as unknown as T;
+}
+
 export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJournalPort {
   private readonly reserved: ReservedLine[] = [];
   private readonly settled: SettledLine[] = [];
@@ -90,10 +261,22 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
     this.now = now;
   }
 
-  async reserve(query: ReserveDecisionQuery): Promise<ReserveDecisionResult> {
-    if (!query || typeof query !== "object") {
+  async reserve(
+    rawQuery: ReserveDecisionQuery,
+  ): Promise<ReserveDecisionResult> {
+    if (!rawQuery || typeof rawQuery !== "object") {
       throw new Error(
         "InMemoryDecisionReceiptJournalAdapter requires a reserve query",
+      );
+    }
+    const query = snapshotDeclaredFields<ReserveDecisionQuery>(
+      rawQuery,
+      RESERVE_SCALARS,
+      NO_FIELDS,
+    );
+    if (query === null) {
+      throw new Error(
+        "InMemoryDecisionReceiptJournalAdapter refuses a reserve query that is not plain data",
       );
     }
     const consumer = query.consumer ?? KNOWLEDGE_RANKING_CONSUMER;
@@ -168,7 +351,7 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
 
   async settle(
     reservationId: string,
-    receipt: DecisionCallReceipt,
+    rawReceipt: DecisionCallReceipt,
   ): Promise<void> {
     if (
       typeof reservationId !== "string" ||
@@ -178,9 +361,19 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
         "InMemoryDecisionReceiptJournalAdapter requires a non-empty reservationId",
       );
     }
-    if (!receipt || typeof receipt !== "object") {
+    if (!rawReceipt || typeof rawReceipt !== "object") {
       throw new Error(
         `InMemoryDecisionReceiptJournalAdapter requires a receipt for reservation ${reservationId}`,
+      );
+    }
+    const receipt = snapshotDeclaredFields<DecisionCallReceipt>(
+      rawReceipt,
+      RECEIPT_SCALARS,
+      RECEIPT_ARRAYS,
+    );
+    if (receipt === null) {
+      throw new Error(
+        "InMemoryDecisionReceiptJournalAdapter refuses a receipt that is not plain data",
       );
     }
     const consumer = receipt.consumer;
@@ -240,6 +433,16 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
     ) {
       throw new Error(
         "InMemoryDecisionReceiptJournalAdapter requires a usable unknownReason",
+      );
+    }
+    if (
+      receipt.costUsd !== undefined &&
+      (typeof receipt.costUsd !== "number" ||
+        !Number.isFinite(receipt.costUsd) ||
+        receipt.costUsd < 0)
+    ) {
+      throw new Error(
+        "InMemoryDecisionReceiptJournalAdapter requires a finite non-negative costUsd",
       );
     }
     const reservation = this.reserved.find((line) => line.id === reservationId);
@@ -315,13 +518,24 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
   }
 
   async readJournal(
-    query: ReadDecisionJournalQuery,
+    rawQuery: ReadDecisionJournalQuery,
   ): Promise<DecisionJournalSnapshot> {
-    if (
-      !query ||
-      typeof query !== "object" ||
-      !isBoundedText(query.consumer, MAX_CONSUMER_CHARS)
-    ) {
+    if (!rawQuery || typeof rawQuery !== "object") {
+      throw new Error(
+        "InMemoryDecisionReceiptJournalAdapter requires a readJournal query with a consumer",
+      );
+    }
+    const query = snapshotDeclaredFields<ReadDecisionJournalQuery>(
+      rawQuery,
+      READ_SCALARS,
+      NO_FIELDS,
+    );
+    if (query === null) {
+      throw new Error(
+        "InMemoryDecisionReceiptJournalAdapter refuses a readJournal query that is not plain data",
+      );
+    }
+    if (!isBoundedText(query.consumer, MAX_CONSUMER_CHARS)) {
       throw new Error(
         "InMemoryDecisionReceiptJournalAdapter requires a readJournal query with a consumer",
       );
@@ -332,6 +546,7 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
         .filter((line) => line.consumer === consumer)
         .map((line) => ({
           ...line.record,
+          questionKinds: [...line.record.questionKinds],
           lexicalOrder: [...line.record.lexicalOrder],
           decidedOrder: [...line.record.decidedOrder],
         })),
@@ -345,9 +560,17 @@ export class InMemoryDecisionReceiptJournalAdapter implements DecisionReceiptJou
 
   /** Declared, bounded fields only; anything unusable is skipped, never thrown. */
   private readOutcomeEntry(
-    outcome: AppendDecisionOutcome,
+    rawOutcome: AppendDecisionOutcome,
   ): DecisionOutcomeRecord | null {
-    if (!outcome || typeof outcome !== "object") {
+    if (!rawOutcome || typeof rawOutcome !== "object") {
+      return null;
+    }
+    const outcome = snapshotDeclaredFields<AppendDecisionOutcome>(
+      rawOutcome,
+      OUTCOME_SCALARS,
+      OUTCOME_ARRAYS,
+    );
+    if (outcome === null) {
       return null;
     }
     const { consumer, contextRef, kind, value, at } = outcome;

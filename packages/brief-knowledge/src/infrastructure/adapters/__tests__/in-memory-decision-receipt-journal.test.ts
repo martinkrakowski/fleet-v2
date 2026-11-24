@@ -8,7 +8,7 @@ import {
   CLAIM_TRIAGE_CONSUMER,
   KNOWLEDGE_RANKING_CONSUMER,
 } from "../../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
-import type { AppendDecisionOutcome, DecisionCallReceipt } from "../../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
+import type { AppendDecisionOutcome, DecisionCallReceipt, ReadDecisionJournalQuery, ReserveDecisionQuery } from "../../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 import { budgetAllows } from "@fleet/shared";
 
 /** Synthetic credential-shaped strings; clearly marked, never real. */
@@ -87,6 +87,131 @@ const settleReceipt = async (
   const reservationId = await reserveOk(adapter);
   await adapter.settle(reservationId, receipt({ contextRef, ...receiptOverrides }));
   return reservationId;
+};
+
+/** The journal state a refused call must leave exactly as it was. */
+const journalState = async (
+  adapter: InMemoryDecisionReceiptJournalAdapter,
+): Promise<unknown> => {
+  const snapshot = await adapter.readJournal({
+    consumer: KNOWLEDGE_RANKING_CONSUMER,
+  });
+  return {
+    receipts: snapshot.receipts,
+    outcomes: snapshot.outcomes,
+    spend: await adapter.monthSpendUsd(now),
+  };
+};
+
+/** Counts every accessor body and Proxy trap that ran; it must stay 0. */
+interface Probe {
+  calls: number;
+}
+
+/** A copy of `base` whose `key` is an accessor that records any use. */
+const withAccessor = (
+  base: object,
+  key: string,
+  probe: Probe,
+  kind: "getter" | "setter" = "getter",
+): Record<string, unknown> => {
+  const copy: Record<string, unknown> = { ...base };
+  Object.defineProperty(copy, key, {
+    enumerable: true,
+    configurable: true,
+    ...(kind === "getter"
+      ? {
+          get: (): never => {
+            probe.calls += 1;
+            throw new Error("getter ran");
+          },
+        }
+      : {
+          set: (): void => {
+            probe.calls += 1;
+          },
+        }),
+  });
+  return copy;
+};
+
+/** A copy of `base` with an own `key` set by definition, so `__proto__` stays own. */
+const withOwnKey = (
+  base: object,
+  key: string,
+  value: unknown,
+): Record<string, unknown> => {
+  const copy: Record<string, unknown> = { ...base };
+  Object.defineProperty(copy, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  return copy;
+};
+
+/** A Proxy whose every trap records itself and throws. */
+const spiedProxy = <T extends object>(target: T, probe: Probe): T => {
+  const trap = (): never => {
+    probe.calls += 1;
+    throw new Error("trap ran");
+  };
+  return new Proxy(target, {
+    get: trap,
+    set: trap,
+    has: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+    getPrototypeOf: trap,
+    defineProperty: trap,
+    deleteProperty: trap,
+  });
+};
+
+/** ["a", <hole>, "b"]: length 3 with index 1 absent. */
+const holey = (): string[] => {
+  const array = new Array<string>(3);
+  array[0] = "a";
+  array[2] = "b";
+  return array;
+};
+
+/** An array whose first element is an accessor. */
+const withElementAccessor = (probe: Probe): string[] => {
+  const array = ["entry-a", "entry-b"];
+  Object.defineProperty(array, 0, {
+    enumerable: true,
+    configurable: true,
+    get: (): never => {
+      probe.calls += 1;
+      throw new Error("getter ran");
+    },
+  });
+  return array;
+};
+
+/** An array-like whose `length` is an accessor. */
+const withLengthAccessor = (probe: Probe): Record<string, unknown> => {
+  const like: Record<string, unknown> = { 0: "entry-a" };
+  Object.defineProperty(like, "length", {
+    enumerable: true,
+    configurable: true,
+    get: (): never => {
+      probe.calls += 1;
+      throw new Error("getter ran");
+    },
+  });
+  return like;
+};
+
+const POLLUTION_KEYS = ["__proto__", "constructor", "prototype"] as const;
+const ARRAY_FIELDS = ["questionKinds", "lexicalOrder", "decidedOrder"] as const;
+
+const expectPrototypeClean = (): void => {
+  expect(Reflect.has(Object.prototype, "polluted")).toBe(false);
+  expect(Object.keys(Object.prototype)).toEqual([]);
+  expect(Object.getPrototypeOf({})).toBe(Object.prototype);
 };
 
 describe("InMemoryDecisionReceiptJournalAdapter", () => {
@@ -377,43 +502,31 @@ describe("InMemoryDecisionReceiptJournalAdapter", () => {
       ).rejects.toThrow("minConfidenceObserved in [0,1]");
     });
 
-    it("settle honours a proxy that consistently presents valid values and refuses a proxy presenting an invalid consumer", async () => {
+    it("settle refuses every proxy receipt, honest, lying or wrong-consumer, without running a trap", async () => {
       const adapter = makeAdapter();
-      // An honest proxy behaves like the object it wraps.
-      await adapter.settle(await reserveOk(adapter), new Proxy(receipt(), {}));
-      // Accepted residual: a proxy lying consistently in every trap is
-      // indistinguishable from the honest object it imitates, so it settles.
-      const garbageTarget = {
-        lexicalOrder: [1, 2],
-        decidedOrder: [3],
-        questionKinds: [4],
-      };
-      const lying = new Proxy(
-        garbageTarget as unknown as DecisionCallReceipt,
+      const probe: Probe = { calls: 0 };
+      // A proxy cannot be screened without running its traps, and a trap
+      // is the caller's code: an honest proxy is refused like the rest.
+      const honest = spiedProxy(receipt(), probe);
+      const lying = spiedProxy(
         {
-          get(target, prop) {
-            if (prop === "consumer") return KNOWLEDGE_RANKING_CONSUMER;
-            if (prop === "contextRef") return "ctx-proxy";
-            if (prop === "latencyMs") return 5;
-            if (prop === "lexicalOrder") return ["entry-a", "entry-b"];
-            if (prop === "decidedOrder") return ["entry-a"];
-            if (prop === "questionKinds") return ["grounding"];
-            return Reflect.get(target as object, prop, target);
-          },
-        },
+          lexicalOrder: [1, 2],
+          decidedOrder: [3],
+          questionKinds: [4],
+        } as unknown as DecisionCallReceipt,
+        probe,
       );
-      await adapter.settle(await reserveOk(adapter), lying);
-      // A proxy that reports a wrong primitive through its get trap is
-      // refused by the same screen as a plain object.
-      const refusing = new Proxy(receipt(), {
-        get(target, prop) {
-          if (prop === "consumer") return 42;
-          return Reflect.get(target as object, prop);
-        },
+      const wrongConsumer = spiedProxy(receipt({ consumer: 42 }), probe);
+      for (const proxy of [honest, lying, wrongConsumer]) {
+        await expect(
+          adapter.settle(await reserveOk(adapter), proxy),
+        ).rejects.toThrow("refuses a receipt that is not plain data");
+      }
+      expect(probe.calls).toBe(0);
+      const snapshot = await adapter.readJournal({
+        consumer: KNOWLEDGE_RANKING_CONSUMER,
       });
-      await expect(
-        adapter.settle(await reserveOk(adapter), refusing),
-      ).rejects.toThrow("usable consumer");
+      expect(snapshot.receipts).toEqual([]);
     });
 
     it("refuses enormous string lengths with bounded checks for consumer, contextRef, unknownReason, and outcome text", async () => {
@@ -618,6 +731,248 @@ describe("InMemoryDecisionReceiptJournalAdapter", () => {
       expect(second.receipts[0]?.decidedOrder).toEqual(["entry-b", "entry-a"]);
       expect(second.outcomes).toHaveLength(1);
       expect(second.outcomes[0]?.value).toEqual(["entry-b"]);
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // 6. Hostile inputs: refused without running a getter or a Proxy trap
+  // ------------------------------------------------------------------
+  describe("hostile inputs", () => {
+    const RECEIPT_REFUSED = "refuses a receipt that is not plain data";
+    const QUERY_REFUSED = "refuses a reserve query that is not plain data";
+    const READ_REFUSED = "refuses a readJournal query that is not plain data";
+    const asReceipt = (value: unknown): DecisionCallReceipt =>
+      value as DecisionCallReceipt;
+    const asQuery = (value: unknown): ReserveDecisionQuery =>
+      value as ReserveDecisionQuery;
+    const asRead = (value: unknown): ReadDecisionJournalQuery =>
+      value as ReadDecisionJournalQuery;
+    const asOutcome = (value: unknown): AppendDecisionOutcome =>
+      value as AppendDecisionOutcome;
+
+    it("refuses a receipt with a getter or setter without invoking it", async () => {
+      const adapter = makeAdapter();
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      const probe: Probe = { calls: 0 };
+      for (const key of ["consumer", "costUsd", "contextRef", "latencyMs", "lexicalOrder"]) {
+        for (const kind of ["getter", "setter"] as const) {
+          await expect(
+            adapter.settle(id, asReceipt(withAccessor(receipt(), key, probe, kind))),
+          ).rejects.toThrow(RECEIPT_REFUSED);
+        }
+      }
+      expect(probe.calls).toBe(0);
+      expect(await journalState(adapter)).toEqual(before);
+      // The refusals left the reservation open: a clean receipt still settles it.
+      await adapter.settle(id, receipt());
+      const snapshot = await adapter.readJournal({ consumer: KNOWLEDGE_RANKING_CONSUMER });
+      expect(snapshot.receipts).toHaveLength(1);
+    });
+
+    it("refuses a getter on an array element or on length without invoking it", async () => {
+      const adapter = makeAdapter();
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      const probe: Probe = { calls: 0 };
+      for (const field of ARRAY_FIELDS) {
+        for (const hostile of [withElementAccessor(probe), withLengthAccessor(probe)]) {
+          await expect(
+            adapter.settle(id, receipt({ [field]: hostile })),
+          ).rejects.toThrow(RECEIPT_REFUSED);
+        }
+      }
+      expect(probe.calls).toBe(0);
+      expect(await journalState(adapter)).toEqual(before);
+    });
+
+    it("refuses prototype-polluting keys on a receipt, a query and an outcome without mutating Object.prototype", async () => {
+      const adapter = makeAdapter();
+      await settleReceipt(adapter, "ctx-0001");
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      const payload = { polluted: true };
+      for (const key of POLLUTION_KEYS) {
+        await expect(
+          adapter.settle(id, asReceipt(withOwnKey(receipt(), key, payload))),
+        ).rejects.toThrow(RECEIPT_REFUSED);
+        await expect(
+          adapter.reserve(asQuery(withOwnKey(reserveQuery(), key, payload))),
+        ).rejects.toThrow(QUERY_REFUSED);
+        await expect(
+          adapter.readJournal(asRead(withOwnKey({ consumer: KNOWLEDGE_RANKING_CONSUMER }, key, payload))),
+        ).rejects.toThrow(READ_REFUSED);
+        await adapter.appendOutcome(asOutcome(withOwnKey(outcome(), key, payload)));
+      }
+      expectPrototypeClean();
+      expect(await journalState(adapter)).toEqual(before);
+    });
+
+    it("refuses a sparse array in every array field of a receipt and in an outcome value", async () => {
+      const adapter = makeAdapter();
+      await settleReceipt(adapter, "ctx-0001");
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      for (const sparse of [holey(), new Array<string>(2)]) {
+        for (const field of ARRAY_FIELDS) {
+          await expect(
+            adapter.settle(id, receipt({ [field]: sparse })),
+          ).rejects.toThrow(RECEIPT_REFUSED);
+        }
+        await adapter.appendOutcome(outcome({ value: sparse }));
+      }
+      expect(await journalState(adapter)).toEqual(before);
+    });
+
+    it("refuses an array-like object in every array field of a receipt and in an outcome value", async () => {
+      const adapter = makeAdapter();
+      await settleReceipt(adapter, "ctx-0001");
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      for (const arrayLike of [{ 0: "a", length: 1 }, { length: 0 }]) {
+        for (const field of ARRAY_FIELDS) {
+          await expect(
+            adapter.settle(id, receipt({ [field]: arrayLike })),
+          ).rejects.toThrow(RECEIPT_REFUSED);
+        }
+        await adapter.appendOutcome(outcome({ value: arrayLike }));
+      }
+      expect(await journalState(adapter)).toEqual(before);
+    });
+
+    it("refuses an invalid costUsd before the clock runs and records no partial entry", async () => {
+      let clockCalls = 0;
+      const adapter = new InMemoryDecisionReceiptJournalAdapter(() => {
+        clockCalls += 1;
+        return now;
+      });
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      const clockCallsBefore = clockCalls;
+      for (const bad of [NaN, Infinity, -Infinity, -0.01, null, "0.5", true]) {
+        await expect(
+          adapter.settle(id, receipt({ costUsd: bad })),
+        ).rejects.toThrow("requires a finite non-negative costUsd");
+      }
+      expect(clockCalls).toBe(clockCallsBefore);
+      expect(await journalState(adapter)).toEqual(before);
+      await adapter.settle(id, receipt({ costUsd: 0.5 }));
+      expect(await adapter.monthSpendUsd(now)).toBe(0.5);
+    });
+
+    it("accepts costUsd 0 and -0 exactly as the file journal does", async () => {
+      const adapter = makeAdapter();
+      for (const cost of [0, -0]) {
+        await adapter.settle(await reserveOk(adapter), receipt({ costUsd: cost }));
+      }
+      const snapshot = await adapter.readJournal({ consumer: KNOWLEDGE_RANKING_CONSUMER });
+      expect(snapshot.receipts.map((record) => record.estimated)).toEqual([false, false]);
+      expect(await adapter.monthSpendUsd(now)).toBe(0);
+    });
+
+    it("refuses hostile or malformed reserve query without invoking getters", async () => {
+      const adapter = makeAdapter();
+      const probe: Probe = { calls: 0 };
+      const before = await journalState(adapter);
+      const hostile: unknown[] = [
+        withAccessor(reserveQuery(), "consumer", probe),
+        withAccessor(reserveQuery(), "assumedCostUsd", probe),
+        withAccessor(reserveQuery(), "stateSha256", probe, "setter"),
+        spiedProxy(reserveQuery(), probe),
+        [],
+        new Date(),
+        Object.create(reserveQuery()),
+      ];
+      for (const query of hostile) {
+        await expect(adapter.reserve(asQuery(query))).rejects.toThrow(QUERY_REFUSED);
+      }
+      expect(probe.calls).toBe(0);
+      expect(await journalState(adapter)).toEqual(before);
+      await expect(adapter.reserve(reserveQuery())).resolves.toMatchObject({ ok: true });
+    });
+
+    it("refuses an array, a Date and an inheriting object as a receipt", async () => {
+      const adapter = makeAdapter();
+      const id = await reserveOk(adapter);
+      const hostile: unknown[] = [[], new Date(), Object.create(receipt())];
+      for (const value of hostile) {
+        await expect(adapter.settle(id, asReceipt(value))).rejects.toThrow(RECEIPT_REFUSED);
+      }
+      await adapter.settle(id, receipt());
+    });
+
+    it("refuses hostile readJournal query without invoking getters", async () => {
+      const adapter = makeAdapter();
+      const probe: Probe = { calls: 0 };
+      const clean = { consumer: KNOWLEDGE_RANKING_CONSUMER };
+      const hostile: unknown[] = [
+        withAccessor(clean, "consumer", probe),
+        withAccessor(clean, "consumer", probe, "setter"),
+        spiedProxy(clean, probe),
+        [],
+        Object.create(clean),
+      ];
+      for (const query of hostile) {
+        await expect(adapter.readJournal(asRead(query))).rejects.toThrow(READ_REFUSED);
+      }
+      expect(probe.calls).toBe(0);
+    });
+
+    it("skips hostile or unjoined outcome without throwing or invoking getters", async () => {
+      const adapter = makeAdapter();
+      await settleReceipt(adapter, "ctx-0001");
+      const before = await journalState(adapter);
+      const probe: Probe = { calls: 0 };
+      const hostile: unknown[] = [
+        withAccessor(outcome(), "consumer", probe),
+        withAccessor(outcome(), "value", probe),
+        withAccessor(outcome(), "at", probe, "setter"),
+        outcome({ value: withElementAccessor(probe) }),
+        outcome({ value: withLengthAccessor(probe) }),
+        outcome({ value: spiedProxy(["entry-b"], probe) }),
+        spiedProxy(outcome(), probe),
+        Object.create(outcome()),
+        outcome({ contextRef: "ctx-unjoined" }),
+      ];
+      for (const entry of hostile) {
+        await expect(adapter.appendOutcome(asOutcome(entry))).resolves.toBeUndefined();
+      }
+      expect(probe.calls).toBe(0);
+      expect(await journalState(adapter)).toEqual(before);
+      // A clean outcome for the same receipt still joins.
+      await adapter.appendOutcome(outcome());
+      const snapshot = await adapter.readJournal({ consumer: KNOWLEDGE_RANKING_CONSUMER });
+      expect(snapshot.outcomes).toHaveLength(1);
+    });
+
+    it("does not mutate state when the clock fails", async () => {
+      let mode: "ok" | "throws" | "invalid" = "ok";
+      const adapter = new InMemoryDecisionReceiptJournalAdapter(() => {
+        if (mode === "throws") {
+          throw new Error("clock failed");
+        }
+        return mode === "invalid" ? new Date("invalid") : now;
+      });
+      const id = await reserveOk(adapter);
+      const before = await journalState(adapter);
+      mode = "throws";
+      await expect(adapter.reserve(reserveQuery())).rejects.toThrow("clock failed");
+      await expect(adapter.settle(id, receipt())).rejects.toThrow("clock failed");
+      mode = "invalid";
+      await expect(adapter.reserve(reserveQuery())).rejects.toThrow(RangeError);
+      await expect(adapter.settle(id, receipt())).rejects.toThrow(RangeError);
+      mode = "ok";
+      expect(await journalState(adapter)).toEqual(before);
+      await adapter.settle(id, receipt());
+    });
+
+    it("readJournal hands out a copy of questionKinds", async () => {
+      const adapter = makeAdapter();
+      await settleReceipt(adapter, "ctx-0001");
+      const first = await adapter.readJournal({ consumer: KNOWLEDGE_RANKING_CONSUMER });
+      (first.receipts[0]!.questionKinds as unknown as string[]).push("polluted");
+      const second = await adapter.readJournal({ consumer: KNOWLEDGE_RANKING_CONSUMER });
+      expect(second.receipts[0]?.questionKinds).toEqual(["grounding"]);
     });
   });
 });

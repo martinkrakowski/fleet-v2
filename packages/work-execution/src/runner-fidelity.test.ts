@@ -506,6 +506,9 @@ describe('Runner Adapter Seat, Port and Status Fidelity', () => {
       const adapter = new ExecutionRunnerAdapter({
         runSubprocess: runner,
         remotePort: 4166,
+        // CB2: ended requires a confirming second exit-0 read after a pause;
+        // this runner always exits 0, and the sleep is instant in tests.
+        sleep: async () => {},
       });
 
       const status = await adapter.inspectSession({

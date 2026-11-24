@@ -319,4 +319,33 @@ describe('findLiveRunForAttempt', () => {
       findLiveRunForAttempt(makeRepo([run(RUN_A, [ATTEMPT_ID])]), makeJournal(new Map([[RUN_A, [null as never]]])), ATTEMPT_ID),
     ).rejects.toThrow(TypeError);
   });
+
+  it('ignores an own Symbol.iterator on the run list and still reports the live run it contains', async () => {
+    const runs: unknown[] = [run(RUN_A, [ATTEMPT_ID])];
+    Object.defineProperty(runs, Symbol.iterator, {
+      value: function* empty() {
+        /* a hostile iterator that yields nothing */
+      },
+    });
+    await expect(
+      findLiveRunForAttempt(makeRepo(runs), makeJournal(liveJournal('running')), ATTEMPT_ID),
+    ).resolves.toEqual({ runId: RUN_A });
+  });
+
+  it('never runs an inherited state getter on a journal entry, reading the entry as plain data', async () => {
+    let ran = false;
+    const proto = {};
+    Object.defineProperty(proto, 'state', {
+      get() {
+        ran = true;
+        return 'merged';
+      },
+    });
+    const entry = Object.create(proto) as Record<string, unknown>;
+    entry.kind = 'conduct';
+    entry.runId = RUN_A;
+    const journal = makeJournal(new Map([[RUN_A, [entry as unknown as LaneRunJournalEntryRecord]]]));
+    await findLiveRunForAttempt(makeRepo([run(RUN_A, [ATTEMPT_ID])]), journal, ATTEMPT_ID).catch(() => null);
+    expect(ran).toBe(false);
+  });
 });

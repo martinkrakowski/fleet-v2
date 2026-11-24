@@ -83,16 +83,27 @@ function requireMethod(port: unknown, name: string, label: string): (...args: ne
   throw new TypeError(`${label} must be an object with a ${name} function`);
 }
 
-/** A journal entry: an object whose own properties are all data properties (no accessor is ever run). */
-function requireJournalEntry(value: unknown): void {
+/**
+ * A journal entry copied to a prototype-less record of its own data
+ * properties: an own accessor is refused (never run), and an inherited getter
+ * cannot exist on the copy, so `laneRunJournalState` only ever reads plain
+ * data. Cost bound: O(own keys) per entry, entries bounded by the journal bound.
+ */
+function copyJournalEntry(value: unknown): LaneRunJournalEntryRecord {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('a journal entry must be a non-array object');
   }
-  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
     if (!('value' in descriptor)) {
       throw new TypeError('a journal entry must not carry accessor properties');
     }
+    if (isPollutingKey(key)) {
+      throw new TypeError('a journal entry must not carry a prototype-polluting key');
+    }
+    copy[key] = descriptor.value;
   }
+  return copy as unknown as LaneRunJournalEntryRecord;
 }
 
 /** One run record: a plain object with own, getter-free, valid `runId` and `attemptIds`. */
@@ -110,8 +121,8 @@ function requireRunRecord(value: unknown): LaneRunRecord {
   const runId = requireIdentifier(record.runId, 'a run entry runId');
   const attemptIdsRaw = requirePlainArray(record.attemptIds, 'a run entry attemptIds', MAX_RUN_ATTEMPT_IDS);
   const attemptIds: string[] = [];
-  for (const attemptId of attemptIdsRaw) {
-    attemptIds.push(requireIdentifier(attemptId, 'a run entry attemptIds element'));
+  for (let index = 0; index < attemptIdsRaw.length; index++) {
+    attemptIds.push(requireIdentifier(attemptIdsRaw[index], 'a run entry attemptIds element'));
   }
   return { runId, attemptIds } as unknown as LaneRunRecord;
 }
@@ -138,8 +149,9 @@ export async function findLiveRunForAttempt(
     'runRepo.list() result',
     MAX_LIVE_RUN_SCAN_RUNS,
   );
-  for (const entry of runs) {
-    const run = requireRunRecord(entry);
+  // Indexed, never `for...of`: an own `Symbol.iterator` on the array is not consulted.
+  for (let runIndex = 0; runIndex < runs.length; runIndex++) {
+    const run = requireRunRecord(runs[runIndex]);
     if (!run.attemptIds.includes(attemptId)) {
       continue;
     }
@@ -148,10 +160,11 @@ export async function findLiveRunForAttempt(
       'runJournal.listForRun() result',
       MAX_LIVE_RUN_JOURNAL_ENTRIES,
     );
-    for (const journalEntry of entries) {
-      requireJournalEntry(journalEntry);
+    const copied: LaneRunJournalEntryRecord[] = [];
+    for (let index = 0; index < entries.length; index++) {
+      copied.push(copyJournalEntry(entries[index]));
     }
-    const state: LaneRunStateValue = laneRunJournalState(entries as readonly LaneRunJournalEntryRecord[], run.runId);
+    const state: LaneRunStateValue = laneRunJournalState(copied, run.runId);
     if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
       // Any non-terminal (or unknown) state is live: report the first such run.
       return { runId: run.runId };

@@ -38,6 +38,9 @@ import type { RunStopMode } from '../../domain/lane-run-transitions.js';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
+
+/** A git commit object id: 40 hex (sha-1) or 64 hex (sha-256) characters, lower-case. */
+const COMMIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 import type {
   ApplyPendingResumeRequest,
   ApplyPendingResumeResult,
@@ -782,9 +785,19 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
         };
       }
       const collectedHead = attempt.artifacts?.headCommit;
-      if (typeof collectedHead === 'string' && typeof read.checkedOutCommit === 'string') {
+      // A head is a fact only when all three commits are well-formed object ids: a malformed
+      // string is no proof the head moved, so it yields no head fact (fail closed). O(1): three
+      // anchored tests over strings of at most 64 characters (longer ones fail the length test).
+      const observedHead = read.checkedOutCommit;
+      if (
+        typeof collectedHead === 'string' &&
+        typeof observedHead === 'string' &&
+        COMMIT_OBJECT_ID_PATTERN.test(collectedHead) &&
+        COMMIT_OBJECT_ID_PATTERN.test(observedHead) &&
+        COMMIT_OBJECT_ID_PATTERN.test(attempt.baseCommit)
+      ) {
         facts.headFact = {
-          headAdvanced: read.checkedOutCommit !== collectedHead && read.checkedOutCommit !== attempt.baseCommit,
+          headAdvanced: observedHead !== collectedHead && observedHead !== attempt.baseCommit,
         };
       }
       return facts;

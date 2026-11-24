@@ -1324,6 +1324,20 @@ describe('ResumeLaneRunUseCase CE1/CE3 park escalation', () => {
     expect(record?.revision).toBe(2);
   });
 
+  it('a malformed checked-out commit is no proof the head advanced: a clean tree stays parked as worktree-clean', async () => {
+    const fx = await seededFixPark();
+    fx.inspection.checkedOutCommit = 'not-a-commit';
+    expect(
+      await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resume-recorded' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'worktree-clean' });
+    const record = await fx.repo.get(RUN_ID);
+    expect(record?.parked).toEqual(FIX_PARK);
+    expect(record?.revision).toBe(2);
+  });
+
   it('an unreadable worktree reads no fact and refuses without escalating (missing-dirty-worktree-fact)', async () => {
     const fx = await seededFixPark();
     const resume = new ResumeLaneRunUseCase({

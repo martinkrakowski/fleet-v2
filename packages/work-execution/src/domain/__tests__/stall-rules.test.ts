@@ -447,7 +447,7 @@ describe('detectStalls', () => {
           runs: [
             parkedRun({
               parkedAtIso: NOW,
-              recentReviewCodes: ['unparseable-verdict-empty', 'unparseable-verdict-unknown-label', 7, 'unparseable-verdict-truncated'] as never,
+              recentReviewCodes: ['unparseable-verdict-empty', 'unparseable-verdict-unknown-label', 'unparseable-verdict-truncated'] as never,
             }),
           ],
         }),

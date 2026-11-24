@@ -470,6 +470,12 @@ export interface MergeRepositoryPolicy {
   readonly updateBranch?: boolean;
   readonly macosProcedure?: string;
   readonly maxAttempts?: number;
+  /**
+   * EV1a: the GitHub login that posts `premerge` commit statuses. 1-39
+   * characters of `A-Z`, `a-z`, `0-9` or `-`, with no leading or trailing
+   * hyphen; validated on parse.
+   */
+  readonly premergePosterLogin?: string;
   readonly checksGraceMinutes?: number;
   readonly veto?: MergeVetoPolicy;
   /**
@@ -526,6 +532,13 @@ export interface ResolvedMergeRepositoryPolicy {
   /** Null means none. */
   readonly macosProcedure: string | null;
   readonly maxAttempts: number;
+  /**
+   * EV1a: present only when the written entry carries a `premergePosterLogin`,
+   * so resolved-entry snapshots and `canonicalMergePolicyJson` digests for
+   * installations that omit the key stay unchanged. It is absent-preserving
+   * like `prepare` and never appears as `null`.
+   */
+  readonly premergePosterLogin?: string;
   readonly checksGraceMinutes: number;
   readonly veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number };
   /**

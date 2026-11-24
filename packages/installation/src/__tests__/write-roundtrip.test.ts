@@ -228,6 +228,7 @@ const fullV2File = {
           updateBranch: true,
           macosProcedure: 'macos-check',
           maxAttempts: 3,
+          premergePosterLogin: 'premerge-bot',
           checksGraceMinutes: 10,
           veto: { mode: 'shadow', holdConfidence: 0.8 },
           prepare: ['yarn', 'install', '--immutable'],

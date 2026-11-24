@@ -435,6 +435,7 @@ export const MERGE_REPO_KEYS: readonly string[] = freezeKeys<MergeRepositoryPoli
   'updateBranch',
   'macosProcedure',
   'maxAttempts',
+  'premergePosterLogin',
   'checksGraceMinutes',
   'veto',
   'prepare',

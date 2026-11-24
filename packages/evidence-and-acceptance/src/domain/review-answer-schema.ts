@@ -10,6 +10,7 @@
  */
 
 import type { FindingSeverity } from './evidence-records.js';
+import { checkJsonDuplicateKeys } from './json-duplicate-keys.js';
 import { isWholeValuePlaceholder } from './placeholder-evidence.js';
 
 /** At most this many findings one structured answer may carry. */
@@ -466,4 +467,172 @@ export function extractSingleTrailingJsonFence(
     return { kind: 'none' };
   }
   return checkTrailingRegion(lines, lastFence);
+}
+
+/**
+ * The fixed unreadability labels of one refused review answer (CB7). Each
+ * label names exactly one shape of a reply that cannot carry a verdict; the
+ * label is a fixed token, never reviewer text.
+ */
+export const UNREADABLE_REVIEW_ANSWER_LABELS = [
+  'empty',
+  'no-json',
+  'no-fence',
+  'multiple-fences',
+  'duplicate-keys',
+  'extra-keys',
+  'bad-verdict-word',
+  'bad-findings',
+  'truncated',
+  'other',
+] as const;
+export type UnreadableReviewAnswerLabel = (typeof UNREADABLE_REVIEW_ANSWER_LABELS)[number];
+
+/**
+ * The untrusted-block marker the review prompt wraps lane-written text in. An
+ * echoed `<<<UNTRUSTED ...>>>` block is data: its body never contributes a
+ * fence or a finding.
+ */
+const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"]*">>>$/;
+
+/**
+ * Every line of `text` outside an echoed `<<<UNTRUSTED ...>>>` block, plus
+ * whether a block was opened and never closed (an unclosed block is a
+ * malformed answer: callers refuse it). Linear over the line count (open
+ * marker trimmed, close marker `<<<END UNTRUSTED nonce=<same-nonce>>>`); the
+ * one shared scan of the domain classifier and the review transport adapter.
+ */
+export function scanUntrustedEchoBlocks(
+  text: string,
+): { readonly stripped: string; readonly unclosed: boolean } {
+  const kept: string[] = [];
+  let openNonce: string | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (openNonce !== null) {
+      if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
+        openNonce = null;
+      }
+      continue;
+    }
+    const openMatch = UNTRUSTED_OPEN_PATTERN.exec(line.trim());
+    if (openMatch !== null) {
+      openNonce = openMatch[1] ?? null;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { stripped: kept.join('\n'), unclosed: openNonce !== null };
+}
+
+const TOP_LEVEL_ANSWER_KEYS = ['verdict', 'findings'] as const;
+const FINDING_KEYS = ['severity', 'file', 'line', 'summary'] as const;
+
+/** The findings check: whether the shape failure is an unexpected key. */
+function findingsLabel(raw: unknown): UnreadableReviewAnswerLabel {
+  if (!Array.isArray(raw) || raw.length > MAX_STRUCTURED_FINDINGS) {
+    return 'bad-findings';
+  }
+  for (const entry of raw as unknown[]) {
+    const record = readPlainRecord(entry);
+    if (record === null) {
+      return 'bad-findings';
+    }
+    const keys = Object.keys(record);
+    if (keys.some((key) => !(FINDING_KEYS as readonly string[]).includes(key))) {
+      return 'extra-keys';
+    }
+  }
+  return 'bad-findings';
+}
+
+/** The single trailing ```json fence body: schema-level labels only. */
+function classifyJsonBody(body: string): UnreadableReviewAnswerLabel {
+  if (body.trim() === '') {
+    return 'no-json';
+  }
+  const duplicateKeyCheck = checkJsonDuplicateKeys(body);
+  if (!duplicateKeyCheck.ok) {
+    if (duplicateKeyCheck.reason === 'duplicate-key') {
+      return 'duplicate-keys';
+    }
+    return duplicateKeyCheck.reason === 'invalid-json' ? 'truncated' : 'other';
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return 'truncated';
+  }
+  const top = readPlainRecord(parsed);
+  if (top === null) {
+    return 'other';
+  }
+  const keys = Object.keys(top);
+  if (keys.some((key) => !(TOP_LEVEL_ANSWER_KEYS as readonly string[]).includes(key))) {
+    return 'extra-keys';
+  }
+  if (keys.length !== TOP_LEVEL_ANSWER_KEYS.length) {
+    return 'other';
+  }
+  if (parseVerdict(top.verdict) === null) {
+    return 'bad-verdict-word';
+  }
+  if (validateFindingsArray(top.findings) === null) {
+    return findingsLabel(top.findings);
+  }
+  return 'other';
+}
+
+/**
+ * Classify one refused review answer (CB7): the single fixed label naming why
+ * the reply cannot carry a verdict. Never throws, never returns or logs any
+ * part of `text`.
+ *
+ * Cost bound: `O(1)` for non-strings and oversized inputs (the length refusal
+ * runs before any property read, so getters and hostile `Proxy` traps never
+ * run); `O(n)` time and space otherwise, with `n <= MAX_REVIEW_REPLY_LENGTH`
+ * (512,000 characters) bounding every scan — the untrusted strip, the fence
+ * scan, the duplicate-key walk and the schema checks are each linear over the
+ * reply or the parsed object, which the cap also bounds.
+ */
+export function classifyUnreadableReviewAnswer(text: unknown): UnreadableReviewAnswerLabel {
+  try {
+    if (typeof text !== 'string' || text.length > MAX_REVIEW_REPLY_LENGTH) {
+      return 'other';
+    }
+    if (text.trim() === '') {
+      return 'empty';
+    }
+    const scanned = scanUntrustedEchoBlocks(text);
+    if (scanned.unclosed) {
+      return 'truncated';
+    }
+    const stripped = scanned.stripped;
+    const lines = stripped.split(/\r?\n/);
+    const { fences, unclosed } = scanFences(lines);
+    if (unclosed) {
+      return 'truncated';
+    }
+    if (fences.length === 0) {
+      const trimmed = stripped.trim();
+      return trimmed.includes('{') || trimmed.includes('[') ? 'no-fence' : 'no-json';
+    }
+    const jsonFences = fences.filter((fence) => INFO_JSON.test(fence.info.trim()));
+    if (jsonFences.length > 1) {
+      return 'multiple-fences';
+    }
+    const lastFence = fences[fences.length - 1]!;
+    if (!INFO_JSON.test(lastFence.info.trim())) {
+      return 'no-fence';
+    }
+    if (lastFence.endLine === null) {
+      return 'truncated';
+    }
+    if (hasTrailingNonBlankLines(lines, lastFence.endLine + 1)) {
+      return 'other';
+    }
+    return classifyJsonBody(lastFence.body);
+  } catch {
+    return 'other';
+  }
 }

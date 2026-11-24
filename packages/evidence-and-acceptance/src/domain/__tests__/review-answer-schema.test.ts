@@ -12,6 +12,7 @@ import {
   MAX_FINDING_SUMMARY_LENGTH,
   MAX_REVIEW_REPLY_LENGTH,
   MAX_STRUCTURED_FINDINGS,
+  classifyUnreadableReviewAnswer,
   containsReviewSecretShape,
   extractSingleTrailingJsonFence,
   isSafeRelativeFilePath,
@@ -535,5 +536,199 @@ describe('extractSingleTrailingJsonFence: glued closing fence (RV1)', () => {
       reason: 'unparseable-verdict',
     });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+});
+
+describe('classifyUnreadableReviewAnswer', () => {
+  const jsonReplyText = (verdict: string, findings: string = '[]'): string =>
+    `\`\`\`json\n{"verdict":"${verdict}","findings":${findings}}\n\`\`\``;
+
+  it('returns empty for blank or whitespace-only replies', () => {
+    expect(classifyUnreadableReviewAnswer('')).toBe('empty');
+    expect(classifyUnreadableReviewAnswer('   \t\r\n  ')).toBe('empty');
+    // Distinct labels are distinct: this input is not `no-json`.
+    expect(classifyUnreadableReviewAnswer('prose about the diff')).not.toBe('empty');
+  });
+
+  it('returns no-json for plain prose without JSON or fences', () => {
+    expect(classifyUnreadableReviewAnswer('Found nothing specific to report.')).toBe('no-json');
+    expect(classifyUnreadableReviewAnswer('Nothing. \nAlso nothing.')).toBe('no-json');
+    // Distinct labels: prose is not `no-fence`.
+    expect(classifyUnreadableReviewAnswer('{"verdict":"PASS"}')).toBe('no-fence');
+  });
+
+  it('returns no-fence for unfenced JSON or non-json fence', () => {
+    expect(classifyUnreadableReviewAnswer('{"verdict":"PASS","findings":[]}')).toBe('no-fence');
+    expect(classifyUnreadableReviewAnswer('[1, 2]')).toBe('no-fence');
+    expect(
+      classifyUnreadableReviewAnswer('~~~text\nnotes\n~~~\n{"verdict":"PASS","findings":[]}'),
+    ).toBe('no-fence');
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":[]}\n```\nextra'),
+    ).not.toBe('no-fence');
+  });
+
+  it('returns multiple-fences when more than one json fence is present', () => {
+    const text = `${jsonReplyText('PASS')}\n${jsonReplyText('FAIL')}`;
+    expect(classifyUnreadableReviewAnswer(text)).toBe('multiple-fences');
+    expect(classifyUnreadableReviewAnswer('notes')).toBe('no-json');
+  });
+
+  it('returns duplicate-keys when JSON contains repeated keys', () => {
+    const text =
+      '```json\n{"verdict":"PASS","verdict":"FAIL","findings":[]}\n```';
+    expect(classifyUnreadableReviewAnswer(text)).toBe('duplicate-keys');
+    // Distinct labels: a unique-key reply with an extra key is not this label.
+    expect(classifyUnreadableReviewAnswer(jsonReplyText('PASS', '[]'))).toBe('other');
+  });
+
+  it('returns extra-keys for unexpected keys at top level or in findings', () => {
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[],"extra":1}\n```',
+      ),
+    ).toBe('extra-keys');
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"__proto__":{},"verdict":"PASS","findings":[]}\n```',
+      ),
+    ).toBe('extra-keys');
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[{"severity":"nit","file":"a.ts","line":1,"summary":"s","why":"x"}]}\n```',
+      ),
+    ).toBe('extra-keys');
+  });
+
+  it('returns bad-verdict-word when verdict is not PASS or FAIL', () => {
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"pass","findings":[]}\n```'),
+    ).toBe('bad-verdict-word');
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":1,"findings":[]}\n```'),
+    ).toBe('bad-verdict-word');
+    // Distinct labels: a bad findings array is not this label.
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":{}}\n```'),
+    ).toBe('bad-findings');
+  });
+
+  it('returns bad-findings when findings fail schema validation', () => {
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":{}}\n```'),
+    ).toBe('bad-findings');
+    expect(
+      classifyUnreadableReviewAnswer(
+        '```json\n{"verdict":"PASS","findings":[{"severity":"warning","file":"a.ts","line":1,"summary":"s"}]}\n```',
+      ),
+    ).toBe('bad-findings');
+    expect(
+      classifyUnreadableReviewAnswer(
+        `\`\`\`json\n{"verdict":"PASS","findings":[${Array.from(
+          { length: 101 },
+          () => '{"severity":"nit","file":"a.ts","line":1,"summary":"s"}',
+        ).join(',')}]}\n\`\`\``,
+      ),
+    ).toBe('bad-findings');
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":[null]}\n```'),
+    ).toBe('bad-findings');
+  });
+
+  it('returns truncated for unclosed fences or truncated JSON', () => {
+    expect(classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":[]}')).toBe(
+      'truncated',
+    );
+    expect(
+      classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS","findings":\n```'),
+    ).toBe('truncated');
+    // An unclosed untrusted echo block is a malformed answer too.
+    expect(
+      classifyUnreadableReviewAnswer(
+        '<<<UNTRUSTED nonce=0123456789abcdef0123456789abcdef0123456789abcdef label="d">>>\nprose',
+      ),
+    ).toBe('truncated');
+    expect(classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS"}\n```\nmore')).toBe('other');
+  });
+
+  it('returns other for trailing prose after a fence, non-record JSON, and unusable bodies', () => {
+    expect(classifyUnreadableReviewAnswer('```json\n{"verdict":"PASS"}\n```\nmore')).toBe('other');
+    expect(classifyUnreadableReviewAnswer('```json\n"just a string"\n```')).toBe('other');
+    expect(classifyUnreadableReviewAnswer('```json\n{}\n```')).toBe('other');
+    expect(classifyUnreadableReviewAnswer('```json\n   \n```')).toBe('no-json');
+  });
+
+  it('returns other for non-string hostile inputs without throwing or running getters', () => {
+    const hostile: unknown[] = [
+      null,
+      undefined,
+      42,
+      true,
+      {},
+      [],
+    ];
+    // The array-hole input is the point of the test: build the sparse array
+    // without a sparse-array literal so no lint suppression is needed.
+    const withHole: unknown[] = ['a', 'a'];
+    delete withHole[0];
+    hostile.push(withHole);
+    hostile.push({ length: 2, 0: 'a', 1: 'b' });
+    for (const bad of hostile) {
+      expect(() => classifyUnreadableReviewAnswer(bad), typeof bad).not.toThrow();
+      expect(classifyUnreadableReviewAnswer(bad)).toBe('other');
+    }
+    // Non-constant: strings classify, so a constant implementation fails.
+    expect(classifyUnreadableReviewAnswer('')).toBe('empty');
+    expect(classifyUnreadableReviewAnswer('prose')).toBe('no-json');
+  });
+
+  it('returns other for hostile Proxy and throwing getter inputs without running getters', () => {
+    const lengthReads: number[] = [];
+    const counting = new Proxy(
+      {},
+      {
+        get(target, key) {
+          if (key === 'length') {
+            lengthReads.push(1);
+            throw new Error('boom');
+          }
+          throw new Error('trap');
+        },
+        has() {
+          throw new Error('trap');
+        },
+        ownKeys() {
+          throw new Error('trap');
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error('trap');
+        },
+      },
+    );
+    expect(classifyUnreadableReviewAnswer(counting)).toBe('other');
+    expect(lengthReads).toEqual([]);
+    const getterHits: number[] = [];
+    const throwingGetter = Object.defineProperty({}, 'length', {
+      get() {
+        getterHits.push(1);
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    expect(classifyUnreadableReviewAnswer(throwingGetter)).toBe('other');
+    const throwingToString = Object.defineProperty(Object.create(null), 'toString', {
+      get() {
+        getterHits.push(1);
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    expect(classifyUnreadableReviewAnswer(throwingToString)).toBe('other');
+    expect(getterHits).toEqual([]);
+  });
+
+  it('returns other in O(1) when input exceeds MAX_REVIEW_REPLY_LENGTH', () => {
+    const oversized = 'a'.repeat(MAX_REVIEW_REPLY_LENGTH + 1);
+    expect(classifyUnreadableReviewAnswer(oversized)).toBe('other');
   });
 });

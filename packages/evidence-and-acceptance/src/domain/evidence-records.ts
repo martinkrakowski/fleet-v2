@@ -6,6 +6,7 @@
 
 import { assessmentIdForAttempt } from './assessment-id.js';
 import type { CheckCoverage } from './check-coverage.js';
+import { UNREADABLE_REVIEW_ANSWER_LABELS } from './review-answer-schema.js';
 import type { EvidenceResultValue } from './value-objects/EvidenceResult.vo.js';
 import type { FindingStateValue } from './value-objects/FindingState.vo.js';
 import type { AssessmentStateValue } from './value-objects/AssessmentState.vo.js';
@@ -42,14 +43,27 @@ export const REVIEW_KINDS = ['brief-check', 'brief-verify', 'code-review', 'pre-
 export type ReviewKind = (typeof REVIEW_KINDS)[number];
 
 /**
+ * The per-label cause codes of an unreadable review answer (CB7): one
+ * `unparseable-verdict-<label>` token per `UNREADABLE_REVIEW_ANSWER_LABELS`
+ * entry (dashes, not colons — the journal reason-code pattern refuses colons).
+ */
+const UNPARSEABLE_VERDICT_REASONS = UNREADABLE_REVIEW_ANSWER_LABELS.map(
+  (label) => `unparseable-verdict-${label}` as `unparseable-verdict-${typeof label}`,
+);
+
+/**
  * The fixed cause codes of an `unknown` review answer (RV2): an empty reply, a
  * reply without a parseable verdict, and a FAIL / FIX FIRST verdict with zero
- * findings. The code is a fixed token, never reviewer text.
+ * findings — plus, since CB7, one per-label `unparseable-verdict-<label>`
+ * token naming exactly why the verdict was unreadable. The code is a fixed
+ * token, never reviewer text. The three plain RV2 tokens stay for backwards
+ * compatibility with receipts recorded before CB7.
  */
 export const REVIEW_UNKNOWN_REASONS = [
   'empty',
   'unparseable-verdict',
   'no-findings-on-fail',
+  ...UNPARSEABLE_VERDICT_REASONS,
 ] as const;
 export type ReviewUnknownReason = (typeof REVIEW_UNKNOWN_REASONS)[number];
 

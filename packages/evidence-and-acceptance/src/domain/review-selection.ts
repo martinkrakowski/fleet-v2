@@ -7,7 +7,7 @@
  */
 
 import type { ReceiptSubject, ReviewKind, ReviewFindingRecord, ReviewReceiptRecord, ReviewUnknownReason } from './evidence-records.js';
-import { attemptIdForBrief, attemptIdForChain, receiptSubjectOf } from './evidence-records.js';
+import { attemptIdForBrief, attemptIdForChain, receiptSubjectOf, REVIEW_UNKNOWN_REASONS } from './evidence-records.js';
 
 export interface ReviewTally {
   readonly pass: number;
@@ -248,7 +248,8 @@ function requiresNonZeroFindingReview(diffFacts: unknown): boolean {
 }
 
 const SEVERITY_VALUES: readonly string[] = ['blocker', 'major', 'minor', 'nit'];
-const UNKNOWN_REASON_VALUES: readonly string[] = ['empty', 'unparseable-verdict', 'no-findings-on-fail'];
+/** Every declared cause token, including the CB7 per-label ones. */
+const UNKNOWN_REASON_VALUES: readonly string[] = REVIEW_UNKNOWN_REASONS;
 
 /** A declared `ReviewUnknownReason` token, or null when the value is not one. */
 function unknownReasonOf(value: unknown): ReviewUnknownReason | null {

@@ -1189,6 +1189,52 @@ describe('AdvanceLaneRunUseCase fix prepare hostile run journals (CB9)', () => {
     ).toBe('prepare-no-failure-source');
   });
 
+  it('refuses prepare-no-failure-source and never invokes an accessor that fabricates an entry at an array index', async () => {
+    const seen = { read: false };
+    const listing: unknown[] = [];
+    Object.defineProperty(listing, 0, {
+      get: () => {
+        seen.read = true;
+        return {
+          kind: 'result',
+          key: reviewKey('brief-check', 0, HEAD12_A),
+          outcome: 'completed',
+          runId: RUN_ID,
+          reasonCode: 'review-failed',
+          detail: null,
+        };
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const harness = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(harness, () => listing))).toBe('prepare-no-failure-source');
+    expect(seen.read).toBe(false);
+  });
+
+  it('classifies an entry from its descriptor values, not from a Proxy get trap that fabricates a review failure', async () => {
+    // The descriptors say an unrelated dry-run result; the `get` trap lies
+    // and returns a review failure. Only the descriptor values may count.
+    const honest = {
+      kind: 'result',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      outcome: 'completed',
+      runId: RUN_ID,
+      reasonCode: 'review-passed',
+      detail: null,
+    };
+    let getCalls = 0;
+    const lying = new Proxy(honest, {
+      get: (target, property) => {
+        getCalls += 1;
+        return property === 'reasonCode' ? 'review-failed' : Reflect.get(target, property);
+      },
+    });
+    const harness = await seededFixingHarness();
+    expect(refusedDetailOf(await prepareDirect(harness, () => [lying]))).toBe('prepare-no-failure-source');
+    expect(getCalls).toBe(0);
+  });
+
   it('refuses prepare-no-failure-source when an entry supplies its fields through inherited data properties', async () => {
     // An entry shaped with `Object.create(proto)`: `kind`, `key`, `outcome`,
     // `runId`, `reasonCode` and `detail` are plain data fields ON THE

@@ -1003,25 +1003,27 @@ const FIXING_WALK_MAX_ENTRIES = 10_000;
  * refused, never a throw to the caller. Cost: O(fields) own descriptor
  * lookups per entry, each O(1); no prototype walk is needed.
  */
-function hasMissingOrAccessorWalkField(entry: object): boolean {
+/**
+ * A plain snapshot of the walk fields, built ONLY from the entry's own data
+ * descriptors' values: a getter is never invoked and a Proxy `get` trap is
+ * never consulted, so the walk classifies exactly what the descriptors say.
+ * A missing, inherited or accessor field, or a throwing trap, yields null.
+ */
+function snapshotWalkEntry(entry: object): LaneRunJournalEntryRecord | null {
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const field of FIXING_WALK_ENTRY_FIELDS) {
     let descriptor: PropertyDescriptor | undefined;
     try {
       descriptor = Object.getOwnPropertyDescriptor(entry, field);
     } catch {
-      // A throwing trap is hostile input, not a readable shape.
-      return true;
+      return null;
     }
-    // No own descriptor: the field would be inherited, so the entry is
-    // refused — the walk reads only what this entry itself carries.
-    if (descriptor === undefined) {
-      return true;
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
     }
-    if (descriptor.get !== undefined || descriptor.set !== undefined) {
-      return true;
-    }
+    snapshot[field] = descriptor.value;
   }
-  return false;
+  return snapshot as unknown as LaneRunJournalEntryRecord;
 }
 
 function fixingFailureSourceOf(
@@ -1067,12 +1069,15 @@ function fixingFailureSourceOf(
     // A sparse journal array has a hole: it is skipped, never read as an
     // entry. A throwing `hasOwnProperty`/index `Proxy` trap is hostile input
     // and skips the entry too — the walk never throws to its caller.
+    // The slot is read from its own data descriptor: an accessor at an index
+    // (a getter fabricating an entry) is skipped and never invoked.
     let entry: unknown;
     try {
-      if (!Object.prototype.hasOwnProperty.call(entries, index)) {
+      const slot = Object.getOwnPropertyDescriptor(entries, index);
+      if (slot === undefined || !('value' in slot) || slot.get !== undefined || slot.set !== undefined) {
         continue;
       }
-      entry = entries[index];
+      entry = slot.value;
     } catch {
       continue;
     }
@@ -1087,10 +1092,10 @@ function fixingFailureSourceOf(
     if (entry === null || typeof entry !== 'object' || entryIsArray) {
       continue;
     }
-    if (hasMissingOrAccessorWalkField(entry)) {
+    const record = snapshotWalkEntry(entry);
+    if (record === null) {
       continue;
     }
-    const record = entry as LaneRunJournalEntryRecord;
     // The descriptor scan above proved the read fields carry no accessor, but
     // a Proxy may still lie between its descriptor trap and its `get` trap;
     // such a throw is hostile input and skips the entry, never escapes.

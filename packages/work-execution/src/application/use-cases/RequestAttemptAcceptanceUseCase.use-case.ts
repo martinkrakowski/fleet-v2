@@ -186,7 +186,8 @@ function resultsMatchExpectedPredicates(
   results: readonly GatePredicateResult[],
   expected: readonly ExpectedGatePredicate[],
 ): boolean {
-  if (results.length !== expected.length) {
+  // A non-array (null, a string, a record) is a mismatch, never a throw and never a pass.
+  if (!Array.isArray(results) || results.length !== expected.length) {
     return false;
   }
   return expected.every(
@@ -436,6 +437,100 @@ function acceptanceEntryIndexOf(
     return null;
   }
   return Number.parseInt(indexText, 10);
+}
+
+/**
+ * Exits that stay congestion even on a repeated `environment-not-installed`:
+ * 75 is the gate-slot wait limit, 137 SIGKILL and 143 SIGTERM. A null exit
+ * (timeout, throw, budget) is not an integer, so it stays congested too.
+ * Only some other non-zero integer is a persistent install failure.
+ */
+function isPersistentInstallFailureExit(exitCode: number | null): boolean {
+  return (
+    typeof exitCode === 'number' &&
+    Number.isInteger(exitCode) &&
+    exitCode !== 0 &&
+    exitCode !== 75 &&
+    exitCode !== 137 &&
+    exitCode !== 143
+  );
+}
+
+/**
+ * The first non-passing predicate stored for one gate run, or null when that
+ * run stored none that parse. A null entry, a throwing id, or a throwing or
+ * malformed detail is skipped — never treated as `environment-not-installed`.
+ */
+function firstStoredNonPassingOfRun(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  candidateHeadSha: string,
+  gateRun: number,
+): GatePredicateResult | null {
+  const prefix = gateRunPrefix(attemptId, candidateHeadSha, gateRun);
+  let first: GatePredicateResult | null = null;
+  let firstOrder = Number.POSITIVE_INFINITY;
+  for (const entry of entries) {
+    let order: number | null;
+    try {
+      order = acceptanceEntryIndexOf(entry, attemptId, prefix);
+    } catch {
+      continue;
+    }
+    if (order === null || order >= firstOrder) {
+      continue;
+    }
+    const parsed = parseStoredPredicateResult(entry);
+    if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
+      continue;
+    }
+    first = parsed;
+    firstOrder = order;
+  }
+  return first;
+}
+
+/**
+ * The 2nd consecutive `environment-not-installed` at one head, when its exit
+ * is a persistent install failure, becomes `fail` so the tail is archived and
+ * the gate verdict is `failed`. Anything else is returned unchanged: the first
+ * occurrence, a prior run whose first non-pass was a different cause, and a
+ * null or congestion exit all stay congested `unknown`.
+ */
+function promoteConsecutiveEnvironmentFailure(
+  results: readonly GatePredicateResult[],
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  candidateHeadSha: string,
+  effectiveRun: number,
+): readonly GatePredicateResult[] {
+  if (effectiveRun < 1) {
+    return results;
+  }
+  let priorCause: GatePredicateCause | undefined;
+  try {
+    priorCause = firstStoredNonPassingOfRun(
+      entries,
+      attemptId,
+      candidateHeadSha,
+      effectiveRun - 1,
+    )?.cause;
+  } catch {
+    return results;
+  }
+  if (priorCause !== 'environment-not-installed') {
+    return results;
+  }
+  return results.map((result) => {
+    if (
+      result.verdict === 'unknown' &&
+      result.cause === 'environment-not-installed' &&
+      isPersistentInstallFailureExit(result.exitCode)
+    ) {
+      return { ...result, verdict: 'fail' as const };
+    }
+    return result;
+  });
 }
 
 function nonPassingDetailOf(parsed: GatePredicateResult): NonPassingGatePredicateDetail {
@@ -1155,8 +1250,7 @@ export class RequestAttemptAcceptanceUseCase
         return gateUnknown('Unknown: gate predicates unavailable: ' + gateResult.reason);
       }
 
-      const results = gateResult.results;
-      if (!resultsMatchExpectedPredicates(results, expected)) {
+      if (!resultsMatchExpectedPredicates(gateResult.results, expected)) {
         try {
           await journal.appendJournalEntry({
             id: gateRunPrefix(id, candidateHeadSha, effectiveRun) + '1',
@@ -1183,6 +1277,19 @@ export class RequestAttemptAcceptanceUseCase
         }
         return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
       }
+
+      // CB1b: the 2nd consecutive persistent install failure at this head is a
+      // gate failure. Promotion happens before archiving, journalling and the
+      // verdict, so the tail is archived and `gateVerdictForResults` returns
+      // `failed`. A first occurrence, a different prior cause, or a null /
+      // congestion exit (75, 137, 143) is left as congested `unknown`.
+      const results = promoteConsecutiveEnvironmentFailure(
+        gateResult.results,
+        resolutionEntries,
+        id,
+        candidateHeadSha,
+        effectiveRun,
+      );
 
       // GD2: a failing command's bounded output tail is archived before the
       // predicate is journalled; the journal carries only the evidence

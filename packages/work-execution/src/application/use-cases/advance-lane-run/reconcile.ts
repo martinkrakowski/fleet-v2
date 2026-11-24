@@ -9,6 +9,7 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, refusedResult, releaseWorkOrderAtEnd, saveOrRefuse } from './step-context.js';
 import { conductDispatching } from './prepare-dispatch.js';
+import { preserveStoppedWorktree } from './stop-cancel.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
 import { reconcileAccept, reconcileMerge, reconcilePrPush } from './merge.js';
@@ -347,6 +348,9 @@ export async function reconcileStop(ctx: AdvanceStepContext,
   if (resultRefusal !== null) {
     return refusedResult(resultRefusal);
   }
+  // CB3: same preserve as the act stop's timeout branch, silent and
+  // non-destructive; never alters this result.
+  await preserveStoppedWorktree(ctx, record, attempt, request.nowIso);
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
 }
 

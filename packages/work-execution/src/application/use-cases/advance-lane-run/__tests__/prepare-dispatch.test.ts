@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  dirtyHandoverRequested,
   performPrepare,
   worktreeRecoveryPatchInputsValid,
 } from '../prepare-dispatch.js';
@@ -346,4 +347,132 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
     expect(savedAttempts.length).toBe(1);
   });
 
+});
+
+describe('dirtyHandoverRequested after a stop-timeout (CB3)', () => {
+  const RUN_ID = 'run-01JB0000000000000000000000';
+  const ATTEMPT_ID = 'attempt-01JB0000000000000000000001';
+  const STOP_KEY = `${RUN_ID}/r1/stop/0`;
+  const DISPATCH_KEY = `${RUN_ID}/r1/dispatch/0/a1`;
+  const COLLECT_KEY = `${RUN_ID}/r1/collect/0/a1`;
+
+  let entryCounter = 0;
+
+  function journalEntry(overrides: {
+    key?: string | null;
+    runId?: string | null;
+    outcome?: 'completed' | 'refused' | 'ambiguous' | null;
+    reasonCode?: string | null;
+  }): Record<string, unknown> {
+    entryCounter += 1;
+    return {
+      version: 1,
+      entryId: `01JB00000000000000000000${String(entryCounter).padStart(2, '0')}`,
+      kind: 'result',
+      key: overrides.key ?? null,
+      runId: overrides.runId ?? RUN_ID,
+      recordedAtIso: '2026-11-20T00:00:00.000Z',
+      mode: null,
+      expectedRevision: null,
+      mintedId: null,
+      outcome: overrides.outcome ?? null,
+      reasonCode: overrides.reasonCode ?? null,
+      detail: null,
+      grantId: null,
+      state: null,
+    };
+  }
+
+  const fixAttempt: AttemptRecord = {
+    schemaVersion: 1,
+    id: ATTEMPT_ID,
+    workOrderId: 'wo-1',
+    kind: 'fix',
+    fixNumber: 1,
+    priorAttemptId: 'attempt-01JB0000000000000000000000',
+    state: 'intent-recorded',
+    worktreePath: '/var/lane/run-01JB0000000000000000000000',
+    baseCommit: '0'.repeat(40),
+    outcome: null,
+    briefPackagePath: '.lane/brief.md',
+    briefDigest: 'b'.repeat(64),
+    seatPlan: {
+      version: 1,
+      'first-pass': [{ id: 'fp1', model: 'alpha-1', tool: 'opencode' }],
+      fix: [{ id: 'fx1', model: 'beta-1', tool: 'opencode' }],
+      review: [],
+    },
+    seatSelection: { seatId: 'fx1', role: 'fix', model: 'beta-1', tool: 'opencode', agent: null, variant: null, seatIndex: 0 },
+    runner: { kind: 'opencode', hostName: 'lane-host', host: null, remotePort: 1234, agent: null, model: null, variant: null },
+    completionReceipt: null,
+    artifacts: null,
+    sessionId: null,
+    stopReason: 'runner-refused',
+    createdAtIso: '2026-11-20T00:00:00.000Z',
+    updatedAtIso: '2026-11-20T00:01:00.000Z',
+  };
+
+  const record: LaneRunRecord = {
+    version: 1,
+    runId: RUN_ID,
+    workOrderId: 'wo-1',
+    tier: 2,
+    seatPlanRef: 'a'.repeat(64),
+    cursors: { 'first-pass': 0, fix: 0, review: null },
+    round: 1,
+    attemptIds: [ATTEMPT_ID],
+    prNumber: null,
+    parked: null,
+    parkCount: 0,
+    lease: null,
+    revision: 1,
+    runPolicyRevision: 'policy-1',
+    branchName: 'feat/test',
+  };
+
+  function ctxOf(entries: readonly unknown[]): AdvanceStepContext {
+    return {
+      deps: {
+        runJournal: { listForRun: vi.fn().mockResolvedValue(entries) },
+      },
+    } as never;
+  }
+
+  it('dirtyHandoverRequested reads true for a fix attempt after a stop-timeout (the handover decision only; the dispatch wiring is not exercised here)', async () => {
+    const stopTimeout = journalEntry({ key: STOP_KEY, outcome: 'completed', reasonCode: 'stop-timeout' });
+    const result = await dirtyHandoverRequested(ctxOf([stopTimeout]), fixAttempt, record);
+    expect(result).toBe(true);
+  });
+
+  it('a fix attempt without any stop-timeout keeps the worktree-uncommitted refusal and recovery path (handover false)', async () => {
+    const result = await dirtyHandoverRequested(ctxOf([]), fixAttempt, record);
+    expect(result).toBe(false);
+  });
+
+  it('a collect result after the stop-timeout clears the handover flag', async () => {
+    const entries = [
+      journalEntry({ key: STOP_KEY, outcome: 'completed', reasonCode: 'stop-timeout' }),
+      journalEntry({ key: COLLECT_KEY, outcome: 'completed' }),
+    ];
+    expect(await dirtyHandoverRequested(ctxOf(entries), fixAttempt, record)).toBe(false);
+  });
+
+  it('a completed dispatch result after the stop-timeout clears the handover flag', async () => {
+    const entries = [
+      journalEntry({ key: STOP_KEY, outcome: 'completed', reasonCode: 'stop-timeout' }),
+      journalEntry({ key: DISPATCH_KEY, outcome: 'completed' }),
+    ];
+    expect(await dirtyHandoverRequested(ctxOf(entries), fixAttempt, record)).toBe(false);
+  });
+
+  it('an initial first-pass attempt (priorAttemptId null) never hands over on a stop-timeout', async () => {
+    const initialAttempt: AttemptRecord = {
+      ...fixAttempt,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+    };
+    const stopTimeout = journalEntry({ key: STOP_KEY, outcome: 'completed', reasonCode: 'stop-timeout' });
+    expect(await dirtyHandoverRequested(ctxOf([stopTimeout]), initialAttempt, record)).toBe(false);
+  });
 });

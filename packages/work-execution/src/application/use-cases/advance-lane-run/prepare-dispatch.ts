@@ -24,7 +24,7 @@ import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPa
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
-import { isDirtyWorktreeDetail, lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
+import { isDirtyWorktreeDetail, lastDispatchLeftDirtyWorktree, lastStopLeftTimedOutSeat } from './dirty-handover.js';
 
 function latestAttemptRecordOf(gathered: GatheredLaneRunFacts): AttemptRecord | null {
   for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
@@ -1339,13 +1339,14 @@ async function dispatchedOutcomeResult(
 }
 
 /**
- * GB3a/GB3c, SN1: a fix dispatch or a round-0 pivot dispatch carries the
+ * GB3a/GB3c, SN1, CB3: a fix dispatch or a round-0 pivot dispatch carries the
  * handed-over worktree as-is, so the next seat's uncommitted work is accepted
- * instead of refused again. A fix attempt still waits for a prior
- * dirty-worktree refusal; a round-0 pivot seat (an initial attempt prepared
- * after an earlier seat failed) hands its worktree over on its first
- * dispatch, because the worktree may already hold the pivot's handed-over
- * work before any dispatch of its own has been refused.
+ * instead of refused again. A fix attempt hands over when a prior dirty-worktree
+ * refusal OR a `stop-timeout` left the worktree dirty: the killed seat's state
+ * is accepted as-is. A round-0 pivot seat (an initial attempt prepared after an
+ * earlier seat failed) hands its worktree over on its first dispatch, because
+ * the worktree may already hold the pivot's handed-over work before any
+ * dispatch of its own has been refused.
  */
 export async function dirtyHandoverRequested(
   ctx: AdvanceStepContext,
@@ -1355,8 +1356,9 @@ export async function dirtyHandoverRequested(
   if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
     return true;
   }
-  return handsOverDirtyWorktree(latest) &&
-    lastDispatchLeftDirtyWorktree(await ctx.deps.runJournal.listForRun(record.runId), record.runId);
+  const entries = await ctx.deps.runJournal.listForRun(record.runId);
+  return (handsOverDirtyWorktree(latest) && lastDispatchLeftDirtyWorktree(entries, record.runId)) ||
+    (latest.kind === 'fix' && lastStopLeftTimedOutSeat(entries, record.runId));
 }
 
 /**

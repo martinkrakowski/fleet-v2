@@ -195,7 +195,7 @@ describe('validateHeldWorkOrderRecord', () => {
     expect(called).toBe(0);
   });
 
-  it('returns null without throwing when a Proxy lies consistently in every trap, or when an ownKeys or descriptor trap throws', () => {
+  it('returns null without throwing when a Proxy reports a wrong key set with a plain prototype, or when a trap throws or the Proxy is revoked', () => {
     const throwingOwnKeys = new Proxy({ ...makeValidRecord() }, {
       ownKeys() {
         throw new Error('hostile ownKeys trap');
@@ -210,8 +210,8 @@ describe('validateHeldWorkOrderRecord', () => {
     });
     expect(validateHeldWorkOrderRecord(throwingDescriptor)).toBeNull();
 
-    // The accepted residual is a Proxy that lies consistently in every trap
-    // it defines: `get` answers every read with the same wrong value, `has`
+    // A Proxy whose traps disagree with its target (the consistently-lying
+    // Proxy is the accepted residual and is not claimed here): `get` answers every read with the same wrong value, `has`
     // denies every key, `ownKeys` reports a wrong key set, the descriptor
     // trap reports a wrong descriptor, and the prototype trap answers a plain
     // prototype so the plain-record gate passes and the `ownKeys` lie is the

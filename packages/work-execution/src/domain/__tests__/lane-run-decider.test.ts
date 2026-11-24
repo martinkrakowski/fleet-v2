@@ -11,6 +11,8 @@ import {
   REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
+  decideConductorReviewOutcome,
+  sanitizeJournalDetail,
 } from '../lane-run-decider.js';
 import type {
   LaneRunAttemptFact,
@@ -3130,5 +3132,143 @@ describe('decision legality', () => {
     for (const entry of enterDecisions) {
       expect(canEnterLaneRunState(entry.from, entry.to, entry.parkedFrom, entry.settledOpenPr)).toBe(true);
     }
+  });
+});
+
+const UNPARSEABLE_VERDICT_LABELS = [
+  'empty',
+  'no-json',
+  'no-fence',
+  'multiple-fences',
+  'duplicate-keys',
+  'extra-keys',
+  'bad-verdict-word',
+  'bad-findings',
+  'truncated',
+  'other',
+] as const;
+const LABELLED_DETAILS: readonly string[] = UNPARSEABLE_VERDICT_LABELS.map(
+  (label) => `unparseable-verdict-${label}`,
+);
+
+describe('labelled unparseable-verdict journal details', () => {
+  it('sanitizeJournalDetail preserves every declared unparseable-verdict-<label> token unchanged', () => {
+    expect(LABELLED_DETAILS).toHaveLength(10);
+    for (const detail of LABELLED_DETAILS) {
+      expect(sanitizeJournalDetail(detail)).toBe(detail);
+    }
+    for (const plain of ['empty', 'unparseable-verdict', 'no-findings-on-fail']) {
+      expect(sanitizeJournalDetail(plain)).toBe(plain);
+    }
+  });
+
+  it('sanitizeJournalDetail returns null for null', () => {
+    expect(sanitizeJournalDetail(null)).toBeNull();
+  });
+
+  it('sanitizeJournalDetail collapses non-string inputs to unparseable-verdict', () => {
+    const sparse: unknown[] = ['x', 'y'];
+    delete sparse[0];
+    const throwing = Object.defineProperty({}, 'toString', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const trapped = new Proxy({}, {
+      get() {
+        throw new Error('trap');
+      },
+    });
+    const hostile: unknown[] = [
+      undefined,
+      0,
+      1,
+      true,
+      false,
+      [],
+      [LABELLED_DETAILS[0]],
+      {},
+      sparse,
+      { length: 2 ** 32, 0: LABELLED_DETAILS[0] },
+      throwing,
+      trapped,
+    ];
+    for (const value of hostile) {
+      expect(sanitizeJournalDetail(value)).toBe('unparseable-verdict');
+    }
+  });
+
+  it('sanitizeJournalDetail collapses unknown unparseable-verdict-<unknown> labels and malformed tokens to unparseable-verdict', () => {
+    const malformed = [
+      'unparseable-verdict-unknown-label',
+      'unparseable-verdict-',
+      'unparseable-verdict-empty ',
+      ' unparseable-verdict-empty',
+      'unparseable-verdict-EMPTY',
+      'Unparseable-Verdict-Empty',
+      'unparseable-verdict-empty\n',
+      'unparseable-verdict-empty:extra',
+      '__proto__',
+      'constructor',
+      'sk-live-abcdef0123456789',
+      '',
+      `unparseable-verdict-${'a'.repeat(64)}`,
+    ];
+    for (const value of malformed) {
+      expect(sanitizeJournalDetail(value)).toBe('unparseable-verdict');
+    }
+  });
+
+  it('decideConductorReviewOutcome carries every declared label for unknown, unverified and zero-finding failed receipts', () => {
+    for (const detail of LABELLED_DETAILS) {
+      expect(decideConductorReviewOutcome({ verdict: 'unknown', findings: [], unknownReason: detail })).toEqual({
+        outcome: 'unknown',
+        reasonCode: 'review-unknown',
+        detail,
+        carriedMinors: [],
+      });
+      expect(decideConductorReviewOutcome({ verdict: 'failed', findings: [], unknownReason: detail }).detail).toBe(detail);
+      expect(
+        decideConductorReviewOutcome({ verdict: 'passed', findings: [], readOnlyVerified: false, unknownReason: detail }).detail,
+      ).toBe(detail);
+    }
+  });
+
+  it('decideConductorReviewOutcome collapses an undeclared label and never throws on hostile receipts', () => {
+    const collapsed = {
+      outcome: 'unknown',
+      reasonCode: 'review-unknown',
+      detail: 'unparseable-verdict',
+      carriedMinors: [],
+    };
+    expect(
+      decideConductorReviewOutcome({ verdict: 'unknown', findings: [], unknownReason: 'unparseable-verdict-unknown-label' }),
+    ).toEqual(collapsed);
+    const sparse: unknown[] = [{ severity: 'nit' }, { severity: 'nit' }];
+    delete sparse[0];
+    const pollution = JSON.parse('{"__proto__":{"verdict":"passed"},"findings":[]}') as unknown;
+    const hostileInputs: unknown[] = [
+      null,
+      undefined,
+      [],
+      'x',
+      7,
+      { verdict: 'unknown', findings: sparse },
+      { verdict: 'unknown', findings: [null] },
+      pollution,
+    ];
+    for (const input of hostileInputs) {
+      expect(() => decideConductorReviewOutcome(input)).not.toThrow();
+      expect(decideConductorReviewOutcome(input)).toEqual(collapsed);
+    }
+    const throwingReason = Object.defineProperty({ verdict: 'unknown', findings: [] }, 'unknownReason', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    expect(decideConductorReviewOutcome(throwingReason).detail).toBeNull();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });

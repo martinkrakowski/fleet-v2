@@ -65,11 +65,18 @@ export interface GatePredicateResult {
    */
   readonly failingFile?: string | null;
   /**
-   * GD2: on a failing command predicate only, the bounded, secret-redacted
-   * tail of the command's combined stdout and stderr. Absent on every other
-   * verdict (pass, skipped, unknown — including congestion) and never part of
-   * the journal detail: the tail is archived through the evidence archive and
-   * only its `evidence://` reference is journalled.
+   * GD2: the bounded, secret-redacted tail of combined stdout and stderr.
+   * On a failing command this is the command's own tail (last 32 KiB / 200
+   * lines). On `environment-not-installed` it is the failed install's tail
+   * bounded to 4 KiB, or the command's own tail when a missing-module failure
+   * was reclassified while the dependency state file was absent. Empty or
+   * whitespace-only streams omit it. Absent on pass, skipped, and on unknown
+   * results that are not this environment failure (including other congestion).
+   * Never part of the journal detail: when the predicate's verdict is `fail`
+   * — a failing command, or an `environment-not-installed` result the
+   * acceptance use case has classified as a persistent install failure — the
+   * tail is archived through the evidence archive and only its `evidence://`
+   * reference is journalled.
    */
   readonly outputTail?: string;
   /**

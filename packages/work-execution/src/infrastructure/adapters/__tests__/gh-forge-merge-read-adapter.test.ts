@@ -82,7 +82,7 @@ function checkRun(
     name,
     status: 'COMPLETED',
     conclusion,
-    createdAt,
+    completedAt: createdAt,
     creator: login === null ? null : { login },
   };
 }
@@ -154,6 +154,14 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(queryArg).toContain('$threadsAfter');
     expect(queryArg).toContain('statusCheckRollup');
     expect(queryArg).toContain('reviewThreads');
+    // Schema pin: GitHub's CheckRun has no `createdAt` (selecting it makes the
+    // whole query fail); it is read from `completedAt`. StatusContext keeps `createdAt`.
+    const checkRunSelection = /\.\.\. on CheckRun \{([^}]*)\}/.exec(queryArg ?? '')?.[1] ?? '';
+    const statusSelection = /\.\.\. on StatusContext \{([^}]*creator[^}]*\}[^}]*)\}/.exec(queryArg ?? '')?.[1] ?? '';
+    expect(checkRunSelection).toContain('completedAt');
+    expect(checkRunSelection).not.toMatch(/\bcreatedAt\b/);
+    expect(checkRunSelection).not.toMatch(/\bstartedAt\b/);
+    expect(statusSelection).toMatch(/\bcreatedAt\b/);
     expect(queryArg).toContain('creator { login }');
     expect(queryArg).not.toMatch(/\.\.\.\s*on\s*CheckRun\s*\{[^}]*creator/);
   });

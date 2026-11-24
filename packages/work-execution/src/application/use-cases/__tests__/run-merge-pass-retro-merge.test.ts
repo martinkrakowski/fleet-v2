@@ -471,8 +471,12 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
     const endless = [...(policy.requiredContexts as readonly string[])];
     Reflect.defineProperty(endless, Symbol.iterator, {
       value: function* (): Generator<string> {
+        // Bounded so a regression FAILS (yielded > 0, then throws) instead of hanging.
         for (;;) {
           yielded += 1;
+          if (yielded > 1_000) {
+            throw new Error('endless iterator was consumed');
+          }
           yield 'gate';
         }
       },

@@ -67,7 +67,7 @@ const MERGE_READ_QUERY = `
                 name
                 status
                 conclusion
-                createdAt
+                completedAt
               }
               ... on StatusContext {
                 context
@@ -236,7 +236,10 @@ function normalizeContextNode(node: unknown): MergeContextNode | null {
     name = record.name;
     state = typeof record.conclusion === 'string' ? record.conclusion : record.status;
     creator = record.creator;
-    createdAtIso = parseCreatedAtIso(record.createdAt);
+    // GitHub's CheckRun has no `createdAt`; its verdict exists from
+    // `completedAt` (never `startedAt`: a run still pending at merge time
+    // must not count as posted before the merge).
+    createdAtIso = parseCreatedAtIso(record.completedAt);
   } else if (typename === 'StatusContext') {
     name = record.context;
     state = record.state;

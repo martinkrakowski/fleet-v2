@@ -1208,9 +1208,10 @@ const RETRO_ACCESSOR_SCAN_MAX_DEPTH = 6;
 const RETRO_ACCESSOR_SCAN_MAX_KEYS = 4096;
 
 /**
- * True when any own property, at any depth up to the bound, of `raw` (plain
- * objects and arrays only) is an accessor, or when the walk exceeds its depth
- * or key budget. Reads own descriptors only, so no getter is ever invoked.
+ * True when any own property, at any depth up to the bound, of `raw` is an
+ * accessor, is symbol-keyed, or is a prototype-polluting key (`__proto__`,
+ * `constructor`, `prototype`), or when the walk exceeds its depth or key
+ * budget. Reads own descriptors only, so no getter is ever invoked.
  * Cost bound: O(RETRO_ACCESSOR_SCAN_MAX_KEYS).
  */
 function hasAccessorDeep(raw: unknown): boolean {
@@ -1225,6 +1226,12 @@ function hasAccessorDeep(raw: unknown): boolean {
     for (const key of Reflect.ownKeys(value)) {
       budget -= 1;
       if (budget < 0) {
+        return true;
+      }
+      // A symbol-keyed own property (e.g. a data-valued `Symbol.iterator`
+      // that yields forever) or a prototype-polluting key at ANY depth is
+      // refused: JSON-shaped facts and policy never carry either.
+      if (typeof key === 'symbol' || key === '__proto__' || key === 'constructor' || key === 'prototype') {
         return true;
       }
       const descriptor = Reflect.getOwnPropertyDescriptor(value, key);

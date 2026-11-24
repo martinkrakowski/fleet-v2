@@ -74,6 +74,7 @@ export type StartLaneRunRefusal =
   | 'no-review-route'
   | 'reserve-refused'
   | 'base-branch-missing'
+  | 'unsupported-base-branch'
   | 'halted';
 
 export interface AbandonStartRequest {

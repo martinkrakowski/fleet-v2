@@ -158,14 +158,23 @@ function stringField(container: object, key: string): string | undefined {
   return field.present && typeof field.value === 'string' ? field.value : undefined;
 }
 
+/** The most allowed path prefixes a gate request may carry. */
+const MAX_ALLOWED_PATH_PREFIXES = 1024;
+
 /**
  * A dense array of untrusted runtime input: a real array whose every index is
  * an own data property. A hole (skipped by `every`, `map` and friends), an
  * index getter and a non-array (an array-like is not a real array) are all
  * refused, so nothing later can reach the executor as `undefined`.
  */
-function isDenseDataArray(value: unknown): value is readonly unknown[] {
+function isDenseDataArray(value: unknown, maxLength: number): value is readonly unknown[] {
   if (!Array.isArray(value)) {
+    return false;
+  }
+  // Cost bound: the length is checked BEFORE any index is walked, so an
+  // oversized (even sparse or enormous-length) array is refused in O(1); a
+  // passing array costs at most `maxLength` own-descriptor reads.
+  if (value.length > maxLength) {
     return false;
   }
   for (let index = 0; index < value.length; index += 1) {
@@ -630,7 +639,7 @@ function isUsableRequest(request: unknown): boolean {
     return false;
   }
   const allowedPathPrefixes = ownDataProperty(request, 'allowedPathPrefixes');
-  if (!allowedPathPrefixes.present || !isDenseDataArray(allowedPathPrefixes.value)) {
+  if (!allowedPathPrefixes.present || !isDenseDataArray(allowedPathPrefixes.value, MAX_ALLOWED_PATH_PREFIXES)) {
     return false;
   }
   const specField = ownDataProperty(request, 'spec');
@@ -638,7 +647,7 @@ function isUsableRequest(request: unknown): boolean {
     return false;
   }
   const commandsField = ownDataProperty(specField.value as object, 'commands');
-  if (!commandsField.present || !isDenseDataArray(commandsField.value)) {
+  if (!commandsField.present || !isDenseDataArray(commandsField.value, MAX_GATE_COMMANDS)) {
     return false;
   }
   const commands = commandsField.value;
@@ -654,7 +663,7 @@ function isUsableCommand(command: unknown): boolean {
     return false;
   }
   const argvField = ownDataProperty(command, 'argv');
-  if (!argvField.present || !isDenseDataArray(argvField.value)) {
+  if (!argvField.present || !isDenseDataArray(argvField.value, MAX_GATE_ARGV_ENTRIES)) {
     return false;
   }
   const argv = argvField.value;

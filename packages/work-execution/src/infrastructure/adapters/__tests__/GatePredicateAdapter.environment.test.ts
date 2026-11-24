@@ -18,6 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { MAX_GATE_ARGV_ENTRIES } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { GatePredicateAdapter } from '../GatePredicateAdapter.adapter.js';
 import type { GatePredicateAdapterOptions } from '../GatePredicateAdapter.adapter.js';
 import type {
@@ -253,7 +254,7 @@ describe('GatePredicateAdapter worktree environment', () => {
     expect(results.every((result) => result.verdict === 'pass')).toBe(true);
   });
 
-  it('returns environment-not-installed for every command and runs none when the install fails', async () => {
+  it('returns environment-not-installed for the first command, skips the rest and runs none when the install fails', async () => {
     const executor = new ScriptedExecutor((argv) => {
       if (argv[0] === 'test') {
         return { exitCode: 1 };
@@ -582,6 +583,27 @@ describe('GatePredicateAdapter hostile command results and requests', () => {
       malformed as unknown as EvaluateGatePredicatesRequest,
     );
     expect(result).toEqual({ outcome: 'unavailable', reason: 'gate predicate request is malformed' });
+    expect(executor.argvRecords.length).toBe(0);
+  });
+
+  it('refuses an argv longer than the maximum before reading a single index (cost O(1), no descriptor walk)', async () => {
+    const executor = new ScriptedExecutor(() => ({ exitCode: 0 }));
+    const { adapter } = makeAdapter(executor);
+    let indexReads = 0;
+    const oversized = new Proxy(Array.from({ length: MAX_GATE_ARGV_ENTRIES + 1 }, () => 'x'), {
+      getOwnPropertyDescriptor(target, key) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) {
+          indexReads += 1;
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const malformed = { ...request(1), spec: { commitRequired: true, diffCheck: true, commands: [{ argv: oversized }] } };
+    const result = await adapter.evaluateGatePredicates(
+      malformed as unknown as EvaluateGatePredicatesRequest,
+    );
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'gate predicate request is malformed' });
+    expect(indexReads).toBe(0);
     expect(executor.argvRecords.length).toBe(0);
   });
 

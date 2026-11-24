@@ -262,9 +262,15 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
   if (entry === null || typeof entry !== 'object') {
     return null;
   }
+  // The detail is read through its own data descriptor, so an accessor (or a
+  // Proxy whose descriptor trap throws) is refused without ever being invoked.
   let detail: unknown;
   try {
-    detail = (entry as { detail?: unknown }).detail;
+    const descriptor = Object.getOwnPropertyDescriptor(entry, 'detail');
+    if (descriptor === undefined || Object.hasOwn(descriptor, 'get') || Object.hasOwn(descriptor, 'set')) {
+      return null;
+    }
+    detail = descriptor.value;
   } catch {
     return null;
   }

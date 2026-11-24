@@ -184,7 +184,7 @@ async function fixture(): Promise<Fixture> {
     baseCommit: COMMIT,
     state: 'running',
     outcome: null,
-    briefDigest: 'b'.repeat(64),
+    briefDigest: BRIEF_DIGEST,
     briefPackagePath: 'brief/manifest.json',
     sessionId: 'ses_lane_one',
     completionReceipt: null,
@@ -518,11 +518,10 @@ describe('relaunch apply live e2e (AR3c2)', () => {
       expectedHeadSha: '',
     });
 
-    // 6. First live apply: the save and adopt run; the seeded attempt record
-    // does not yet match what the adopt requires (it is still `running` with
-    // no collected artifact), so the lane stops with `adopt-failed` AFTER the
-    // save completed and journaled.
-    const firstApply = await cli(fx.runtime, [
+    // 6. The live apply: the runner's still-running attempt record is ended
+    // by the apply itself (AR3d `end-attempt`), never by a test write, so the
+    // save, abort, end-attempt, adopt and redispatch all run in one pass.
+    const applyArgs = [
       'relaunch',
       'apply',
       '--plan-digest',
@@ -534,61 +533,19 @@ describe('relaunch apply live e2e (AR3c2)', () => {
       saveInputsJson(fx),
       '--adopt-inputs',
       adoptInputsJson(),
-    ]);
-    expect(firstApply.code).toBe(1);
-    expect(JSON.parse(firstApply.stdout)).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'attempt-l1' });
-    const firstJournal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/attempt-l1/`);
-    if (firstJournal.outcome !== 'listed') throw new Error('journal unreadable');
-    const saveResult = firstJournal.entries.find(
-      (entry) => entry.key === `relaunch/${planDigest}/attempt-l1/save` && entry.kind === 'result',
-    );
-    expect(saveResult).toMatchObject({ outcome: 'completed' });
-    const saveCommit = (saveResult as { commitId?: string }).commitId;
-    expect(typeof saveCommit).toBe('string');
+    ];
+    const firstApply = await cli(fx.runtime, applyArgs);
+    expect(firstApply.code, `${firstApply.stdout}\n${firstApply.stderr}`).toBe(0);
+    expect(JSON.parse(firstApply.stdout)).toMatchObject({ outcome: 'applied', wave: 1 });
+    const ended = await fx.runtime.execution.attemptRepository.findAttemptById('attempt-l1');
+    expect(ended).toMatchObject({ state: 'ended', outcome: 'partial' });
 
-    // 7. The attempt's collected facts are updated to what the adopt expects
-    // (a fixture step: the lane's real driver records them, the apply never
-    // writes attempt records itself).
-    const attempt = await fx.runtime.execution.attemptRepository.findAttemptById('attempt-l1');
-    expect(attempt).not.toBeNull();
-    if (attempt === null) throw new Error('unreachable');
-    const storedRevision = attempt.revision ?? 0;
-    await fx.runtime.execution.attemptRepository.saveAttempt({
-      ...attempt,
-      state: 'ended',
-      outcome: 'partial',
-      briefDigest: BRIEF_DIGEST,
-      artifacts: {
-        headCommit: saveCommit as string,
-        commitsSinceBase: [saveCommit as string],
-        collectedArtifactPaths: [],
-        notes: 'missing',
-      },
-      revision: storedRevision + 1,
-      updatedAtIso: new Date().toISOString(),
-    });
+    // 7. A replay re-derives everything from the journal and repeats nothing.
+    const replay = await cli(fx.runtime, applyArgs);
+    expect(replay.code, `${replay.stdout}\n${replay.stderr}`).toBe(0);
+    expect(JSON.parse(replay.stdout)).toMatchObject({ outcome: 'applied' });
 
-    // 8. The replayed apply re-derives everything from the journal (the save
-    // and its intent are never repeated), adopts the lane into a conducted
-    // run and journals the redispatch hand-off: applied, wave 1.
-    const secondApply = await cli(fx.runtime, [
-      'relaunch',
-      'apply',
-      '--plan-digest',
-      planDigest,
-      '--apply',
-      '--grant',
-      grant.grantId,
-      '--save-inputs',
-      saveInputsJson(fx),
-      '--adopt-inputs',
-      adoptInputsJson(),
-    ]);
-    expect(secondApply.code).toBe(0);
-    const applied = JSON.parse(secondApply.stdout) as { outcome: string; wave: number | null };
-    expect(applied).toMatchObject({ outcome: 'applied', wave: 1 });
-
-    // 9. The cutover journal carries the completed save and the completed
+    // 8. The cutover journal carries the completed save and the completed
     // adopt/work-order results.
     const finalJournal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/attempt-l1/`);
     if (finalJournal.outcome !== 'listed') throw new Error('journal unreadable');
@@ -614,6 +571,215 @@ describe('relaunch apply live e2e (AR3c2)', () => {
     const journal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/`);
     if (journal.outcome !== 'listed') throw new Error('journal unreadable');
     expect(journal.entries).toEqual([]);
+  });
+});
+
+/** Everything that proves an apply refused BEFORE any write: journal empty, worktree edit intact, attempt record untouched. */
+async function expectNothingWritten(fx: Fixture, planDigest: string): Promise<void> {
+  const journal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/`);
+  if (journal.outcome !== 'listed') throw new Error('journal unreadable');
+  expect(journal.entries).toEqual([]);
+  expect(await fs.readFile(path.join(fx.worktreePath, 'packages', 'pkg-one', 'src', 'feature.ts'), 'utf8')).toContain(
+    'export const one = 1;',
+  );
+  const attempt = await fx.runtime.execution.attemptRepository.findAttemptById('attempt-l1');
+  expect(attempt).toMatchObject({ state: 'running', outcome: null, artifacts: null });
+}
+
+/** The owner sequence up to a signed, resolved grant; `signer` lets a test sign with a non-owner key. */
+async function ownerGrant(
+  fx: Fixture,
+  options: { readonly signer?: EphemeralOwnerKey } = {},
+): Promise<{ planDigest: string; grantId: string; resolved: { code: number; stdout: string } }> {
+  const planned = await cli(fx.runtime, ['relaunch', 'plan']);
+  const planResult = JSON.parse(planned.stdout) as PlanRelaunchResult;
+  if (planResult.outcome !== 'planned') throw new Error('plan failed');
+  const planDigest = planResult.plan.planDigest;
+  const granted = await cli(fx.runtime, [
+    'relaunch',
+    'request-grant',
+    '--plan-digest',
+    planDigest,
+    '--policy-revision',
+    'pol-1',
+  ]);
+  expect(granted.code, granted.stderr).toBe(0);
+  const grant = JSON.parse(granted.stdout) as RequestGrantResult;
+  const recorded = await cli(fx.runtime, [
+    'coordination',
+    'request-decision',
+    '--request-id',
+    grant.requestId,
+    '--project-id',
+    'relaunch',
+    '--kind',
+    'action-decision',
+    '--action-scope',
+    'relaunch:apply',
+    '--proposal-digest',
+    planDigest,
+    '--policy-revision',
+    'pol-1',
+    '--now-iso',
+    grant.createdAtIso,
+  ]);
+  expect(recorded.code, `${recorded.stdout} ${recorded.stderr}`).toBe(0);
+  const keyPath = path.join(fx.root, 'signer-key.pem');
+  writeFileSync(keyPath, (options.signer ?? fx.ownerKey).privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  chmodSync(keyPath, 0o600);
+  await cli(fx.runtime, [
+    'coordination',
+    'sign-decision',
+    '--request',
+    grant.requestId,
+    '--answer',
+    'approve',
+    '--key',
+    keyPath,
+    '--yes',
+  ]);
+  const resolved = await cli(fx.runtime, [
+    'coordination',
+    'resolve-auth',
+    '--project-id',
+    'relaunch',
+    '--action-scope',
+    'relaunch:apply',
+    '--proposal-digest',
+    planDigest,
+    '--authorization-grant-id',
+    grant.grantId,
+  ]);
+  return { planDigest, grantId: grant.grantId, resolved };
+}
+
+function applyArgv(planDigest: string, grantId: string, saveInputs: string, adoptInputs: string): string[] {
+  return [
+    'relaunch',
+    'apply',
+    '--plan-digest',
+    planDigest,
+    '--apply',
+    '--grant',
+    grantId,
+    '--save-inputs',
+    saveInputs,
+    '--adopt-inputs',
+    adoptInputs,
+  ];
+}
+
+describe('relaunch apply pre-write refusals (AR3c2 hardening)', () => {
+  it('refuses an attemptId that is not the plan lane attempt before any write', async () => {
+    const fx = await fixture();
+    const { planDigest, grantId, resolved } = await ownerGrant(fx);
+    expect(resolved.code).toBe(0);
+    const wrongSave = (JSON.parse(saveInputsJson(fx)) as Array<Record<string, unknown>>).map((entry) => ({
+      ...entry,
+      attemptId: 'attempt-other',
+    }));
+    const wrongAdopt = (JSON.parse(adoptInputsJson()) as Array<{ attempt: Record<string, unknown> }>).map((entry) => ({
+      ...entry,
+      attempt: { ...entry.attempt, attemptId: 'attempt-other' },
+    }));
+    const refused = await cli(
+      fx.runtime,
+      applyArgv(planDigest, grantId, JSON.stringify(wrongSave), JSON.stringify(wrongAdopt)),
+    );
+    expect(refused.code).toBe(1);
+    expect(JSON.parse(refused.stdout)).toEqual({ outcome: 'refused', reason: 'stale-plan-state', laneId: 'attempt-l1' });
+    await expectNothingWritten(fx, planDigest);
+  });
+
+  it('refuses a stored attempt that is not the lane own record (sameAttempt identity false) before any write', async () => {
+    const fx = await fixture();
+    const { planDigest, grantId, resolved } = await ownerGrant(fx);
+    expect(resolved.code).toBe(0);
+    // A foreign brief digest on the stored record: every other identity field matches.
+    const stored = await fx.runtime.execution.attemptRepository.findAttemptById('attempt-l1');
+    if (stored === null) throw new Error('unreachable');
+    await fx.runtime.execution.attemptRepository.saveAttempt({
+      ...stored,
+      briefDigest: 'c'.repeat(64),
+      revision: (stored.revision ?? 0) + 1,
+    });
+    const refused = await cli(fx.runtime, applyArgv(planDigest, grantId, saveInputsJson(fx), adoptInputsJson()));
+    expect(refused.code).toBe(1);
+    expect(JSON.parse(refused.stdout)).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'attempt-l1' });
+    const journal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/`);
+    if (journal.outcome !== 'listed') throw new Error('journal unreadable');
+    expect(journal.entries).toEqual([]);
+    expect(await fs.readFile(path.join(fx.worktreePath, 'packages', 'pkg-one', 'src', 'feature.ts'), 'utf8')).toContain(
+      'export const one = 1;',
+    );
+    expect(await fx.runtime.execution.attemptRepository.findAttemptById('attempt-l1')).toMatchObject({
+      state: 'running',
+      briefDigest: 'c'.repeat(64),
+    });
+  });
+
+  it('refuses a grant signed by a non-owner key and an out-of-window grant, writing nothing', async () => {
+    const nonOwner = await fixture();
+    const forged = await ownerGrant(nonOwner, { signer: ephemeralOwnerKey() });
+    expect(forged.resolved.code).toBe(1);
+    expect(JSON.parse(forged.resolved.stdout)).toMatchObject({ outcome: 'blocked' });
+    const forgedApply = await cli(
+      nonOwner.runtime,
+      applyArgv(forged.planDigest, forged.grantId, saveInputsJson(nonOwner), adoptInputsJson()),
+    );
+    expect(forgedApply.code).toBe(1);
+    expect(JSON.parse(forgedApply.stdout)).toMatchObject({ outcome: 'refused' });
+    await expectNothingWritten(nonOwner, forged.planDigest);
+
+    // An out-of-window grant cannot even be recorded (expiry is measured on the
+    // trusted clock), so the apply finds no grant and refuses before any write.
+    const expiredFx = await fixture();
+    const planned = JSON.parse((await cli(expiredFx.runtime, ['relaunch', 'plan'])).stdout) as PlanRelaunchResult;
+    if (planned.outcome !== 'planned') throw new Error('plan failed');
+    const old = JSON.parse(
+      (
+        await cli(expiredFx.runtime, [
+          'relaunch',
+          'request-grant',
+          '--plan-digest',
+          planned.plan.planDigest,
+          '--policy-revision',
+          'pol-1',
+          '--now',
+          '2020-01-01T00:00:00.000Z',
+        ])
+      ).stdout,
+    ) as RequestGrantResult;
+    const oldRecorded = await cli(expiredFx.runtime, [
+      'coordination',
+      'request-decision',
+      '--request-id',
+      old.requestId,
+      '--project-id',
+      'relaunch',
+      '--kind',
+      'action-decision',
+      '--action-scope',
+      'relaunch:apply',
+      '--proposal-digest',
+      planned.plan.planDigest,
+      '--policy-revision',
+      'pol-1',
+      '--now-iso',
+      old.createdAtIso,
+    ]);
+    expect(oldRecorded.code).toBe(1);
+    expect(JSON.parse(oldRecorded.stdout)).toEqual({
+      outcome: 'rejected',
+      reason: 'relaunch-apply-created-at-out-of-window',
+    });
+    const expiredApply = await cli(
+      expiredFx.runtime,
+      applyArgv(planned.plan.planDigest, old.grantId, saveInputsJson(expiredFx), adoptInputsJson()),
+    );
+    expect(expiredApply.code).toBe(1);
+    expect(JSON.parse(expiredApply.stdout)).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    await expectNothingWritten(expiredFx, planned.plan.planDigest);
   });
 });
 

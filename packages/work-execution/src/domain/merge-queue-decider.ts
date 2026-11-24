@@ -661,8 +661,21 @@ function isPremergeGreen(fact: MergeContextFact, name: string, policy: Normalize
   if (name !== 'premerge') {
     return true;
   }
+  // EV1b (EV1a's Fable pre-merge note): GitHub logins are case-insensitive, so compare
+  // ASCII-lowercase on both sides while the stored value stays verbatim. ASCII-only
+  // folding: `toLowerCase()` also applies Unicode mappings, so a Kelvin sign U+212A in
+  // the creator would wrongly match an ASCII "k" poster.
   const creator = fact.creatorLogin;
-  return creator !== null && creator !== undefined && creator === policy.premergePosterLogin;
+  const poster = policy.premergePosterLogin;
+  if (creator === null || creator === undefined || poster === null || poster === undefined) {
+    return false;
+  }
+  return asciiLowerLogin(creator) === asciiLowerLogin(poster);
+}
+
+/** Lower-cases ASCII A-Z only: no Unicode case folding (the Kelvin sign stays itself). */
+function asciiLowerLogin(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 }
 
 function contextGraceMinutes(name: string, policy: NormalizedMergeRepoPolicy): number {

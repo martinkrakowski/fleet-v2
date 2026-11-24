@@ -34,6 +34,8 @@ export interface MergePolicyRepository {
   readonly macosProcedure: string | null;
   readonly maxAttempts: number;
   readonly checksGraceMinutes: number;
+  /** EV1b: null means none; present only when the resolved source carries the key. */
+  readonly premergePosterLogin?: string | null;
   readonly veto: { readonly mode: MergePolicyVetoMode; readonly holdConfidence: number };
 }
 

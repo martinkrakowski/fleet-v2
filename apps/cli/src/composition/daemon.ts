@@ -148,6 +148,9 @@ export function toDaemonRepositoryRefs(
         gate: entry.checksGraceMinutes,
         premerge: entry.checksGraceMinutes,
       },
+      // EV1b: forward the poster only when present; a null/absent value keeps the
+      // policy object byte-identical to pre-EV1b behaviour.
+      ...(entry.premergePosterLogin != null ? { premergePosterLogin: entry.premergePosterLogin } : {}),
       veto: {
         mode: entry.veto.mode,
         holdConfidence: entry.veto.holdConfidence,

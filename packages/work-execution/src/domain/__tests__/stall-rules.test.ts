@@ -374,6 +374,90 @@ describe('detectStalls', () => {
       );
       expect(keysOf(findings)).toEqual(['review-failing:run-a']);
     });
+
+    const LABELLED_CODES: readonly string[] = [
+      'unparseable-verdict-empty',
+      'unparseable-verdict-no-json',
+      'unparseable-verdict-no-fence',
+      'unparseable-verdict-multiple-fences',
+      'unparseable-verdict-duplicate-keys',
+      'unparseable-verdict-extra-keys',
+      'unparseable-verdict-bad-verdict-word',
+      'unparseable-verdict-bad-findings',
+      'unparseable-verdict-truncated',
+      'unparseable-verdict-other',
+    ];
+
+    it('counts every declared unparseable-verdict-<label> variant toward review-failing', () => {
+      const all = detectStalls(
+        snapshot({
+          runs: [parkedRun({ parkedAtIso: NOW, recentReviewCodes: [...LABELLED_CODES] })],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(all)).toEqual(['review-failing']);
+      expect(all[0]?.evidence.failures).toBe(LABELLED_CODES.length);
+      for (const code of LABELLED_CODES) {
+        const pair = detectStalls(
+          snapshot({
+            runs: [parkedRun({ parkedAtIso: NOW, recentReviewCodes: [code, code] })],
+          }),
+          DEFAULT_STALL_THRESHOLDS,
+          NOW,
+        );
+        expect(rulesOf(pair)).toEqual(['review-failing']);
+        expect(pair[0]?.evidence.failures).toBe(2);
+        const single = detectStalls(
+          snapshot({
+            runs: [parkedRun({ parkedAtIso: NOW, recentReviewCodes: [code] })],
+          }),
+          DEFAULT_STALL_THRESHOLDS,
+          NOW,
+        );
+        expect(rulesOf(single)).toEqual([]);
+      }
+    });
+
+    it('ignores non-array recentReviewCodes, non-string entries, and unknown unparseable-verdict-<unknown> labels', () => {
+      const sparse: unknown[] = ['unparseable-verdict-empty', 'unparseable-verdict-empty'];
+      delete sparse[0];
+      const ignored: unknown[] = [
+        ['unparseable-verdict-unknown-label', 'unparseable-verdict-', 'unparseable-verdict-EMPTY', 'unparseable-verdict-empty '],
+        [null, undefined, 7, {}, ['unparseable-verdict-empty']],
+        sparse,
+        'unparseable-verdict-empty',
+        null,
+        undefined,
+        42,
+        { length: 2 ** 32, 0: 'unparseable-verdict-empty', 1: 'unparseable-verdict-empty' },
+      ];
+      for (const codes of ignored) {
+        const findings = detectStalls(
+          snapshot({
+            runs: [parkedRun({ parkedAtIso: NOW, recentReviewCodes: codes as never })],
+          }),
+          DEFAULT_STALL_THRESHOLDS,
+          NOW,
+        );
+        expect(findings.filter((f) => f.rule === 'review-failing')).toEqual([]);
+      }
+      const mixed = detectStalls(
+        snapshot({
+          runs: [
+            parkedRun({
+              parkedAtIso: NOW,
+              recentReviewCodes: ['unparseable-verdict-empty', 'unparseable-verdict-unknown-label', 7, 'unparseable-verdict-truncated'] as never,
+            }),
+          ],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      const failing = mixed.filter((f) => f.rule === 'review-failing');
+      expect(failing).toHaveLength(1);
+      expect(failing[0]?.evidence.failures).toBe(2);
+    });
   });
 
   describe('admission-loop', () => {

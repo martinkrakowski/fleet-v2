@@ -535,7 +535,8 @@ function findingsLabel(raw: unknown): UnreadableReviewAnswerLabel {
   for (const entry of raw as unknown[]) {
     const record = readPlainRecord(entry);
     if (record === null) {
-      return 'bad-findings';
+      // A non-record entry does not settle the label: a later entry may carry an extra key.
+      continue;
     }
     const keys = Object.keys(record);
     if (keys.some((key) => !(FINDING_KEYS as readonly string[]).includes(key))) {

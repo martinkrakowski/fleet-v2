@@ -504,6 +504,18 @@ describe('ResumeLaneRunUseCase fix-no-progress park escalation', () => {
     expect((await entriesForRun(fx)).some((entry) => entry.kind === 'intent' && entry.key === RESUME_CLI_KEY)).toBe(false);
   });
 
+  it('refuses fix-no-progress with head-advanced when the worktree is clean but the HEAD moved past the recorded head commit', async () => {
+    // CE2: a clean worktree whose checked-out HEAD differs from the attempt's
+    // collected headCommit is `head-advanced`, not `worktree-clean`.
+    const moved = 'c'.repeat(40);
+    const fx = await seededEscalation({
+      inspect: { ...DIRTY_INSPECTION, uncommittedPaths: [], checkedOutCommit: moved },
+    });
+    expect(await request(fx)).toEqual({ outcome: 'refused', reason: 'head-advanced' });
+    // No intent was recorded for the refused resume.
+    expect((await entriesForRun(fx)).some((entry) => entry.kind === 'intent' && entry.key === RESUME_CLI_KEY)).toBe(false);
+  });
+
   it('refuses a second escalation with already-escalated', async () => {
     const fx = await seededEscalation();
     const keyBuilt = buildLaneRunStepKey({

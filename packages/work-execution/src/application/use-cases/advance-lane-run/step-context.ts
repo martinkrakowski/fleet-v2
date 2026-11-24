@@ -543,6 +543,9 @@ export async function saveOrRefuse(ctx: AdvanceStepContext, next: LaneRunRecord,
  */
 const PARK_ESCALATION_UNCOMMITTED_MAX = 4096;
 
+/** A full lowercase 40-hex git SHA (CE2), local to this module's head-fact read. */
+const LANE_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
 const STAY_PARKED: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'parked' };
 
 /**
@@ -554,11 +557,18 @@ const STAY_PARKED: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'parked'
  * descriptor and `readBoundedDenseArray`: O(1) refusal of a non-array, a
  * wrong prototype, an accessor or a list longer than the cap, then one
  * descriptor per index. A getter on the list never runs.
+ *
+ * CE2: the optional `headAdvanced` key is present only when BOTH the
+ * inspection's `checkedOutCommit` and the attempt's collected `headCommit`
+ * are valid lowercase 40-hex SHAs, and it is their strict inequality. It
+ * proves the head differs, not that it advanced (SPLIT_NEXT: the recollect
+ * must verify ancestry). A missing, malformed, uppercase or getter-backed
+ * `checkedOutCommit` leaves the key absent (unknown, read as `false`).
  */
-async function dirtyWorktreeFactOf(
+export async function dirtyWorktreeFactOf(
   ctx: AdvanceStepContext,
   latest: AttemptRecord | null,
-): Promise<{ readonly trackedFilesChanged: number } | undefined> {
+): Promise<{ readonly trackedFilesChanged: number; readonly headAdvanced?: boolean } | undefined> {
   const port = ctx.deps.worktreeInspect;
   if (port?.inspectWorktree === undefined || latest === null) {
     return undefined;
@@ -582,10 +592,12 @@ async function dirtyWorktreeFactOf(
     return undefined;
   }
   let paths: unknown;
+  let checkedOutCommit: unknown;
   try {
     // Own data descriptor only: an accessor's `value` is absent, so the
     // getter never runs.
     paths = Object.getOwnPropertyDescriptor(inspection, 'uncommittedPaths')?.value;
+    checkedOutCommit = Object.getOwnPropertyDescriptor(inspection, 'checkedOutCommit')?.value;
   } catch {
     return undefined;
   }
@@ -593,7 +605,25 @@ async function dirtyWorktreeFactOf(
   if (bounded === null) {
     return undefined;
   }
-  return { trackedFilesChanged: bounded.length };
+  // CE2: the attempt's collected head commit, read through its own
+  // descriptor too. A missing or malformed one leaves the head fact absent.
+  let headCommit: unknown;
+  try {
+    headCommit = Object.getOwnPropertyDescriptor(latest, 'artifacts')?.value;
+    headCommit = Object.getOwnPropertyDescriptor(headCommit, 'headCommit')?.value;
+  } catch {
+    headCommit = undefined;
+  }
+  const headAdvanced =
+    typeof checkedOutCommit === 'string' &&
+    typeof headCommit === 'string' &&
+    LANE_HEAD_SHA_PATTERN.test(checkedOutCommit) &&
+    LANE_HEAD_SHA_PATTERN.test(headCommit)
+      ? checkedOutCommit !== headCommit
+      : undefined;
+  return headAdvanced === undefined
+    ? { trackedFilesChanged: bounded.length }
+    : { trackedFilesChanged: bounded.length, headAdvanced };
 }
 
 /**

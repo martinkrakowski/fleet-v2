@@ -326,7 +326,10 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
           return null;
         }
       }
-      return { trackedFilesChanged: paths.length };
+      // CE2: the head fact is a strict inequality of the two 40-hex values
+      // (both validated above). It proves the head differs, not that it
+      // advanced (SPLIT_NEXT: the recollect must verify ancestry).
+      return { trackedFilesChanged: paths.length, headAdvanced: checkedOutCommit !== headCommit };
     } catch {
       return null;
     }

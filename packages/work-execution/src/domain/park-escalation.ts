@@ -13,7 +13,6 @@ import { parseParkClass } from './park-class.js';
 import { PARK_FINDINGS_MAX_COUNT } from './park-findings-view.js';
 import {
   readBoundedDenseArray,
-  readExactPlainRecord,
   readPlainRecordWithOptionalKeys,
   snapshotPlainDataRecord,
 } from './plain-record-reads.js';
@@ -29,6 +28,11 @@ export const PARK_ESCALATION_HISTORY_MAX = 256;
 /** The observed fact that justifies an escalation: tracked files changed since the attempt's head. */
 export interface DirtyWorktreeFact {
   readonly trackedFilesChanged: number;
+  /**
+   * Optional: the checked-out HEAD differs from the attempt's recorded head
+   * commit. Absent means unknown (treated as `false`).
+   */
+  readonly headAdvanced?: boolean;
 }
 
 /** Why the run stays parked instead of escalating. */
@@ -39,6 +43,7 @@ export const PARK_ESCALATION_STAY_REASONS = [
   'missing-dirty-worktree-fact',
   'malformed-dirty-worktree-fact',
   'worktree-clean',
+  'head-advanced',
   'park-reason-not-escalatable',
   'already-escalated',
 ] as const;
@@ -164,7 +169,7 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     if (dirtyWorktree === undefined || dirtyWorktree === null) {
       return { kind: 'stay-parked', reason: 'missing-dirty-worktree-fact' };
     }
-    const fact = readExactPlainRecord(dirtyWorktree, ['trackedFilesChanged']);
+    const fact = readPlainRecordWithOptionalKeys(dirtyWorktree, ['trackedFilesChanged'], ['headAdvanced']);
     if (fact === null) {
       return STAY_MALFORMED_DIRTY;
     }
@@ -172,7 +177,19 @@ export function decideParkEscalation(parked: unknown, history: unknown, dirtyWor
     if (typeof trackedFilesChanged !== 'number' || !Number.isSafeInteger(trackedFilesChanged) || trackedFilesChanged < 0) {
       return STAY_MALFORMED_DIRTY;
     }
+    // Optional `headAdvanced`: absent means unknown (treated as `false`). A
+    // present value that is not a boolean is malformed.
+    const headAdvanced = fact.headAdvanced;
+    if (headAdvanced !== undefined && typeof headAdvanced !== 'boolean') {
+      return STAY_MALFORMED_DIRTY;
+    }
     if (trackedFilesChanged === 0) {
+      // A clean worktree is only "nothing to do" when the head has not moved.
+      // A clean worktree whose HEAD advanced past the attempt's recorded head
+      // commit is a distinct typed reason (CE2): the work landed as commits.
+      if (headAdvanced === true) {
+        return { kind: 'stay-parked', reason: 'head-advanced' };
+      }
       return { kind: 'stay-parked', reason: 'worktree-clean' };
     }
     return { kind: 'escalate', mode: 'commit-pending' };

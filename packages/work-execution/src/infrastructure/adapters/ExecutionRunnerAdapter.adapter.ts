@@ -772,6 +772,16 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
   }
 
   async inspectSession(session: RunnerSessionRef): Promise<RunnerSessionStatus> {
+    // The session id is read once, inside a guard, and that one value serves every
+    // later use: a getter that throws or answers differently the second time is a
+    // refusal, never an exception or a different id in the receipt.
+    let readSessionId: unknown;
+    try {
+      readSessionId = session.sessionId;
+    } catch {
+      return unknownRunnerStatus();
+    }
+    const sessionId = typeof readSessionId === 'string' ? readSessionId : '';
     const guarded = await this.resolveRecordedRunner(session);
     if (!guarded.ok) {
       return unknownRunnerStatus();
@@ -793,7 +803,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     // No keyword scanning of the text.
     if (result.exitCode === 3) {
       const parsedId = parseSessionId(result.stdout);
-      if (parsedId !== null && session.sessionId && parsedId !== session.sessionId) {
+      if (parsedId !== null && sessionId !== '' && parsedId !== sessionId) {
         return {
           runnerReachable: 'unknown',
           workspacePreparation: 'unprepared',
@@ -818,14 +828,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       // --wait) confirms "nothing runs" only after two status reads
       // OCM_WAIT_CONFIRM seconds apart. One momentary idle read between two
       // steps would otherwise end the session and park the lane.
-      // Read once, inside a guard: a getter that throws is a refusal, never an exception.
-      let readSessionId: unknown;
-      try {
-        readSessionId = session.sessionId;
-      } catch {
-        return unknownRunnerStatus();
-      }
-      if (typeof readSessionId !== 'string' || readSessionId.trim() === '') {
+      if (sessionId.trim() === '') {
         return unknownRunnerStatus();
       }
 
@@ -902,7 +905,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
 
       const receipt: CommandCompletionReceipt = {
         attemptId: session.attemptId,
-        sessionId: session.sessionId,
+        sessionId,
         endedAtIso: parsedEndedAtIso,
         authoritative: true,
         exitStatus: parsedExitStatus,

@@ -136,6 +136,29 @@ describe('ExecutionRunnerAdapter inspectSession confirms an exit-0 status with a
     expect(calls.length).toBeLessThanOrEqual(1);
   });
 
+  it('reads a sessionId getter exactly once: a getter that answers once and then throws never reaches the receipt or an exception', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 0, stdout: startedJson, stderr: '' },
+      { exitCode: 0, stdout: endedJson, stderr: '' },
+    ]);
+    const { sleep } = spySleep();
+    const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166, sleep });
+    let reads = 0;
+    const flaky = {
+      attemptId: 'att-1',
+      worktreePath: worktree,
+      runner: runnerRecord,
+      get sessionId(): string {
+        reads += 1;
+        if (reads > 1) throw new Error('second read must never happen');
+        return 'ses_cb2';
+      },
+    };
+    const status = await adapter.inspectSession(flaky as never);
+    expect(status.completionReceipt?.sessionId).toBe('ses_cb2');
+    expect(status.workerCommand).toBe('ended');
+  });
+
   it('returns unknown with one spawn when the first status read throws or exits non-0/non-3', async () => {
     for (const first of [new Error('connection refused'), { exitCode: 1, stdout: '', stderr: 'down' } as SubprocessResult]) {
       const { runner, calls } = scriptedRunner([first]);

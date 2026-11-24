@@ -936,6 +936,22 @@ describe('renderHandoverBrief output tails (GD2)', () => {
     expect(withBrief).toEqual({ ok: false, reason: 'handover-too-large' });
   });
 
+  it('refuses a wrong-primitive or throwing-getter originalBrief with invalid-original-brief, never treating it as absent', () => {
+    for (const hostile of [7, {}, ['a'], true, undefined]) {
+      expect(renderHandoverBrief(input({ findings: [finding({ severity: 'blocker', summary: 'x' })], originalBrief: hostile as unknown as string })), String(hostile)).toEqual({
+        ok: false,
+        reason: 'invalid-original-brief',
+      });
+    }
+    const withGetter = {
+      ...input({ findings: [finding({ severity: 'blocker', summary: 'x' })] }),
+      get originalBrief(): string {
+        throw new Error('getter must not escape');
+      },
+    } as RenderHandoverBriefInput;
+    expect(renderHandoverBrief(withGetter)).toEqual({ ok: false, reason: 'invalid-original-brief' });
+  });
+
   it('trims a 60 000-character three-byte-character brief under the 61 440-byte cap (bytes, not .length)', () => {
     // 60 000 characters of U+2014 are 180 000 UTF-8 bytes: a `.length`-based
     // cap (60 000 characters) would trim nothing and the assembled text would

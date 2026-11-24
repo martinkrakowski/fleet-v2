@@ -86,6 +86,7 @@ export const HANDOVER_BRIEF_REFUSAL_REASONS = [
   'invalid-gate-predicate',
   'invalid-gate-code',
   'invalid-proof-command',
+  'invalid-original-brief',
   'nothing-to-fix',
   'handover-too-large',
 ] as const;
@@ -600,8 +601,21 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   // The tails never take the room the original brief's truncation marker needs:
   // when a brief is present, one marker line (sized for its largest possible
   // omitted-byte count) is reserved, so a brief is never dropped unmarked.
+  // The brief is read once, here: a throwing getter or a wrong primitive is a
+  // typed refusal, never an absent brief. O(1) check; the byte measure below is
+  // one O(brief length) pass.
+  let originalBrief: string | null;
+  try {
+    const read: unknown = input.originalBrief;
+    if (read !== null && typeof read !== 'string') {
+      return { ok: false, reason: 'invalid-original-brief' };
+    }
+    originalBrief = read;
+  } catch {
+    return { ok: false, reason: 'invalid-original-brief' };
+  }
   const originalBriefBytes =
-    input.originalBrief !== null && input.originalBrief.length > 0 ? utf8ByteLength(input.originalBrief) : 0;
+    originalBrief !== null && originalBrief.length > 0 ? utf8ByteLength(originalBrief) : 0;
   const markerReserveBytes =
     originalBriefBytes > 0 ? 1 + utf8ByteLength(truncatedBriefMarkerLine(originalBriefBytes)) : 0;
   let tailSectionLines: string[] = [];
@@ -619,10 +633,11 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
       .map((line) => TAIL_LINE_PREFIX + line);
     const tailLineBytes = tailLines.map(utf8ByteLength);
     // The section renders as ['', ...tailHeader, ...kept, '```'] joined with
-    // '\n': the header block, one newline, the kept lines with one newline
-    // between each, and the closing fence.
+    // '\n': the header block, one newline before the first kept line, the
+    // kept lines with one newline between each, one newline before the
+    // closing fence, and the closing fence.
     const tailOverheadBytes =
-      utf8ByteLength(['', ...tailHeader].join('\n')) + 1 + utf8ByteLength('```');
+      utf8ByteLength(['', ...tailHeader].join('\n')) + 2 + utf8ByteLength('```');
     let keptBytes = tailLineBytes.reduce((total, bytes) => total + bytes, 0);
     let head = 0;
     while (
@@ -649,12 +664,12 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   // reads back null.
   let closingLines = closingLinesWithoutBrief;
   let briefSectionLines: string[] = [];
-  if (input.originalBrief !== null) {
-    if (containsSecretShape(input.originalBrief)) {
+  if (originalBrief !== null) {
+    if (containsSecretShape(originalBrief)) {
       return { ok: false, reason: 'secret-shaped-input' };
     }
-    if (input.originalBrief.length > 0) {
-      const briefLines = input.originalBrief.split('\n');
+    if (originalBrief.length > 0) {
+      const briefLines = originalBrief.split('\n');
       const briefLineBytes = briefLines.map(utf8ByteLength);
       const totalBriefBytes =
         briefLineBytes.reduce((total, bytes) => total + bytes, 0) + Math.max(0, briefLines.length - 1);

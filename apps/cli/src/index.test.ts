@@ -478,6 +478,76 @@ describe('CLI installation wiring', () => {
       expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
       expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-old')).toEqual(before);
     });
+
+    /** A runtime whose inspect port returns the given work-order object verbatim (so a getter or prototype survives). */
+    async function seedInspected(workOrder: object) {
+      const runtime = await seedStoppedWorkOrder({});
+      Object.assign(runtime.execution, {
+        inspectWorkOrder: {
+          inspectWorkOrder: async () => ({
+            outcome: 'found' as const,
+            workOrder,
+            attempts: [],
+            activeReservations: [],
+          }),
+        },
+      });
+      return runtime;
+    }
+
+    const rerunBase = {
+      id: 'wo-old',
+      state: 'stopped',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'git@example.org:acme/app.git',
+      baseCommit: 'abc123',
+      ownedPaths: ['packages/app-a/**'],
+      policyRevision: 'policy-7',
+      prerequisiteWorkOrderIds: [] as string[],
+      revision: 1,
+    };
+
+    it('refuses an own baseBranch getter returning main as unsupported-base-branch without invoking the getter', async () => {
+      let invoked = 0;
+      const workOrder = Object.defineProperty({ ...rerunBase }, 'baseBranch', {
+        enumerable: true,
+        get() {
+          invoked += 1;
+          return 'main';
+        },
+      });
+      const runtime = await seedInspected(workOrder);
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(invoked).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'refused', reason: 'unsupported-base-branch' });
+      expect(await runtime.execution.workOrderRepository.findWorkOrderById('wo-new')).toBeNull();
+    });
+
+    it('treats an inherited baseBranch staging on the prototype as absent and reruns on main', async () => {
+      const workOrder = Object.assign(Object.create({ baseBranch: 'staging' }) as object, rerunBase);
+      expect('baseBranch' in workOrder).toBe(true);
+      expect(Object.hasOwn(workOrder, 'baseBranch')).toBe(false);
+      const runtime = await seedInspected(workOrder);
+      const { io, stdout } = createMockIo();
+      const exitCode = await runCli(
+        ['work-order', 'rerun', '--from', 'wo-old', '--workOrderId', 'wo-new', '--yes'],
+        io,
+        runtime,
+      );
+
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ outcome: 'registered' });
+      expect((await runtime.execution.workOrderRepository.findWorkOrderById('wo-new'))?.baseBranch).toBe('main');
+    });
   });
 
   describe('coordination resolve-auth head requirement (GR1a2 M5)', () => {

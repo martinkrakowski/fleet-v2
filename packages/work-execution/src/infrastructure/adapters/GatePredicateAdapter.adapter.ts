@@ -1461,7 +1461,11 @@ export class GatePredicateAdapter implements GatePredicatePort {
     if (raw === 'fail') {
       const combined = run.stdout + '\n' + run.stderr;
       if (combined.includes('Cannot find module') || combined.includes('ERR_MODULE_NOT_FOUND')) {
-        const present = await this.stateFilePresent(executor, worktreePath);
+        // A non-yarn worktree can never be environment-not-installed (nothing
+        // here could install it): its failure stays the command's own verdict.
+        const present =
+          (await this.stateFilePresent(executor, worktreePath)) ||
+          !(await this.isYarnProject(executor, worktreePath));
         if (!present) {
           // The missing-module path carries the command's own tail (the 32 KiB
           // command bound), not the shorter install tail.

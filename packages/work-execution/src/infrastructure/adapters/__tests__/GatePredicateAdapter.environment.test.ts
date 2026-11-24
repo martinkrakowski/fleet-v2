@@ -349,9 +349,29 @@ describe('GatePredicateAdapter worktree environment', () => {
       verdict: 'unknown',
       cause: 'environment-not-installed',
       exitCode: 1,
-      outputTail: "\nError: Cannot find module '@fleet/shared'",
+      outputTail: "Error: Cannot find module '@fleet/shared'",
     });
     expect(results[0]).not.toHaveProperty('failingFile');
+  });
+
+  it('keeps a missing-module failure as fail in a non-yarn worktree even with no state file', async () => {
+    const executor = new ScriptedExecutor(
+      (argv) => {
+        if (argv[0] === 'test') {
+          return { exitCode: 1 };
+        }
+        if (argv[0] === 'sh') {
+          return { exitCode: 1, stderr: 'Error: Cannot find module \'@fleet/shared\'\n' };
+        }
+        return happyGit(argv);
+      },
+      false,
+    );
+    const { adapter } = makeAdapter(executor);
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(1))));
+    expect(results[0].verdict).toBe('fail');
+    expect(results[0]).not.toHaveProperty('cause');
+    expect(executor.installs()).toBe(0);
   });
 
   it('keeps a missing-module failure as fail when the dependency state file is present', async () => {

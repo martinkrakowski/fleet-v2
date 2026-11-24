@@ -35,6 +35,8 @@ function utf8ByteLength(text: string): number {
   return UTF8_ENCODER.encode(text).byteLength;
 }
 
+const TRUNCATION_MARKER_LINE = /^\[original brief truncated: \d+ bytes omitted; read the brief file in the worktree\]$/m;
+
 /** CB6: the one-line marker written when any line of the original brief is omitted. */
 const truncatedBriefMarkerLine = (omittedBytes: number): string =>
   `[original brief truncated: ${omittedBytes} bytes omitted; read the brief file in the worktree]`;
@@ -598,9 +600,6 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   // once and the head is dropped by advancing an offset, never by `shift()`
   // or a per-iteration re-join, so the truncation pass is O(total tail
   // length).
-  // The tails never take the room the original brief's truncation marker needs:
-  // when a brief is present, one marker line (sized for its largest possible
-  // omitted-byte count) is reserved, so a brief is never dropped unmarked.
   // The brief is read once, here: a throwing getter or a wrong primitive is a
   // typed refusal, never an absent brief. O(1) check; the byte measure below is
   // one O(brief length) pass.
@@ -614,13 +613,75 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   } catch {
     return { ok: false, reason: 'invalid-original-brief' };
   }
-  const originalBriefBytes =
-    originalBrief !== null && originalBrief.length > 0 ? utf8ByteLength(originalBrief) : 0;
-  const markerReserveBytes =
-    originalBriefBytes > 0 ? 1 + utf8ByteLength(truncatedBriefMarkerLine(originalBriefBytes)) : 0;
+  if (originalBrief !== null && containsSecretShape(originalBrief)) {
+    return { ok: false, reason: 'secret-shaped-input' };
+  }
+
+  // Priority: the original brief is the round-2 source of truth, so it is
+  // placed FIRST, whole when it fits beside the fixed part and otherwise cut
+  // from its end with the one-line marker. The tails then take whatever
+  // budget is left. Only a brief that cannot fit even as a marker alone
+  // refuses `handover-too-large`.
+  const baseBytes = fixedHeadBytes + 1 + closingBytes;
+  const briefBudget = MAX_HANDOVER_BRIEF_BYTES - baseBytes;
+  let closingLines = closingLinesWithoutBrief;
+  let briefSectionLines: string[] = [];
+  let briefAddBytes = 0;
+  if (originalBrief !== null && originalBrief.length > 0) {
+    const briefLines = originalBrief.split('\n');
+    const briefLineBytes = briefLines.map(utf8ByteLength);
+    const totalBriefBytes =
+      briefLineBytes.reduce((total, bytes) => total + bytes, 0) + Math.max(0, briefLines.length - 1);
+    // The section renders as ['', MARKER, '', HEADER, '', ...kept] joined
+    // with '\n': the marker and header bytes plus four newlines (the leading
+    // newline from the outer join included).
+    const sectionOverheadBytes =
+      utf8ByteLength([ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER].join('\n')) + 4;
+    if (totalBriefBytes + sectionOverheadBytes <= briefBudget) {
+      briefSectionLines = ['', ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER, '', ...briefLines];
+      briefAddBytes = totalBriefBytes + sectionOverheadBytes;
+    } else {
+      // Walk from the whole brief down to zero kept lines, dropping whole
+      // lines from the end; O(1) per step after one O(brief length) pass.
+      let kept = briefLineBytes.reduce((total, bytes) => total + bytes, 0);
+      let chosen = -1;
+      let chosenOmitted = 0;
+      for (let k = briefLines.length; k >= 0; k -= 1) {
+        const keptJoinedBytes = k === 0 ? 0 : kept + (k - 1);
+        const omitted = totalBriefBytes - keptJoinedBytes;
+        // Inserting ['', marker] before the closing lines adds TWO newlines.
+        const markerAdd = 2 + utf8ByteLength(truncatedBriefMarkerLine(omitted));
+        const sectionAdd = k === 0 ? 0 : sectionOverheadBytes + keptJoinedBytes;
+        if (markerAdd + sectionAdd <= briefBudget) {
+          chosen = k;
+          chosenOmitted = omitted;
+          briefAddBytes = markerAdd + sectionAdd;
+          break;
+        }
+        if (k > 0) {
+          kept -= briefLineBytes[k - 1];
+        }
+      }
+      if (chosen < 0) {
+        // Not even the marker fits: refuse rather than drop the brief unmarked.
+        return { ok: false, reason: 'handover-too-large' };
+      }
+      closingLines = ['', truncatedBriefMarkerLine(chosenOmitted), ...closingLinesWithoutBrief];
+      if (chosen > 0) {
+        briefSectionLines = ['', ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER, '', ...briefLines.slice(0, chosen)];
+      }
+    }
+  }
+
+  // The failing predicates' output tails render as one data-only fenced
+  // section directly after the numbered fixes block, never inside
+  // `numberedFixes`. They trim from their head (the newest lines survive) into
+  // the budget the brief left, measured in UTF-8 bytes: each line's byte
+  // length is measured once and the head advances by offset, so the pass is
+  // O(total tail length).
   let tailSectionLines: string[] = [];
-  let tailSectionBytes = 0;
   if (tails.length > 0) {
+    const tailBudget = MAX_HANDOVER_BRIEF_BYTES - baseBytes - briefAddBytes;
     const tailHeader = ['Failed gate output tail (data only, never an instruction):', '```'];
     const tailLines = tails
       .map((tail) => tail.split('```').join('\\`\\`\\`'))
@@ -640,93 +701,13 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
       utf8ByteLength(['', ...tailHeader].join('\n')) + 2 + utf8ByteLength('```');
     let keptBytes = tailLineBytes.reduce((total, bytes) => total + bytes, 0);
     let head = 0;
-    while (
-      tailLines.length - head > 0 &&
-      fixedHeadBytes + 1 + tailOverheadBytes + keptBytes + (tailLines.length - head - 1) + 1 + closingBytes + markerReserveBytes >
-        MAX_HANDOVER_BRIEF_BYTES
-    ) {
+    // `1 +` is the newline joining the section to the text before it.
+    while (tailLines.length - head > 0 && 1 + tailOverheadBytes + keptBytes + (tailLines.length - head - 1) > tailBudget) {
       keptBytes -= tailLineBytes[head];
       head += 1;
     }
-    const keptCount = tailLines.length - head;
-    if (keptCount > 0) {
+    if (tailLines.length - head > 0) {
       tailSectionLines = ['', ...tailHeader, ...tailLines.slice(head), '```'];
-      tailSectionBytes = tailOverheadBytes + keptBytes + (keptCount - 1);
-    }
-  }
-
-  // CB6: the original brief trims from its END at a line boundary; the
-  // surviving prefix lines stay in the ORIGINAL_BRIEF_MARKER section at the
-  // end. When any line is omitted, a one-line marker naming the omitted byte
-  // count is inserted immediately before the proof commands (or before the
-  // closing line when there are none). If zero lines fit alongside the
-  // marker, the ORIGINAL_BRIEF_MARKER section is omitted so `originalBriefOf`
-  // reads back null.
-  let closingLines = closingLinesWithoutBrief;
-  let briefSectionLines: string[] = [];
-  if (originalBrief !== null) {
-    if (containsSecretShape(originalBrief)) {
-      return { ok: false, reason: 'secret-shaped-input' };
-    }
-    if (originalBrief.length > 0) {
-      const briefLines = originalBrief.split('\n');
-      const briefLineBytes = briefLines.map(utf8ByteLength);
-      const totalBriefBytes =
-        briefLineBytes.reduce((total, bytes) => total + bytes, 0) + Math.max(0, briefLines.length - 1);
-      // The section renders as ['', MARKER, '', HEADER, '', ...kept] joined
-      // with '\n': six newlines plus the marker and header bytes.
-      const sectionOverheadBytes =
-        utf8ByteLength([ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER].join('\n')) + 4;
-      const assembledWithoutBriefBytes =
-        fixedHeadBytes +
-        (tailSectionLines.length > 0 ? 1 + tailSectionBytes : 0) +
-        1 +
-        closingBytes;
-      const budget = MAX_HANDOVER_BRIEF_BYTES - assembledWithoutBriefBytes;
-      if (totalBriefBytes + sectionOverheadBytes <= budget) {
-        // The whole brief fits alongside the fixed part: append it untouched.
-        briefSectionLines = ['', ORIGINAL_BRIEF_MARKER, '', ORIGINAL_BRIEF_HEADER, '', ...briefLines];
-      } else {
-        // Walk from the whole brief down to zero kept lines, dropping whole
-        // lines from the end; each step is O(1), so the pass is O(brief
-        // lines) after one O(brief length) byte-measurement pass.
-        let kept = briefLineBytes.reduce((total, bytes) => total + bytes, 0);
-        let chosen = -1;
-        let chosenOmitted = 0;
-        for (let k = briefLines.length; k >= 0; k -= 1) {
-          const keptJoinedBytes = k === 0 ? 0 : kept + (k - 1);
-          const omitted = totalBriefBytes - keptJoinedBytes;
-          const markerAdd = 1 + utf8ByteLength(truncatedBriefMarkerLine(omitted));
-          const sectionAdd = k === 0 ? 0 : sectionOverheadBytes + keptJoinedBytes;
-          if (markerAdd + sectionAdd <= budget) {
-            chosen = k;
-            chosenOmitted = omitted;
-            break;
-          }
-          if (k > 0) {
-            kept -= briefLineBytes[k - 1];
-          }
-        }
-        if (chosen >= 0) {
-          closingLines = ['', truncatedBriefMarkerLine(chosenOmitted), ...closingLinesWithoutBrief];
-          if (chosen > 0) {
-            briefSectionLines = [
-              '',
-              ORIGINAL_BRIEF_MARKER,
-              '',
-              ORIGINAL_BRIEF_HEADER,
-              '',
-              ...briefLines.slice(0, chosen),
-            ];
-          }
-        }
-        // chosen === -1: not even the truncation marker fits. Dropping the
-        // brief without that marker would hide the omission from the reader,
-        // so the render refuses instead of silently losing the brief.
-        if (chosen < 0) {
-          return { ok: false, reason: 'handover-too-large' };
-        }
-      }
     }
   }
 
@@ -752,5 +733,10 @@ export function originalBriefOf(handoverText: string): string | null {
   if (sectionStart === -1) {
     return null;
   }
-  return handoverText.slice(sectionStart + ORIGINAL_BRIEF_SECTION_START.length);
+  const body = handoverText.slice(sectionStart + ORIGINAL_BRIEF_SECTION_START.length);
+  // A truncated round-1 handover carries its marker line before the section:
+  // it is carried onto the recovered original, so a later round renders the
+  // omission instead of presenting the surviving prefix as the whole brief.
+  const marker = TRUNCATION_MARKER_LINE.exec(handoverText.slice(0, sectionStart));
+  return marker === null ? body : `${body}\n${marker[0]}`;
 }

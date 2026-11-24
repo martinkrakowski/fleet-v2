@@ -397,7 +397,9 @@ describe('conductor review structured composition (RV5, F153)', () => {
     expect(freeTextStored!.reviewReceipts).toHaveLength(2);
     for (const receipt of freeTextStored!.reviewReceipts) {
       expect(receipt.result).toBe('unknown');
-      expect(receipt.unknownReason).toBe('unparseable-verdict');
+      // The classification threads the readable label: plain prose with no
+      // JSON and no fence classifies as 'no-json' (brief step 3).
+      expect(receipt.unknownReason).toBe('unparseable-verdict-no-json');
     }
     // The bounded diagnostic findings (if any) never rescue the unknown:
     // the reply stays unparseable and nothing passes.

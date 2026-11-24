@@ -31,6 +31,12 @@ import {
 import type { ReviewLocation } from '../ReviewTransportRouter.js';
 import type { SpawnRunOptions } from '../spawn-run.js';
 
+// CB7: a non-empty refusal carries the per-label cause token
+// `unparseable-verdict-<label>`; the bare token stays only on receipts
+// recorded before CB7. Tables of many malformed replies assert the token
+// shape; exact-label cases assert the exact token.
+const UNPARSEABLE_REASON = /^unparseable-verdict-[a-z-]+$/;
+
 const NONCE = 'a'.repeat(32);
 const DIFF = 'diff --git a/a.txt b/a.txt\n-old\n+new\n';
 
@@ -1203,7 +1209,7 @@ describe('structured review answers (RV5, CLI conductor replies)', () => {
       const { transport } = conductorHarness(reply);
       const result = await transport(CONDUCTOR_REQUEST);
       expect(result.result, reply).toBe('unknown');
-      expect(result.unknownReason, reply).toBe('unparseable-verdict');
+      expect(result.unknownReason, reply).toMatch(UNPARSEABLE_REASON);
       expect(result.result, reply).not.toBe('pass');
     }
   });
@@ -1212,7 +1218,7 @@ describe('structured review answers (RV5, CLI conductor replies)', () => {
     const { transport } = conductorHarness(jsonReply('PASS') + '\n' + jsonReply('FAIL', [finding('major', 'a.txt', 1, 'x')]));
     const result = await transport(CONDUCTOR_REQUEST);
     expect(result.result).toBe('unknown');
-    expect(result.unknownReason).toBe('unparseable-verdict');
+    expect(result.unknownReason).toMatch(UNPARSEABLE_REASON);
     expect(result.findings).toEqual([]);
   });
 
@@ -1224,7 +1230,7 @@ describe('structured review answers (RV5, CLI conductor replies)', () => {
     const { transport } = conductorHarness(echoedAlone);
     const result = await transport(CONDUCTOR_REQUEST);
     expect(result.result).toBe('unknown');
-    expect(result.unknownReason).toBe('unparseable-verdict');
+    expect(result.unknownReason).toMatch(UNPARSEABLE_REASON);
     expect(result.findings).toEqual([]);
 
     const outerDecides = conductorHarness(echoedAlone + '\n' + jsonReply('PASS'));
@@ -1246,7 +1252,7 @@ describe('structured review answers (RV5, CLI conductor replies)', () => {
       const { transport } = conductorHarness(reply);
       const result = await transport(CONDUCTOR_REQUEST);
       expect(result.result, reply).toBe('unknown');
-      expect(result.unknownReason, reply).toBe('unparseable-verdict');
+      expect(result.unknownReason, reply).toMatch(UNPARSEABLE_REASON);
       expect(result.findings, reply).toEqual([]);
     }
   });

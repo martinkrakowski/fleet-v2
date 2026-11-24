@@ -103,6 +103,10 @@ class ScriptedExecutor implements CommandExecutorPort {
     }
     // The environment probe is not a gate run; it never counts.
     if (head === 'test') {
+      // The yarn-project probe (`-a`): this fixture worktree is a yarn project.
+      if (argv.includes('-a')) {
+        return ok('');
+      }
       return this.stateFilePresent
         ? ok('')
         : { exitCode: 1, signal: null, stdout: '', stderr: '' };

@@ -1071,6 +1071,23 @@ export class GatePredicateAdapter implements GatePredicatePort {
   }
 
   /**
+   * Whether the worktree is a yarn project: `package.json` and `yarn.lock` both
+   * exist, probed with one `test` through the host executor. Any failure reads
+   * as not a yarn project, which leaves the gate behaving as before CB1.
+   */
+  private async isYarnProject(executor: CommandExecutorPort, worktreePath: string): Promise<boolean> {
+    try {
+      const probe = await executor.run(
+        ['test', '-f', join(worktreePath, 'package.json'), '-a', '-f', join(worktreePath, 'yarn.lock')],
+        { cwd: worktreePath, timeoutMs: PROBE_TIMEOUT_MS },
+      );
+      return isUsableRun(probe) && probe.error === undefined && probe.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * The memoized environment check of ONE gate run: probe the dependency
    * state file once; when it is absent, run at most one bounded
    * `yarn install --immutable` through the same executor and gate-slot
@@ -1099,6 +1116,12 @@ export class GatePredicateAdapter implements GatePredicatePort {
     budget: GateSlotBudget,
   ): Promise<EnvironmentReadiness> {
     if (await this.stateFilePresent(executor, worktreePath)) {
+      return { ready: true };
+    }
+    // Only a yarn project can need an install: a worktree without a
+    // package.json AND a yarn.lock is gated exactly as before CB1 (no install
+    // attempted, no environment verdict).
+    if (!(await this.isYarnProject(executor, worktreePath))) {
       return { ready: true };
     }
     const started = this.nowMs();

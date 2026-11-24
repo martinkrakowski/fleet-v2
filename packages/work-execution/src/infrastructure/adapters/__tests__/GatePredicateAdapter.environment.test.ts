@@ -52,15 +52,25 @@ function request(commands: number): EvaluateGatePredicatesRequest {
   };
 }
 
+/** The one `test -f <wt>/package.json -a -f <wt>/yarn.lock` probe of the yarn-project check. */
+function isYarnProjectProbe(argv: readonly string[]): boolean {
+  return argv[0] === 'test' && argv.includes('-a');
+}
+
 class ScriptedExecutor implements CommandExecutorPort {
   readonly argvRecords: string[][] = [];
 
   constructor(
     private readonly script: (argv: readonly string[]) => Partial<CommandRunResult>,
+    /** Whether the worktree has a package.json AND a yarn.lock (the yarn-project probe). */
+    private readonly yarnProject = true,
   ) {}
 
   async run(argv: readonly string[], _options?: CommandRunOptions): Promise<CommandRunResult> {
     this.argvRecords.push([...argv]);
+    if (isYarnProjectProbe(argv)) {
+      return { exitCode: this.yarnProject ? 0 : 1, signal: null, stdout: '', stderr: '' };
+    }
     return {
       exitCode: 0,
       signal: null,
@@ -71,7 +81,11 @@ class ScriptedExecutor implements CommandExecutorPort {
   }
 
   probes(): number {
-    return this.argvRecords.filter((argv) => argv[0] === 'test' && argv[1] === '-f').length;
+    return this.argvRecords.filter((argv) => argv[0] === 'test' && argv[1] === '-f' && !isYarnProjectProbe(argv)).length;
+  }
+
+  yarnProjectProbes(): number {
+    return this.argvRecords.filter(isYarnProjectProbe).length;
   }
 
   installs(): number {
@@ -166,6 +180,27 @@ describe('GatePredicateAdapter worktree environment', () => {
     expect(executor.installs()).toBe(0);
     expect(executor.commands()).toBe(1);
     expect(executor.probes()).toBe(1);
+  });
+
+  it('attempts no install and keeps the command verdict when the worktree is not a yarn project (no package.json and yarn.lock)', async () => {
+    const executor = new ScriptedExecutor((argv) => {
+      if (argv[0] === 'test') {
+        return { exitCode: 1 };
+      }
+      if (argv[0] === 'sh') {
+        return { exitCode: 0 };
+      }
+      return happyGit(argv);
+    }, false);
+    const { adapter } = makeAdapter(executor);
+    const results = commandResultsOf(evaluatedResults(await adapter.evaluateGatePredicates(request(2))));
+    expect(executor.installs()).toBe(0);
+    expect(executor.yarnProjectProbes()).toBe(1);
+    expect(executor.commands()).toBe(2);
+    for (const result of results) {
+      expect(result).toMatchObject({ verdict: 'pass', exitCode: 0 });
+      expect(result.cause).toBeUndefined();
+    }
   });
 
   it('installs once, re-probes, and passes both commands when the state file is absent', async () => {

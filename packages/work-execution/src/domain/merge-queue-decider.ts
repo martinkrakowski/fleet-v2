@@ -1243,10 +1243,103 @@ function hasAccessorDeep(raw: unknown): boolean {
   return walk(raw, 0);
 }
 
-/** True when the record's own descriptor for the key is an accessor (get or set). */
-function ownsAccessor(raw: Record<string, unknown>, key: string): boolean {
-  const descriptor = Reflect.getOwnPropertyDescriptor(raw, key);
-  return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
+type RetroRecord = Extract<ReturnType<typeof readMergeQueueEntryRecord>, { ok: true }>['record'];
+type RetroFacts = Extract<ReturnType<typeof validateFacts>, { ok: true }>['value'];
+type RetroPolicy = NonNullable<ReturnType<typeof normalizeRepoPolicy>>;
+
+/**
+ * True when a raw record has an own numeric or accessor `length` (an
+ * array-like) or a prototype-polluting own key. Reads own descriptors only;
+ * cost O(1).
+ */
+function isArrayLikeOrPolluting(raw: Record<string, unknown>): boolean {
+  const length = Reflect.getOwnPropertyDescriptor(raw, 'length');
+  if (length !== undefined && (length.get !== undefined || length.set !== undefined || typeof length.value === 'number')) {
+    return true;
+  }
+  return ['__proto__', 'constructor', 'prototype'].some((key) => Reflect.getOwnPropertyDescriptor(raw, key) !== undefined);
+}
+
+/**
+ * The retro preflight over the raw inputs, before anything is normalized or
+ * validated: an array-like or prototype-polluting policy or facts record, or
+ * an accessor ANYWHERE in either (every own key at every depth, bounded by
+ * RETRO_ACCESSOR_SCAN_MAX_DEPTH / _MAX_KEYS, failing closed past a bound), is
+ * refused, so no getter is ever invoked. Cost O(RETRO_ACCESSOR_SCAN_MAX_KEYS).
+ */
+function retroInputsHostile(repoPolicy: unknown, facts: unknown): boolean {
+  if (isPlainObject(repoPolicy) && isArrayLikeOrPolluting(repoPolicy as Record<string, unknown>)) {
+    return true;
+  }
+  if (isPlainObject(facts) && isArrayLikeOrPolluting(facts as Record<string, unknown>)) {
+    return true;
+  }
+  return hasAccessorDeep(repoPolicy) || hasAccessorDeep(facts);
+}
+
+/**
+ * The live path's decider predicates on the merged head: the entry head is
+ * the merged head (and the re-read agrees), every required context is green
+ * with the premerge posted by the configured poster, threads are known and
+ * zero, no veto holds, the observed base matches, and no macOS procedure is
+ * owed. Cost O(|policy.requiredContexts|).
+ */
+function retroDeciderWouldMerge(record: RetroRecord, facts: RetroFacts, policy: RetroPolicy, nowIso: string): boolean {
+  // A parked entry is eligible only when its park reason was `checks` —
+  // the one park the retro re-enters through the live predicates.
+  if (record.state === 'parked' && record.reason !== 'checks') {
+    return false;
+  }
+  const pr = facts.pr;
+  if (pr.status !== 'merged' || !isMergeHex40(pr.headOid) || pr.headOid !== record.headOid) {
+    return false;
+  }
+  const reRead = facts.reReadHeadOid;
+  if (reRead !== undefined && (!isMergeHex40(reRead) || reRead !== record.headOid)) {
+    return false;
+  }
+  const checks = checksStep(record, facts, policy, nowIso, Date.parse(nowIso));
+  if (checks.decision !== null || checks.deferCarry || threadsStep(record, facts) !== null) {
+    return false;
+  }
+  const resolvedVeto = resolveVeto(record, facts);
+  if (resolvedVeto === VETO_UNREADABLE) {
+    return false;
+  }
+  const verdict = evaluateMergeVeto(resolvedVeto, { mode: policy.vetoMode, holdConfidence: policy.holdConfidence });
+  if (verdict === 'act-veto' || verdict === 'park-hold' || verdict === 'would-hold') {
+    return false;
+  }
+  // A macOS procedure row exists on the live path; a retro head that owes
+  // one cannot be estimated from the facts gathered, so it refuses.
+  return observedBaseStep(record, facts) === null && policy.macosProcedure === null;
+}
+
+/**
+ * The merge state at merge time is unobservable (owner-accepted residual for
+ * `detail: 'retro'` rows, 2026-11-24). The retro estimate needs the
+ * merge-commit time and every required context's own creation time, each at
+ * or before the merge: a missing or unparsable timestamp refuses.
+ * Cost O(|policy.requiredContexts|).
+ */
+function retroChecksPredateMerge(facts: RetroFacts, policy: RetroPolicy): boolean {
+  const mergedAt = facts.mergedAtIso;
+  if (typeof mergedAt !== 'string' || !isZonedIsoDateTime(mergedAt)) {
+    return false;
+  }
+  const mergedAtMs = Date.parse(mergedAt);
+  const contexts = facts.contexts;
+  if (!isPlainObject(contexts)) {
+    return false;
+  }
+  return policy.requiredContexts.every((name) => {
+    const fact = readContextFact(contexts as Record<string, unknown>, name);
+    if (!fact.ok) {
+      return false;
+    }
+    const createdAt = fact.value.createdAtIso;
+    return typeof createdAt === 'string' && isZonedIsoDateTime(createdAt) && Date.parse(createdAt) <= mergedAtMs;
+  });
 }
 
 /**
@@ -1273,160 +1366,19 @@ export function isMergedHeadRetroMergeEligible(
 ): boolean {
   try {
     const read = readMergeQueueEntryRecord(entry);
-    if (!read.ok || !isZonedIsoDateTime(nowIso)) {
-      return false;
-    }
-    // The policy is normalized only after its own readable keys are probed
-    // for accessors: a getter on any key `normalizeRepoPolicy` would read
-    // is refused before it could run. An own numeric `length` (array-like)
-    // and a prototype-polluting own key are refused the same way. Cost O(1)
-    // per probed key.
-    if (isPlainObject(repoPolicy)) {
-      const policyRecord = repoPolicy as unknown as Record<string, unknown>;
-      const policyLength = Reflect.getOwnPropertyDescriptor(policyRecord, 'length');
-      if (
-        policyLength !== undefined &&
-        (policyLength.get !== undefined || policyLength.set !== undefined || typeof policyLength.value === 'number')
-      ) {
-        return false;
-      }
-      for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
-        if (Reflect.getOwnPropertyDescriptor(policyRecord, key) !== undefined) {
-          return false;
-        }
-      }
-      for (const key of [
-        'policyRevision', 'shadow', 'unattended', 'updateBranch', 'requiredContexts',
-        'premergePosterLogin', 'updateGraceMinutes', 'macosProcedure', 'maxAttempts',
-        'checksGraceMinutes', 'veto',
-      ] as const) {
-        if (ownsAccessor(policyRecord, key)) {
-          return false;
-        }
-      }
-      // Nested fields the normalizer reads. A getter here would run inside
-      // it; refuse the accessor first. Still O(1).
-      const veto = policyRecord.veto;
-      if (isPlainObject(veto)) {
-        for (const key of ['mode', 'holdConfidence'] as const) {
-          if (ownsAccessor(veto, key)) {
-            return false;
-          }
-        }
-      }
-      const grace = policyRecord.checksGraceMinutes;
-      if (isPlainObject(grace)) {
-        for (const key of ['gate', 'premerge'] as const) {
-          if (ownsAccessor(grace, key)) {
-            return false;
-          }
-        }
-      }
-    }
-    // An accessor ANYWHERE in the raw facts (every own key, at every depth
-    // `validateFacts` could read) is refused BEFORE the facts are validated,
-    // so no getter is ever invoked. The walk reads own descriptors only and
-    // is bounded (RETRO_ACCESSOR_SCAN_MAX_DEPTH / _MAX_KEYS); past either
-    // bound it fails closed.
-    if (hasAccessorDeep(facts)) {
+    if (!read.ok || !isZonedIsoDateTime(nowIso) || retroInputsHostile(repoPolicy, facts)) {
       return false;
     }
     const validated = validateFacts(facts);
-    if (!validated.ok) {
-      return false;
-    }
     const policy = normalizeRepoPolicy(repoPolicy);
-    if (policy === null) {
-      return false;
-    }
-    const record = read.record;
     // The shadow retro is a shadow-only estimate; a live policy never acts.
-    if (policy.shadow !== true) {
+    if (!validated.ok || policy === null || policy.shadow !== true) {
       return false;
     }
-    // An array-like shape (own numeric `length`) and prototype-polluting
-    // own keys are refused before any nested value is read. Cost O(1).
-    const factRecord = validated.value as unknown as Record<string, unknown>;
-    const lengthDescriptor = Reflect.getOwnPropertyDescriptor(factRecord, 'length');
-    if (
-      lengthDescriptor !== undefined &&
-      (lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined || typeof lengthDescriptor.value === 'number')
-    ) {
-      return false;
-    }
-    for (const key of ['__proto__', 'constructor', 'prototype'] as const) {
-      if (Reflect.getOwnPropertyDescriptor(factRecord, key) !== undefined) {
-        return false;
-      }
-    }
-    const pr = validated.value.pr;
-    // A parked entry is eligible only when its park reason was `checks` —
-    // the one park the retro re-enters through the live predicates.
-    if (record.state === 'parked' && record.reason !== 'checks') {
-      return false;
-    }
-    if (pr.status !== 'merged' || !isMergeHex40(pr.headOid) || pr.headOid !== record.headOid) {
-      return false;
-    }
-    const reRead = validated.value.reReadHeadOid;
-    if (reRead !== undefined && (!isMergeHex40(reRead) || reRead !== record.headOid)) {
-      return false;
-    }
-    // All `policy.requiredContexts` must be green and the premerge posted by
-    // `policy.premergePosterLogin` (classifyContext + readContextFact inside).
-    const checks = checksStep(record, validated.value, policy, nowIso, Date.parse(nowIso));
-    if (checks.decision !== null || checks.deferCarry) {
-      return false;
-    }
-    if (threadsStep(record, validated.value) !== null) {
-      return false;
-    }
-    const resolvedVeto = resolveVeto(record, validated.value);
-    if (resolvedVeto === VETO_UNREADABLE) {
-      return false;
-    }
-    const verdict = evaluateMergeVeto(resolvedVeto, {
-      mode: policy.vetoMode,
-      holdConfidence: policy.holdConfidence,
-    });
-    if (verdict === 'act-veto' || verdict === 'park-hold' || verdict === 'would-hold') {
-      return false;
-    }
-    // The base gate must already pass on the observed base.
-    if (observedBaseStep(record, validated.value) !== null) {
-      return false;
-    }
-    // A macOS procedure row exists on the live path; a retro head that owes
-    // one cannot be estimated from the facts gathered, so it refuses.
-    if (policy.macosProcedure !== null) {
-      return false;
-    }
-    // The merge state at merge time is unobservable. The retro estimate
-    // needs the merge-commit time and every required context's own
-    // creation time: a missing or unparsable timestamp refuses.
-    const mergedAt = validated.value.mergedAtIso;
-    if (typeof mergedAt !== 'string' || !isZonedIsoDateTime(mergedAt)) {
-      return false;
-    }
-    const mergedAtMs = Date.parse(mergedAt);
-    const contexts = validated.value.contexts;
-    if (!isPlainObject(contexts)) {
-      return false;
-    }
-    for (const name of policy.requiredContexts) {
-      const fact = readContextFact(contexts as Record<string, unknown>, name);
-      if (!fact.ok) {
-        return false;
-      }
-      const createdAt = fact.value.createdAtIso;
-      if (typeof createdAt !== 'string' || !isZonedIsoDateTime(createdAt)) {
-        return false;
-      }
-      if (Date.parse(createdAt) > mergedAtMs) {
-        return false;
-      }
-    }
-    return true;
+    return (
+      retroDeciderWouldMerge(read.record, validated.value, policy, nowIso) &&
+      retroChecksPredateMerge(validated.value, policy)
+    );
   } catch {
     return false;
   }

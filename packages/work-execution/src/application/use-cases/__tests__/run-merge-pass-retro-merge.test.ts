@@ -240,6 +240,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses null, undefined, wrong primitives, array-likes, and prototype-polluting keys on retro-merge check', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const facts = makeFacts();
     const policy = makePolicy();
@@ -301,6 +303,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses getter properties without invoking them', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const policy = makePolicy();
     let invoked = false;
@@ -459,6 +463,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses a throwing Proxy, an accessor-lying Proxy, and an enormous length', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const policy = makePolicy();
     const facts = makeFacts();
@@ -497,6 +503,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses non-array, sparse, and oversized requiredContexts', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const facts = makeFacts();
     expect(
@@ -533,6 +541,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses a live policy, an invalid now timestamp, a head that is not the entry head, and a re-read that mismatches or is unknown', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const facts = makeFacts();
     expect(isMergedHeadRetroMergeEligible(entry, facts, makePolicy({ shadow: false }), NOW)).toBe(false);
@@ -556,6 +566,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses when a required context is pending, failed, or missing', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const policy = makePolicy();
     expect(
@@ -593,6 +605,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses unknown or non-zero unresolved threads', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const policy = makePolicy();
     expect(
@@ -604,6 +618,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses a veto hold, an act veto, and an unreadable veto record', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const holdFacts = makeFacts({
       veto: { outcome: 'hold-for-human', confidence: 0.9, mode: 'live', decisionReceiptId: null },
@@ -688,6 +704,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
   });
 
   it('refuses when the observed base does not match or a macos procedure is configured', () => {
+    // Control: the unmodified eligible input passes, so a constant `false` fails this test.
+    expect(isMergedHeadRetroMergeEligible(makeEntry(), makeFacts(), makePolicy(), NOW)).toBe(true);
     const entry = makeEntry();
     const policy = makePolicy();
     expect(

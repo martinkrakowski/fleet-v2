@@ -39,7 +39,8 @@ import { ephemeralOwnerKey, type EphemeralOwnerKey } from './signed-decision-fix
 
 const execFileAsync = promisify(execFile);
 
-const COMMIT = 'a'.repeat(40);
+/** The fixture clone's real HEAD: the save's diff check resolves the base commit in git, so a made-up sha cannot stand in. */
+let COMMIT = 'a'.repeat(40);
 const HOST = 'lane-host';
 const RUNNER_PORT = 46_000;
 const RUN_ID = 'run-01JC000000000000000000000B';
@@ -127,6 +128,7 @@ async function fixture(): Promise<Fixture> {
   await fs.writeFile(path.join(clonePath, 'README.md'), 'fixture\n');
   await git(clonePath, 'add', 'README.md');
   await git(clonePath, 'commit', '--quiet', '-m', 'fixture');
+  COMMIT = (await git(clonePath, 'rev-parse', 'HEAD')).trim();
   await git(clonePath, 'worktree', 'add', '--quiet', '-b', 'fleet/lane-one', worktreePath);
   // The lane's uncommitted edit, inside the save input's allowed prefixes and
   // free of every secret shape: the save's diff check must stay clean.
@@ -534,9 +536,6 @@ describe('relaunch apply live e2e (AR3c2)', () => {
       adoptInputsJson(),
     ]);
     expect(firstApply.code).toBe(1);
-    console.log('FIRST_APPLY_OUT', firstApply.stdout, firstApply.stderr);
-    const dbgJournal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/attempt-l1/`);
-    if (dbgJournal.outcome === 'listed') console.log('FIRST_JOURNAL', JSON.stringify(dbgJournal.entries));
     expect(JSON.parse(firstApply.stdout)).toEqual({ outcome: 'refused', reason: 'adopt-failed', laneId: 'attempt-l1' });
     const firstJournal = await fx.runtime.execution.cutoverJournal.listByKeyPrefix(`relaunch/${planDigest}/attempt-l1/`);
     if (firstJournal.outcome !== 'listed') throw new Error('journal unreadable');
@@ -686,6 +685,57 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
     expect(getterCalls).toBe(0);
   });
 
+  it('refuses each inputs-clone hardening case (nested getter, symbol key, depth, node budget, array extras, foreign prototype, function and undefined values, polluting keys) in both flags with zero getter calls', async () => {
+    let getterCalls = 0;
+    const nestedGetter: Record<string, unknown> = { laneId: 'attempt-l1' };
+    Object.defineProperty(nestedGetter, 'inner', {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return 1;
+      },
+    });
+    const symbolKeyed: Record<PropertyKey, unknown> = { laneId: 'attempt-l1' };
+    symbolKeyed[Symbol('hostile')] = 1;
+    // Depth 11 of nested single-key objects exceeds MAX_INPUT_DEPTH (10).
+    let deep: unknown = { leaf: 1 };
+    for (let level = 0; level < 11; level += 1) deep = { next: deep };
+    // 4,100 primitives in one element exceeds the 4,096-node budget while each
+    // single array and object stays within its own bounds.
+    const wide = Array.from({ length: 4100 }, (_, index) => index);
+    const arrayWithExtra: unknown[] = [{}];
+    (arrayWithExtra as unknown as Record<string, unknown>).extra = 1;
+    const foreignPrototype = Object.setPrototypeOf([{}], null) as unknown[];
+    const nestedHole: unknown[] = [];
+    nestedHole.length = 1;
+    const nestedProtoKey = JSON.parse('{"laneId":"attempt-l1","prototype":{"x":1}}') as unknown;
+    const nestedConstructorKey = JSON.parse('{"a":{"constructor":{"x":1}}}') as unknown;
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+      ['nested object getter', [nestedGetter]],
+      ['symbol key on an element', [symbolKeyed]],
+      ['depth past the cap', [deep]],
+      ['node budget past the cap', [{ wide }]],
+      ['non-index own key on the array', arrayWithExtra],
+      ['array with a foreign prototype', foreignPrototype],
+      ['hole in a nested array', [{ nestedHole }]],
+      ['nested prototype key', [nestedProtoKey]],
+      ['nested constructor key', [nestedConstructorKey]],
+      ['function value', [{ run: () => 1 }]],
+      ['undefined value', [{ laneId: undefined }]],
+      ['bigint value', [{ laneId: 1n }]],
+    ];
+    const rtStub = {} as FleetCliRuntime;
+    for (const flag of ['saveInputs', 'adoptInputs'] as const) {
+      for (const [label, hostile] of cases) {
+        await expect(
+          relaunchCommands.apply({ planDigest: PLAN_DIGEST, [flag]: hostile }, rtStub),
+          `${flag}: ${label}`,
+        ).rejects.toBeInstanceOf(CliUsageError);
+      }
+    }
+    expect(getterCalls).toBe(0);
+  });
+
   it('passes a dense array supplied through generic --json to the bounded reader, never a usage error', async () => {
     const fx = await fixture();
     const { code, stdout, stderr } = await cli(fx.runtime, [
@@ -705,8 +755,8 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
 
   it('never echoes a secret sent through --grant, --save-inputs, or --adopt-inputs (usage and refusal paths)', async () => {
     const fx = await fixture();
-    const grantSecret = 'sk-ant-api03-SECRET_SENTINEL_12345';
-    const tokenSecret = 'ghp_SECRET_SENTINEL_99999';
+    const grantSecret = 'sk-ant-api03-SECRETSENTINEL_12345';
+    const tokenSecret = 'ghp_SECRETSENTINEL9999999999999999999999';
 
     // Usage path: a non-string --grant carrying secret-shaped keys.
     const nonStringGrant = await cli(fx.runtime, [
@@ -719,7 +769,7 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
       JSON.stringify({ planDigest: PLAN_DIGEST, apply: true, grant: { [grantSecret]: 1 } }),
     ]);
     expect(nonStringGrant.code).toBe(2);
-    expect(nonStringGrant.stdout + nonStringGrant.stderr).not.toContain('SECRET_SENTINEL');
+    expect(nonStringGrant.stdout + nonStringGrant.stderr).not.toContain('SECRETSENTINEL');
 
     // Refusal path: a secret-shaped --grant reaches the use case, which
     // refuses `secret-detected` without echoing it.
@@ -734,7 +784,13 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
     ]);
     expect(secretGrant.code).toBe(1);
     expect(JSON.parse(secretGrant.stdout)).toEqual({ outcome: 'refused', reason: 'secret-detected' });
-    expect(secretGrant.stdout + secretGrant.stderr).not.toContain('SECRET_SENTINEL');
+    expect(secretGrant.stdout + secretGrant.stderr).not.toContain('SECRETSENTINEL');
+
+    // The input scan runs against a stored plan, so the refusal paths below
+    // use a real plan digest.
+    const plannedForScan = JSON.parse((await cli(fx.runtime, ['relaunch', 'plan'])).stdout) as PlanRelaunchResult;
+    if (plannedForScan.outcome !== 'planned') throw new Error('plan fixture failed');
+    const scanDigest = plannedForScan.plan.planDigest;
 
     // Refusal path for the inputs flags: a secret inside a well-formed array
     // (the secret rides in a validated field, so the parse's secret scan —
@@ -768,13 +824,13 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
         'relaunch',
         'apply',
         '--plan-digest',
-        PLAN_DIGEST,
+        scanDigest,
         flag,
         payload,
       ]);
       expect(code, flag).toBe(1);
       expect(JSON.parse(stdout), flag).toEqual({ outcome: 'refused', reason: 'secret-detected' });
-      expect(stdout + stderr, flag).not.toContain('SECRET_SENTINEL');
+      expect(stdout + stderr, flag).not.toContain('SECRETSENTINEL');
     }
 
     // Usage path for the inputs flags: JSON that cannot parse still never
@@ -788,7 +844,7 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
       `[{"note":"${tokenSecret}"`,
     ]);
     expect(badJson.code).toBe(2);
-    expect(badJson.stdout + badJson.stderr).not.toContain('SECRET_SENTINEL');
+    expect(badJson.stdout + badJson.stderr).not.toContain('SECRETSENTINEL');
   });
 
   it('rejects non-string --grant, --now, and --deadline, and non-boolean --apply with exit 2', async () => {
@@ -801,7 +857,7 @@ describe('relaunch apply hostile payload gates (AR3c2)', () => {
       { planDigest: PLAN_DIGEST, apply: 'yes' },
       { planDigest: PLAN_DIGEST, apply: 1 },
     ]) {
-      const { code, stderr } = await cli(fx.runtime, ['relaunch', 'apply', '--json', JSON.stringify(json)]);
+      const { code } = await cli(fx.runtime, ['relaunch', 'apply', '--json', JSON.stringify(json)]);
       expect(code, JSON.stringify(json)).toBe(2);
     }
   });

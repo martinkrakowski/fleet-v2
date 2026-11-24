@@ -683,8 +683,8 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
     expect(isMergedHeadRetroMergeEligible(entry, missingCreated, policy, NOW)).toBe(false);
     // Text order is not chronological. `11:30Z` sorts before `12:00+01:00`,
     // but 11:30 UTC is after 11:00 UTC, so the status was created after the
-    // merge and the retro refuses. The reverse offset that names the same
-    // instant as the merge (`12:00+01:00` vs `11:00Z`) still passes.
+    // merge and the retro refuses. An offset instant one second BEFORE the
+    // merge (`11:59:59+01:00` vs `11:00Z`) passes: comparison is by instant.
     const textEarlierButLater = makeFacts({
       mergedAtIso: '2026-11-01T12:00:00.000+01:00',
       contexts: {
@@ -693,14 +693,14 @@ describe('isMergedHeadRetroMergeEligible (EV2 retro decider helper)', () => {
       },
     });
     expect(isMergedHeadRetroMergeEligible(entry, textEarlierButLater, policy, NOW)).toBe(false);
-    const sameInstant = makeFacts({
+    const offsetJustBefore = makeFacts({
       mergedAtIso: '2026-11-01T11:00:00.000Z',
       contexts: {
-        gate: { state: 'success', creatorLogin: null, createdAtIso: '2026-11-01T12:00:00.000+01:00' },
-        premerge: { state: 'success', creatorLogin: POSTER, createdAtIso: '2026-11-01T12:00:00.000+01:00' },
+        gate: { state: 'success', creatorLogin: null, createdAtIso: '2026-11-01T11:59:59.000+01:00' },
+        premerge: { state: 'success', creatorLogin: POSTER, createdAtIso: '2026-11-01T11:59:59.000+01:00' },
       },
     });
-    expect(isMergedHeadRetroMergeEligible(entry, sameInstant, policy, NOW)).toBe(true);
+    expect(isMergedHeadRetroMergeEligible(entry, offsetJustBefore, policy, NOW)).toBe(true);
   });
 
   it('refuses a required context created at the merge instant or within the same millisecond', () => {

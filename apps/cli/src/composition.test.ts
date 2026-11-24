@@ -2620,3 +2620,76 @@ describe('KEY0c1b: a tampered signed answer on disk never authorizes', () => {
     }
   });
 });
+
+// AR3c2: the relaunch apply composition reaches authorization. A valid stored
+// plan applied live with an unrecorded grant must refuse `grant-missing` —
+// the coordination resolve's own typed answer — and never the
+// missing-port answer `authorization-unavailable`, which would mean the
+// twelve-port wiring had not reached the resolve at all.
+describe('relaunch apply composition reaches authorization (AR3c2)', () => {
+  it('refuses grant-missing, never authorization-unavailable, when apply: true names an unrecorded grant', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-relaunch-auth-'));
+    try {
+      const rt = createFleetCliRuntime({
+        stateDir,
+        daemonNow: () => '2026-11-23T10:00:00Z',
+        runSubprocess: () => {
+          throw new Error('no subprocess may run in this composition test');
+        },
+      });
+      // One conducted lane with no plan steps: the live preflight has no
+      // save, adopt or redispatch work, so its only remaining gate is the
+      // grant — exactly what this test observes.
+      const lane = {
+        laneId: 'lane-1',
+        hostName: 'host-a',
+        projectId: null,
+        population: 'conducted' as const,
+        runnerState: 'running' as const,
+        runId: 'run-1',
+        attemptId: null,
+        workOrderId: null,
+        baseBranch: 'main',
+        chainHead: true,
+        dependsOnLaneIds: [],
+        admissionWave: 0,
+        dispatchEndpointKey: null,
+        staggerOffsetMs: null,
+        steps: [] as { step: string; idempotencyKey: string }[],
+      };
+      const body = {
+        schemaVersion: 1 as const,
+        hostFilter: null,
+        maxActiveRuns: 3,
+        dispatchStaggerMs: 250,
+        conductor: { halted: true, driverLease: 'lapsed' as const, runCount: 2 },
+        lanes: [lane],
+      };
+      const { canonicalRelaunchPlanBodyJson, sha256HexDigest } = await import('@fleet/work-execution');
+      const planDigest = sha256HexDigest(
+        canonicalRelaunchPlanBodyJson(body as unknown as Parameters<typeof canonicalRelaunchPlanBodyJson>[0]),
+      );
+      const saved = await rt.execution.relaunchPlanRepository.save({
+        ...body,
+        planDigest,
+        requestDigest: 'a'.repeat(64),
+        createdAtIso: '2026-11-23T09:00:00Z',
+        lanes: [lane],
+      } as unknown as Parameters<typeof rt.execution.relaunchPlanRepository.save>[0]);
+      expect(saved).toMatchObject({ outcome: 'saved' });
+
+      const result = (await rt.execution.applyRelaunch.applyRelaunch({
+        planDigest,
+        nowIso: '2026-11-23T10:00:00Z',
+        apply: true,
+        grantId: 'grant-never-recorded',
+        saveInputs: [],
+        adoptInputs: [],
+      })) as { outcome: string; reason?: string };
+
+      expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});

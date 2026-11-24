@@ -11,6 +11,7 @@ import {
   SHADOW_IMPORT_DIGEST_PREFIX,
   isReleaseActionScope,
   isReleaseRootCoordinate,
+  isRelaunchApplyActionScope,
   releaseGrantDigestPayload,
   shadowImportDigestPayload,
   buildPreSignShadowImportPlan,
@@ -102,6 +103,19 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
           authorizationGrantId: optStr(p, 'authorizationGrantId'),
           ...(optStr(p, 'repository') !== undefined ? { repository: optStr(p, 'repository') } : {}),
           ...(releaseRoot !== undefined ? { releaseRoot } : {}),
+        });
+      }
+      // AR3c2: the relaunch:apply grant resolves head-free too, just like the
+      // standing shadow import grant: it is bound by its digest-bound grant id
+      // and the plan digest it names, never by a commit, so no
+      // `--expected-head-sha` is taken or required.
+      if (isRelaunchApplyActionScope(actionScope)) {
+        return rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+          projectId: str(p, 'projectId'),
+          actionScope,
+          expectedHeadSha: optStr(p, 'expectedHeadSha') ?? '',
+          authorizationGrantId: optStr(p, 'authorizationGrantId') ?? optStr(p, 'grantId'),
+          proposalDigest: str(p, 'proposalDigest'),
         });
       }
       // M5: the head is a required flag on every non-shadow scope, so a

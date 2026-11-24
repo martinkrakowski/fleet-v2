@@ -101,6 +101,23 @@ describe('ExecutionRunnerAdapter inspectSession confirms an exit-0 status with a
     expect(delays).toHaveLength(0);
   });
 
+  it('returns unknown without sleeping or re-polling when the sessionId is not a string', async () => {
+    for (const sessionId of [1, {}, ['ses'], true]) {
+      const { runner, calls } = scriptedRunner([{ exitCode: 0, stdout: startedJson, stderr: '' }]);
+      const { sleep, delays } = spySleep();
+      const adapter = new ExecutionRunnerAdapter({ runSubprocess: runner, remotePort: 4166, sleep });
+      const status = await adapter.inspectSession({
+        attemptId: 'att-1',
+        sessionId: sessionId as unknown as string,
+        worktreePath: worktree,
+        runner: runnerRecord,
+      });
+      expect(status).toEqual(unknownStatus);
+      expect(calls).toHaveLength(1);
+      expect(delays).toEqual([]);
+    }
+  });
+
   it('returns unknown with one spawn when the first status read throws or exits non-0/non-3', async () => {
     for (const first of [new Error('connection refused'), { exitCode: 1, stdout: '', stderr: 'down' } as SubprocessResult]) {
       const { runner, calls } = scriptedRunner([first]);

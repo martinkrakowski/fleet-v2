@@ -817,7 +817,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       // --wait) confirms "nothing runs" only after two status reads
       // OCM_WAIT_CONFIRM seconds apart. One momentary idle read between two
       // steps would otherwise end the session and park the lane.
-      if (!session.sessionId || session.sessionId.trim() === '') {
+      if (typeof session.sessionId !== 'string' || session.sessionId.trim() === '') {
         return unknownRunnerStatus();
       }
 

@@ -360,6 +360,89 @@ async function heldFor(journal: ExecutionJournalAdapter, attemptId: string): Pro
   );
 }
 
+/** RP1c: a stored baseBranch that is not main or chain/<name> is refused, never coerced to main. */
+const UNSUPPORTED_STORED_BASE_BRANCHES: readonly unknown[] = [
+  'staging',
+  'Main',
+  'main ',
+  'chain/',
+  'chain/Bad',
+  'chain/a--b',
+  '',
+  42,
+  true,
+  null,
+  ['main'],
+  { name: 'main' },
+  `chain/${'a'.repeat(100_000)}`,
+];
+
+describe('StartLaneRunUseCase stored baseBranch (RP1c)', () => {
+  it('refuses every unsupported stored baseBranch with unsupported-base-branch and touches no reservation, tip, worktree, brief, attempt or run', async () => {
+    for (const stored of UNSUPPORTED_STORED_BASE_BRANCHES) {
+      const harness = makeHarness({ workOrder: storedWorkOrder({ baseBranch: stored as string }) });
+      const release = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+      const create = vi.spyOn(harness.runRepo, 'create');
+      const result = await harness.useCase.startLaneRun(requestFixture());
+
+      expect(result).toEqual({ outcome: 'refused', reason: 'unsupported-base-branch' });
+      expect(harness.capacityCalls).toHaveLength(0);
+      expect(harness.resolveTipCalls).toHaveLength(0);
+      expect(harness.worktreeCalls).toHaveLength(0);
+      expect(harness.briefCalls).toHaveLength(0);
+      expect(create).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      expect(await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID)).toBeNull();
+      expect(await harness.runRepoStore.get(RUN_ID)).toBeNull();
+    }
+  });
+
+  it('refuses an own accessor baseBranch without invoking it and reads an inherited baseBranch as absent (main)', async () => {
+    let invoked = 0;
+    const accessorOrder = storedWorkOrder();
+    Object.defineProperty(accessorOrder, 'baseBranch', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        invoked += 1;
+        return 'main';
+      },
+    });
+    const refused = makeHarness({ workOrder: accessorOrder });
+    expect(await refused.useCase.startLaneRun(requestFixture())).toEqual({
+      outcome: 'refused',
+      reason: 'unsupported-base-branch',
+    });
+    expect(invoked).toBe(0);
+    expect(refused.capacityCalls).toHaveLength(0);
+
+    const inherited = Object.assign(Object.create({ baseBranch: 'staging' }) as object, storedWorkOrder()) as WorkOrderRecord;
+    const started = makeHarness({ workOrder: inherited });
+    expect((await started.useCase.startLaneRun(requestFixture())).outcome).toBe('started');
+    expect(started.resolveTipCalls.map((call) => call.baseBranch)).toEqual(['main']);
+  });
+
+  it('starts an absent, undefined or explicit main baseBranch on main and records main on the run', async () => {
+    const absent = storedWorkOrder();
+    const undefinedBase = { ...storedWorkOrder(), baseBranch: undefined } as unknown as WorkOrderRecord;
+    for (const order of [absent, undefinedBase, storedWorkOrder({ baseBranch: 'main' })]) {
+      const harness = makeHarness({ workOrder: order });
+      const create = vi.spyOn(harness.runRepo, 'create');
+      expect((await harness.useCase.startLaneRun(requestFixture())).outcome).toBe('started');
+      expect(harness.resolveTipCalls.map((call) => call.baseBranch)).toEqual(['main']);
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ baseBranch: 'main' }));
+    }
+  });
+
+  it('keeps a chain/<name> stored baseBranch: the tip is resolved on it and the run records it', async () => {
+    const harness = makeHarness({ workOrder: storedWorkOrder({ baseBranch: 'chain/example-1' }) });
+    const create = vi.spyOn(harness.runRepo, 'create');
+    expect((await harness.useCase.startLaneRun(requestFixture())).outcome).toBe('started');
+    expect(harness.resolveTipCalls.map((call) => call.baseBranch)).toEqual(['chain/example-1']);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ baseBranch: 'chain/example-1' }));
+  });
+});
+
 describe('StartLaneRunUseCase', () => {
   it('test 1: a fresh start runs reserve, worktree, brief, attempt, run in order and ends started', async () => {
     const harness = makeHarness();

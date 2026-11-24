@@ -19,7 +19,7 @@
 
 import { containsSecretShape, isValidHostName, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
-import { parseBaseBranch, resolveLaneRunBaseBranch, resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
+import { parseBaseBranch, resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { DEFAULT_DISPATCH_STAGGER_MS, dispatchEndpointKey } from '../../domain/dispatch-stagger.js';
@@ -388,9 +388,9 @@ export class PlanRelaunchUseCase implements PlanRelaunchPort {
 
     // 3. Join, order and admit.
     const drafted = joinLanes(gathered.inputs.read.rows, validated.clones, gathered.inputs.runs, gathered.inputs.attempts, gathered.inputs.workOrders);
-    if (drafted === null) return { outcome: 'refused', reason: 'invalid-request' };
-    deriveDependencies(drafted, gathered.inputs.lanePlans);
-    const ordering = topologicalOrder(drafted);
+    if (!drafted.ok) return { outcome: 'refused', reason: drafted.reason };
+    deriveDependencies(drafted.lanes, gathered.inputs.lanePlans);
+    const ordering = topologicalOrder(drafted.lanes);
     if (!ordering.ok) return { outcome: 'refused', reason: 'dependency-cycle' };
     const ordered = ordering.lanes;
     assignWaves(ordered, validated.maxActiveRuns);
@@ -703,9 +703,153 @@ function hasDanglingReference(
   return false;
 }
 
+type JoinRefusal = { readonly ok: false; readonly reason: 'invalid-request' | 'unsupported-base-branch' };
+
+type JoinResult = { readonly ok: true; readonly lanes: DraftLane[] } | JoinRefusal;
+
+const INVALID_JOIN: JoinRefusal = { ok: false, reason: 'invalid-request' };
+
+/**
+ * The base branch a stored work order declares (RP1c): `main` when its own
+ * `baseBranch` is absent or `undefined` (an inherited value counts as absent), the parsed
+ * `main` or `chain/<name>` when it parses, and `undefined` for anything else, including an own
+ * accessor (never invoked), a wrong primitive and a throwing read. Never `main` by coercion.
+ * Cost: one own-descriptor read plus the length-bounded match in `parseBaseBranch`.
+ */
+function readStoredWorkOrderBaseBranch(workOrder: WorkOrderRecord): BaseBranchValue | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(workOrder, 'baseBranch');
+    if (descriptor === undefined) return 'main';
+    if (!('value' in descriptor)) return undefined;
+    if (descriptor.value === undefined) return 'main';
+    return parseBaseBranch(descriptor.value);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A lane id that is shaped, secret-free and not already joined. Same short-circuit as the inlined check. */
+function laneIdIsJoinable(laneId: string, seen: ReadonlySet<string>): boolean {
+  return LANE_ID.test(laneId) && !hasSecretShape(laneId) && !seen.has(laneId);
+}
+
+type LaneLink =
+  | {
+      readonly ok: true;
+      readonly run: LaneRunRecord | null;
+      readonly attempt: AttemptRecord | null;
+      readonly workOrder: WorkOrderRecord | null;
+      readonly workOrderId: string | null;
+    }
+  | JoinRefusal;
+
+/** The run, attempt and work order a row points at. An unreadable work-order id is `invalid-request`. */
+function linkLaneRecords(
+  row: RelaunchLaneRow,
+  runById: ReadonlyMap<string, LaneRunRecord>,
+  attemptById: ReadonlyMap<string, AttemptRecord>,
+  workOrderById: ReadonlyMap<string, WorkOrderRecord>,
+): LaneLink {
+  const run = row.runId === null ? null : (runById.get(row.runId) ?? null);
+  const attempt = row.attemptId === null ? null : (attemptById.get(row.attemptId) ?? null);
+  const workOrderId = run?.workOrderId ?? attempt?.workOrderId ?? null;
+  if (workOrderId !== null && idText(workOrderId) === null) return INVALID_JOIN;
+  const workOrder = workOrderId === null ? null : (workOrderById.get(workOrderId) ?? null);
+  return { ok: true, run, attempt, workOrder, workOrderId };
+}
+
+type LanePlace =
+  | { readonly ok: true; readonly projectId: string | null; readonly cloneHost: AttemptRunnerRecord | null }
+  | JoinRefusal;
+
+/** The clone and project a row sits on. An unreadable project id is `invalid-request`. */
+function placeLaneOnClone(
+  row: RelaunchLaneRow,
+  clones: readonly RelaunchCloneRef[],
+  workOrder: WorkOrderRecord | null,
+): LanePlace {
+  const hostClones = clones.filter((clone) => clone.hostName === row.hostName);
+  const under = hostClones.filter((clone) => pathUnderPrefix(row.worktreePath, clone.worktreeRoot));
+  const matched = under.length === 1 ? under[0] : null;
+  const projectId = workOrder?.projectId ?? matched?.projectId ?? null;
+  if (projectId !== null && idText(projectId) === null) return INVALID_JOIN;
+  const cloneHost = (matched ?? hostClones.find((clone) => clone.recordedHost !== null))?.recordedHost ?? null;
+  return { ok: true, projectId, cloneHost };
+}
+
+/**
+ * The base one joined lane is planned on. A run's stored base wins; otherwise
+ * the work order's stored base, which is `main` when its own `baseBranch` is
+ * absent. An unsupported stored work-order base (for example `staging`) refuses
+ * the whole plan and is never read as `main`. Extracted from `joinLanes` so
+ * that function stays within Sonar's cognitive-complexity limit of 15.
+ * Cost: one own-descriptor read plus the length-bounded match in `parseBaseBranch`.
+ */
+function resolveJoinedLaneBaseBranch(
+  run: LaneRunRecord | null,
+  workOrder: WorkOrderRecord | null,
+): { readonly ok: true; readonly baseBranch: BaseBranchValue } | JoinRefusal {
+  let baseBranch: BaseBranchValue = 'main';
+  if (run !== null) baseBranch = resolveLaneRunBaseBranch(run);
+  else if (workOrder !== null) {
+    const declared = readStoredWorkOrderBaseBranch(workOrder);
+    if (declared === undefined) return { ok: false, reason: 'unsupported-base-branch' };
+    baseBranch = declared;
+  }
+  if (parseBaseBranch(baseBranch) === undefined) return INVALID_JOIN;
+  return { ok: true, baseBranch };
+}
+
+type DraftedLane = { readonly ok: true; readonly lane: DraftLane } | JoinRefusal;
+
+/** One inventoried row, joined or refused. Checks run in the same order as before the split. */
+function draftJoinedLane(
+  row: RelaunchLaneRow,
+  clones: readonly RelaunchCloneRef[],
+  runById: ReadonlyMap<string, LaneRunRecord>,
+  attemptById: ReadonlyMap<string, AttemptRecord>,
+  workOrderById: ReadonlyMap<string, WorkOrderRecord>,
+  seen: Set<string>,
+): DraftedLane {
+  if (!laneIdIsJoinable(row.laneId, seen)) return INVALID_JOIN;
+  seen.add(row.laneId);
+  if (idText(row.hostName) === null) return INVALID_JOIN;
+  if (row.runId !== null && idText(row.runId) === null) return INVALID_JOIN;
+  if (row.attemptId !== null && idText(row.attemptId) === null) return INVALID_JOIN;
+  if (row.runnerState === 'unknown') return INVALID_JOIN;
+  const linked = linkLaneRecords(row, runById, attemptById, workOrderById);
+  if (!linked.ok) return linked;
+  const placed = placeLaneOnClone(row, clones, linked.workOrder);
+  if (!placed.ok) return placed;
+  const base = resolveJoinedLaneBaseBranch(linked.run, linked.workOrder);
+  if (!base.ok) return base;
+  return {
+    ok: true,
+    lane: {
+      row,
+      laneId: row.laneId,
+      hostName: row.hostName,
+      population: row.population,
+      runnerState: row.runnerState,
+      projectId: placed.projectId,
+      workOrder: linked.workOrder,
+      workOrderId: linked.workOrderId,
+      attempt: linked.attempt,
+      cloneHost: placed.cloneHost,
+      baseBranch: base.baseBranch,
+      dependsOn: [],
+      chainHead: false,
+      wave: 0,
+    },
+  };
+}
+
 /**
  * Join each inventoried lane to its run, attempt, work order and project. A lane
- * whose ids are not plain, secret-free ids, or whose id repeats, is invalid (null).
+ * whose ids are not plain, secret-free ids, or whose id repeats, is `invalid-request`; a lane
+ * whose stored work order declares an unsupported base branch is `unsupported-base-branch`.
+ * Per-lane decisions, including the base branch, live in helpers so this function
+ * stays within Sonar's cognitive-complexity limit of 15.
  */
 function joinLanes(
   rows: readonly RelaunchLaneRow[],
@@ -713,57 +857,18 @@ function joinLanes(
   runs: readonly LaneRunRecord[],
   attempts: readonly AttemptRecord[],
   workOrders: readonly WorkOrderRecord[],
-): DraftLane[] | null {
+): JoinResult {
   const runById = new Map(runs.map((run) => [run.runId, run]));
   const attemptById = new Map(attempts.map((attempt) => [attempt.id, attempt]));
   const workOrderById = new Map(workOrders.map((workOrder) => [workOrder.id, workOrder]));
   const seen = new Set<string>();
   const lanes: DraftLane[] = [];
   for (const row of rows) {
-    if (!LANE_ID.test(row.laneId) || hasSecretShape(row.laneId) || seen.has(row.laneId)) return null;
-    seen.add(row.laneId);
-    if (idText(row.hostName) === null) return null;
-    if (row.runId !== null && idText(row.runId) === null) return null;
-    if (row.attemptId !== null && idText(row.attemptId) === null) return null;
-    if (row.runnerState === 'unknown') return null;
-    const run = row.runId === null ? null : (runById.get(row.runId) ?? null);
-    const attempt = row.attemptId === null ? null : (attemptById.get(row.attemptId) ?? null);
-    const workOrderId = run?.workOrderId ?? attempt?.workOrderId ?? null;
-    if (workOrderId !== null && idText(workOrderId) === null) return null;
-    const workOrder = workOrderId === null ? null : (workOrderById.get(workOrderId) ?? null);
-    const hostClones = clones.filter((clone) => clone.hostName === row.hostName);
-    const under = hostClones.filter((clone) => pathUnderPrefix(row.worktreePath, clone.worktreeRoot));
-    const matched = under.length === 1 ? under[0] : null;
-    const projectId = workOrder?.projectId ?? matched?.projectId ?? null;
-    if (projectId !== null && idText(projectId) === null) return null;
-    const cloneHost = (matched ?? hostClones.find((clone) => clone.recordedHost !== null))?.recordedHost ?? null;
-    let baseBranch: BaseBranchValue = 'main';
-    if (run !== null) baseBranch = resolveLaneRunBaseBranch(run);
-    else if (workOrder !== null) {
-      // RP1: a work order may now carry a profile base (e.g. `staging`); the
-      // lane-run record still only takes declared branches until RP1b, so an
-      // undeclared value reads as `main` here, as it always has.
-      baseBranch = parseBaseBranch(resolveWorkOrderBaseBranch(workOrder)) ?? 'main';
-    }
-    if (parseBaseBranch(baseBranch) === undefined) return null;
-    lanes.push({
-      row,
-      laneId: row.laneId,
-      hostName: row.hostName,
-      population: row.population,
-      runnerState: row.runnerState,
-      projectId,
-      workOrder,
-      workOrderId,
-      attempt,
-      cloneHost,
-      baseBranch,
-      dependsOn: [],
-      chainHead: false,
-      wave: 0,
-    });
+    const drafted = draftJoinedLane(row, clones, runById, attemptById, workOrderById, seen);
+    if (!drafted.ok) return drafted;
+    lanes.push(drafted.lane);
   }
-  return lanes;
+  return { ok: true, lanes };
 }
 
 /** Sets `dependsOn` (sorted, unique, inventory lanes only) and `chainHead` on every lane. */

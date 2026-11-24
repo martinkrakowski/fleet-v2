@@ -481,4 +481,122 @@ describe('persistent environment-not-installed classification (CB1b)', () => {
     expect(run1).toMatchObject({ verdict: 'unknown', congested: true });
     expect(run1.verdict).not.toBe('failed');
   });
+
+  it('a timed-out first install failure followed by a persistent second one promotes to fail (current behaviour: only the current run\'s exit is checked)', async () => {
+    const archive = new FakeArchive();
+    const journal = new InMemoryJournal();
+    const gate = new FakeGatePredicatePort([
+      evaluated(envResult(null, TAIL)),
+      evaluated(envResult(2, TAIL)),
+    ]);
+    const { deps } = makeDeps({ gate, journal, archive });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+    expect(run0.verdict).not.toBe('failed');
+    expect(archive.archived).toEqual([]);
+
+    const run1 = await useCase.evaluateAttemptGate(gateRequest(1));
+    expect(run1.verdict).toBe('failed');
+    if (run1.verdict !== 'failed' || run1.results === undefined) {
+      throw new Error('expected a failed gate with predicate results');
+    }
+    expect(run1.results[2]).toMatchObject({
+      verdict: 'fail',
+      cause: 'environment-not-installed',
+      exitCode: 2,
+      outputTail: TAIL,
+    });
+    expect(archive.archived).toEqual([
+      {
+        artifactId: `attempt-1:accept:${HEAD_SHA}/g1:3:output-tail`,
+        candidateHeadSha: HEAD_SHA,
+        content: TAIL,
+      },
+    ]);
+    const stored = parseStoredPredicateResult(commandEntry(journal, 1) as ActionJournalEntryRecord);
+    expect(stored).toMatchObject({
+      verdict: 'fail',
+      cause: 'environment-not-installed',
+      exitCode: 2,
+    });
+    expect(stored?.outputEvidenceRef).toMatch(/^evidence:\/\//);
+  });
+
+  it('a persistent first install failure followed by a timed-out second one stays congested unknown', async () => {
+    const archive = new FakeArchive();
+    const journal = new InMemoryJournal();
+    const gate = new FakeGatePredicatePort([
+      evaluated(envResult(2, TAIL)),
+      evaluated(envResult(null, TAIL)),
+    ]);
+    const { deps } = makeDeps({ gate, journal, archive });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+    expect(archive.archived).toEqual([]);
+
+    const run1 = await useCase.evaluateAttemptGate(gateRequest(1));
+    expect(run1).toMatchObject({ verdict: 'unknown', congested: true });
+    expect(run1.verdict).not.toBe('failed');
+    expect(archive.archived).toEqual([]);
+    expect(commandEntry(journal, 1)?.detail ?? '').not.toContain('outputEvidenceRef');
+
+    // Positive control: the same persistent exit twice does promote.
+    const controlJournal = new InMemoryJournal();
+    const controlArchive = new FakeArchive();
+    const controlGate = new FakeGatePredicatePort([
+      evaluated(envResult(2, TAIL)),
+      evaluated(envResult(2, TAIL)),
+    ]);
+    const control = makeDeps({ gate: controlGate, journal: controlJournal, archive: controlArchive });
+    const controlUseCase = new RequestAttemptAcceptanceUseCase(control.deps);
+    await controlUseCase.evaluateAttemptGate(gateRequest());
+    const controlRun1 = await controlUseCase.evaluateAttemptGate(gateRequest(1));
+    expect(controlRun1.verdict).toBe('failed');
+    expect(controlArchive.archived).toEqual([
+      {
+        artifactId: `attempt-1:accept:${HEAD_SHA}/g1:3:output-tail`,
+        candidateHeadSha: HEAD_SHA,
+        content: TAIL,
+      },
+    ]);
+  });
+
+  it('a congestion-exited first install failure followed by a persistent second one promotes to fail', async () => {
+    // The prior run's exit code (137) is deliberately not consulted:
+    // promoteConsecutiveEnvironmentFailure inspects only
+    // priorCause === 'environment-not-installed'.
+    const archive = new FakeArchive();
+    const journal = new InMemoryJournal();
+    const gate = new FakeGatePredicatePort([
+      evaluated(envResult(137, TAIL)),
+      evaluated(envResult(2, TAIL)),
+    ]);
+    const { deps } = makeDeps({ gate, journal, archive });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+    expect(run0.verdict).not.toBe('failed');
+    expect(archive.archived).toEqual([]);
+
+    const run1 = await useCase.evaluateAttemptGate(gateRequest(1));
+    expect(run1.verdict).toBe('failed');
+    if (run1.verdict !== 'failed' || run1.results === undefined) {
+      throw new Error('expected a failed gate with predicate results');
+    }
+    expect(run1.results[2]).toMatchObject({
+      verdict: 'fail',
+      cause: 'environment-not-installed',
+      exitCode: 2,
+    });
+    expect(archive.archived).toHaveLength(1);
+    expect(archive.archived[0]?.artifactId).toMatch(/\/g1:3:output-tail$/);
+    const stored = parseStoredPredicateResult(commandEntry(journal, 1) as ActionJournalEntryRecord);
+    expect(stored).toMatchObject({
+      verdict: 'fail',
+      cause: 'environment-not-installed',
+      exitCode: 2,
+    });
+  });
 });

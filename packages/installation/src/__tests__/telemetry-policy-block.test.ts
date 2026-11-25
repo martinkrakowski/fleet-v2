@@ -54,6 +54,46 @@ describe('readTelemetryPolicyBlock', () => {
     }
   });
 
+  it('refuses non-boolean sendCost and includeDryRun and accepts boolean values', () => {
+    // Cost bound: each field check is O(1) — one Object.hasOwn, one descriptor
+    // read and one typeof comparison.
+    for (const [field, badValue] of [
+      ['sendCost', 'yes'],
+      ['sendCost', 1],
+      ['includeDryRun', 'true'],
+      ['includeDryRun', null],
+    ] as const) {
+      expect(readTelemetryPolicyBlock({ enabled: false, [field]: badValue })).toEqual({
+        ok: false,
+        errors: [`policy.telemetry.${field}: must be a boolean`],
+      });
+    }
+    expect(readTelemetryPolicyBlock({ enabled: false, sendCost: true, includeDryRun: false })).toEqual({
+      ok: true,
+      policy: { enabled: false, sendCost: true, includeDryRun: false },
+    });
+  });
+
+  it('never invokes an accessor-valued sendCost getter and refuses it', () => {
+    let calls = 0;
+    const block: Record<string, unknown> = { enabled: false };
+    Object.defineProperty(block, 'sendCost', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return true;
+      },
+    });
+    const result = readTelemetryPolicyBlock(block);
+    // Cost bound: readOwnDataProperty reads the descriptor without running the
+    // getter — O(1), no invocation.
+    expect(result).toEqual({
+      ok: false,
+      errors: ['policy.telemetry.sendCost: must be a boolean'],
+    });
+    expect(calls).toBe(0);
+  });
+
   it('refuses an empty object with policy.telemetry.enabled: required', () => {
     expect(readTelemetryPolicyBlock({})).toEqual({
       ok: false,
@@ -253,6 +293,116 @@ describe('readTelemetryPolicyBlock', () => {
       ok: false,
       errors: ['policy.telemetry.projectAliases: two projects share an alias'],
     });
+  });
+
+  it('refuses invalid projectAliases values including a getter-valued alias', () => {
+    // Cost bound: each entry costs one isAlias check — a regex test and one
+    // containsSecretShape scan of the alias, O(n) in the value length.
+    const secretShapedAlias = 'sk-' + 'b'.repeat(20);
+    const badValues: unknown[] = ['Bad', '1abc', 123, null, secretShapedAlias, 'a'.repeat(33)];
+    for (const alias of badValues) {
+      const result = readTelemetryPolicyBlock({
+        enabled: false,
+        projectAliases: { 'org/repo': alias },
+      });
+      expect(result).toEqual({
+        ok: false,
+        errors: [
+          'policy.telemetry.projectAliases: every alias must match ^[a-z][a-z0-9-]{0,31}$ and hold no secret-shaped value',
+        ],
+      });
+      expect(JSON.stringify(result)).not.toContain(String(alias));
+    }
+  });
+
+  it('never invokes a getter-valued alias and refuses it', () => {
+    let calls = 0;
+    const aliases: Record<string, unknown> = {};
+    Object.defineProperty(aliases, 'org/repo', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return 'alias-one';
+      },
+    });
+    const result = readTelemetryPolicyBlock({ enabled: false, projectAliases: aliases });
+    // Cost bound: readOwnDataProperty returns the descriptor's value field,
+    // which is undefined for an accessor — O(1), the getter never runs.
+    expect(result).toEqual({
+      ok: false,
+      errors: [
+        'policy.telemetry.projectAliases: every alias must match ^[a-z][a-z0-9-]{0,31}$ and hold no secret-shaped value',
+      ],
+    });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses undefined, sparse-array, array-like, and enormous-length projectAliases containers', () => {
+    // undefined: not an object, refused by isPlainRecord — O(1).
+    expect(readTelemetryPolicyBlock({ enabled: false, projectAliases: undefined })).toEqual({
+      ok: false,
+      errors: ['policy.telemetry.projectAliases: must be an object'],
+    });
+    // Sparse array with a hole: Array.isArray rejects it before any index is
+    // read, so the hole is never inspected — O(1).
+    const sparse: string[] = new Array(3);
+    sparse[1] = 'alias-one';
+    expect(readTelemetryPolicyBlock({ enabled: false, projectAliases: sparse })).toEqual({
+      ok: false,
+      errors: ['policy.telemetry.projectAliases: must be an object'],
+    });
+    // Array-like plain object: refused on the non-string values it carries; the
+    // cost is O(k) in the two own keys, independent of the length value.
+    const arrayLike: Record<string, unknown> = { 0: 'alias-zero', length: 1 };
+    expect(readTelemetryPolicyBlock({ enabled: false, projectAliases: arrayLike })).toEqual({
+      ok: false,
+      errors: [
+        'policy.telemetry.projectAliases: every alias must match ^[a-z][a-z0-9-]{0,31}$ and hold no secret-shaped value',
+      ],
+    });
+    // Enormous length value: still just two own keys, so the walk stays O(2)
+    // and the non-string length is refused as an alias value — no throw.
+    const enormous: Record<string, unknown> = { 0: 'alias-zero', length: Number.MAX_SAFE_INTEGER };
+    expect(readTelemetryPolicyBlock({ enabled: false, projectAliases: enormous })).toEqual({
+      ok: false,
+      errors: [
+        'policy.telemetry.projectAliases: every alias must match ^[a-z][a-z0-9-]{0,31}$ and hold no secret-shaped value',
+      ],
+    });
+  });
+
+  it('refuses a throwing-trap Proxy as projectAliases without leaking the trap error', () => {
+    // Cost bound: isPlainRecord's getPrototypeOf call hits the throwing trap,
+    // which the outer catch converts to the fixed object error — O(1).
+    expect(readTelemetryPolicyBlock({ enabled: false, projectAliases: throwingProxy() })).toEqual({
+      ok: false,
+      errors: [OBJECT_ERROR],
+    });
+  });
+
+  it('refuses a Proxy presenting accessor descriptors without invoking the getters', () => {
+    let calls = 0;
+    const target: Record<string, unknown> = {};
+    const accessorProxy = new Proxy(target, {
+      getPrototypeOf: () => Object.prototype,
+      ownKeys: () => ['org/repo'],
+      getOwnPropertyDescriptor(_target, key) {
+        if (key === 'org/repo') {
+          return { enumerable: true, configurable: true, get() { calls += 1; return 'alias-one'; } };
+        }
+        return undefined;
+      },
+    });
+    const result = readTelemetryPolicyBlock({ enabled: false, projectAliases: accessorProxy });
+    // Cost bound: the descriptor read is O(1); accessor descriptors carry no
+    // value field, so the alias reads as undefined and the getter never runs.
+    expect(result).toEqual({
+      ok: false,
+      errors: [
+        'policy.telemetry.projectAliases: every alias must match ^[a-z][a-z0-9-]{0,31}$ and hold no secret-shaped value',
+      ],
+    });
+    expect(calls).toBe(0);
   });
 
   it('refuses prototype-polluting and over-length project ids in projectAliases', () => {

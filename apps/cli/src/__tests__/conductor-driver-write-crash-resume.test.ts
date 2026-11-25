@@ -441,13 +441,20 @@ async function expectLockTimeoutRefusal(lockPath: string, holderPid: number): Pr
   expect(Date.now() - started).toBeLessThan(2_000);
 }
 
+/**
+ * The exact per-test cleanup `afterEach` runs: restore every spy, then sweep
+ * temp dirs. T5 exercises this function directly so the restoration it proves
+ * is the restoration `afterEach` performs.
+ */
+function sweepAfterTest(): void {
+  vi.restoreAllMocks();
+  for (const dir of CREATED_DIRS.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe('conductor driver resumed after a crash inside a state-file write or lock', () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-    for (const dir of CREATED_DIRS.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+  afterEach(sweepAfterTest);
 
   it('T1 (major): a stray run-journal temp file left between the temp write and the rename is ignored on resume and the drive reaches the baseline terminal state', async () => {
     const baseline = await runBaseline();
@@ -579,19 +586,21 @@ describe('conductor driver resumed after a crash inside a state-file write or lo
     }
   });
 
-  it('T5 (minor): every runSubprocess spy in the suite stays silent and afterEach restores all spies with no leak', () => {
+  it('T5 (minor): every runSubprocess spy in the suite stays silent and the afterEach cleanup restores injected spies', () => {
     for (const spy of SUBPROCESS_SPIES) {
       expect(spy).not.toHaveBeenCalled();
     }
-    // The afterEach behaviour: restoration clears injected faults; a mock
-    // created afterwards carries none of them.
-    const faulted = vi.fn(() => {
-      throw new Error('injected fault');
-    });
-    expect(() => faulted()).toThrow('injected fault');
-    vi.restoreAllMocks();
-    const clean = vi.fn(() => 'clean');
-    expect(clean()).toBe('clean');
-    expect(clean).toHaveBeenCalledTimes(1);
+    // A real spy (vi.spyOn, like T4's rename spy) with an injected fault.
+    // vi.fn mocks are untouched by vi.restoreAllMocks(), so only a spyOn spy
+    // can prove the afterEach restoration actually happens: with the
+    // `afterEach(sweepAfterTest)` line removed, this test fails, because the
+    // fault stays installed.
+    const probe = { signal: () => 'original' };
+    const probeSpy = vi.spyOn(probe, 'signal').mockImplementation(() => 'faulted');
+    expect(probeSpy.getMockName()).toBeTruthy();
+    expect(probe.signal()).toBe('faulted');
+    expect(probeSpy).toHaveBeenCalledTimes(1);
+    sweepAfterTest(); // the exact cleanup afterEach runs
+    expect(probe.signal()).toBe('original'); // the fault is gone
   });
 });

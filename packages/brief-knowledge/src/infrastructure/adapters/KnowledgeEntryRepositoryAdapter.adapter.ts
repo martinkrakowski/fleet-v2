@@ -29,16 +29,34 @@ export interface KnowledgeEntryRepositoryAdapterDependencies {
   readonly stateDir?: string;
 }
 
+/**
+ * Reads one own data property holding a string, without ever invoking an
+ * accessor: an own getter (or setter) on the field is refused with
+ * `undefined` rather than executed, so an untrusted record can never run
+ * arbitrary code through the state parsers.
+ */
+function readOwnStringDataProperty(record: object, field: 'id' | 'attemptId'): string | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(record, field);
+  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+    return undefined;
+  }
+  return typeof descriptor.value === 'string' ? descriptor.value : undefined;
+}
+
 /** The entries reader's record parser, shared with `fleet-v2 state check`. */
 export function parseKnowledgeEntryStateRecord(raw: unknown): KnowledgeEntryRecord | undefined {
-  return typeof raw === 'object' && raw !== null && typeof (raw as { id?: unknown }).id === 'string'
+  return typeof raw === 'object' &&
+    raw !== null &&
+    readOwnStringDataProperty(raw, 'id') !== undefined
     ? (raw as KnowledgeEntryRecord)
     : undefined;
 }
 
 /** The selections reader's record parser, shared with `fleet-v2 state check`. */
 export function parseContextSelectionStateRecord(raw: unknown): ContextSelectionProps | undefined {
-  return typeof raw === 'object' && raw !== null && typeof (raw as { attemptId?: unknown }).attemptId === 'string'
+  return typeof raw === 'object' &&
+    raw !== null &&
+    readOwnStringDataProperty(raw, 'attemptId') !== undefined
     ? (raw as ContextSelectionProps)
     : undefined;
 }

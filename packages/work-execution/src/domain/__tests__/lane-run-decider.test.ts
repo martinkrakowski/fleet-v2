@@ -2201,6 +2201,23 @@ describe('merging state', () => {
       });
     });
 
+    it('RM3 helper round 2: a queue outcome on a Tier 2 run whose PR head the queue moved is handled, never masked by premerge-pending', () => {
+      const headSha = `${HEAD}${'0'.repeat(28)}`;
+      const movedSha = `${HEAD}${'f'.repeat(28)}`;
+      const queued = (mergeEnqueue: LaneRunFacts['mergeEnqueue']): LaneRunFacts => baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, headSha: movedSha, containsLaneHead: true }, attempt: attemptFact(), mergeEnqueue,
+      });
+      expect(decide(record({}), queued('none'))).toEqual({ kind: 'wait', reason: 'premerge-pending' });
+      assertDecision(queued('dropped-fixable'), record({}), decide(record({}), queued('dropped-fixable')), { kind: 'enter', to: 'fixing' });
+      assertDecision(queued('held'), record({}), decide(record({}), queued('held')), {
+        kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
+      });
+      assertDecision(queued('stuck'), record({}), decide(record({}), queued('stuck')), {
+        kind: 'park', reason: 'step-refused', qualifier: 'merge-enqueue', parkedFrom: 'merging',
+      });
+    });
+
     it('RM3 helper round: a missing full sha on either side stays premerge-pending, never trusting a shared 12-character prefix', () => {
       const headSha = `${HEAD}${'0'.repeat(28)}`;
       const missingLane = baseFacts({

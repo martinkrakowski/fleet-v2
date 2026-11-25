@@ -333,7 +333,7 @@ export interface LaneRunFacts {
   readonly attempt: LaneRunAttemptFact | null;
   /** Current head of the run's branch (collected head, or the PR head once pushed) (K4/K6). */
   readonly head12: string | null;
-  /** The lane's full head sha when the attempt artifacts carry it; absent or null reads as unknown (the 12-character compare stands). */
+  /** The lane's full head sha when the attempt artifacts carry it; absent or null reads as unknown (the PR head is then not verified and reads as moved). */
   readonly headSha?: string | null;
   /** Head of the run's last `accepted` acceptance (K1b). */
   readonly acceptedHead12: string | null;
@@ -619,8 +619,15 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   // PR's head exists. A lane head move is G7's re-gating, not this guard.
   // Fix round 2: the move is detected at full sha precision when both shas
   // are known — two distinct heads sharing the 12-character prefix are still
-  // a move; without the shas the 12-character compare stands.
-  if (record.tier === 2 && hold.kind === 'released' && facts.pr !== null && laneRunPrHeadMovedOf(facts)) {
+  // a move; without both shas the head is unverified and reads as moved.
+  // Helper round 2: once the merge queue has recorded an outcome for the run
+  // (its `update-branch` may itself have moved the PR head), the queue outcome
+  // (`dropped-fixable`, `held`, `stuck`, `merged`) is handled by the merge
+  // tail, never masked by this guard.
+  if (
+    record.tier === 2 && hold.kind === 'released' && facts.mergeEnqueue === 'none' &&
+    facts.pr !== null && laneRunPrHeadMovedOf(facts)
+  ) {
     return { kind: 'wait', reason: 'premerge-pending' };
   }
   if (hold.kind === 'released' && facts.premergePost === 'success') {

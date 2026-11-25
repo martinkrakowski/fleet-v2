@@ -348,11 +348,24 @@ const NO_DISK_QUOTA_PROBE = Symbol('no-disk-quota-probe');
  * Read one probe answer's two numbers. `O(1)`: only the probe result's own
  * data descriptors `'usedBytes'` and `'totalBytes'` are inspected, never a
  * getter (a getter is refused, not invoked), never a prototype property,
- * never anything else on the object. Anything else is `undefined`.
+ * never anything else on the object. An array-like is refused. Anything else
+ * is `undefined`.
  */
 export function readDiskQuotaUsage(raw: unknown): DiskQuotaUsage | undefined {
   try {
     if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
+      return undefined;
+    }
+    // An array-like is refused too: its own numeric `length` is the defining
+    // marker, read through the own descriptor so no getter is ever invoked.
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(raw, 'length');
+    if (
+      lengthDescriptor !== undefined &&
+      'value' in lengthDescriptor &&
+      typeof lengthDescriptor.value === 'number' &&
+      Number.isSafeInteger(lengthDescriptor.value) &&
+      lengthDescriptor.value >= 0
+    ) {
       return undefined;
     }
     const readings: [string, number | undefined][] = [];
@@ -424,10 +437,17 @@ async function diskQuotaLine(
     return undefined;
   }
   const raw: unknown = await safely(async () => {
-    const probe = probes.diskQuotaUsage;
-    return typeof probe === 'function'
-      ? await probe.call(probes, probeHost)
-      : NO_DISK_QUOTA_PROBE;
+    // The port is read through its own data descriptor, so a getter on
+    // `probes.diskQuotaUsage` is refused without ever being invoked.
+    const descriptor = Object.getOwnPropertyDescriptor(probes, 'diskQuotaUsage');
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      typeof descriptor.value !== 'function'
+    ) {
+      return NO_DISK_QUOTA_PROBE;
+    }
+    return await descriptor.value.call(probes, probeHost);
   });
   const [status, detail] = diskQuotaVerdict(raw, probeHost);
   return line('host', name, 'disk-quota', status, detail);

@@ -2197,12 +2197,14 @@ describe('runDoctor disk quota headroom (OPQ1)', () => {
     expect(doctorExitCode(lines)).toBe(1);
   });
 
-  it('reports UNKNOWN when diskQuotaUsage returns null, undefined, an array, or a wrong primitive', async () => {
+  it('reports UNKNOWN when diskQuotaUsage returns null, undefined, an array, an array-like, or a wrong primitive', async () => {
     for (const answer of [
       null,
       undefined,
       [],
       [100, 1000],
+      // An array-like passes typeof 'object' but is refused all the same.
+      { 0: 1, 1: 10, length: 2, usedBytes: 1, totalBytes: 10 },
       '100 1000',
       42,
       true,
@@ -2252,9 +2254,9 @@ describe('runDoctor disk quota headroom (OPQ1)', () => {
       },
     } as unknown as DoctorProbes;
     const hostileLines = await collect(loadedResult(runnerModel()), hostile);
-    // Reading the port property itself is unavoidable; the throw is caught
-    // by `safely`, never by the doctor crashing, and the result is UNKNOWN.
-    expect(probeReads).toEqual(['probe']);
+    // The port property is read through its own descriptor, so the throwing
+    // getter is refused without ever being invoked; the result is UNKNOWN.
+    expect(probeReads).toEqual([]);
     expect(diskQuotaLines(hostileLines)[0]?.status).toBe('UNKNOWN');
   });
 

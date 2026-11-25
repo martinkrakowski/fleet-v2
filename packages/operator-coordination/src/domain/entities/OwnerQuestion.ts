@@ -14,12 +14,15 @@
 import { containsSecretShape } from '@fleet/shared';
 import type {
   OwnerQuestionAnswerRecord,
+  OwnerQuestionAudience,
   OwnerQuestionBlockRecord,
   OwnerQuestionOptionRecord,
   OwnerQuestionRecord,
   OwnerQuestionRecordInput,
   OwnerQuestionState,
 } from '../owner-question-records.js';
+import { OWNER_QUESTION_RECORD_VERSION } from '../owner-question-records.js';
+import { readPlainObjectWithOptional } from '../record-input.js';
 
 const DOOR_KINDS: readonly string[] = ['one-way', 'two-way'];
 const STATES: readonly string[] = ['open', 'answered', 'rejected', 'expired', 'acknowledged'];
@@ -35,6 +38,51 @@ const OPTION_TEXT_MAX_CHARS = 1024;
 const ANSWER_TEXT_MAX_CHARS = 4096;
 const RECORD_JSON_MAX_CHARS = 32768;
 const IDEMPOTENCY_KEY_PATTERN = /^[\x21-\x7e]{1,256}$/;
+
+/**
+ * Who answered: the literal 'owner' or `agent:<id>` with 1 to 128 id
+ * characters from [A-Za-z0-9._-]. The explicit {1,128} bound keeps the
+ * character-class regex linear-time with no backtracking.
+ */
+export const OWNER_QUESTION_ACTOR_PATTERN = /^agent:[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Every own key a record may carry (18). `readPlainObjectWithOptional` refuses
+ * anything else, so the reflective inspection is bounded by this fixed set.
+ */
+const ALLOWED_RECORD_KEYS: readonly string[] = [
+  'questionId',
+  'revision',
+  'askedBy',
+  'title',
+  'body',
+  'options',
+  'recommendation',
+  'doorKind',
+  'linkedRequestId',
+  'blocks',
+  'state',
+  'askedAt',
+  'expiresAt',
+  'answer',
+  'acknowledgement',
+  'schemaVersion',
+  'audience',
+  'idempotencyKey',
+];
+
+/** Every own key an answer may carry (9). */
+const ALLOWED_ANSWER_KEYS: readonly string[] = [
+  'shape',
+  'optionId',
+  'text',
+  'reason',
+  'questionRevision',
+  'answeredVia',
+  'answeredAt',
+  'sessionId',
+  'actor',
+];
 
 /** States each state may move to; nothing else is allowed. */
 const ALLOWED_TRANSITIONS: Readonly<Record<OwnerQuestionState, readonly OwnerQuestionState[]>> = {
@@ -77,42 +125,130 @@ function normaliseTimestamp(field: string, value: string): string {
   return parsed.toISOString();
 }
 
+// Residual: "owner" means a holder of the shared bearer or the CLI, or an owner-verified session. It is not a fresh human check.
+
+/**
+ * Validate who answered. A signed-decision answer is always the owner: an
+ * absent actor reads as 'owner' and anything else is refused. Every other
+ * answer accepts 'owner' or `agent:<id>`; a missing actor reads as 'owner' at
+ * every schema version until FVM2b tightens the writers. The thrown error
+ * never echoes the refused value.
+ */
+export function validateAnswerActor(
+  actor: unknown,
+  answeredVia: unknown,
+  isLegacyRecord: boolean,
+): string {
+  if (answeredVia === 'signed-decision') {
+    if (actor === undefined || actor === 'owner') {
+      return 'owner';
+    }
+    throw new Error('OwnerQuestion signed-decision answer requires actor owner');
+  }
+  if (actor === undefined) {
+    // FVM2a: a missing actor reads as 'owner' at every schema version;
+    // `isLegacyRecord` stays in the signature for the FVM2b tightening.
+    void isLegacyRecord;
+    return 'owner';
+  }
+  if (
+    typeof actor !== 'string' ||
+    (actor !== 'owner' && !OWNER_QUESTION_ACTOR_PATTERN.test(actor)) ||
+    containsSecretShape(actor)
+  ) {
+    throw new Error('OwnerQuestion answer actor must be owner or agent:<id>');
+  }
+  return actor;
+}
+
+/**
+ * Read the stored schema version. Absent reads as 1 (a legacy record on
+ * disk); 2 is the current version. Anything else — including 0, 3, 1.5, '2',
+ * null, NaN and objects — is refused.
+ */
+function readSchemaVersion(rawVersion: unknown): {
+  readonly storedVersion: number;
+  readonly isLegacy: boolean;
+} {
+  if (rawVersion === undefined) {
+    return { storedVersion: 1, isLegacy: true };
+  }
+  if (rawVersion === 1) {
+    return { storedVersion: 1, isLegacy: true };
+  }
+  if (rawVersion === 2) {
+    return { storedVersion: 2, isLegacy: false };
+  }
+  throw new Error('OwnerQuestion unsupported schemaVersion');
+}
+
+/**
+ * Read the answer audience: 'any' is accepted on a current record; anything
+ * missing or unknown — and every legacy (v1) record — reads fail-closed as
+ * 'owner-only'.
+ */
+function readAudience(rawAudience: unknown, isLegacy: boolean): OwnerQuestionAudience {
+  if (isLegacy) {
+    return 'owner-only';
+  }
+  return rawAudience === 'any' ? 'any' : 'owner-only';
+}
+
 export class OwnerQuestion {
   private constructor(private readonly record: OwnerQuestionRecord) {
     // Invariants are validated in fromRecord.
   }
 
   static fromRecord(input: OwnerQuestionRecordInput): OwnerQuestion {
-    if (typeof input !== 'object' || input === null) {
+    // The whole record is read through its own property descriptors: getters
+    // never run, and a non-object, non-plain prototype, revoked Proxy,
+    // prototype-polluting or unrecognised extra key is refused before any
+    // field is looked at. Required keys stay `[]` so the per-field errors
+    // below keep their messages.
+    const snap = readPlainObjectWithOptional(input, [], ALLOWED_RECORD_KEYS, {
+      refuseOptionalAccessors: true,
+    });
+    if (snap === null) {
       throw new Error('OwnerQuestion requires a record');
     }
+    const safeInput = snap as unknown as OwnerQuestionRecordInput;
+    const { isLegacy } = readSchemaVersion(safeInput.schemaVersion);
+    const audience = readAudience(safeInput.audience, isLegacy);
     for (const field of ['questionId', 'askedBy', 'title', 'body', 'askedAt'] as const) {
-      const value = input[field];
+      const value = safeInput[field];
       if (typeof value !== 'string' || value.trim().length === 0) {
         throw new Error(`OwnerQuestion requires a non-empty ${field}`);
       }
     }
-    const questionId = readText('questionId', input.questionId, ID_MAX_CHARS);
-    const askedBy = readText('askedBy', input.askedBy, ID_MAX_CHARS);
-    const title = readText('title', input.title, TITLE_MAX_CHARS);
-    const body = readText('body', input.body, BODY_MAX_CHARS);
-    if (!Number.isInteger(input.revision) || input.revision < 1) {
+    const questionId = readText('questionId', safeInput.questionId, ID_MAX_CHARS);
+    const askedBy = readText('askedBy', safeInput.askedBy, ID_MAX_CHARS);
+    const title = readText('title', safeInput.title, TITLE_MAX_CHARS);
+    const body = readText('body', safeInput.body, BODY_MAX_CHARS);
+    if (!Number.isInteger(safeInput.revision) || safeInput.revision < 1) {
       throw new Error('OwnerQuestion requires a positive integer revision of at least 1');
     }
-    const askedAt = normaliseTimestamp('askedAt', input.askedAt);
-    const expiresAt = readExpiresAt(input);
-    const options = OwnerQuestion.readOptions(input.options);
-    const recommendation = OwnerQuestion.readRecommendation(input.recommendation, options);
-    const doorKind = readDoorKind(input);
-    const linkedRequestId = readLinkedRequestId(input, doorKind);
-    const blocks = OwnerQuestion.readBlocks(input.blocks);
-    const state = readState(input);
-    const answer = OwnerQuestion.readAnswer(input.answer, state, recommendation, options, input.revision);
-    const acknowledgement = OwnerQuestion.readAcknowledgement(input.acknowledgement, state, answer);
-    const idempotencyKey = readIdempotencyKey(input);
+    const askedAt = normaliseTimestamp('askedAt', safeInput.askedAt);
+    const expiresAt = readExpiresAt(safeInput);
+    const options = OwnerQuestion.readOptions(safeInput.options);
+    const recommendation = OwnerQuestion.readRecommendation(safeInput.recommendation, options);
+    const doorKind = readDoorKind(safeInput);
+    const linkedRequestId = readLinkedRequestId(safeInput, doorKind);
+    const blocks = OwnerQuestion.readBlocks(safeInput.blocks);
+    const state = readState(safeInput);
+    const answer = OwnerQuestion.readAnswer(
+      safeInput.answer,
+      state,
+      recommendation,
+      options,
+      safeInput.revision,
+      audience,
+      isLegacy,
+    );
+    const acknowledgement = OwnerQuestion.readAcknowledgement(safeInput.acknowledgement, state, answer);
+    const idempotencyKey = readIdempotencyKey(safeInput);
     const record: OwnerQuestionRecord = {
       questionId,
-      revision: input.revision,
+      revision: safeInput.revision,
       askedBy,
       title,
       body,
@@ -126,6 +262,8 @@ export class OwnerQuestion {
       expiresAt,
       answer,
       acknowledgement,
+      schemaVersion: OWNER_QUESTION_RECORD_VERSION,
+      audience,
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
     };
     const jsonChars = JSON.stringify(record).length;
@@ -225,6 +363,8 @@ export class OwnerQuestion {
     recommendation: OwnerQuestionRecord['recommendation'],
     options: readonly OwnerQuestionOptionRecord[],
     revision: number,
+    audience: OwnerQuestionAudience,
+    isLegacy: boolean,
   ): OwnerQuestionAnswerRecord | null {
     if (answer === undefined || answer === null) {
       if (state === 'answered' || state === 'rejected') {
@@ -238,49 +378,66 @@ export class OwnerQuestion {
     if (state === 'expired') {
       throw new Error('OwnerQuestion in state expired must not carry an answer');
     }
-    if (typeof answer !== 'object' || answer === null) {
+    // The answer is read through its own property descriptors too: getters
+    // never run and extra, accessor or prototype-polluting keys are refused.
+    const snap = readPlainObjectWithOptional(answer, [], ALLOWED_ANSWER_KEYS, {
+      refuseOptionalAccessors: true,
+    });
+    if (snap === null) {
       throw new Error('OwnerQuestion answer must be an object');
     }
-    if (!ANSWER_SHAPES.includes(answer.shape)) {
+    const safeAnswer = snap as unknown as OwnerQuestionAnswerRecord & { readonly actor?: string };
+    if (!ANSWER_SHAPES.includes(safeAnswer.shape)) {
       throw new Error(`OwnerQuestion answer shape is not one of ${ANSWER_SHAPES.join(', ')}`);
     }
-    if (state === 'rejected' && answer.shape !== 'reject') {
+    if (state === 'rejected' && safeAnswer.shape !== 'reject') {
       throw new Error('OwnerQuestion in state rejected requires an answer of shape reject');
     }
-    if (state === 'answered' && answer.shape !== 'accept' && answer.shape !== 'answer') {
+    if (state === 'answered' && safeAnswer.shape !== 'accept' && safeAnswer.shape !== 'answer') {
       throw new Error('OwnerQuestion in state answered requires an answer of shape accept or answer');
     }
-    if (!ANSWER_VIAS.includes(answer.answeredVia)) {
+    if (!ANSWER_VIAS.includes(safeAnswer.answeredVia)) {
       throw new Error(`OwnerQuestion answer answeredVia is not one of ${ANSWER_VIAS.join(', ')}`);
     }
     if (
-      !Number.isInteger(answer.questionRevision) ||
-      answer.questionRevision < 1 ||
-      answer.questionRevision > revision
+      !Number.isInteger(safeAnswer.questionRevision) ||
+      safeAnswer.questionRevision < 1 ||
+      safeAnswer.questionRevision > revision
     ) {
       throw new Error(
         `OwnerQuestion answer questionRevision must be an integer between 1 and the record revision ${revision}`,
       );
     }
-    if (typeof answer.answeredAt !== 'string' || Number.isNaN(Date.parse(answer.answeredAt))) {
+    if (typeof safeAnswer.answeredAt !== 'string' || Number.isNaN(Date.parse(safeAnswer.answeredAt))) {
       throw new Error('OwnerQuestion answer requires a valid answeredAt timestamp');
+    }
+    const actor = validateAnswerActor(safeAnswer.actor, safeAnswer.answeredVia, isLegacy);
+    // Domain backstop: an agent answers only where the asker opened the door
+    // to any audience, and never through a signed owner decision.
+    if (
+      actor.startsWith('agent:') &&
+      (audience !== 'any' || safeAnswer.answeredVia === 'signed-decision')
+    ) {
+      throw new Error(
+        'OwnerQuestion refuses agent answer when audience is not any or answeredVia is signed-decision',
+      );
     }
     // An accept always lands on the recommended option, whatever the caller named.
     const optionId =
-      answer.shape === 'accept' ? recommendation.optionId : (answer.optionId ?? null);
-    const text = answer.text ?? null;
-    const reason = answer.reason ?? null;
-    const sessionId = answer.sessionId ?? null;
+      safeAnswer.shape === 'accept' ? recommendation.optionId : (safeAnswer.optionId ?? null);
+    const text = safeAnswer.text ?? null;
+    const reason = safeAnswer.reason ?? null;
+    const sessionId = safeAnswer.sessionId ?? null;
     if (optionId !== null && !options.some((option) => option.id === optionId)) {
       throw new Error('OwnerQuestion answer names an option that is not one of the options');
     }
-    if (answer.shape === 'reject' && optionId !== null) {
+    if (safeAnswer.shape === 'reject' && optionId !== null) {
       throw new Error('OwnerQuestion answer shape reject must not name an option');
     }
-    if (answer.shape === 'answer' && optionId === null && (text === null || text.length === 0)) {
+    if (safeAnswer.shape === 'answer' && optionId === null && (text === null || text.length === 0)) {
       throw new Error('OwnerQuestion answer shape answer requires an optionId or text');
     }
-    if (answer.shape === 'accept' && (reason !== null || (text !== null && text.length > 0))) {
+    if (safeAnswer.shape === 'accept' && (reason !== null || (text !== null && text.length > 0))) {
       throw new Error('OwnerQuestion answer shape accept carries no free text or reason');
     }
     const readTexts: { field: 'answer text' | 'answer reason'; value: string | null }[] = [
@@ -293,14 +450,15 @@ export class OwnerQuestion {
       }
     }
     return {
-      shape: answer.shape,
+      shape: safeAnswer.shape,
       optionId,
       text,
       reason,
-      questionRevision: answer.questionRevision,
-      answeredVia: answer.answeredVia as OwnerQuestionAnswerRecord['answeredVia'],
-      answeredAt: normaliseTimestamp('answer answeredAt', answer.answeredAt),
+      questionRevision: safeAnswer.questionRevision,
+      answeredVia: safeAnswer.answeredVia as OwnerQuestionAnswerRecord['answeredVia'],
+      answeredAt: normaliseTimestamp('answer answeredAt', safeAnswer.answeredAt),
       sessionId: sessionId === null ? null : readText('answer sessionId', sessionId, ID_MAX_CHARS),
+      actor,
     };
   }
 

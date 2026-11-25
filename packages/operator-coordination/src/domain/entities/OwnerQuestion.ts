@@ -40,6 +40,22 @@ const RECORD_JSON_MAX_CHARS = 32768;
 const IDEMPOTENCY_KEY_PATTERN = /^[\x21-\x7e]{1,256}$/;
 
 /**
+ * The smallest JSON a valid option can serialize to (one non-empty character
+ * in each of id, label, consequence) and, with its separating comma, the
+ * per-entry minimum of an options array. An array of `n` options therefore
+ * needs at least `n * (MIN + 1) - 1` JSON characters, so any array longer than
+ * the bound below can never fit the record's 32768-character budget: it is
+ * refused BEFORE any element is traversed, so a very large array costs O(1),
+ * not unbounded time and memory.
+ */
+const MIN_OPTION_JSON_CHARS = JSON.stringify({ id: 'a', label: 'b', consequence: 'c' }).length;
+const MAX_OPTION_COUNT = Math.floor((RECORD_JSON_MAX_CHARS + 1) / (MIN_OPTION_JSON_CHARS + 1));
+
+/** The same bound for `blocks`, from the smallest valid block (`kind: 'plan'`). */
+const MIN_BLOCK_JSON_CHARS = JSON.stringify({ kind: 'plan', ref: 'a' }).length;
+const MAX_BLOCK_COUNT = Math.floor((RECORD_JSON_MAX_CHARS + 1) / (MIN_BLOCK_JSON_CHARS + 1));
+
+/**
  * Who answered: the literal 'owner' or `agent:<id>` with 1 to 128 id
  * characters from [A-Za-z0-9._-]. The explicit {1,128} bound keeps the
  * character-class regex linear-time with no backtracking.
@@ -83,6 +99,80 @@ const ALLOWED_ANSWER_KEYS: readonly string[] = [
   'sessionId',
   'actor',
 ];
+
+/** Every own key an option may carry (3). */
+const ALLOWED_OPTION_KEYS: readonly string[] = ['id', 'label', 'consequence'];
+
+/** Every own key a recommendation may carry (2). */
+const ALLOWED_RECOMMENDATION_KEYS: readonly string[] = ['optionId', 'because'];
+
+/** Every own key a block may carry (2). */
+const ALLOWED_BLOCK_KEYS: readonly string[] = ['kind', 'ref'];
+
+/** Every own key an acknowledgement may carry (2). */
+const ALLOWED_ACKNOWLEDGEMENT_KEYS: readonly string[] = ['by', 'at'];
+
+/**
+ * Marks an absent index (an array hole) in a `readBoundedArray` copy; the
+ * callers refuse it, never treat it as a value.
+ */
+const ARRAY_HOLE: unique symbol = Symbol('OwnerQuestion array hole');
+
+/**
+ * Read an untrusted array defensively. `Array.isArray` and the own `length`
+ * descriptor are read inside try/catch (a revoked Proxy throws), and the count
+ * bound is applied BEFORE any element is touched, so an enormous array is
+ * refused in constant time. Elements are then copied from their own index
+ * descriptors — no iterator, no `length`/index property read beyond the copy —
+ * and an absent index is reported as `ARRAY_HOLE` so the caller refuses it.
+ * A Proxy that lies consistently in every trap remains an accepted residual.
+ * Returns null for a non-array; throws a named error when `maxCount` is
+ * exceeded, before any element is read.
+ */
+function readBoundedArray(
+  value: unknown,
+  field: string,
+  maxCount: number,
+): { readonly values: readonly unknown[] } | null {
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return null;
+  }
+  if (!isArray) {
+    return null;
+  }
+  let lengthDescriptor: PropertyDescriptor | undefined;
+  try {
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  } catch {
+    return null;
+  }
+  if (
+    lengthDescriptor === undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (length > maxCount) {
+    throw new Error(`OwnerQuestion ${field} exceed the record budget of at most ${maxCount} entries`);
+  }
+  const values: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, index);
+    } catch {
+      return null;
+    }
+    values.push(descriptor === undefined ? ARRAY_HOLE : descriptor.value);
+  }
+  return { values };
+}
 
 /** States each state may move to; nothing else is allowed. */
 const ALLOWED_TRANSITIONS: Readonly<Record<OwnerQuestionState, readonly OwnerQuestionState[]>> = {
@@ -278,18 +368,27 @@ export class OwnerQuestion {
   private static readOptions(
     options: readonly OwnerQuestionOptionRecord[],
   ): readonly OwnerQuestionOptionRecord[] {
-    if (!Array.isArray(options)) {
+    // The array is read defensively and count-bounded BEFORE any element is
+    // traversed (item 1 of the fix round), and every element is read through
+    // its own property descriptors (item 2): a hostile getter on an option
+    // field never runs, and a hole or a non-object is refused.
+    const bounded = readBoundedArray(options, 'options', MAX_OPTION_COUNT);
+    if (bounded === null) {
       throw new Error('OwnerQuestion requires an array of options');
     }
-    if (options.length < 2) {
+    if (bounded.values.length < 2) {
       throw new Error('OwnerQuestion requires at least 2 options');
     }
     const seenIds = new Set<string>();
     const read: OwnerQuestionOptionRecord[] = [];
-    for (const option of options) {
-      if (typeof option !== 'object' || option === null) {
+    for (const raw of bounded.values) {
+      const snap = readPlainObjectWithOptional(raw, ['id', 'label', 'consequence'], ALLOWED_OPTION_KEYS, {
+        refuseOptionalAccessors: true,
+      });
+      if (snap === null) {
         throw new Error('OwnerQuestion options must be objects');
       }
+      const option = snap as unknown as OwnerQuestionOptionRecord;
       if (typeof option.id !== 'string' || option.id.trim().length === 0) {
         throw new Error('OwnerQuestion option id must be a non-empty string');
       }
@@ -317,35 +416,49 @@ export class OwnerQuestion {
     recommendation: OwnerQuestionRecord['recommendation'],
     options: readonly OwnerQuestionOptionRecord[],
   ): OwnerQuestionRecord['recommendation'] {
-    if (typeof recommendation !== 'object' || recommendation === null) {
+    // The recommendation is read through its own property descriptors too: a
+    // hostile getter on optionId or because never runs, and a non-object,
+    // extra or accessor key is refused.
+    const snap = readPlainObjectWithOptional(
+      recommendation,
+      [],
+      ALLOWED_RECOMMENDATION_KEYS,
+      { refuseOptionalAccessors: true },
+    );
+    if (snap === null) {
       throw new Error('OwnerQuestion requires a recommendation');
     }
-    const optionId = readText('recommendation optionId', recommendation.optionId, OPTION_ID_MAX_CHARS);
-    if (optionId.trim().length === 0) {
+    const safe = snap as unknown as OwnerQuestionRecord['recommendation'];
+    if (typeof safe.optionId !== 'string' || safe.optionId.trim().length === 0) {
       throw new Error('OwnerQuestion recommendation optionId must be a non-empty string');
     }
+    const optionId = readText('recommendation optionId', safe.optionId, OPTION_ID_MAX_CHARS);
     if (!options.some((option) => option.id === optionId)) {
       throw new Error('OwnerQuestion recommendation names an option that is not one of the options');
     }
-    if (typeof recommendation.because !== 'string' || recommendation.because.trim().length === 0) {
+    if (typeof safe.because !== 'string' || safe.because.trim().length === 0) {
       throw new Error('OwnerQuestion recommendation because must be a non-empty string');
     }
-    const because = readText('recommendation because', recommendation.because, OPTION_TEXT_MAX_CHARS);
+    const because = readText('recommendation because', safe.because, OPTION_TEXT_MAX_CHARS);
     return { optionId, because };
   }
 
   private static readBlocks(
     blocks: readonly OwnerQuestionBlockRecord[] | undefined,
   ): readonly OwnerQuestionBlockRecord[] {
-    const list = blocks ?? [];
-    if (!Array.isArray(list)) {
+    const bounded = readBoundedArray(blocks ?? [], 'blocks', MAX_BLOCK_COUNT);
+    if (bounded === null) {
       throw new Error('OwnerQuestion blocks must be an array');
     }
     const read: OwnerQuestionBlockRecord[] = [];
-    for (const block of list) {
-      if (typeof block !== 'object' || block === null) {
+    for (const raw of bounded.values) {
+      const snap = readPlainObjectWithOptional(raw, ['kind', 'ref'], ALLOWED_BLOCK_KEYS, {
+        refuseOptionalAccessors: true,
+      });
+      if (snap === null) {
         throw new Error('OwnerQuestion blocks must be objects');
       }
+      const block = snap as unknown as OwnerQuestionBlockRecord;
       if (!BLOCK_KINDS.includes(block.kind)) {
         throw new Error(`OwnerQuestion block kind is not one of ${BLOCK_KINDS.join(', ')}`);
       }
@@ -479,18 +592,27 @@ export class OwnerQuestion {
     if (answer === null) {
       throw new Error('OwnerQuestion acknowledgement requires a recorded answer');
     }
-    if (typeof acknowledgement !== 'object' || acknowledgement === null) {
+    // Read through its own property descriptors: a hostile getter on by or at
+    // never runs, and a non-object, extra or accessor key is refused.
+    const snap = readPlainObjectWithOptional(
+      acknowledgement,
+      [],
+      ALLOWED_ACKNOWLEDGEMENT_KEYS,
+      { refuseOptionalAccessors: true },
+    );
+    if (snap === null) {
       throw new Error('OwnerQuestion acknowledgement must be an object');
     }
-    if (typeof acknowledgement.by !== 'string' || acknowledgement.by.trim().length === 0) {
+    const safe = snap as unknown as { readonly by: string; readonly at: string };
+    if (typeof safe.by !== 'string' || safe.by.trim().length === 0) {
       throw new Error('OwnerQuestion acknowledgement by must be a non-empty string');
     }
-    if (typeof acknowledgement.at !== 'string' || Number.isNaN(Date.parse(acknowledgement.at))) {
+    if (typeof safe.at !== 'string' || Number.isNaN(Date.parse(safe.at))) {
       throw new Error('OwnerQuestion acknowledgement requires a valid at timestamp');
     }
     return {
-      by: readText('acknowledgement by', acknowledgement.by, ID_MAX_CHARS),
-      at: normaliseTimestamp('acknowledgement at', acknowledgement.at),
+      by: readText('acknowledgement by', safe.by, ID_MAX_CHARS),
+      at: normaliseTimestamp('acknowledgement at', safe.at),
     };
   }
 

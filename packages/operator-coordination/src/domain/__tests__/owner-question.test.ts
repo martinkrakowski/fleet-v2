@@ -974,4 +974,132 @@ describe('OwnerQuestion record version, audience and answer actor', () => {
       expect(message).toBe('OwnerQuestion answer actor must be owner or agent:<id>');
     });
   });
+
+  describe('hostile-input cost bounds and nested descriptor reads', () => {
+    it('refuses an options array beyond the record JSON budget before touching any element', () => {
+      let getterRuns = 0;
+      const hostileOption: Record<string, unknown> = {};
+      Object.defineProperty(hostileOption, 'id', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return 'a';
+        },
+      });
+      // Far beyond any count a record within 32768 JSON characters could hold;
+      // every element carries a getter, so traversal would run it.
+      const huge = Array.from({ length: 5000 }, () => hostileOption);
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          options: huge as unknown as OwnerQuestionOptionRecord[],
+        }),
+      ).toThrow(/at most \d+ entries/);
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses a blocks array beyond the record JSON budget before touching any element', () => {
+      let getterRuns = 0;
+      const hostileBlock: Record<string, unknown> = {};
+      Object.defineProperty(hostileBlock, 'kind', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return 'lane';
+        },
+      });
+      const huge = Array.from({ length: 5000 }, () => hostileBlock);
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          blocks: huge as unknown as OwnerQuestionRecordInput['blocks'],
+        }),
+      ).toThrow(/at most \d+ entries/);
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses getters on nested option, recommendation, block and acknowledgement fields without invoking them', () => {
+      // A getter on an option field is refused and never runs.
+      let optionRuns = 0;
+      const option: Record<string, unknown> = { label: 'L', consequence: 'C' };
+      Object.defineProperty(option, 'id', {
+        enumerable: true,
+        get() {
+          optionRuns += 1;
+          return 'a';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          options: [option, option] as unknown as OwnerQuestionOptionRecord[],
+        }),
+      ).toThrow('OwnerQuestion options must be objects');
+      expect(optionRuns).toBe(0);
+
+      // A getter on the recommendation's optionId is refused and never runs.
+      let recommendationRuns = 0;
+      const recommendation: Record<string, unknown> = { because: 'Reversibility beats speed here.' };
+      Object.defineProperty(recommendation, 'optionId', {
+        enumerable: true,
+        get() {
+          recommendationRuns += 1;
+          return 'a';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          recommendation: recommendation as unknown as OwnerQuestionRecordInput['recommendation'],
+        }),
+      ).toThrow('OwnerQuestion requires a recommendation');
+      expect(recommendationRuns).toBe(0);
+
+      // A getter on a block's ref is refused and never runs.
+      let blockRuns = 0;
+      const block: Record<string, unknown> = { kind: 'lane' };
+      Object.defineProperty(block, 'ref', {
+        enumerable: true,
+        get() {
+          blockRuns += 1;
+          return 'lane-7';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          blocks: [block] as unknown as OwnerQuestionRecordInput['blocks'],
+        }),
+      ).toThrow('OwnerQuestion blocks must be objects');
+      expect(blockRuns).toBe(0);
+
+      // A getter on the acknowledgement's by is refused and never runs.
+      let acknowledgementRuns = 0;
+      const acknowledgement: Record<string, unknown> = { at: '2026-10-16T12:00:00.000Z' };
+      Object.defineProperty(acknowledgement, 'by', {
+        enumerable: true,
+        get() {
+          acknowledgementRuns += 1;
+          return 'orchestrator';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord({ state: 'acknowledged' }),
+          answer: {
+            shape: 'accept',
+            optionId: 'a',
+            text: null,
+            reason: null,
+            questionRevision: 1,
+            answeredVia: 'web',
+            answeredAt: '2026-10-16T11:00:00.000Z',
+            sessionId: null,
+          },
+          acknowledgement: acknowledgement as unknown as OwnerQuestionRecordInput['acknowledgement'],
+        }),
+      ).toThrow('OwnerQuestion acknowledgement must be an object');
+      expect(acknowledgementRuns).toBe(0);
+    });
+  });
 });

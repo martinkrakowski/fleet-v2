@@ -467,18 +467,29 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
    * declared order: only a real array within the length bound whose entries
    * are all own string data properties. A hole, a getter (never run — read
    * from the property descriptor, not the entry), a non-string entry, an
-   * enormous length, or anything a descriptor read throws on (a hostile
+   * enormous length, or anything a read throws on (a hostile or revoked
    * `Proxy`) yields null, so the caller fails closed. A `Proxy` that lies
    * consistently in every trap is an accepted residual. Cost: one descriptor
    * read per entry, bounded by `MAX_OWNED_PATHS`; the input is never invoked.
    */
   private static safeOwnedPathsView(ownedPaths: unknown): readonly string[] | null {
-    if (!Array.isArray(ownedPaths) || ownedPaths.length > LaneRunAdmissionAdapter.MAX_OWNED_PATHS) {
+    // `Array.isArray` on a revoked `Proxy` throws, and a `Proxy`'s `get` trap
+    // for `length` can throw too; both are hostile input, so the shape check
+    // is guarded and the length is snapshotted once instead of re-read per
+    // entry (a trap that varies between reads cannot extend the scan).
+    let input: readonly unknown[];
+    try {
+      if (!Array.isArray(ownedPaths) || ownedPaths.length > LaneRunAdmissionAdapter.MAX_OWNED_PATHS) {
+        return null;
+      }
+      input = ownedPaths;
+    } catch {
       return null;
     }
     const paths: string[] = [];
     try {
-      for (let index = 0; index < ownedPaths.length; index += 1) {
+      const length = input.length;
+      for (let index = 0; index < length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(ownedPaths, index);
         if (descriptor === undefined || descriptor.get !== undefined || typeof descriptor.value !== 'string') {
           return null;

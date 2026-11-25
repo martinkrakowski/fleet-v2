@@ -1675,4 +1675,53 @@ describe('LaneRunAdmissionBlockers overlaps and unreadable (CB10)', () => {
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
+
+  it('a Proxy whose length get trap throws on the blocker\'s ownedPaths fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    const target: string[] = ['packages/other/src'];
+    const hostile = new Proxy(target, {
+      get(_target, property) {
+        if (property === 'length') {
+          throw new Error('hostile length');
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: hostile as unknown as readonly string[] }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a revoked Proxy as the blocker\'s ownedPaths fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    const { proxy, revoke } = Proxy.revocable(['packages/other/src'], {});
+    revoke();
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: proxy as unknown as readonly string[] }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
 });

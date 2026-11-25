@@ -204,6 +204,9 @@ describe("MCP-to-API mutation route parity", () => {
     expect(client.calls).toHaveLength(FLEET_TOOL_NAMES.length);
     for (const name of FLEET_TOOL_NAMES) {
       const call = callsByName.get(name);
+      if (!call) {
+        throw new Error(`${name} was not recorded during the first pass`);
+      }
       const expected = EXPECTED_ROUTES[name];
       expect(`${call.method} ${toPatternForm(call.path)}`).toBe(
         `${expected.method} ${expected.path}`,

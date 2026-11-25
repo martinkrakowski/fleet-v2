@@ -4,6 +4,7 @@ export * from "./acceptance-blockers.js";
 export * from "./assessment-id.js";
 export * from "./check-coverage.js";
 export * from "./entities/index.js";
+export * from "./evidence-bundle-manifest.js";
 export * from "./evidence-records.js";
 export * from "./failing-file.js";
 export * from "./finding-citations.js";

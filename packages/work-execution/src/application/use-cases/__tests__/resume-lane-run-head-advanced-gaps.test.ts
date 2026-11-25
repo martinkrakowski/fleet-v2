@@ -510,8 +510,12 @@ async function appendResult(
 }
 
 /** One dirty tracked path: the fact that justifies an escalation. */
-function dirtyInspection(): { readonly uncommittedPaths: readonly string[]; readonly untrackedPaths: readonly string[] } {
-  return { uncommittedPaths: ['src/a.ts'], untrackedPaths: [] };
+function dirtyInspection(): {
+  readonly uncommittedPaths: readonly string[];
+  readonly untrackedPaths: readonly string[];
+  readonly checkedOutCommit: string;
+} {
+  return { uncommittedPaths: ['src/a.ts'], untrackedPaths: [], checkedOutCommit: COMMIT };
 }
 
 interface WiredInspect {
@@ -1213,80 +1217,165 @@ describe('tryEscalatePark STAY_PARKED contract (FY03 gap 2)', () => {
     expect(wired.counters()).toStrictEqual({ saves: 0, appends: 0 });
   });
 
-  it('escalates on the advance path when the head is malformed or missing and uncommittedPaths is non-empty (the dirty rule wins; an unreadable head is unknown, never clean)', async () => {
-    // Gap 1: the malformed/missing `checkedOutCommit` refusals above are the
-    // RESUME path's pin (the whole fact is refused there). The advance path
-    // is pinned here: the merged advance-side read leaves `headAdvanced`
-    // ABSENT for a malformed, uppercase, wrong-typed or missing head
-    // (unknown, read as `false` — CE2) while the bounded path read still
-    // counts the uncommitted edits, so the fact keeps its exact
-    // `{ trackedFilesChanged }` shape and the dirty-worktree rule wins:
-    // `tryEscalatePark` escalates. An unreadable head can never masquerade
-    // as a clean worktree to park on; an implementation that read it as
-    // clean (parking `head-advanced`) or refused the whole fact fails this
-    // test. Cost: the fact read is the usual O(1) gates plus one bounded
-    // O(cap) walk, cap = 4096; the head check is O(1) per case.
-    const heads: unknown[] = ['not-a-sha', HEAD.slice(0, 12), MOVED_HEAD.toUpperCase(), null, 7];
-    for (const checkedOutCommit of heads) {
+  it('refuses every malformed recorded head identically on the advance and resume paths: stays parked, zero saves, zero appends, no escalation', async () => {
+    // FY03F. One table of hostile head shapes feeds BOTH paths. Cost: each
+    // head check is O(1) (typeof string, length 40, one regexp over 40
+    // chars); no list is walked beyond the single-path fixture. A getter is
+    // never run on either path (the counter stays 0).
+    const OMIT = Symbol('omit');
+    class GetterOf {
+      constructor(readonly value: unknown) {
+        getterSpecs.add(this);
+      }
+    }
+    // `instanceof` would trip a hostile Proxy's prototype trap, so the marker
+    // is read through a WeakSet instead.
+    const getterSpecs = new WeakSet<object>();
+    const isGetterSpec = (spec: unknown): spec is GetterOf => {
+      try {
+        return typeof spec === 'object' && spec !== null && getterSpecs.has(spec);
+      } catch {
+        return false;
+      }
+    };
+    const throwingProxy = (): unknown =>
+      new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor: () => {
+            throw new Error('hostile descriptor trap');
+          },
+          ownKeys: () => {
+            throw new Error('hostile ownKeys trap');
+          },
+          getPrototypeOf: () => {
+            throw new Error('hostile prototype trap');
+          },
+        },
+      );
+    interface HeadCase {
+      readonly label: string;
+      readonly checked?: unknown;
+      readonly recorded?: unknown;
+      readonly artifacts?: unknown;
+    }
+    const cases: readonly HeadCase[] = [
+      { label: 'checked: non-hex text', checked: 'not-a-sha' },
+      { label: 'checked: 12 chars', checked: 'abcdef012345' },
+      { label: 'checked: uppercase', checked: 'ABCDEF0123456789ABCDEF0123456789ABCDEF01' },
+      { label: 'checked: 41 chars', checked: `${'a'.repeat(41)}` },
+      { label: 'checked: null', checked: null },
+      { label: 'checked: undefined', checked: undefined },
+      { label: 'checked: number', checked: 7 },
+      { label: 'checked: array of one sha', checked: [COMMIT] },
+      { label: 'checked: missing key', checked: OMIT },
+      { label: 'checked: getter', checked: new GetterOf(COMMIT) },
+      { label: 'checked: throwing Proxy', checked: throwingProxy() },
+      { label: 'recorded: 3 chars', recorded: 'abc' },
+      { label: 'recorded: uppercase', recorded: 'ABCDEF0123456789ABCDEF0123456789ABCDEF01' },
+      { label: 'recorded: null', recorded: null },
+      { label: 'recorded: number', recorded: 7 },
+      { label: 'recorded: missing key', recorded: OMIT },
+      { label: 'recorded: getter', recorded: new GetterOf(COMMIT) },
+      { label: 'recorded: throwing Proxy', recorded: throwingProxy() },
+      { label: 'artifacts: null', artifacts: null },
+      { label: 'artifacts: missing key', artifacts: OMIT },
+      { label: 'artifacts: getter', artifacts: new GetterOf({ headCommit: COMMIT }) },
+      { label: 'artifacts: throwing Proxy', artifacts: throwingProxy() },
+    ];
+    const getterRuns = { count: 0 };
+    const field = (base: Record<string, unknown>, key: string, spec: unknown): Record<string, unknown> => {
+      const out: Record<string, unknown> = { ...base };
+      Reflect.deleteProperty(out, key);
+      if (spec === OMIT) {
+        return out;
+      }
+      if (isGetterSpec(spec)) {
+        Object.defineProperty(out, key, {
+          enumerable: true,
+          get: () => {
+            getterRuns.count += 1;
+            return spec.value;
+          },
+        });
+        return out;
+      }
+      out[key] = spec;
+      return out;
+    };
+    const build = (
+      make: (overrides: Partial<AttemptRecord>) => AttemptRecord,
+      valid: string,
+      c: HeadCase,
+    ): { readonly inspection: unknown; readonly attempt: AttemptRecord } => {
+      const checked = 'checked' in c ? (isGetterSpec(c.checked) ? new GetterOf(valid) : c.checked) : valid;
+      const recorded = 'recorded' in c ? (isGetterSpec(c.recorded) ? new GetterOf(valid) : c.recorded) : valid;
+      const inspection = field({ ...dirtyInspection() }, 'checkedOutCommit', checked);
+      const artifacts = field(
+        { headCommit: valid, commitsSinceBase: [valid], collectedArtifactPaths: [], notes: 'present' },
+        'headCommit',
+        recorded,
+      );
+      const attempt = field(make({}) as unknown as Record<string, unknown>, 'artifacts', 'artifacts' in c ? c.artifacts : artifacts);
+      return { inspection, attempt: attempt as unknown as AttemptRecord };
+    };
+    const advanceAttemptOverrides = {
+      id: 'attempt-example-2',
+      kind: 'fix' as const,
+      fixNumber: 1,
+      priorAttemptId: 'attempt-example-1',
+      runner: CONDUCTED_RUNNER,
+    };
+
+    for (const c of cases) {
+      // Advance path: the fact is absent and the park stays parked, untouched.
+      const made = build((o) => attemptFixture({ ...advanceAttemptOverrides, ...o }), COMMIT, c);
       expect(
         await dirtyWorktreeFactOf(
-          {
-            deps: {
-              worktreeInspect: {
-                inspectWorktree: async () => ({ ...dirtyInspection(), checkedOutCommit }),
-              },
-            },
-          } as unknown as AdvanceStepContext,
-          attemptFixture(),
+          { deps: { worktreeInspect: { inspectWorktree: async () => made.inspection } } } as unknown as AdvanceStepContext,
+          made.attempt,
         ),
-        String(checkedOutCommit),
-      ).toStrictEqual({ trackedFilesChanged: 1 });
+        c.label,
+      ).toBeUndefined();
+      const harness = await parkedHarness({ round: 1 });
+      const record = await harness.runRepo.get(RUN_ID);
+      if (record === null) {
+        throw new Error('fixture: the run record disappeared');
+      }
+      const wired = withWriteCounters(withInspect(harness, () => made.inspection).deps);
+      expect(await tryEscalateDirectly(wired.deps, record, made.attempt), c.label).toStrictEqual({
+        outcome: 'waiting',
+        reason: 'parked',
+      });
+      expect(wired.counters(), c.label).toStrictEqual({ saves: 0, appends: 0 });
+      expect((await harness.runRepo.get(RUN_ID))?.parked?.reason, c.label).toBe('fix-no-progress');
+      expect(await escalationResults(harness), c.label).toEqual([]);
+
+      // Resume path: the same malformed head refuses `fix-no-progress`.
+      const resumeMade = build((o) => makeAttempt(o), HEAD, c);
+      const fx = await seededEscalation({ inspect: resumeMade.inspection, attempt: resumeMade.attempt });
+      await seedPendingResume(fx);
+      const revisionBefore = (await fx.repo.get(RUN_ID))?.revision;
+      expect(await apply(fx), c.label).toStrictEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'fix-no-progress' });
+      expect((await fx.repo.get(RUN_ID))?.parked, c.label).toStrictEqual(FIX_PARK);
+      expect((await fx.repo.get(RUN_ID))?.revision, c.label).toBe(revisionBefore);
+      expect((await entriesForRun(fx)).filter((entry) => entry.kind === 'conduct' && entry.state === 'fixing'), c.label).toEqual([]);
+      expect(await escalationMarkers(fx), c.label).toEqual([]);
     }
+    expect(getterRuns.count).toBe(0);
 
-    // A missing key reads the same: no own descriptor, head fact absent.
-    expect(
-      await dirtyWorktreeFactOf(
-        {
-          deps: {
-            worktreeInspect: {
-              inspectWorktree: async () => {
-                const missing: Record<string, unknown> = { ...dirtyInspection() };
-                Reflect.deleteProperty(missing, 'checkedOutCommit');
-                return missing;
-              },
-            },
-          },
-        } as unknown as AdvanceStepContext,
-        attemptFixture(),
-      ),
-    ).toStrictEqual({ trackedFilesChanged: 1 });
-
-    // End to end: the unreadable-head dirty fact drives `tryEscalatePark`
-    // into `fixing` exactly once, with the usual one save and three
-    // appends, and the park is lifted — the head fact never blocks it.
+    // Control: the same fixtures with VALID heads escalate on the advance
+    // path (one save, three appends), so the refusals above are caused by
+    // the head, not by the fixture.
+    const control = build((o) => attemptFixture({ ...advanceAttemptOverrides, ...o }), COMMIT, { label: 'valid' });
     const harness = await parkedHarness({ round: 1 });
     const record = await harness.runRepo.get(RUN_ID);
-    expect(record).not.toBeNull();
     if (record === null) {
       throw new Error('fixture: the run record disappeared');
     }
-    const wired = withWriteCounters(
-      withInspect(harness, () => ({ ...dirtyInspection(), checkedOutCommit: 'not-a-sha' })).deps,
-    );
-    expect(
-      await tryEscalateDirectly(wired.deps, record, attemptFixture({
-        id: 'attempt-example-2',
-        kind: 'fix',
-        fixNumber: 1,
-        priorAttemptId: 'attempt-example-1',
-        runner: CONDUCTED_RUNNER,
-      })),
-    ).toStrictEqual({ outcome: 'entered', state: 'fixing' });
+    const wired = withWriteCounters(withInspect(harness, () => control.inspection).deps);
+    expect(await tryEscalateDirectly(wired.deps, record, control.attempt)).toStrictEqual({ outcome: 'entered', state: 'fixing' });
     expect(wired.counters()).toStrictEqual({ saves: 1, appends: 3 });
-    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
-    expect(await escalationResults(harness)).toEqual([
-      expect.objectContaining({ outcome: 'completed', reasonCode: 'park-escalated', detail: 'commit-pending' }),
-    ]);
   });
 
   it('refuses non-array, array-like, holed, and over-bound uncommittedPaths in bounded time', async () => {
@@ -1324,7 +1413,7 @@ describe('tryEscalatePark STAY_PARKED contract (FY03 gap 2)', () => {
       expect(
         await dirtyWorktreeFactOf(
           {
-            deps: { worktreeInspect: { inspectWorktree: async () => ({ uncommittedPaths, untrackedPaths: [] }) } },
+            deps: { worktreeInspect: { inspectWorktree: async () => ({ uncommittedPaths, untrackedPaths: [], checkedOutCommit: COMMIT }) } },
           } as unknown as AdvanceStepContext,
           attemptFixture(),
         ),
@@ -1338,7 +1427,7 @@ describe('tryEscalatePark STAY_PARKED contract (FY03 gap 2)', () => {
       throw new Error('fixture: the run record disappeared');
     }
     const wired = withWriteCounters(
-      withInspect(harness, () => ({ uncommittedPaths: { length: 2 ** 32 }, untrackedPaths: [] })).deps,
+      withInspect(harness, () => ({ uncommittedPaths: { length: 2 ** 32 }, untrackedPaths: [], checkedOutCommit: COMMIT })).deps,
     );
     expect(
       await tryEscalateDirectly(wired.deps, record, attemptFixture({

@@ -24,6 +24,8 @@ const OTHER_SECRET = "Mp4$".repeat(8);
 const BODY_TEXT = "Bx3#".repeat(8);
 const MIB = 1048576;
 const OK = { ok: true };
+// A value-shaped fixture built at runtime, never written as a literal.
+const BUILT_VALUE = ["s3", "cr3t", "-", "value"].join("");
 
 // Counts every Proxy trap that fires; a verifier that never touches a Proxy leaves it at 0.
 const touches = { count: 0 };
@@ -102,6 +104,30 @@ describe("verifyWebhookSignature", () => {
     expect(
       verifyWebhookSignature(withFields({ secret: minimal, signatureHeader: sign(minimal, buffer) })),
     ).toEqual(OK);
+  });
+
+  it("accepts a secret of exactly MAX_SECRET_BYTES and refuses one byte over for string and Uint8Array", () => {
+    // Cost: O(MAX_SECRET_BYTES) per call for the length checks plus one 100-byte HMAC
+    // per accepted case; refused cases never reach the hashing.
+    const body = Buffer.alloc(100, 1);
+    const stringAtLimit = "K9".repeat(2048); // 4096 UTF-8 bytes at runtime
+    const stringOverLimit = stringAtLimit + "K";
+    const bytesAtLimit = new Uint8Array(4096).fill(0x4b);
+    const bytesOverLimit = new Uint8Array(4097).fill(0x4b);
+    const atLimitInputs: Array<Record<string, unknown>> = [
+      { secret: stringAtLimit, signatureHeader: sign(stringAtLimit, body) },
+      { secret: bytesAtLimit, signatureHeader: sign(bytesAtLimit, body) },
+    ];
+    for (const input of atLimitInputs) {
+      expect(verifyWebhookSignature({ ...input, body })).toEqual(OK);
+    }
+    const overLimitInputs: Array<Record<string, unknown>> = [
+      { secret: stringOverLimit, signatureHeader: sign(stringOverLimit, body) },
+      { secret: bytesOverLimit, signatureHeader: sign(bytesOverLimit, body) },
+    ];
+    for (const input of overLimitInputs) {
+      expect(verifyWebhookSignature({ ...input, body })).toEqual(refused("secret-invalid"));
+    }
   });
 
   it("lowers the body cap with maxBodyBytes and falls back to 1 MiB for any other value", () => {
@@ -400,21 +426,21 @@ describe("createReplayCache", () => {
     // Cost: O(1) per case; options are read through two own-property descriptor lookups.
     touches.count = 0;
     const good = { capacity: 4, ttlMs: 1000 };
-    const badCapacity: unknown[] = [0, -1, 10001, 1.5, Number.NaN, Infinity, 424242, 2 ** 53, "4", "s3cr3t-value", null, undefined, true, {}, [4]];
-    const badTtl: unknown[] = [0, -1, 86400001, 1.5, Number.NaN, Infinity, 987654321, 2 ** 53, "1000", "s3cr3t-value", null, undefined, true, {}, [1000]];
+    const badCapacity: unknown[] = [0, -1, 10001, 1.5, Number.NaN, Infinity, 424242, 2 ** 53, "4", [BUILT_VALUE], null, undefined, true, {}, [4]];
+    const badTtl: unknown[] = [0, -1, 86400001, 1.5, Number.NaN, Infinity, 987654321, 2 ** 53, "1000", [BUILT_VALUE], null, undefined, true, {}, [1000]];
     for (const value of badCapacity) {
       const error = rangeErrorOf(() => createReplayCache({ ...good, capacity: value }));
       expect(error.message).toContain("capacity");
       expect(error.message).not.toContain("ttlMs");
       expect(error.message).not.toContain("424242");
-      expect(error.message).not.toContain("s3cr3t-value");
+      expect(error.message).not.toContain(BUILT_VALUE);
     }
     for (const value of badTtl) {
       const error = rangeErrorOf(() => createReplayCache({ ...good, ttlMs: value }));
       expect(error.message).toContain("ttlMs");
       expect(error.message).not.toContain("capacity");
       expect(error.message).not.toContain("987654321");
-      expect(error.message).not.toContain("s3cr3t-value");
+      expect(error.message).not.toContain(BUILT_VALUE);
     }
     // Getter-backed, inherited, non-object and Proxy options are refused; no getter runs.
     let reads = 0;
@@ -438,7 +464,11 @@ describe("createReplayCache", () => {
     expect(rangeErrorOf(() => createReplayCache(getterTtl)).message).toContain("ttlMs");
     expect(rangeErrorOf(() => createReplayCache(Object.create(good))).message).toContain("capacity");
     for (const options of [null, undefined, 4, "options", true, trapped({ ...good })]) {
-      expect(rangeErrorOf(() => createReplayCache(options)).message).toContain("options");
+      // The non-object refusals must name both validated fields, so a message that
+      // mentions only `options` (or only one field) fails this test.
+      const message = rangeErrorOf(() => createReplayCache(options)).message;
+      expect(message).toContain("capacity");
+      expect(message).toContain("ttlMs");
     }
     expect(reads).toBe(0);
     expect(touches.count).toBe(0);

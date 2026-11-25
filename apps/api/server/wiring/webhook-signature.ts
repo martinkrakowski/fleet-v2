@@ -13,9 +13,10 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { types } from "node:util";
 
 const DEFAULT_MAX_BODY_BYTES = 1048576;
+// Maximum accepted secret: bounds the HMAC key work per call and the cost of
+// validating a secret's byte length.
+export const MAX_SECRET_BYTES = 4096;
 const MIN_SECRET_BYTES = 16;
-// Keys beyond a few KiB add nothing; the ceiling bounds the cost of validating a secret.
-const MAX_SECRET_BYTES = 4096;
 const SIGNATURE_PREFIX = "sha256=";
 const SIGNATURE_LENGTH = 71;
 const SIGNATURE_PATTERN = /^sha256=[0-9a-f]{64}$/;
@@ -114,8 +115,10 @@ function resolveMaxBodyBytes(requested: unknown): number {
  * Verifies `signatureHeader` (`sha256=<64 lowercase hex>`) as HMAC-SHA256 of the raw
  * `body` under `secret`. `input` is untrusted: only own data properties `secret`,
  * `body`, `signatureHeader` and `maxBodyBytes` are read, each once, and no getter,
- * Proxy trap or inherited value is ever run or consulted. Unusable `input` reports
- * `secret-invalid`, the first field validated; an unreadable `maxBodyBytes` fails
+ * Proxy trap or inherited value is ever run or consulted. The accepted `secret` is
+ * a `string` or `Uint8Array` of at least 16 and at most `MAX_SECRET_BYTES` (4096)
+ * UTF-8 bytes; anything else reports `secret-invalid`, the first field validated;
+ * an unreadable `maxBodyBytes` fails
  * closed as `body-too-large`.
  */
 export function verifyWebhookSignature(input: unknown): WebhookSignatureResult {
@@ -175,7 +178,9 @@ function isIntegerInRange(value: unknown, min: number, max: number): value is nu
  */
 export function createReplayCache(options: unknown): ReplayCache {
   if (typeof options !== "object" || options === null || types.isProxy(options)) {
-    throw new RangeError("createReplayCache: options must be an object with capacity and ttlMs");
+    throw new RangeError(
+      "createReplayCache: options must be an object with integer capacity and ttlMs",
+    );
   }
   const capacity = readOwnDataProperty(options, "capacity");
   const ttlMs = readOwnDataProperty(options, "ttlMs");

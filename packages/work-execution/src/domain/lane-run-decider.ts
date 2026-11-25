@@ -579,8 +579,8 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
  * RM3 fix round 2: whether the PR's head has moved off the lane's head.
  * `O(1)`: two string compares, no getter, no iteration. At full sha precision
  * when both shas are known — a move that shares the 12-character prefix is
- * still a move. Without them the 12-character compare stands (a pr fact
- * without `headSha` reads as unknown and never blocks a matching prefix).
+ * still a move. When either full sha is unavailable the head is not verified
+ * and reads as moved (fail closed; a 12-character prefix match proves nothing).
  */
 function laneRunPrHeadMovedOf(facts: LaneRunFacts): boolean {
   const pr = facts.pr;
@@ -590,7 +590,8 @@ function laneRunPrHeadMovedOf(facts: LaneRunFacts): boolean {
   if (typeof pr.headSha === 'string' && typeof facts.headSha === 'string') {
     return pr.headSha !== facts.headSha;
   }
-  return pr.head12 !== facts.head12;
+  // Fail closed: without both full shas the head is not verified, so it reads as moved.
+  return true;
 }
 
 /**

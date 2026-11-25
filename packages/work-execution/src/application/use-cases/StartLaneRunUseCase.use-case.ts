@@ -57,6 +57,7 @@ import type {
 import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemptPort.in-port.js';
 import type { PrepareBriefPackagePort } from '../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from './PrepareBriefPackageUseCase.use-case.js';
+import { validateStaticBriefRequest } from './PrepareBriefPackageUseCase.use-case.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
@@ -152,6 +153,35 @@ function incomplete(
   reason: StartLaneRunIncompleteReason | string,
 ): StartLaneRunResult {
   return { outcome: 'incomplete', runId, attemptId, step, reason };
+}
+
+/**
+ * The `incomplete` result a brief refusal maps to, both for the pre-reserve
+ * static check (RB4) and for the prepare's own rejection: the class stays
+ * the prefix so callers matching on it keep working, and the prepare's
+ * reason follows it, flattened and bounded. The prepare's reasons are
+ * authored messages ('worktreePath is required', 'acceptanceChecks must be
+ * distinct names'), never matched text: the secret scan reports rule names
+ * only. Even so this is bounded before it joins a result string — a reason
+ * that embeds a nested error message is the one case that could carry
+ * caller input, and an unbounded newline-carrying string in a one-line CLI
+ * result is a readability problem at best.
+ */
+function briefRejectionResult(
+  request: StartLaneRunRequest,
+  reason: string,
+  reasonClass: 'acceptance-spec-shell' | undefined,
+): Extract<StartLaneRunResult, { outcome: 'incomplete' }> {
+  const briefClass =
+    reasonClass === 'acceptance-spec-shell' ? 'brief-acceptance-spec-shell' : 'brief-rejected';
+  const detail = reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS);
+  return {
+    outcome: 'incomplete',
+    runId: request.runId,
+    attemptId: request.attemptId,
+    step: 'brief',
+    reason: detail === '' ? briefClass : `${briefClass}: ${detail}`,
+  };
 }
 
 /** Non-terminal journal states of the runs the scan saw, excluding `excludeRunId`. */
@@ -357,6 +387,18 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       return await this.recordIncomplete(request, 'attempt', 'attempt-differs');
     }
 
+    // RB4: the brief-step refusals that depend only on the request itself
+    // (no worktree, no file read) run before the capacity reserve. A refusal
+    // here returns the same `incomplete` shape and reason string the brief
+    // step would have produced, records no `start-incomplete` fact and
+    // reserves nothing: the slot is never taken for a request the brief
+    // would refuse on its face. Refusals that need the worktree or the
+    // prepare's I/O stay at the brief step below, with the reservation held.
+    const staticBrief = validateStaticBriefRequest(request.brief);
+    if (!staticBrief.ok) {
+      return briefRejectionResult(request, staticBrief.reason, staticBrief.reasonClass);
+    }
+
     // Step 1: reserve (a retry reuses the held reservation).
     const held = await this.heldReservationFor(request.attemptId);
     let hostName: string;
@@ -488,27 +530,13 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       // The class is what callers switch on, but discarding the prepare's own
       // reason left an operator with `brief-rejected` and nothing else: the
       // reason had to be recovered by re-running `brief prepare` by hand with a
-      // reconstructed request. The class stays first in the string so prefix
-      // matching still works, and the detail follows it.
-      const briefClass =
-        briefResult.reasonClass === 'acceptance-spec-shell'
-          ? 'brief-acceptance-spec-shell'
-          : 'brief-rejected';
-      // The prepare's reasons are authored messages ('worktreePath is
-      // required', 'acceptanceChecks must be distinct names'), never matched
-      // text: the secret scan reports rule names only. Even so this is bounded
-      // and flattened before it joins a result string - a reason that embeds a
-      // nested error message is the one case that could carry caller input, and
-      // an unbounded newline-carrying string in a one-line CLI result is a
-      // readability problem at best.
-      const detail =
-        typeof briefResult.reason === 'string'
-          ? briefResult.reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS)
-          : '';
+      // reconstructed request. `briefRejectionResult` keeps the class first in
+      // the string so prefix matching still works, and the detail follows it,
+      // flattened and bounded.
       return await this.recordIncomplete(
         request,
         'brief',
-        detail === '' ? briefClass : `${briefClass}: ${detail}`,
+        briefRejectionResult(request, briefResult.reason, briefResult.reasonClass).reason,
       );
     }
     const briefDigest = briefResult.prepared.briefDigest;

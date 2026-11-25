@@ -111,6 +111,29 @@ function isPlainObject(value: object): boolean {
  * rejected when it is an accessor and ignored when it is a data property
  * (for example the non-enumerable `length`).
  */
+function isCanonicalIndexKey(key: string, length: number): boolean {
+  const n = Number(key);
+  return (
+    String(n) === key && Number.isInteger(n) && n >= 0 && n < length
+  );
+}
+
+/** Refuses the own property `key` of `target` when it is an accessor. */
+function assertNoAccessorProperty(
+  target: object,
+  key: string | symbol,
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor === undefined) {
+    return;
+  }
+  if (
+    typeof descriptor.get === "function" ||
+    typeof descriptor.set === "function"
+  ) {
+    throw new GetterPropertyError();
+  }
+}
 
 /**
  * Refuses every own property of `value` that is not a JSON data property:
@@ -123,15 +146,9 @@ function assertJsonOwnProperties(
   keys: readonly (string | symbol)[],
 ): void {
   for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined) {
+    assertNoAccessorProperty(value, key);
+    if (descriptorMissing(value, key)) {
       continue;
-    }
-    if (
-      typeof descriptor.get === "function" ||
-      typeof descriptor.set === "function"
-    ) {
-      throw new GetterPropertyError();
     }
     if (typeof key === "symbol") {
       throw new UnsupportedValueError(key);
@@ -140,6 +157,10 @@ function assertJsonOwnProperties(
     // non-enumerable `length`) are ignored; any non-index own *accessor* was
     // already refused above.
   }
+}
+
+function descriptorMissing(value: object, key: string | symbol): boolean {
+  return Object.getOwnPropertyDescriptor(value, key) === undefined;
 }
 
 interface Frame {
@@ -183,46 +204,73 @@ export function jsonPaths(value: unknown): string[] {
       continue;
     }
     nodes += 1;
-    // Budget-first, O(1): an array's own keys always include one per
-    // canonical index, and `nodes` already charges this node itself, so
-    // `nodes + length` is a lower bound on the node charge. Refusing here
-    // avoids the full `Reflect.ownKeys` walk and its key-array allocation
-    // for any array that cannot fit in the budget, whether because of its
-    // length alone or because of nodes already spent.
-    if (Array.isArray(frame.value) && nodes + frame.value.length > MAX_NODES) {
-      throw new NodeBudgetExceededError();
+    // Budget-first, O(1): an array's canonical indices are already a lower
+    // bound on its own-key charge, so `nodes + length` refuses any array
+    // that cannot fit in the budget BEFORE any key enumeration at all —
+    // no `Reflect.ownKeys` key array is ever allocated for a refused array.
+    if (Array.isArray(frame.value)) {
+      const arr = frame.value as unknown[];
+      if (nodes + arr.length > MAX_NODES) {
+        throw new NodeBudgetExceededError();
+      }
+      nodes += arr.length;
     }
-    const keys = Reflect.ownKeys(frame.value);
-    // The non-enumerable own `length` of an array is an internal marker, not
-    // a JSON value, so it is excluded from the node charge.
-    const chargedKeys =
-      Array.isArray(frame.value) &&
-      Object.prototype.hasOwnProperty.call(frame.value, "length")
-        ? keys.length - 1
-        : keys.length;
-    nodes += chargedKeys;
-    if (nodes > MAX_NODES) {
-      throw new NodeBudgetExceededError();
-    }
-    assertJsonOwnProperties(frame.value, keys);
     if (activeAncestors.has(frame.value)) {
       throw new CycleDetectedError();
     }
     activeAncestors.add(frame.value);
-    const isArray = Array.isArray(frame.value);
     const pending: { child: unknown; path: string }[] = [];
-    if (isArray) {
+    if (Array.isArray(frame.value)) {
       const arr = frame.value as unknown[];
       if (arr.length === 0) {
         results.add(`${frame.path}[]`);
       }
+      // Every remaining own key (anything that is not a canonical index) is
+      // enumerated lazily, one key at a time, and charged as it is found:
+      // a budget refusal fires DURING this walk, before a single child is
+      // visited and without materialising a key array of extras.
+      for (const extraKey in arr) {
+        if (!Object.prototype.hasOwnProperty.call(arr, extraKey)) {
+          continue;
+        }
+        if (isCanonicalIndexKey(extraKey, arr.length)) {
+          continue;
+        }
+        nodes += 1;
+        if (nodes > MAX_NODES) {
+          throw new NodeBudgetExceededError();
+        }
+        assertNoAccessorProperty(arr, extraKey);
+      }
+      const symbols = Object.getOwnPropertySymbols(arr);
+      nodes += symbols.length;
+      if (nodes > MAX_NODES) {
+        throw new NodeBudgetExceededError();
+      }
+      for (const symbol of symbols) {
+        assertNoAccessorProperty(arr, symbol);
+        // Symbol keys are never JSON data, accessor or not.
+        throw new UnsupportedValueError(symbol);
+      }
       for (let i = 0; i < arr.length; i += 1) {
-        if (!Object.prototype.hasOwnProperty.call(arr, String(i))) {
+        const indexKey = String(i);
+        if (!Object.prototype.hasOwnProperty.call(arr, indexKey)) {
           throw new SparseArrayError();
         }
+        // Inspect the descriptor instead of reading through a possible
+        // accessor: a getter is never invoked.
+        assertNoAccessorProperty(arr, indexKey);
         pending.push({ child: arr[i], path: `${frame.path}[${i}]` });
       }
     } else {
+      // Plain objects: every own key is a JSON field, so enumerating them is
+      // the O(N) work itself; charge and refuse before visiting any child.
+      const keys = Reflect.ownKeys(frame.value);
+      nodes += keys.length;
+      if (nodes > MAX_NODES) {
+        throw new NodeBudgetExceededError();
+      }
+      assertJsonOwnProperties(frame.value, keys);
       for (const key of keys) {
         const keyText = String(key);
         const child = (frame.value as Record<string, unknown>)[keyText];
@@ -294,29 +342,51 @@ function makeChildFrame(
   return { value: child, path, depth, children: null };
 }
 
-/** Shared O(1)/O(k) guard for path lists consumed by `compareFieldPaths`. */
+/** Shared budget-first guard for path lists consumed by `compareFieldPaths`. */
 function assertPathList(label: string, value: unknown): readonly string[] {
   if (value === null || value === undefined || !Array.isArray(value)) {
     throw new TypeError(`${label} must be an array of strings`);
   }
-  // O(1) budget refusal before any per-property walk.
-  if (value.length > MAX_NODES) {
+  // Budget-first, O(1): the canonical indices alone are a lower bound on the
+  // own-key charge, so an oversized list is refused before any key
+  // enumeration (and before any `Reflect.ownKeys` allocation).
+  if (1 + value.length > MAX_NODES) {
     throw new NodeBudgetExceededError();
   }
-  const keys = Reflect.ownKeys(value);
-  const chargedKeys =
-    Object.prototype.hasOwnProperty.call(value, "length") &&
-    value.length === keys.length - 1
-      ? keys.length - 1
-      : keys.length;
-  if (1 + chargedKeys > MAX_NODES) {
+  // Remaining own keys are enumerated lazily, one at a time, and charged as
+  // they are found; the budget refusal fires during this walk, before any
+  // element is read and without materialising a key array of extras.
+  let nodes = 1 + value.length;
+  for (const extraKey in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, extraKey)) {
+      continue;
+    }
+    if (isCanonicalIndexKey(extraKey, value.length)) {
+      continue;
+    }
+    nodes += 1;
+    if (nodes > MAX_NODES) {
+      throw new NodeBudgetExceededError();
+    }
+    assertNoAccessorProperty(value, extraKey);
+  }
+  const symbols = Object.getOwnPropertySymbols(value);
+  nodes += symbols.length;
+  if (nodes > MAX_NODES) {
     throw new NodeBudgetExceededError();
   }
-  assertJsonOwnProperties(value, keys);
+  for (const symbol of symbols) {
+    assertNoAccessorProperty(value, symbol);
+    // Symbol keys are never JSON data, accessor or not.
+    throw new UnsupportedValueError(symbol);
+  }
   for (let i = 0; i < value.length; i += 1) {
     if (!Object.prototype.hasOwnProperty.call(value, String(i))) {
       throw new SparseArrayError();
     }
+    // Inspect the descriptor instead of reading through a possible
+    // accessor: a getter is never invoked.
+    assertNoAccessorProperty(value, String(i));
     if (typeof value[i] !== "string") {
       throw new TypeError(`${label} must contain only strings`);
     }
@@ -653,18 +723,45 @@ describe("jsonPaths", () => {
     expect(jsonPaths(justUnderKeys)).toHaveLength(MAX_NODES - 1);
   });
 
-  it("refuses an array whose many extra own keys exceed the budget, charged before any child walk", () => {
-    // Budget-first: nodes(1) + length(1) alone stays under MAX_NODES, so only
-    // the extra own keys push the charge over; the refusal still names
-    // NodeBudgetExceededError rather than walking any child.
+  it("refuses an array whose many extra own keys exceed the budget during the lazy key walk, before any child is visited", () => {
+    // Budget-first: nodes(1) + length(1) alone stays under MAX_NODES, so the
+    // charge only crosses the budget during the lazy own-key walk. Each
+    // extra key holds a non-plain object as its value: if ANY child were
+    // visited before the budget refusal, the error would be
+    // UnsupportedObjectError, not NodeBudgetExceededError.
     const withExtras: string[] = ["only"];
     for (let i = 0; i < MAX_NODES - 1; i += 1) {
       Object.defineProperty(withExtras, `extra${i}`, {
-        value: "x",
+        value: new Date(0),
         enumerable: true,
       });
     }
     expect(() => jsonPaths(withExtras)).toThrow(NodeBudgetExceededError);
+  });
+
+  it("refuses the budget before enumerating a single own key for an oversized array length", () => {
+    // A Proxy records whether its ownKeys trap (or any per-key inspection)
+    // ever ran: for a length-only overrun, the O(1) check must refuse before
+    // any key enumeration happens at all.
+    let ownKeysInvoked = false;
+    const oversized = new Proxy(new Array<string>(10 * MAX_NODES).fill("x"), {
+      ownKeys() {
+        ownKeysInvoked = true;
+        return Reflect.ownKeys(new Array<string>(1).fill("x"));
+      },
+      getOwnPropertyDescriptor(target, key) {
+        ownKeysInvoked = true;
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          ownKeysInvoked = true;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(() => jsonPaths(oversized)).toThrow(NodeBudgetExceededError);
+    expect(ownKeysInvoked).toBe(false);
   });
 
   it("refuses an enormous array length above the budget in constant time, before any walk", () => {
@@ -819,6 +916,51 @@ describe("compareFieldPaths hostilities", () => {
     expect(() =>
       compareFieldPaths("f.json", new Array<string>(10 * MAX_NODES), []),
     ).toThrow(NodeBudgetExceededError);
+  });
+
+  it("refuses a path list whose many extra own keys exceed the budget during the lazy key walk, before any element is read", () => {
+    // Budget-first: 1 + length(1) alone stays under MAX_NODES, so the charge
+    // only crosses the budget during the lazy own-key walk. Element 0 is a
+    // non-string: if any ELEMENT were read before the budget refusal, the
+    // error would be TypeError, not NodeBudgetExceededError.
+    const withExtras: string[] = ["result.code"];
+    for (let i = 0; i < MAX_NODES - 1; i += 1) {
+      Object.defineProperty(withExtras, `extra${i}`, {
+        value: "x",
+        enumerable: true,
+      });
+    }
+    withExtras[0] = 1 as unknown as string;
+    expect(() =>
+      compareFieldPaths("f.json", withExtras, ["result.code"]),
+    ).toThrow(NodeBudgetExceededError);
+  });
+
+  it("refuses the path-list budget before enumerating a single own key for an oversized length", () => {
+    // A Proxy records whether its ownKeys trap (or any per-key inspection)
+    // ever ran: for a length-only overrun, the O(1) check must refuse before
+    // any key enumeration happens at all.
+    let ownKeysInvoked = false;
+    const oversized = new Proxy(new Array<string>(10 * MAX_NODES), {
+      ownKeys() {
+        ownKeysInvoked = true;
+        return Reflect.ownKeys(new Array<string>(1));
+      },
+      getOwnPropertyDescriptor(target, key) {
+        ownKeysInvoked = true;
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          ownKeysInvoked = true;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(() =>
+      compareFieldPaths("f.json", oversized, ["result.code"]),
+    ).toThrow(NodeBudgetExceededError);
+    expect(ownKeysInvoked).toBe(false);
   });
 });
 

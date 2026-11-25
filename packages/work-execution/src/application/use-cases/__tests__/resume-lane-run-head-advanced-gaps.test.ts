@@ -17,6 +17,14 @@
  *    and zero journal appends, while a dirty round-1 worktree still escalates
  *    (so an always-stay-parked implementation fails) and an existing
  *    escalation is never duplicated.
+ * 4. The advance path for a malformed or missing `checkedOutCommit`: the
+ *    head fact reads as absent (unknown, never clean), so with non-empty
+ *    `uncommittedPaths` the dirty rule wins and `tryEscalatePark` escalates
+ *    — the unreadable head can never park the run as `head-advanced`.
+ * 5. Own `constructor` / `prototype` keys on the INSPECTION RECORD itself:
+ *    the shared snapshot copies unknown data keys by design, so they are
+ *    inert and never reach the decision record (whose typed refusal for
+ *    those keys is pinned separately below).
  *
  * Hostile inputs (O(1) or bounded O(cap), cap = 4096 for path lists): every
  * refusal below is the merged code's typed refusal — `fix-no-progress` on the
@@ -737,6 +745,53 @@ describe('applyPendingResume head-advanced (FY03 gap 1)', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(await escalationMarkers(fx)).toEqual([]);
 
+    // Correction 2 on the INSPECTION RECORD itself: own `constructor` and
+    // `prototype` keys there are NOT refused the way an own `__proto__` key
+    // is — the merged snapshot copies unknown data keys by design, and the
+    // fact reader builds the fact from named fields only, so the poison
+    // keys are inert and never reach the decision record (whose typed
+    // refusal for these keys is pinned below, on the decision fact). The
+    // case stays outcome-changing: with non-empty paths and a moved head, a
+    // snapshot that refused these keys like `__proto__` would answer the
+    // plain `fix-no-progress` refusal here instead of the dirty-rule
+    // escalation this test asserts, and no global pollution happens either
+    // way.
+    for (const poisonKey of ['constructor', 'prototype']) {
+      const poisoned: Record<string, unknown> = { ...DIRTY_INSPECTION, checkedOutCommit: MOVED_HEAD };
+      Object.defineProperty(poisoned, poisonKey, { enumerable: true, value: 'poison' });
+      const poisonFx = await seededEscalation({ inspect: poisoned });
+      await seedPendingResume(poisonFx);
+      expect(await apply(poisonFx), poisonKey).toStrictEqual({
+        outcome: 'resumed',
+        to: 'fixing',
+        key: RESUME_CLI_KEY,
+      });
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      expect((await poisonFx.repo.get(RUN_ID))?.parked).toBeNull();
+      expect(await escalationMarkers(poisonFx)).not.toEqual([]);
+    }
+
+    // Advance side: the descriptor-based fact read ignores the extra keys
+    // too, so the fact keeps its exact shape (the poison is inert there as
+    // well) instead of reading the fact as unreadable.
+    for (const poisonKey of ['constructor', 'prototype']) {
+      const advancePoisoned: Record<string, unknown> = {
+        uncommittedPaths: ['src/a.ts'],
+        untrackedPaths: [],
+        checkedOutCommit: MOVED_HEAD,
+      };
+      Object.defineProperty(advancePoisoned, poisonKey, { enumerable: true, value: 'poison' });
+      expect(
+        await dirtyWorktreeFactOf(
+          {
+            deps: { worktreeInspect: { inspectWorktree: async () => advancePoisoned } },
+          } as unknown as AdvanceStepContext,
+          attemptFixture(),
+        ),
+        poisonKey,
+      ).toStrictEqual({ trackedFilesChanged: 1, headAdvanced: true });
+    }
+
     // Own `constructor` and `prototype` keys are refused at the escalation
     // DECISION record: the inspection snapshot copies unknown data keys by
     // design (the head read is descriptor-based), so the typed refusal for
@@ -1156,6 +1211,82 @@ describe('tryEscalatePark STAY_PARKED contract (FY03 gap 2)', () => {
       })),
     ).toStrictEqual({ outcome: 'waiting', reason: 'parked' });
     expect(wired.counters()).toStrictEqual({ saves: 0, appends: 0 });
+  });
+
+  it('escalates on the advance path when the head is malformed or missing and uncommittedPaths is non-empty (the dirty rule wins; an unreadable head is unknown, never clean)', async () => {
+    // Gap 1: the malformed/missing `checkedOutCommit` refusals above are the
+    // RESUME path's pin (the whole fact is refused there). The advance path
+    // is pinned here: the merged advance-side read leaves `headAdvanced`
+    // ABSENT for a malformed, uppercase, wrong-typed or missing head
+    // (unknown, read as `false` — CE2) while the bounded path read still
+    // counts the uncommitted edits, so the fact keeps its exact
+    // `{ trackedFilesChanged }` shape and the dirty-worktree rule wins:
+    // `tryEscalatePark` escalates. An unreadable head can never masquerade
+    // as a clean worktree to park on; an implementation that read it as
+    // clean (parking `head-advanced`) or refused the whole fact fails this
+    // test. Cost: the fact read is the usual O(1) gates plus one bounded
+    // O(cap) walk, cap = 4096; the head check is O(1) per case.
+    const heads: unknown[] = ['not-a-sha', HEAD.slice(0, 12), MOVED_HEAD.toUpperCase(), null, 7];
+    for (const checkedOutCommit of heads) {
+      expect(
+        await dirtyWorktreeFactOf(
+          {
+            deps: {
+              worktreeInspect: {
+                inspectWorktree: async () => ({ ...dirtyInspection(), checkedOutCommit }),
+              },
+            },
+          } as unknown as AdvanceStepContext,
+          attemptFixture(),
+        ),
+        String(checkedOutCommit),
+      ).toStrictEqual({ trackedFilesChanged: 1 });
+    }
+
+    // A missing key reads the same: no own descriptor, head fact absent.
+    expect(
+      await dirtyWorktreeFactOf(
+        {
+          deps: {
+            worktreeInspect: {
+              inspectWorktree: async () => {
+                const missing: Record<string, unknown> = { ...dirtyInspection() };
+                Reflect.deleteProperty(missing, 'checkedOutCommit');
+                return missing;
+              },
+            },
+          },
+        } as unknown as AdvanceStepContext,
+        attemptFixture(),
+      ),
+    ).toStrictEqual({ trackedFilesChanged: 1 });
+
+    // End to end: the unreadable-head dirty fact drives `tryEscalatePark`
+    // into `fixing` exactly once, with the usual one save and three
+    // appends, and the park is lifted — the head fact never blocks it.
+    const harness = await parkedHarness({ round: 1 });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record).not.toBeNull();
+    if (record === null) {
+      throw new Error('fixture: the run record disappeared');
+    }
+    const wired = withWriteCounters(
+      withInspect(harness, () => ({ ...dirtyInspection(), checkedOutCommit: 'not-a-sha' })).deps,
+    );
+    expect(
+      await tryEscalateDirectly(wired.deps, record, attemptFixture({
+        id: 'attempt-example-2',
+        kind: 'fix',
+        fixNumber: 1,
+        priorAttemptId: 'attempt-example-1',
+        runner: CONDUCTED_RUNNER,
+      })),
+    ).toStrictEqual({ outcome: 'entered', state: 'fixing' });
+    expect(wired.counters()).toStrictEqual({ saves: 1, appends: 3 });
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+    expect(await escalationResults(harness)).toEqual([
+      expect.objectContaining({ outcome: 'completed', reasonCode: 'park-escalated', detail: 'commit-pending' }),
+    ]);
   });
 
   it('refuses non-array, array-like, holed, and over-bound uncommittedPaths in bounded time', async () => {

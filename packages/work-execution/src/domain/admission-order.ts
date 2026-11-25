@@ -74,7 +74,7 @@ export type FairAdmissionResult =
   | { readonly ok: true; readonly admit: readonly AdmittedRun[]; readonly parked: readonly ParkedRun[] }
   | { readonly ok: false; readonly reason: FairAdmissionRefusalReason };
 
-/** Budget: groups + repositories + waiting runs + lastServed keys. */
+/** Budget: groups + repositories + waiting runs in total. */
 const ELEMENT_BUDGET = 10_000;
 /** Cap on any single array's `length` before the budget applies. */
 const SINGLE_ARRAY_CAP = 10_000;
@@ -202,7 +202,14 @@ function validateFairAdmission(
   if (rawGroups === null) {
     return { ok: false, reason: 'invalid-input' };
   }
-  let elementTotal = rawGroups.length + lastServedKeyCount;
+  // The budget covers groups + repositories + waiting runs only; the
+  // `lastServedAtIso` key count is a separate cap, checked above.
+  let elementTotal = rawGroups.length;
+  // Over-budget inputs are refused as soon as the count exceeds the budget,
+  // before any of the counted elements are traversed or copied.
+  if (elementTotal > ELEMENT_BUDGET) {
+    return { ok: false, reason: 'too-large' };
+  }
 
   const groupIds = new Set<string>();
   const runIds = new Set<string>();
@@ -229,6 +236,9 @@ function validateFairAdmission(
       return { ok: false, reason: 'invalid-input' };
     }
     elementTotal += rawRepositories.length;
+    if (elementTotal > ELEMENT_BUDGET) {
+      return { ok: false, reason: 'too-large' };
+    }
 
     const repositoryIds = new Set<string>();
     const repositories: ValidatedRepository[] = [];
@@ -253,6 +263,9 @@ function validateFairAdmission(
         return { ok: false, reason: 'invalid-input' };
       }
       elementTotal += rawWaiting.length;
+      if (elementTotal > ELEMENT_BUDGET) {
+        return { ok: false, reason: 'too-large' };
+      }
 
       const waiting: ValidatedWaitingRun[] = [];
       for (const rawRun of rawWaiting.array) {
@@ -292,7 +305,8 @@ function validateFairAdmission(
     });
   }
 
-  // One budget over groups + repositories + waiting runs + lastServed keys.
+  // One budget over groups + repositories + waiting runs; the check above
+  // fires as soon as the running total exceeds it, so this is a backstop.
   if (elementTotal > ELEMENT_BUDGET) {
     return { ok: false, reason: 'too-large' };
   }
@@ -312,8 +326,13 @@ interface RotationRepository {
   readonly repository: string;
   readonly maxConcurrent: number;
   readonly running: number;
-  queue: ValidatedWaitingRun[];
+  readonly queue: readonly ValidatedWaitingRun[];
+  /** Index of the next unconsumed waiting run; queues are never re-sliced. */
+  head: number;
   admitted: number;
+  /** Circular doubly-linked rotation links (-1 when the list is empty). */
+  prev: number;
+  next: number;
 }
 
 /** One group inside the rotation, with its admission counters. */
@@ -324,30 +343,68 @@ interface RotationGroup {
   readonly running: number;
   readonly repositories: RotationRepository[];
   admitted: number;
+  /** Waiting runs not yet consumed, maintained incrementally (O(1) read). */
+  remaining: number;
+  /** Index of the next repository the group will try. */
   repoCursor: number;
+  /** How many repositories are still in the group's rotation. */
+  repoLive: number;
+  /** Circular doubly-linked rotation links (-1 when the list is empty). */
+  prev: number;
+  next: number;
 }
 
-/** The repository still has repo capacity and remaining waiting runs. */
+/** The repository still has queue remaining and repo capacity. */
 function repoCanAdmit(repo: RotationRepository): boolean {
-  return repo.queue.length > 0 && repo.running + repo.admitted < repo.maxConcurrent;
+  return repo.head < repo.queue.length && repo.running + repo.admitted < repo.maxConcurrent;
 }
 
-/** Waiting runs left across the group's repositories. */
-function queueRemaining(group: RotationGroup): number {
-  let total = 0;
-  for (const repo of group.repositories) {
-    total += repo.queue.length;
-  }
-  return total;
-}
-
-/** The group still has group capacity, waiting runs, and an eligible repo. */
+/** The group still has group capacity, waiting runs, and a live repository. */
 function groupCanAdmit(group: RotationGroup): boolean {
   return (
-    queueRemaining(group) > 0 &&
-    group.running + group.admitted < group.groupCap &&
-    group.repositories.some(repoCanAdmit)
+    group.remaining > 0 && group.running + group.admitted < group.groupCap && group.repoLive > 0
   );
+}
+
+/** Wire an array into a circular doubly-linked list; returns the head index. */
+function linkCircular(list: { prev: number; next: number }[]): number {
+  const count = list.length;
+  for (let index = 0; index < count; index += 1) {
+    list[index].prev = (index - 1 + count) % count;
+    list[index].next = (index + 1) % count;
+  }
+  return count === 0 ? -1 : 0;
+}
+
+/** Remove one repository from its group's circular rotation in O(1). */
+function unlinkRepo(group: RotationGroup, index: number): void {
+  const repositories = group.repositories;
+  const node = repositories[index];
+  repositories[node.prev].next = node.next;
+  repositories[node.next].prev = node.prev;
+  if (group.repoCursor === index) {
+    group.repoCursor = node.next;
+  }
+  group.repoLive -= 1;
+}
+
+/** The group rotation: the linked nodes plus the cursor and live count. */
+interface GroupRotation {
+  readonly groups: RotationGroup[];
+  cursor: number;
+  live: number;
+}
+
+/** Remove one group from the circular rotation in O(1). */
+function unlinkGroup(rotation: GroupRotation, index: number): void {
+  const groups = rotation.groups;
+  const node = groups[index];
+  groups[node.prev].next = node.next;
+  groups[node.next].prev = node.prev;
+  if (rotation.cursor === index) {
+    rotation.cursor = node.next;
+  }
+  rotation.live -= 1;
 }
 
 /**
@@ -374,8 +431,7 @@ export function decideFairAdmission(input: unknown): FairAdmissionResult {
 function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
   const rotationGroups: RotationGroup[] = [];
   for (const group of validated.groups) {
-    // Only repositories with at least one waiting run enter the rotation;
-    // exhausted ones never come back, so removal keeps the walk linear.
+    // Only repositories with at least one waiting run enter the rotation.
     const repositories: RotationRepository[] = [];
     for (const repository of group.repositories) {
       if (repository.waiting.length === 0) {
@@ -386,7 +442,10 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
         maxConcurrent: repository.maxConcurrent,
         running: repository.running,
         queue: [...repository.waiting].sort(compareWaiting),
+        head: 0,
         admitted: 0,
+        prev: -1,
+        next: -1,
       });
     }
     if (repositories.length === 0) {
@@ -405,7 +464,11 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
       running: group.running,
       repositories,
       admitted: 0,
+      remaining: repositories.reduce((total, repository) => total + repository.queue.length, 0),
       repoCursor: 0,
+      repoLive: repositories.length,
+      prev: -1,
+      next: -1,
     });
   }
 
@@ -421,56 +484,75 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
 
   const admit: AdmittedRun[] = [];
 
-  // Round-robin across groups: a group cursor and a per-group repo cursor.
-  // Groups exhausted of capacity or eligible repositories are removed from
-  // the rotation, so the walk stays O(N log N) in the total waiting runs.
-  let groupCursor = 0;
-  while (admit.length < validated.freeSlots && rotationGroups.length > 0) {
-    let advanced = false;
-    for (let step = 0; step < rotationGroups.length && admit.length < validated.freeSlots; step += 1) {
-      const groupIndex = (groupCursor + step) % rotationGroups.length;
-      const group = rotationGroups[groupIndex];
-      const repos = group.repositories;
-      let chosen = -1;
+  // Round-robin across groups: a group cursor and a per-group repo cursor,
+  // both circular doubly-linked lists so removal is O(1). Every walk step
+  // either admits a run or removes a group or repository that can never
+  // admit again, so the whole walk is O(N + G + R) on top of the O(N log N)
+  // sort; no queue is ever re-sliced and no admission list is re-scanned.
+  const rotation: GroupRotation = {
+    groups: rotationGroups,
+    cursor: linkCircular(rotationGroups),
+    live: rotationGroups.length,
+  };
+  for (const group of rotationGroups) {
+    group.repoCursor = linkCircular(group.repositories);
+  }
+  while (admit.length < validated.freeSlots && rotation.live > 0) {
+    const liveBefore = rotation.live;
+    let chosenGroup = -1;
+    let chosenRepo = -1;
+    let scanned = 0;
+    let index = rotation.cursor;
+    while (scanned < liveBefore && chosenGroup === -1) {
+      const group = rotation.groups[index];
+      const nextIndex = group.next;
       if (groupCanAdmit(group)) {
-        // Advance from the group's repo cursor to the next eligible repository.
-        for (let repoStep = 0; repoStep < repos.length; repoStep += 1) {
-          const repoIndex = (group.repoCursor + repoStep) % repos.length;
-          if (repoCanAdmit(repos[repoIndex])) {
-            chosen = repoIndex;
+        // Advance from the group's repo cursor to the next eligible
+        // repository, removing repositories that can never admit again.
+        const repoLiveBefore = group.repoLive;
+        let repoScanned = 0;
+        let repoIndex = group.repoCursor;
+        while (repoScanned < repoLiveBefore) {
+          const repo = group.repositories[repoIndex];
+          const repoNext = repo.next;
+          if (repoCanAdmit(repo)) {
+            chosenGroup = index;
+            chosenRepo = repoIndex;
             break;
           }
+          unlinkRepo(group, repoIndex);
+          repoIndex = repoNext;
+          repoScanned += 1;
         }
       }
-      if (chosen === -1) {
+      if (chosenGroup === -1) {
         // Capacity or waiting runs are gone for good: drop from the rotation.
-        rotationGroups.splice(groupIndex, 1);
-        if (groupIndex < groupCursor) {
-          groupCursor -= 1;
-        }
-        step -= 1;
-        continue;
+        unlinkGroup(rotation, index);
+        index = nextIndex;
+        scanned += 1;
       }
-      const repo = repos[chosen];
-      const run = repo.queue[0];
-      admit.push({ runId: run.runId, groupId: group.groupId, repository: repo.repository });
-      repo.queue = repo.queue.slice(1);
-      repo.admitted += 1;
-      group.admitted += 1;
-      group.repoCursor = (chosen + 1) % repos.length;
-      groupCursor = (groupIndex + 1) % rotationGroups.length;
-      advanced = true;
+    }
+    if (chosenGroup === -1) {
       break;
     }
-    if (!advanced) {
-      break;
-    }
+    const group = rotation.groups[chosenGroup];
+    const repo = group.repositories[chosenRepo];
+    const run = repo.queue[repo.head];
+    admit.push({ runId: run.runId, groupId: group.groupId, repository: repo.repository });
+    repo.head += 1;
+    repo.admitted += 1;
+    group.admitted += 1;
+    group.remaining -= 1;
+    group.repoCursor = repo.next;
+    rotation.cursor = group.next;
   }
 
   // Per-group and per-repo admission counts for the park-reason classification.
+  const admittedRunIds = new Set<string>();
   const admittedByGroup = new Map<string, number>();
   const admittedByRepo = new Map<string, number>();
   for (const entry of admit) {
+    admittedRunIds.add(entry.runId);
     admittedByGroup.set(entry.groupId, (admittedByGroup.get(entry.groupId) ?? 0) + 1);
     admittedByRepo.set(entry.groupId + '\u0000' + entry.repository, (admittedByRepo.get(entry.groupId + '\u0000' + entry.repository) ?? 0) + 1);
   }
@@ -495,7 +577,7 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
         reason = 'no-capacity';
       }
       for (const run of repository.waiting) {
-        if (!admit.some((entry) => entry.runId === run.runId)) {
+        if (!admittedRunIds.has(run.runId)) {
           parkedEntries.push({
             runId: run.runId,
             reason,

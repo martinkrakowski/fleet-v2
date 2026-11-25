@@ -1,0 +1,10 @@
+[
+  {
+    "version": 1,
+    "projectId": "project-example-1",
+    "role": "first-pass",
+    "ticket": 1,
+    "revision": 1,
+    "updatedAtIso": "2026-01-01T00:00:00.000Z"
+  }
+]

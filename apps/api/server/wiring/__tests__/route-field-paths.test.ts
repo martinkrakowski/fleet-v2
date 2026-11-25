@@ -242,6 +242,22 @@ export function jsonPaths(value: unknown): string[] {
         }
         assertNoAccessorProperty(arr, extraKey);
       }
+      // `for...in` skips non-enumerable own string keys; the enumerable ones
+      // are already charged (so this allocation is bounded by the budget),
+      // and the remainder is charged and descriptor-checked here.
+      for (const name of Object.getOwnPropertyNames(arr)) {
+        if (isCanonicalIndexKey(name, arr.length) || name === "length") {
+          continue;
+        }
+        if (Object.prototype.propertyIsEnumerable.call(arr, name)) {
+          continue;
+        }
+        nodes += 1;
+        if (nodes > MAX_NODES) {
+          throw new NodeBudgetExceededError();
+        }
+        assertNoAccessorProperty(arr, name);
+      }
       const symbols = Object.getOwnPropertySymbols(arr);
       nodes += symbols.length;
       if (nodes > MAX_NODES) {
@@ -369,6 +385,19 @@ function assertPathList(label: string, value: unknown): readonly string[] {
       throw new NodeBudgetExceededError();
     }
     assertNoAccessorProperty(value, extraKey);
+  }
+  for (const name of Object.getOwnPropertyNames(value)) {
+    if (isCanonicalIndexKey(name, value.length) || name === "length") {
+      continue;
+    }
+    if (Object.prototype.propertyIsEnumerable.call(value, name)) {
+      continue;
+    }
+    nodes += 1;
+    if (nodes > MAX_NODES) {
+      throw new NodeBudgetExceededError();
+    }
+    assertNoAccessorProperty(value, name);
   }
   const symbols = Object.getOwnPropertySymbols(value);
   nodes += symbols.length;
@@ -879,6 +908,36 @@ describe("jsonPaths", () => {
 });
 
 describe("compareFieldPaths hostilities", () => {
+  it("refuses a non-enumerable accessor on a path list without invoking it", () => {
+    let calls = 0;
+    const snapshotPaths: string[] = ["result.code"];
+    Object.defineProperty(snapshotPaths, "hidden", {
+      enumerable: false,
+      get() {
+        calls += 1;
+        return 1;
+      },
+    });
+    expect(() =>
+      compareFieldPaths("f.json", snapshotPaths, ["result.code"]),
+    ).toThrow(GetterPropertyError);
+    expect(calls).toBe(0);
+  });
+
+  it("refuses a non-enumerable accessor on a fixture array without invoking it", () => {
+    let calls = 0;
+    const arr: string[] = ["a"];
+    Object.defineProperty(arr, "hidden", {
+      enumerable: false,
+      get() {
+        calls += 1;
+        return 1;
+      },
+    });
+    expect(() => jsonPaths({ list: arr })).toThrow(GetterPropertyError);
+    expect(calls).toBe(0);
+  });
+
   it("refuses any own string property that is an accessor, including non-index keys like extra", () => {
     const snapshotPaths: string[] = ["result.code"];
     Object.defineProperty(snapshotPaths, "extra", {

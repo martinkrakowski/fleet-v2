@@ -31,13 +31,14 @@
  *    environment whose stored `sessionId` matches the request. An unknown,
  *    in-flight or indeterminate attempt is refused, and `destroy` is not
  *    called with a session id the driver never confirmed.
- *  - **Driver calls are bounded.** `create` and `destroy` race an injected
- *    deadline (`driverTimeoutMs`, default 120000, a positive integer of at
- *    most 600000). The clock is `setTimer` / `clearTimer`, so a test can
+ *  - **Driver calls are bounded.** `create`, `inspect` and `destroy` race an
+ *    injected deadline (`driverTimeoutMs`, default 120000, a positive integer
+ *    of at most 600000). The clock is `setTimer` / `clearTimer`, so a test can
  *    settle the deadline without waiting. A `create` that does not settle
  *    is `unknown` and leaves the attempt indeterminate, so a later start
  *    is `blocked` with zero further `create` calls. A `destroy` that does
  *    not settle is `still-running`, and a later stop calls `destroy` again.
+ *    An `inspect` that does not settle reports the unreachable status.
  *    The timer is cleared when the call settles. A result that arrives
  *    after the deadline does not rewrite the recorded outcome.
  *  - **Capability is declared, never inferred.** The six fixed capability
@@ -123,7 +124,7 @@ export interface SandboxRunnerAdapterOptions {
   /** Clock for completion receipts; injectable so tests stay deterministic. */
   readonly now?: () => Date;
   /**
-   * How long `create` and `destroy` may stay pending, in milliseconds.
+   * How long `create`, `inspect` and `destroy` may stay pending, in milliseconds.
    * Omitted means 120000. Any other value must be a positive integer of at
    * most 600000; construction throws when it is not. Pair with `setTimer`
    * and `clearTimer` in tests so the deadline does not wait on the wall clock.
@@ -361,6 +362,10 @@ function readNested(
  */
 function asReference(value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 4096) {
+    return null;
+  }
+  // A leading dash would be read as an option flag, never a path or commit.
+  if (value.startsWith('-')) {
     return null;
   }
   if (value.includes('\0') || value.includes('\r') || value.includes('\n')) {
@@ -1071,13 +1076,21 @@ export class SandboxRunnerAdapter implements ExecutionRunnerPort {
       return unreachableStatus();
     }
 
-    let raw: unknown;
+    let raced: DriverCall<unknown>;
     try {
-      raw = await this.options.driver.inspect(sessionId);
+      raced = await raceDriverCall<unknown>(
+        this.options.driver.inspect(sessionId),
+        this.driverTimeoutMs,
+        this.setTimer,
+        this.clearTimer,
+      );
     } catch {
       return unreachableStatus();
     }
-    return parseInspect(raw, attemptId, sessionId) ?? unreachableStatus();
+    if (raced.kind !== 'value') {
+      return unreachableStatus();
+    }
+    return parseInspect(raced.value, attemptId, sessionId) ?? unreachableStatus();
   }
 
   async stopSession(request: StopRunnerSessionRequest): Promise<StopRunnerSessionResult> {

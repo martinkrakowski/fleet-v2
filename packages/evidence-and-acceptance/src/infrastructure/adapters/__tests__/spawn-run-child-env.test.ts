@@ -189,6 +189,11 @@ describe('allowListedChildEnv', () => {
       setEnv(key, secret);
     }
 
+    // The result is not merely "missing the forbidden keys": it must still
+    // carry every allow-listed key with its exact value, so a constant {}
+    // (or any implementation that drops real values) fails this test too.
+    const expectedSsh = { ...LOCAL_ALL, SSH_AUTH_SOCK: SSH_AUTH_SOCK_VALUE };
+
     for (const transport of ['local', 'ssh'] as const) {
       const env = allowListedChildEnv(transport);
       for (const key of FORBIDDEN_KEYS) {
@@ -196,6 +201,8 @@ describe('allowListedChildEnv', () => {
       }
       // No forbidden value leaked under any key, listed or not.
       expect(JSON.stringify(env)).not.toContain(secret);
+      // The allow-listed keys survive with their exact synthetic values.
+      expect(env).toStrictEqual(transport === 'ssh' ? expectedSsh : LOCAL_ALL);
     }
   });
 

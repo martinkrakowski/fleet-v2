@@ -54,6 +54,15 @@ const globalSetupFn = (mod: GlobalTmpModule): (() => () => void) => {
   return fn;
 };
 
+// Fail fast, before any write or remove, unless `runDir` is a fresh run
+// directory created under the incoming tmpdir: without the redirect, the
+// value would be the suite's shared run root.
+const assertFreshRunDir = (runDir: string, before: string): void => {
+  if (runDir === before || !runDir.startsWith(join(before, 'fleet-vitest-'))) {
+    throw new Error(`TMPDIR ${runDir} is not a fresh run directory under ${before}`);
+  }
+};
+
 describe('vitest.global-tmp globalSetup', () => {
   it('creates a fleet-vitest- directory under the incoming tmpdir', async () => {
     const mod = await getModule();
@@ -85,8 +94,10 @@ describe('vitest.global-tmp globalSetup', () => {
 
   it('teardown removes the run directory including nested files', async () => {
     const mod = await getModule();
+    const before = tmpdir();
     const teardown = globalSetupFn(mod)();
     const runDir = process.env.TMPDIR as string;
+    assertFreshRunDir(runDir, before);
     const { writeFileSync, mkdirSync } = await import('node:fs');
     mkdirSync(join(runDir, 'nested', 'deeper'), { recursive: true });
     writeFileSync(join(runDir, 'nested', 'deeper', 'file.txt'), 'x');
@@ -116,8 +127,10 @@ describe('vitest.global-tmp globalSetup', () => {
 
   it('teardown does not throw when the run directory was already removed', async () => {
     const mod = await getModule();
+    const before = tmpdir();
     const teardown = globalSetupFn(mod)();
     const runDir = process.env.TMPDIR as string;
+    assertFreshRunDir(runDir, before);
     rmSync(runDir, { recursive: true, force: true });
     expect(() => teardown()).not.toThrow();
   });

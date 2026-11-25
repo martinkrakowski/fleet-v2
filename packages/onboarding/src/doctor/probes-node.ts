@@ -431,9 +431,6 @@ export function seatProbeArgv(seat: SeatModel, template: readonly string[]): str
  * a readable model list.
  */
 export function serverModelIds(stdout: string): readonly string[] | undefined {
-  if (typeof stdout !== 'string') {
-    return undefined;
-  }
   const opencode = BUILT_IN_TOOLS.find((tool) => tool.id === 'opencode');
   if (opencode?.models === undefined) {
     return undefined;

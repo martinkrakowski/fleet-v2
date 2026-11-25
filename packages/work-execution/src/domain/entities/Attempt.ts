@@ -12,7 +12,7 @@ import type {
   AttemptSeatOverrideRecord,
 } from '../execution-records.js';
 import type { AttemptStateValue } from '../value-objects/AttemptState.vo.js';
-import { CAPACITY_RELEASE_STATES, AttemptState } from '../value-objects/AttemptState.vo.js';
+import { CAPACITY_RELEASE_STATES, AttemptState, describeRejectedValue } from '../value-objects/AttemptState.vo.js';
 
 export class Attempt {
   private constructor(private record: AttemptRecord) {
@@ -43,7 +43,7 @@ export class Attempt {
     }
     const state = AttemptState.create(record.state);
     if (!state.success || state.value === undefined) {
-      throw new Error(`Attempt has an invalid state: ${String(record.state)}`);
+      throw new Error('Attempt has an invalid state: ' + describeRejectedValue(record.state));
     }
     return new Attempt({ ...record });
   }

@@ -117,6 +117,22 @@ describe('serverModelIds', () => {
     expect(serverModelIds('{"data":{"models":{"a/b":{"variants":[123]}}}}')).toBeUndefined();
   });
 
+  it('returns undefined when a variants array has a hole or null entry', () => {
+    // A hole cannot survive JSON.stringify/JSON.parse (it serialises as
+    // null), so the closest reachable shape through the stdout-string
+    // contract is the null entry: the same `for...of` loop sees a
+    // non-string element and refuses the whole answer. The hole itself is
+    // refused in that loop too: a hole yields `undefined`, also non-string.
+    expect(serverModelIds('{"data":{"models":{"a/b":{"variants":["low",null]}}}}')).toBeUndefined();
+    expect(serverModelIds('{"data":{"models":{"a/b":{"variants":[null]}}}}')).toBeUndefined();
+    // Runtime proof that the hole-shaped array serialises to that refused
+    // null entry: length 2 with only index 0 assigned makes index 1 a hole.
+    const holedVariants: string[] = new Array(2);
+    holedVariants[0] = 'low';
+    expect(1 in holedVariants).toBe(false);
+    expect(JSON.stringify(holedVariants)).toBe('["low",null]');
+  });
+
   it('returns undefined without running getters or throwing on hostile non-string inputs', () => {
     let getterRuns = 0;
     const hostile: readonly unknown[] = [

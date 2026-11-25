@@ -201,8 +201,9 @@ function contentLines(content: string): { line: number; text: string }[] {
 
 /**
  * Whole content as 1-based numbered lines with duplicate suppression by
- * (line, text). Used by the commit-range scan, whose single blob per path
- * never merges two versions of a file.
+ * (line, text). Used only by `rangeCommitContent` (the commit-range scan):
+ * one blob per changed path, so two versions of a file are never merged
+ * here.
  */
 function mergeContentLines(
   merged: Map<number, Set<string>>,

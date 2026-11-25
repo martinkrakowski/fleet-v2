@@ -183,22 +183,43 @@ const DETAIL_RULE_PATTERN = /^[A-Za-z0-9._/@:-]+$/;
 const MALFORMED_FINDINGS_DETAIL = 'edit-only commit refused: diff-findings (malformed-findings)';
 
 /**
+ * CB8: whether a detail token matches any lane diff secret shape. A `g`/`y`
+ * flag would keep `lastIndex` across `.test()` calls, so one clean copy
+ * serves every check (the registry itself carries none).
+ */
+function secretShaped(text: string): boolean {
+  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+    const matcher = new RegExp(pattern.regex.source, pattern.regex.flags.replace(/[gy]/g, ''));
+    if (matcher.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Fix round 1: a finding's rule as the journal detail may carry it — the
+ * rule text itself only when it is plain rule characters and matches no
+ * secret shape (a hostile LaneDiffCheckPort could put a token-shaped value
+ * in `rule`, e.g. `ghp_` followed by 20 alphanumerics); `<rule-omitted>`
+ * otherwise. Never a matched value, never line content.
+ */
+function findingRuleForDetail(rule: string): string {
+  if (!DETAIL_RULE_PATTERN.test(rule) || secretShaped(rule)) {
+    return '<rule-omitted>';
+  }
+  return rule;
+}
+
+/**
  * CB8: a finding's path as the journal detail may carry it — the path text
  * itself only when it is plain path characters and matches no secret shape
  * (a path could carry a secret-shaped token); `<path-omitted>` otherwise.
  * Never a matched value, never line content.
  */
 function findingPathForDetail(path: string): string {
-  if (!DETAIL_PATH_PATTERN.test(path)) {
+  if (!DETAIL_PATH_PATTERN.test(path) || secretShaped(path)) {
     return '<path-omitted>';
-  }
-  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
-    // A `g`/`y` flag would keep `lastIndex` across `.test()` calls, so one
-    // clean copy serves every check (the registry itself carries none).
-    const matcher = new RegExp(pattern.regex.source, pattern.regex.flags.replace(/[gy]/g, ''));
-    if (matcher.test(path)) {
-      return '<path-omitted>';
-    }
   }
   return path;
 }
@@ -237,9 +258,7 @@ export function diffFindingsDetail(findings: unknown): string {
       return MALFORMED_FINDINGS_DETAIL;
     }
     parts.push(
-      (DETAIL_RULE_PATTERN.test(rule) ? rule : '<rule-omitted>') +
-        '@' +
-        findingPathForDetail(path),
+      findingRuleForDetail(rule) + '@' + findingPathForDetail(path),
     );
   }
   let body = '';

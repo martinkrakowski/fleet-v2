@@ -600,6 +600,25 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     expect(entry.detail).not.toContain('=');
   });
 
+  it('a token-shaped rule in a hostile finding is written as <rule-omitted>, never journaled verbatim (fix round 1 item 1)', async () => {
+    // Built by concatenation: a fixture shaped like a GitHub token
+    // (`ghp_` + 20 alphanumerics), never a real token.
+    const tokenShapedRule = 'ghp_' + 'abcdefghijklmnopqrst';
+    const lane = makeLane({
+      initialDiffOutcome: {
+        outcome: 'findings',
+        findings: [{ path: 'packages/example/secret.txt', line: 3, rule: tokenShapedRule }],
+      },
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'diff-findings' });
+    const entry = lane.journal.entries[0]!;
+    expect(entry.detail).toBe(
+      'edit-only commit refused: diff-findings (<rule-omitted>@packages/example/secret.txt)',
+    );
+    expect(entry.detail).not.toContain('ghp');
+  });
+
   it('a diff error and an unreachable diff check are unknown', async () => {
     const errored = makeLane({
       initialDiffOutcome: { outcome: 'error', reason: 'git not available' },

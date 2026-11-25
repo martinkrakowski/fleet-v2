@@ -12,6 +12,7 @@
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+import { types } from 'node:util';
 import type {
   KnowledgeEntryRecord,
   KnowledgeTriageFlag,
@@ -27,6 +28,43 @@ const SELECTIONS_FILE = 'context-selections.json';
 export interface KnowledgeEntryRepositoryAdapterDependencies {
   /** When set, entries and selections persist as JSON files in this directory. */
   readonly stateDir?: string;
+}
+
+/** True for a Proxy, and for anything whose proxy-ness cannot be told. */
+function isProxyOrUnknown(value: unknown): boolean {
+  try {
+    return types.isProxy(value);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The one hostile-shape guard both state parsers share. It refuses, before
+ * any field is read: a Proxy (never trusted, whatever its traps claim — even
+ * a transparent one may run trap code while its fields are inspected), an
+ * array or array-like (an own numeric `length`, however enormous), and a
+ * prototype-polluting own `__proto__` key.
+ */
+function isHostileRecordShape(record: object): boolean {
+  if (isProxyOrUnknown(record) || Array.isArray(record)) {
+    return true;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(record, 'length');
+  if (
+    lengthDescriptor !== undefined &&
+    // A data `length` that is a number makes the record array-like (or
+    // enormous); an accessor `length` is refused because its value cannot be
+    // checked without invoking it.
+    (lengthDescriptor.get !== undefined ||
+      lengthDescriptor.set !== undefined ||
+      typeof lengthDescriptor.value === 'number')
+  ) {
+    return true;
+  }
+  // `JSON.parse` gives a `__proto__` key a real own data property; an object
+  // literal never does, so this only ever fires on untrusted input.
+  return Object.getOwnPropertyDescriptor(record, '__proto__') !== undefined;
 }
 
 /**
@@ -45,18 +83,18 @@ function readOwnStringDataProperty(record: object, field: 'id' | 'attemptId'): s
 
 /** The entries reader's record parser, shared with `fleet-v2 state check`. */
 export function parseKnowledgeEntryStateRecord(raw: unknown): KnowledgeEntryRecord | undefined {
-  return typeof raw === 'object' &&
-    raw !== null &&
-    readOwnStringDataProperty(raw, 'id') !== undefined
-    ? (raw as KnowledgeEntryRecord)
-    : undefined;
+  if (typeof raw !== 'object' || raw === null || isHostileRecordShape(raw)) {
+    return undefined;
+  }
+  return readOwnStringDataProperty(raw, 'id') !== undefined ? (raw as KnowledgeEntryRecord) : undefined;
 }
 
 /** The selections reader's record parser, shared with `fleet-v2 state check`. */
 export function parseContextSelectionStateRecord(raw: unknown): ContextSelectionProps | undefined {
-  return typeof raw === 'object' &&
-    raw !== null &&
-    readOwnStringDataProperty(raw, 'attemptId') !== undefined
+  if (typeof raw !== 'object' || raw === null || isHostileRecordShape(raw)) {
+    return undefined;
+  }
+  return readOwnStringDataProperty(raw, 'attemptId') !== undefined
     ? (raw as ContextSelectionProps)
     : undefined;
 }

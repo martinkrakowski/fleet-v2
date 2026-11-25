@@ -59,13 +59,49 @@ describe('parseKnowledgeEntryStateRecord', () => {
     expect(parseKnowledgeEntryStateRecord({ attemptId: 'a' })).toBeUndefined();
   });
 
-  it('returns undefined for arrays [], and pins that an array with an own string id is accepted today and returns that same array reference', () => {
+  it('refuses arrays, even with an own string id', () => {
     expect(parseKnowledgeEntryStateRecord([])).toBeUndefined();
     expect(parseKnowledgeEntryStateRecord(['x'])).toBeUndefined();
-    // Pinned behaviour today: an array is an object, so an own string `id`
-    // makes it pass; the parser returns the same array reference.
-    const arrayWithId = Object.assign(['x'], { id: 'a' });
-    expect(parseKnowledgeEntryStateRecord(arrayWithId)).toBe(arrayWithId);
+    expect(parseKnowledgeEntryStateRecord(Object.assign(['x'], { id: 'a' }))).toBeUndefined();
+  });
+
+  it('refuses an array-like record (own numeric length) that also carries a string id', () => {
+    const arrayLike: Record<string, unknown> = { id: 'a', length: 1, 0: 'x' };
+    expect(parseKnowledgeEntryStateRecord(arrayLike)).toBeUndefined();
+  });
+
+  it('refuses a record with an enormous own numeric length, before reading anything else', () => {
+    const enormous: Record<string, unknown> = { id: 'a', length: Number.MAX_SAFE_INTEGER };
+    expect(parseKnowledgeEntryStateRecord(enormous)).toBeUndefined();
+  });
+
+  it('refuses a Proxy around a valid record without running any trap', () => {
+    let trapCalls = 0;
+    const proxy = new Proxy({ id: 'a' }, {
+      get(target, key, receiver) {
+        trapCalls += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        trapCalls += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(parseKnowledgeEntryStateRecord(proxy)).toBeUndefined();
+    expect(trapCalls).toBe(0);
+  });
+
+  it('refuses an own __proto__ key on an otherwise valid record, without polluting Object.prototype', () => {
+    const record: Record<string, unknown> = { id: 'a' };
+    Object.defineProperty(record, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expect(Object.hasOwn(record, '__proto__')).toBe(true);
+    expect(parseKnowledgeEntryStateRecord(record)).toBeUndefined();
+    expect('polluted' in Object.prototype).toBe(false);
   });
 
   it('refuses an own getter id with a typed refusal (undefined) and never invokes it (call count 0)', () => {
@@ -110,13 +146,49 @@ describe('parseContextSelectionStateRecord', () => {
     expect(parseContextSelectionStateRecord({ id: 'a' })).toBeUndefined();
   });
 
-  it('returns undefined for arrays [], and pins that an array with an own string attemptId is accepted today and returns that same array reference', () => {
+  it('refuses arrays, even with an own string attemptId', () => {
     expect(parseContextSelectionStateRecord([])).toBeUndefined();
     expect(parseContextSelectionStateRecord(['x'])).toBeUndefined();
-    // Pinned behaviour today: an array is an object, so an own string
-    // `attemptId` makes it pass; the parser returns the same array reference.
-    const arrayWithAttemptId = Object.assign(['x'], { attemptId: 'a' });
-    expect(parseContextSelectionStateRecord(arrayWithAttemptId)).toBe(arrayWithAttemptId);
+    expect(parseContextSelectionStateRecord(Object.assign(['x'], { attemptId: 'a' }))).toBeUndefined();
+  });
+
+  it('refuses an array-like record (own numeric length) that also carries a string attemptId', () => {
+    const arrayLike: Record<string, unknown> = { attemptId: 'a', length: 1, 0: 'x' };
+    expect(parseContextSelectionStateRecord(arrayLike)).toBeUndefined();
+  });
+
+  it('refuses a record with an enormous own numeric length, before reading anything else', () => {
+    const enormous: Record<string, unknown> = { attemptId: 'a', length: Number.MAX_SAFE_INTEGER };
+    expect(parseContextSelectionStateRecord(enormous)).toBeUndefined();
+  });
+
+  it('refuses a Proxy around a valid record without running any trap', () => {
+    let trapCalls = 0;
+    const proxy = new Proxy({ attemptId: 'a' }, {
+      get(target, key, receiver) {
+        trapCalls += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        trapCalls += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(parseContextSelectionStateRecord(proxy)).toBeUndefined();
+    expect(trapCalls).toBe(0);
+  });
+
+  it('refuses an own __proto__ key on an otherwise valid record, without polluting Object.prototype', () => {
+    const record: Record<string, unknown> = { attemptId: 'a' };
+    Object.defineProperty(record, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expect(Object.hasOwn(record, '__proto__')).toBe(true);
+    expect(parseContextSelectionStateRecord(record)).toBeUndefined();
+    expect('polluted' in Object.prototype).toBe(false);
   });
 
   it('refuses an own getter attemptId with a typed refusal (undefined) and never invokes it (call count 0)', () => {
@@ -218,11 +290,13 @@ describe('inspectRecordListBytes', () => {
     ).toEqual({ status: 'unreadable', detail: 'expects a record list', recordIndex: null });
   });
 
-  it('does not pollute Object.prototype when the JSON contains a __proto__ key', () => {
-    inspectRecordListBytes(
-      Buffer.from('[{"id":"a","__proto__":{"polluted":true}}]'),
-      parseKnowledgeEntryStateRecord,
-    );
+  it('refuses a record with a __proto__ key and does not pollute Object.prototype', () => {
+    expect(
+      inspectRecordListBytes(
+        Buffer.from('[{"id":"a","__proto__":{"polluted":true}}]'),
+        parseKnowledgeEntryStateRecord,
+      ),
+    ).toEqual({ status: 'unreadable', detail: 'record 0 failed validation', recordIndex: 0 });
     expect('polluted' in Object.prototype).toBe(false);
   });
 });

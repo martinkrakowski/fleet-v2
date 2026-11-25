@@ -386,7 +386,7 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     await harness.holdReservation('attempt-example-2');
 
     const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(blocked).toEqual({
+    expect(blocked).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
     });
@@ -411,7 +411,7 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     await harness.holdReservation('attempt-example-9');
 
     const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(blocked).toEqual({
+    expect(blocked).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -428,7 +428,7 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     harness.workOrders.set('wo-example-3', workOrderFixture({ id: 'wo-example-3', ownedPaths: ['packages/another/src'] }));
 
     const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(blocked).toEqual({
+    expect(blocked).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: {
         runIds: ['run-01JB0000000000000000000001'],
@@ -484,7 +484,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     );
     expect(shared).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: 'packages/work-execution/src/adapters' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -507,7 +512,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     );
     expect(blocked).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: 'packages/work-execution/src/x.ts' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -528,7 +538,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     const realPath = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(realPath).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
 
@@ -539,7 +554,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     const bothDotDot = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(bothDotDot).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -565,7 +585,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     );
     expect(shared).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+      blockedBy: {
+        runIds: [],
+        attemptIds: ['attempt-example-9'],
+        unreadable: [],
+        overlaps: [{ kind: 'attempt', id: 'attempt-example-9', path: 'packages/work-execution/src/adapters' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
 
@@ -602,7 +627,7 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
 
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -726,7 +751,7 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
 
     const result = await harness.adapter.admit(admitRequest());
 
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -772,11 +797,11 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     ]);
 
     expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
-    expect(first).toEqual({
+    expect(first).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [RUN_B_ID], attemptIds: [] },
     });
-    expect(second).toEqual({
+    expect(second).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
     });
@@ -889,11 +914,21 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
     expect(first).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [RUN_B_ID], attemptIds: [] },
+      blockedBy: {
+        runIds: [RUN_B_ID],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: RUN_B_ID, path: 'packages/work-execution/src' }],
+      },
     });
     expect(second).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+      blockedBy: {
+        runIds: [RUN_A_ID],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: RUN_A_ID, path: 'packages/work-execution/src/adapters' }],
+      },
     });
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
     expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
@@ -930,11 +965,11 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
       harness.adapter.admit(admitRequest()),
     ]);
 
-    expect(startResult).toEqual({
+    expect(startResult).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
     });
-    expect(admitResult).toEqual({
+    expect(admitResult).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -1196,7 +1231,12 @@ describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
       );
       expect(result).toEqual({
         outcome: 'no-capacity',
-        blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+        blockedBy: {
+          runIds: [RUN_A_ID],
+          attemptIds: [],
+          unreadable: [],
+          overlaps: [{ kind: 'run', id: RUN_A_ID, path: 'packages/work-execution/src/adapters' }],
+        },
       });
       expect(harness.reserveCalls).toHaveLength(0);
     }
@@ -1219,7 +1259,12 @@ describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
     );
     expect(result).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+      blockedBy: {
+        runIds: [RUN_A_ID],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: RUN_A_ID, path: 'packages/work-execution/src/adapters' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -1237,7 +1282,7 @@ describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
     const result = await harness.adapter.reserveFirst(
       firstReservationRequest({ attemptId: NEW_START_ATTEMPT }),
     );
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
     });
@@ -1254,7 +1299,7 @@ describe('LaneRunAdmissionAdapter project lane cap (AD-1)', () => {
     const result = await harness.adapter.reserveFirst(
       firstReservationRequest({ attemptId: 'attempt-example-9' }),
     );
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
     });
@@ -1293,7 +1338,7 @@ describe('LaneRunAdmissionAdapter project lane cap (AD-1)', () => {
     const result = await harness.adapter.reserveFirst(
       firstReservationRequest({ attemptId: 'attempt-example-1' }),
     );
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -1335,7 +1380,12 @@ describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(result).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+      blockedBy: {
+        runIds: [],
+        attemptIds: ['attempt-example-9'],
+        unreadable: ['attempt-example-9'],
+        overlaps: [],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -1348,7 +1398,12 @@ describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(result).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+      blockedBy: {
+        runIds: [],
+        attemptIds: ['attempt-example-9'],
+        unreadable: [],
+        overlaps: [{ kind: 'attempt', id: 'attempt-example-9', path: 'packages/example/src' }],
+      },
     });
     expect(harness.reserveCalls).toHaveLength(0);
   });
@@ -1381,7 +1436,12 @@ describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', 
     const nonShared = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(nonShared).toEqual({
       outcome: 'no-capacity',
-      blockedBy: { runIds: [], attemptIds: ['attempt-example-10'] },
+      blockedBy: {
+        runIds: [],
+        attemptIds: ['attempt-example-10'],
+        unreadable: [],
+        overlaps: [{ kind: 'attempt', id: 'attempt-example-10', path: 'packages/example/src' }],
+      },
     });
   });
 
@@ -1391,7 +1451,7 @@ describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', 
     await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(result).toEqual({
+    expect(result).toStrictEqual({
       outcome: 'no-capacity',
       blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
     });
@@ -1405,5 +1465,214 @@ describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', 
     const listed = await harness.executionJournal.listActiveReservations();
     const held = listed.find((reservation) => reservation.attemptId === 'attempt-example-9');
     expect(held?.workOrderId).toBe('wo-b');
+  });
+});
+
+describe('LaneRunAdmissionBlockers overlaps and unreadable (CB10)', () => {
+  it('an overlapping run records the first overlapping owned path of the requested order in declared order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/example/src/adapters/y.ts'] }));
+    await harness.holdReservation('attempt-example-2');
+    // Both declared paths overlap the blocker; the first one declared wins.
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/example/src', 'packages/example/src/adapters'] }),
+    );
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: 'packages/example/src' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a run whose work order cannot be read is in runIds and unreadable and has no overlaps entry', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-missing'));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: ['run-01JB0000000000000000000001'],
+        overlaps: [],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('overlaps are sorted by id then path and deduplicated', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000009', ['attempt-example-2'], 'wo-b'));
+    await harness.createRun(runRecord('run-01JB0000000000000000000003', ['attempt-example-4'], 'wo-b'));
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/example/src'] }));
+    await harness.holdReservation('attempt-example-2');
+    await harness.holdReservation('attempt-example-4');
+    harness.attempts.set('attempt-example-9', attemptFixture('attempt-example-9', { workOrderId: 'wo-b' }));
+    await harness.holdReservation('attempt-example-9');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000003', 'run-01JB0000000000000000000009'],
+        attemptIds: ['attempt-example-9'],
+        unreadable: [],
+        overlaps: [
+          { kind: 'attempt', id: 'attempt-example-9', path: 'packages/example/src' },
+          { kind: 'run', id: 'run-01JB0000000000000000000003', path: 'packages/example/src' },
+          { kind: 'run', id: 'run-01JB0000000000000000000009', path: 'packages/example/src' },
+        ],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a getter in the blocker\'s ownedPaths is never run and fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    let getterRuns = 0;
+    const hostile: string[] = ['packages/example/src'];
+    Object.defineProperty(hostile, 0, {
+      get() {
+        getterRuns += 1;
+        return 'packages/example/src';
+      },
+    });
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: hostile as unknown as readonly string[] }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(getterRuns).toBe(0);
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('an array hole in the blocker\'s ownedPaths fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    const holey: string[] = ['packages/other/src'];
+    holey.length = 2;
+    // The visible path is disjoint from the requested order's path, so only
+    // the fail-closed treatment of the hole can block.
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: holey }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a non-string entry in the blocker\'s ownedPaths fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    harness.workOrders.set('wo-b', workOrderFixture({
+      id: 'wo-b',
+      ownedPaths: ['packages/other/src', 42] as unknown as readonly string[],
+    }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a non-array ownedPaths on the blocker\'s work order does not crash and fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    harness.workOrders.set('wo-b', workOrderFixture({
+      id: 'wo-b',
+      ownedPaths: null as unknown as readonly string[],
+    }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('an ownedPaths array longer than the scan bound fails closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    const huge: string[] = new Array(2000).fill('packages/other/src');
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: huge }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('malformed ownedPaths on the requested work order fail closed with the whole work order', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-b'));
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/example/src'] }));
+    await harness.holdReservation('attempt-example-2');
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: undefined as unknown as readonly string[] }),
+    );
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: [],
+        unreadable: [],
+        overlaps: [{ kind: 'run', id: 'run-01JB0000000000000000000001', path: '(whole work order)' }],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
   });
 });

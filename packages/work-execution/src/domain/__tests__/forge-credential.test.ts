@@ -426,6 +426,26 @@ describe('isExpired', () => {
     expect(isExpired(c, AFTER_EXPIRY)).toBe(true);
   });
 
+  it('never invokes a hostile subclass getter over expiresAtIso of a ScopedForgeCredential and returns true', () => {
+    let getterRuns = 0;
+    class Hostile extends ScopedForgeCredential {
+      constructor() {
+        super({ repository: 'owner/name', permission: 'read', expiresAtIso: EXPIRES_AT, secret: GITHUB_SECRET });
+        Object.defineProperty(this, 'expiresAtIso', {
+          enumerable: true,
+          configurable: true,
+          get() {
+            getterRuns += 1;
+            return '2999-01-01T00:00:00Z';
+          },
+        });
+      }
+    }
+    const hostile = new Hostile();
+    expect(isExpired(hostile, BEFORE_EXPIRY)).toBe(true);
+    expect(getterRuns).toBe(0);
+  });
+
   it('returns true for a Proxy credential whose getPrototypeOf trap throws', () => {
     const proxy = new Proxy({ expiresAtIso: EXPIRES_AT }, {
       getPrototypeOf(): never {

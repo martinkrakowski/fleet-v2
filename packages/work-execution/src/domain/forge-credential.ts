@@ -223,8 +223,26 @@ export function isExpired(credential: unknown, nowIso: unknown): boolean {
 /** Read `expiresAtIso` without ever invoking a getter, or null when absent/hostile. */
 function readExpiresAtIso(credential: unknown): string | null {
   if (credential instanceof ScopedForgeCredential) {
-    // Own instance property; the class stores it as a plain data field.
-    return credential.expiresAtIso;
+    // The public field is overridable: a hostile subclass can install a
+    // getter over `expiresAtIso` after `super()` returns, so the value is
+    // read through the instance's own property descriptor and a getter is
+    // never invoked. A hostile getter cannot run and cannot return a
+    // forged future timestamp.
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(credential, 'expiresAtIso');
+    } catch {
+      return null;
+    }
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      typeof descriptor.value !== 'string'
+    ) {
+      return null;
+    }
+    return descriptor.value;
   }
   if (!isPlainRecordObject(credential)) {
     return null;

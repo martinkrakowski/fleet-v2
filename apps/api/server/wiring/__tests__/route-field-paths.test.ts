@@ -373,6 +373,7 @@ function assertPathList(label: string, value: unknown): readonly string[] {
   // they are found; the budget refusal fires during this walk, before any
   // element is read and without materialising a key array of extras.
   let nodes = 1 + value.length;
+  let hasExtraDataKey = false;
   for (const extraKey in value) {
     if (!Object.prototype.hasOwnProperty.call(value, extraKey)) {
       continue;
@@ -385,6 +386,9 @@ function assertPathList(label: string, value: unknown): readonly string[] {
       throw new NodeBudgetExceededError();
     }
     assertNoAccessorProperty(value, extraKey);
+    // An own data key besides the indices (for example `constructor`) would
+    // steer later array methods (`filter` reads it for species); refuse it.
+    hasExtraDataKey = true;
   }
   for (const name of Object.getOwnPropertyNames(value)) {
     if (isCanonicalIndexKey(name, value.length) || name === "length") {
@@ -398,6 +402,9 @@ function assertPathList(label: string, value: unknown): readonly string[] {
       throw new NodeBudgetExceededError();
     }
     assertNoAccessorProperty(value, name);
+    // An own data key besides the indices (for example `constructor`) would
+    // steer later array methods (`filter` reads it for species); refuse it.
+    hasExtraDataKey = true;
   }
   const symbols = Object.getOwnPropertySymbols(value);
   nodes += symbols.length;
@@ -408,6 +415,10 @@ function assertPathList(label: string, value: unknown): readonly string[] {
     assertNoAccessorProperty(value, symbol);
     // Symbol keys are never JSON data, accessor or not.
     throw new UnsupportedValueError(symbol);
+  }
+  // Deferred so the budget refusal above always wins.
+  if (hasExtraDataKey) {
+    throw new UnsupportedObjectError();
   }
   for (let i = 0; i < value.length; i += 1) {
     if (!Object.prototype.hasOwnProperty.call(value, String(i))) {
@@ -755,9 +766,9 @@ describe("jsonPaths", () => {
   it("refuses an array whose many extra own keys exceed the budget during the lazy key walk, before any child is visited", () => {
     // Budget-first: nodes(1) + length(1) alone stays under MAX_NODES, so the
     // charge only crosses the budget during the lazy own-key walk. Each
-    // extra key holds a non-plain object as its value: if ANY child were
-    // visited before the budget refusal, the error would be
-    // UnsupportedObjectError, not NodeBudgetExceededError.
+    // extra key holds a non-plain object as its value; extra keys are never
+    // read as children, so the only refusal that can fire is the budget one
+    // (NodeBudgetExceededError), reached during the key walk itself.
     const withExtras: string[] = ["only"];
     for (let i = 0; i < MAX_NODES - 1; i += 1) {
       Object.defineProperty(withExtras, `extra${i}`, {
@@ -908,6 +919,35 @@ describe("jsonPaths", () => {
 });
 
 describe("compareFieldPaths hostilities", () => {
+  it("refuses a path list with an own data constructor key before any array method runs", () => {
+    let speciesReads = 0;
+    let constructed = 0;
+    const ctor = function () {
+      constructed += 1;
+    } as unknown as object;
+    Object.defineProperty(ctor, Symbol.species, {
+      get() {
+        speciesReads += 1;
+        throw new Error("species getter invoked");
+      },
+    });
+    const withData: string[] = ["result.code"];
+    Object.defineProperty(withData, "constructor", {
+      value: ctor,
+      enumerable: false,
+    });
+    expect(() =>
+      compareFieldPaths("f.json", withData, ["result.code"]),
+    ).toThrow(UnsupportedObjectError);
+    const plain: string[] = ["result.code"];
+    Object.defineProperty(plain, "constructor", { value: 1, enumerable: true });
+    expect(() =>
+      compareFieldPaths("f.json", plain, ["result.code"]),
+    ).toThrow(UnsupportedObjectError);
+    expect(speciesReads).toBe(0);
+    expect(constructed).toBe(0);
+  });
+
   it("refuses a non-enumerable accessor on a path list without invoking it", () => {
     let calls = 0;
     const snapshotPaths: string[] = ["result.code"];

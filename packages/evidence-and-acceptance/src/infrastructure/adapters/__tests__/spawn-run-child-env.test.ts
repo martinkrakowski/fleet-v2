@@ -220,6 +220,17 @@ describe('allowListedChildEnv', () => {
     expect(second.HOME).toBe(HOME_VALUE);
   });
 
+  it('fails closed to the local allow-list for a transport value cast past the type', () => {
+    setAllEight();
+    for (const key of FORBIDDEN_KEYS) {
+      setEnv(key, secret);
+    }
+
+    const env = allowListedChildEnv('SSH' as unknown as 'ssh');
+
+    expect(env).toStrictEqual(LOCAL_ALL);
+  });
+
   it.skipIf(process.platform === 'win32')(
     'ignores lowercase path on non-win32 platforms',
     () => {

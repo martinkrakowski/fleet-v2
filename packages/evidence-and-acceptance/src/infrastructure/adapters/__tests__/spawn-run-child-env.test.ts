@@ -2,31 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { allowListedChildEnv } from '../spawn-run.js';
 
-/**
- * Every `process.env` key this suite touches. Each key is snapshotted with
- * `Object.hasOwn` before the suite runs and restored (or deleted) in
- * `afterEach`, so host values are never read, logged or asserted on, and
- * never leak between tests.
- */
-const TOUCHED_ENV_KEYS = [
-  'PATH',
-  'HOME',
-  'USER',
-  'LOGNAME',
-  'LANG',
-  'LC_ALL',
-  'TMPDIR',
-  'SSH_AUTH_SOCK',
-  'path',
-  'GH_TOKEN',
-  'GITHUB_TOKEN',
-  'AWS_SECRET_ACCESS_KEY',
-  'OPENROUTER_API_KEY',
-  'HTTPS_PROXY',
-  'NODE_OPTIONS',
-  'LD_PRELOAD',
-] as const;
-
 const LOCAL_KEYS = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
 
 const SSH_KEYS = [...LOCAL_KEYS, 'SSH_AUTH_SOCK'] as const;
@@ -42,33 +17,26 @@ const SYNTHETIC_VALUES: Record<string, string> = {
   SSH_AUTH_SOCK: '/synthetic/agent.sock',
 };
 
-interface EnvSnapshot {
-  present: boolean;
-  value: string | undefined;
-}
-
-const snapshots = new Map<string, EnvSnapshot>();
+/**
+ * The suite never reads, copies, logs or asserts on any host environment
+ * value — host credentials (GH_TOKEN, AWS_*, a proxy password) must not
+ * enter this file. Instead of per-key snapshots (which would read each
+ * host value), the whole `process.env` object is captured by reference
+ * only: each test runs against a fresh, empty, plain object, and the
+ * host object is restored untouched in `afterEach`.
+ */
+let hostEnv: typeof process.env | undefined;
 
 beforeEach(() => {
-  for (const key of TOUCHED_ENV_KEYS) {
-    snapshots.set(key, {
-      present: Object.hasOwn(process.env, key),
-      value: process.env[key],
-    });
-    delete process.env[key];
-  }
+  hostEnv = process.env;
+  process.env = {};
 });
 
 afterEach(() => {
-  for (const key of TOUCHED_ENV_KEYS) {
-    const snapshot = snapshots.get(key);
-    if (snapshot?.present) {
-      process.env[key] = snapshot.value;
-    } else {
-      delete process.env[key];
-    }
+  if (hostEnv !== undefined) {
+    process.env = hostEnv;
+    hostEnv = undefined;
   }
-  snapshots.clear();
 });
 
 describe('allowListedChildEnv', () => {
@@ -97,7 +65,8 @@ describe('allowListedChildEnv', () => {
     process.env.PATH = SYNTHETIC_VALUES.PATH;
     process.env.HOME = SYNTHETIC_VALUES.HOME;
     process.env.USER = SYNTHETIC_VALUES.USER;
-    // LANG, LC_ALL, TMPDIR, SSH_AUTH_SOCK stay deleted by beforeEach.
+    // LANG, LC_ALL, TMPDIR, SSH_AUTH_SOCK stay unset in the fresh
+    // environment installed by beforeEach.
 
     const local = allowListedChildEnv('local');
     expect(Object.hasOwn(local, 'LANG')).toBe(false);

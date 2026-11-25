@@ -477,18 +477,23 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     // for `length` can throw too; both are hostile input, so the shape check
     // is guarded and the length is snapshotted once instead of re-read per
     // entry (a trap that varies between reads cannot extend the scan).
-    let input: readonly unknown[];
+    let length: number;
     try {
-      if (!Array.isArray(ownedPaths) || ownedPaths.length > LaneRunAdmissionAdapter.MAX_OWNED_PATHS) {
+      if (!Array.isArray(ownedPaths)) {
         return null;
       }
-      input = ownedPaths;
+      // Snapshot the length once and reuse it for the loop below: a `Proxy`
+      // could report a small `length` here and a huge one on a second read,
+      // so the bound that was checked is the only length the scan may use.
+      length = ownedPaths.length;
+      if (length > LaneRunAdmissionAdapter.MAX_OWNED_PATHS) {
+        return null;
+      }
     } catch {
       return null;
     }
     const paths: string[] = [];
     try {
-      const length = input.length;
       for (let index = 0; index < length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(ownedPaths, index);
         if (descriptor === undefined || descriptor.get !== undefined || typeof descriptor.value !== 'string') {

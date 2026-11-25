@@ -39,6 +39,7 @@ import {
   createNodeDoctorProbes,
   LOGIN_SHELL_CANARY,
   seatProbeArgv,
+  serverModelIds,
 } from '../probes-node.js';
 import { posixQuote } from '../ssh-remote.js';
 
@@ -1351,5 +1352,268 @@ describe('createNodeDoctorProbes loginShell (SHP1)', () => {
       },
     });
     await expect(probes.loginShell!('lane-host')).resolves.toBe('unknown');
+  });
+});
+
+/** A successful run: every probe maps this to its success answer. */
+const GOOD_RUN = { exitCode: 0, signal: null, stdout: 'active\n', stderr: '' } as const;
+
+interface HostileCase {
+  readonly label: string;
+  readonly make: (counter: { getters: number }) => unknown;
+}
+
+function accessorOn(field: string, value: unknown) {
+  return (counter: { getters: number }): unknown =>
+    Object.defineProperty({ ...GOOD_RUN }, field, {
+      enumerable: true,
+      get() {
+        counter.getters += 1;
+        return value;
+      },
+    });
+}
+
+class RunResultClass {
+  exitCode = 0;
+  signal = null;
+  stdout = 'active\n';
+  stderr = '';
+}
+
+const HOSTILE_RUN_RESULTS: readonly HostileCase[] = [
+  { label: 'a getter on exitCode', make: accessorOn('exitCode', 0) },
+  { label: 'a getter on stdout', make: accessorOn('stdout', 'active\n') },
+  { label: 'a getter on error', make: accessorOn('error', undefined) },
+  { label: 'a getter on signal', make: accessorOn('signal', null) },
+  { label: 'a non-throwing Proxy', make: () => new Proxy({ ...GOOD_RUN }, {}) },
+  {
+    label: 'a Proxy whose descriptor trap throws',
+    make: () =>
+      new Proxy({ ...GOOD_RUN }, {
+        getOwnPropertyDescriptor() {
+          throw new Error('trap');
+        },
+        getPrototypeOf() {
+          throw new Error('trap');
+        },
+      }),
+  },
+  { label: 'a non-plain prototype carrying the answer', make: () => Object.create({ ...GOOD_RUN }) },
+  { label: 'a class instance', make: () => new RunResultClass() },
+  {
+    label: 'an own __proto__ key',
+    make: () => Object.defineProperty({ ...GOOD_RUN }, '__proto__', { value: {}, enumerable: true }),
+  },
+  { label: 'an own constructor key', make: () => ({ ...GOOD_RUN, constructor: 'x' }) },
+  { label: 'an own prototype key', make: () => ({ ...GOOD_RUN, prototype: 'x' }) },
+  { label: 'an array-like with an enormous length', make: () => ({ length: 1_000_000, 0: 'a' }) },
+  { label: 'an array', make: () => [GOOD_RUN] },
+  { label: 'more than 64 own keys', make: () => ({ ...GOOD_RUN, ...Object.fromEntries(Array.from({ length: 70 }, (_, i) => [`k${i}`, i])) }) },
+  { label: 'a string stdout replaced by a number', make: () => ({ ...GOOD_RUN, stdout: 42 }) },
+  { label: 'a fractional exit code', make: () => ({ ...GOOD_RUN, exitCode: 0.5 }) },
+  { label: 'null', make: () => null },
+  { label: 'undefined', make: () => undefined },
+  { label: 'the number 42', make: () => 42 },
+  { label: 'the string active', make: () => 'active' },
+];
+
+describe('createNodeDoctorProbes untrusted executor answers', () => {
+  it.each(HOSTILE_RUN_RESULTS)('refuses $label on every executor-backed probe and never runs a getter', async ({ make }) => {
+    const counter = { getters: 0 };
+    const executor: DoctorCommandExecutor = {
+      async run() {
+        return make(counter) as DoctorCommandRunResult;
+      },
+    };
+    const probes = createNodeDoctorProbes({
+      localExecutor: executor,
+      sshExecutor: executor,
+      repoRoot: '/nonexistent-fleet-doctor-probes-root',
+      serviceEnv: { GH_TOKEN: 'x' },
+    });
+    const toolId = BUILT_IN_TOOLS[0].id;
+    expect(await probes.hostReachable('lane-host')).toBe(false);
+    expect(await probes.commandAvailable('lane-host', 'git')).toBe(false);
+    expect(await probes.toolVersion('lane-host', toolId)).toBeUndefined();
+    expect(await probes.fileMode('lane-host', '/etc/x')).toBeUndefined();
+    expect(await probes.worktreeRootWritable('lane-host')).toBe(false);
+    expect(await probes.ciRunnerSlot!('lane-host', 'runner.service')).toBe('unknown');
+    expect(await probes.loginShell!('lane-host')).toBe('unknown');
+    expect((await probes.serverProbe('lane-host', 4096)).outcome).toBe('unknown');
+    expect((await probes.ghAuth!('/usr/bin/gh')).authCheck.outcome).toBe('unknown');
+    expect((await probes.seatProbe(seat)).outcome).toBe('unknown');
+    expect(await probes.pinnedBuild!()).toEqual({
+      pinnedCommit: undefined,
+      baseTipCommit: undefined,
+      behindCount: undefined,
+      installRootName: expect.any(String),
+    });
+    expect(counter.getters).toBe(0);
+  });
+
+  it('refuses an executor that throws as a failed run on every probe', async () => {
+    const executor: DoctorCommandExecutor = {
+      async run() {
+        throw new Error('spawn exploded');
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, sshExecutor: executor });
+    expect(await probes.hostReachable('lane-host')).toBe(false);
+    expect(await probes.ciRunnerSlot!('lane-host', 'runner.service')).toBe('unknown');
+    expect((await probes.seatProbe(seat)).outcome).toBe('unknown');
+  });
+
+  it('still maps a well-formed answer to its success outcome, so refusal is not a constant', async () => {
+    const executor: DoctorCommandExecutor = {
+      async run() {
+        return { ...GOOD_RUN };
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, sshExecutor: executor });
+    expect(await probes.hostReachable('lane-host')).toBe(true);
+    expect(await probes.ciRunnerSlot!('lane-host', 'runner.service')).toBe('active');
+    expect((await probes.seatProbe(seat)).outcome).toBe('pass');
+  });
+
+  it('reads a null-prototype answer as data, so plain-object detection is not a prototype-equality check only', async () => {
+    const executor: DoctorCommandExecutor = {
+      async run() {
+        return Object.assign(Object.create(null), GOOD_RUN) as DoctorCommandRunResult;
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, sshExecutor: executor });
+    expect(await probes.hostReachable('lane-host')).toBe(true);
+  });
+});
+
+describe('createNodeDoctorProbes untrusted pinned-build answers', () => {
+  const GOOD_BUILD = { pinnedCommit: 'a'.repeat(40), baseTipCommit: 'b'.repeat(40), behindCount: 3, installRootName: 'fleet' };
+  const probesFor = (answer: unknown) =>
+    createNodeDoctorProbes({ readPinnedBuild: async () => answer as never });
+
+  it('returns a fresh copy of a well-formed answer, not the injected object', async () => {
+    const answer = { ...GOOD_BUILD };
+    const read = await probesFor(answer).pinnedBuild!();
+    expect(read).toEqual(GOOD_BUILD);
+    expect(read).not.toBe(answer);
+  });
+
+  it.each([
+    ['null', () => null],
+    ['undefined', () => undefined],
+    ['a string', () => 'pinned'],
+    ['an array', () => [GOOD_BUILD]],
+    ['a Proxy', () => new Proxy({ ...GOOD_BUILD }, {})],
+    ['a foreign prototype', () => Object.create({ ...GOOD_BUILD })],
+    ['a non-integer behindCount', () => ({ ...GOOD_BUILD, behindCount: 1.5 })],
+    ['a numeric pinnedCommit', () => ({ ...GOOD_BUILD, pinnedCommit: 7 })],
+    ['an own constructor key', () => ({ ...GOOD_BUILD, constructor: 'x' })],
+  ])('refuses %s as undefined', async (_label, make) => {
+    expect(await probesFor(make()).pinnedBuild!()).toBeUndefined();
+  });
+
+  it.each(['pinnedCommit', 'baseTipCommit', 'behindCount', 'installRootName'])(
+    'refuses a getter on %s without running it',
+    async (field) => {
+      let getters = 0;
+      const answer = Object.defineProperty({ ...GOOD_BUILD }, field, {
+        enumerable: true,
+        get() {
+          getters += 1;
+          return (GOOD_BUILD as Record<string, unknown>)[field];
+        },
+      });
+      expect(await probesFor(answer).pinnedBuild!()).toBeUndefined();
+      expect(getters).toBe(0);
+    },
+  );
+
+  it('refuses a reader that throws as undefined', async () => {
+    const probes = createNodeDoctorProbes({
+      readPinnedBuild: async () => {
+        throw new Error('boom');
+      },
+    });
+    expect(await probes.pinnedBuild!()).toBeUndefined();
+  });
+});
+
+describe('createNodeDoctorProbes untrusted gh candidates, seat and model list', () => {
+  it.each([
+    ['a non-iterable', () => 42],
+    ['an array hole', () => {
+      const holey = ['/usr/bin/gh', '/usr/bin/gh'];
+      delete holey[0];
+      return holey;
+    }],
+    ['an enormous sparse array', () => new Array(10_000)],
+    ['a dense list longer than 64 entries', () => Array.from({ length: 65 }, () => '/nonexistent/gh')],
+    ['a non-string element', () => [42]],
+    ['an array-like', () => ({ length: 1, 0: '/usr/bin/gh' })],
+    ['a Proxy over an array', () => new Proxy(['/usr/bin/gh'], {})],
+    ['an array with a foreign prototype', () => Object.setPrototypeOf(['/usr/bin/gh'], { evil: true })],
+  ])('refuses %s as ghBinaryCandidates with undefined', async (_label, make) => {
+    const probes = createNodeDoctorProbes({ ghBinaryCandidates: make() as never });
+    expect(await probes.ghBinary!()).toBeUndefined();
+  });
+
+  it('refuses an accessor element of ghBinaryCandidates without running it', async () => {
+    let getters = 0;
+    const candidates = ['/nonexistent/gh'];
+    Object.defineProperty(candidates, 0, {
+      enumerable: true,
+      get() {
+        getters += 1;
+        return '/usr/bin/gh';
+      },
+    });
+    const probes = createNodeDoctorProbes({ ghBinaryCandidates: candidates });
+    expect(await probes.ghBinary!()).toBeUndefined();
+    expect(getters).toBe(0);
+  });
+
+  it('reports a well-formed candidate list as unresolved with the same candidates', async () => {
+    const probes = createNodeDoctorProbes({ ghBinaryCandidates: ['/nonexistent/gh'] });
+    expect(await probes.ghBinary!()).toEqual({ resolved: undefined, candidates: ['/nonexistent/gh'] });
+  });
+
+  it.each(['model', 'variant', 'tool'])('refuses a getter on seat.%s without running it', async (field) => {
+    let getters = 0;
+    const hostileSeat = Object.defineProperty({ ...seat }, field, {
+      enumerable: true,
+      get() {
+        getters += 1;
+        return (seat as unknown as Record<string, unknown>)[field];
+      },
+    });
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    expect((await probes.seatProbe(hostileSeat)).outcome).toBe('unknown');
+    expect(local.calls).toEqual([]);
+    expect(getters).toBe(0);
+  });
+
+  it('gives no argv for a getter on seat.model, a Proxy seat, or a template with a hole', () => {
+    let getters = 0;
+    const getterSeat = Object.defineProperty({ ...seat }, 'model', {
+      enumerable: true,
+      get() {
+        getters += 1;
+        return 'm';
+      },
+    });
+    expect(seatProbeArgv(getterSeat, ['run', '{model}'])).toEqual([]);
+    expect(getters).toBe(0);
+    expect(seatProbeArgv(new Proxy({ ...seat }, {}), ['run', '{model}'])).toEqual([]);
+    const holeyTemplate = ['run', '{model}'];
+    delete holeyTemplate[0];
+    expect(seatProbeArgv(seat, holeyTemplate)).toEqual([]);
+    expect(seatProbeArgv(seat, ['run', '{model}'])).toEqual(['run', 'glm-5.3']);
+  });
+
+  it('answers undefined for a model list that is not a string', () => {
+    expect(serverModelIds(42 as never)).toBeUndefined();
+    expect(serverModelIds(null as never)).toBeUndefined();
   });
 });

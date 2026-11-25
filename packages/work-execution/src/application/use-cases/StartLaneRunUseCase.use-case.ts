@@ -174,7 +174,13 @@ function briefRejectionResult(
 ): Extract<StartLaneRunResult, { outcome: 'incomplete' }> {
   const briefClass =
     reasonClass === 'acceptance-spec-shell' ? 'brief-acceptance-spec-shell' : 'brief-rejected';
-  const detail = reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS);
+  // A port may answer `rejected` with a reason that is not a string; that
+  // yields the bare class, never a throw (O(1) type check, then the bounded
+  // flatten below).
+  const detail =
+    typeof reason === 'string'
+      ? reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS)
+      : '';
   return {
     outcome: 'incomplete',
     runId: request.runId,

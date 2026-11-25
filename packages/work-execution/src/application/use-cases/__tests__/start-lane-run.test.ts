@@ -1228,6 +1228,31 @@ describe('StartLaneRunUseCase', () => {
     expect(result).toMatchObject({ step: 'brief', reason: 'brief-rejected' });
   });
 
+  it('test 4m: a rejected brief whose reason is a number or an object with a throwing toString yields the bare class, never a throw', async () => {
+    for (const hostile of [42, { toString: () => { throw new Error('must not run'); } }]) {
+      const harness = makeHarness();
+      harness.setBriefAnswers([{ outcome: 'rejected', reason: hostile as never }]);
+      const result = await harness.useCase.startLaneRun(requestFixture());
+      expect(result).toEqual({
+        outcome: 'incomplete',
+        runId: RUN_ID,
+        attemptId: ATTEMPT_ID,
+        step: 'brief',
+        reason: 'brief-rejected',
+      });
+      expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+    }
+  });
+
+  it('test 4n: an empty baseCommit passes the pre-reserve static check and the start reaches started', async () => {
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({ brief: briefFixture({ baseCommit: '' }) }),
+    );
+    expect(result).toMatchObject({ outcome: 'started' });
+    expect(harness.capacityCalls).toHaveLength(1);
+  });
+
   it('test 5: a retry after completion returns started and calls no fake again', async () => {
     const harness = makeHarness();
     expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });

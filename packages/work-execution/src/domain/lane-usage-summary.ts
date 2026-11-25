@@ -70,15 +70,23 @@ function isFiniteNonNegativeNumber(value: unknown): value is number {
 }
 
 /**
- * Checked accumulation: the sum is refused, not rounded, when it leaves the
- * finite or the safe-integer range. The values are integer runner-minutes (and
- * bounded token counts), so the safe-integer bound is the contract; the finite
- * check catches float cost sums whose midpoint already exceeds
- * `Number.MAX_VALUE`. `null` means "refuse", never a partial sum.
+ * Checked accumulation. Two contracts:
+ * - Integer runner-minutes are bounded by `Number.MAX_SAFE_INTEGER`: the sum
+ *   is refused, not rounded, when `acc + value` leaves the safe-integer
+ *   range (`integerBound`).
+ * - Every other summable field (costs, wall seconds, token counts) must be
+ *   summed whenever the total is a finite number: only a midpoint that is
+ *   not finite (e.g. `Number.MAX_VALUE + 2 ** 970`, which rounds to
+ *   infinity) is refused. A large-but-finite total such as `costUsd`
+ *   summing to `1e16` is valid and is never rejected.
+ * `null` means "refuse", never a partial sum.
  */
-function addTo(acc: number, value: number): number | null {
+function addTo(acc: number, value: number, integerBound: boolean): number | null {
   const next = acc + value;
-  if (!Number.isFinite(next) || acc > Number.MAX_SAFE_INTEGER - value) {
+  if (!Number.isFinite(next)) {
+    return null;
+  }
+  if (integerBound && acc > Number.MAX_SAFE_INTEGER - value) {
     return null;
   }
   return next;
@@ -89,10 +97,12 @@ interface SumAccumulator {
   seen: boolean;
   value: number;
   overflow: boolean;
+  /** True only for integer runner-minutes, which are safe-integer bounded. */
+  integerBound: boolean;
 }
 
-function newAccumulator(): SumAccumulator {
-  return { seen: false, value: 0, overflow: false };
+function newAccumulator(integerBound: boolean): SumAccumulator {
+  return { seen: false, value: 0, overflow: false, integerBound };
 }
 
 function accumulate(acc: SumAccumulator, value: number | null): void {
@@ -103,7 +113,7 @@ function accumulate(acc: SumAccumulator, value: number | null): void {
     acc.overflow = true;
     return;
   }
-  const next = addTo(acc.value, value);
+  const next = addTo(acc.value, value, acc.integerBound);
   if (next === null) {
     acc.overflow = true;
     return;
@@ -136,15 +146,15 @@ function newLaneGroup(runId: string | null, attemptId: string | null): LaneGroup
     attemptId,
     attemptCount: 0,
     unmeasuredAttempts: 0,
-    runnerMinutes: newAccumulator(),
-    wallSeconds: newAccumulator(),
-    tokensInput: newAccumulator(),
-    tokensOutput: newAccumulator(),
-    tokensReasoning: newAccumulator(),
-    tokensCacheRead: newAccumulator(),
-    tokensCacheWrite: newAccumulator(),
-    meteredUsd: newAccumulator(),
-    planEstimateUsd: newAccumulator(),
+    runnerMinutes: newAccumulator(true),
+    wallSeconds: newAccumulator(false),
+    tokensInput: newAccumulator(false),
+    tokensOutput: newAccumulator(false),
+    tokensReasoning: newAccumulator(false),
+    tokensCacheRead: newAccumulator(false),
+    tokensCacheWrite: newAccumulator(false),
+    meteredUsd: newAccumulator(false),
+    planEstimateUsd: newAccumulator(false),
     unknownCount: 0,
   };
 }

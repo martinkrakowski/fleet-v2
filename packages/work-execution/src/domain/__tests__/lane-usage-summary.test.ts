@@ -418,4 +418,28 @@ describe('summariseLaneUsage — checked accumulation (overflow contract)', () =
       reason: 'invalid-row',
     });
   });
+
+  it('sums large-but-finite costs, wall seconds and tokens instead of refusing them', () => {
+    // The safe-integer bound is the runner-minutes contract only; a finite
+    // cost or token total of any magnitude must be summed.
+    const result = summariseLaneUsage([
+      row({ costUsd: 5e15, tokensInput: 5e15, wallSeconds: 5e15 }),
+      row({ costUsd: 5e15, tokensInput: 5e15, wallSeconds: 5e15 }),
+    ]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const lane = result.lanes[0];
+    expect(lane.cost.meteredUsd).toBe(1e16);
+    expect(lane.tokens.input).toBe(1e16);
+    expect(lane.wallSeconds).toBe(1e16);
+    expect(lane.runnerMinutes).toBe(4);
+  });
+
+  it('refuses a non-runnerMinutes sum whose midpoint exceeds MAX_VALUE', () => {
+    const result = summariseLaneUsage([
+      row({ costUsd: Number.MAX_VALUE }),
+      row({ costUsd: Number.MAX_VALUE }),
+    ]);
+    expect(result).toEqual({ ok: false, reason: 'invalid-row' });
+  });
 });

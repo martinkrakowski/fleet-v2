@@ -333,6 +333,8 @@ export interface LaneRunFacts {
   readonly attempt: LaneRunAttemptFact | null;
   /** Current head of the run's branch (collected head, or the PR head once pushed) (K4/K6). */
   readonly head12: string | null;
+  /** The lane's full head sha when the attempt artifacts carry it; absent or null reads as unknown (the 12-character compare stands). */
+  readonly headSha?: string | null;
   /** Head of the run's last `accepted` acceptance (K1b). */
   readonly acceptedHead12: string | null;
   /** Gate result at `head12`; `unknown` is not a pass (K4, S2b). */
@@ -574,6 +576,24 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
 }
 
 /**
+ * RM3 fix round 2: whether the PR's head has moved off the lane's head.
+ * `O(1)`: two string compares, no getter, no iteration. At full sha precision
+ * when both shas are known — a move that shares the 12-character prefix is
+ * still a move. Without them the 12-character compare stands (a pr fact
+ * without `headSha` reads as unknown and never blocks a matching prefix).
+ */
+function laneRunPrHeadMovedOf(facts: LaneRunFacts): boolean {
+  const pr = facts.pr;
+  if (pr === null) {
+    return false;
+  }
+  if (typeof pr.headSha === 'string' && typeof facts.headSha === 'string') {
+    return pr.headSha !== facts.headSha;
+  }
+  return pr.head12 !== facts.head12;
+}
+
+/**
  * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
  * the `premerge` commit status, the merge hold, before the policy-grant /
  * train / merge tail. Returns `null` to fall through to that tail. Total;
@@ -596,7 +616,10 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   // RM3: a Tier 2 `released` hold never posts success while the PR's head has
   // moved off the lane's head: the pending post waits until a receipt for the
   // PR's head exists. A lane head move is G7's re-gating, not this guard.
-  if (record.tier === 2 && hold.kind === 'released' && facts.pr !== null && facts.pr.head12 !== facts.head12) {
+  // Fix round 2: the move is detected at full sha precision when both shas
+  // are known — two distinct heads sharing the 12-character prefix are still
+  // a move; without the shas the 12-character compare stands.
+  if (record.tier === 2 && hold.kind === 'released' && facts.pr !== null && laneRunPrHeadMovedOf(facts)) {
     return { kind: 'wait', reason: 'premerge-pending' };
   }
   if (hold.kind === 'released' && facts.premergePost === 'success') {

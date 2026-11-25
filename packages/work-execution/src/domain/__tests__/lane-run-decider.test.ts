@@ -2168,6 +2168,38 @@ describe('merging state', () => {
       assertDecision(successFacts, record({}), decide(record({}), successFacts), { kind: 'wait', reason: 'premerge-pending' });
     });
 
+    it('RM3 fix round 2: a PR head move that shares the 12-character prefix waits premerge-pending at full sha precision, on the act and after a posted success', () => {
+      const headSha = `${HEAD}${'0'.repeat(28)}`;
+      const movedSha = `${HEAD}${'f'.repeat(28)}`;
+      const prMoved = { state: 'open' as const, head12: HEAD, headSha: movedSha, containsLaneHead: true };
+      const actFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'none',
+        pr: prMoved, attempt: attemptFact(), merge: { oneWayDoor: false, policyGrant: false },
+      });
+      assertDecision(actFacts, record({}), decide(record({}), actFacts), { kind: 'wait', reason: 'premerge-pending' });
+      const successFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: prMoved, attempt: attemptFact(),
+      });
+      assertDecision(successFacts, record({}), decide(record({}), successFacts), { kind: 'wait', reason: 'premerge-pending' });
+      // The same head at full sha precision still falls through to merge-enqueue.
+      const sameFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, headSha, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      expect(decide(record({}), sameFacts)).toEqual({
+        kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      });
+      // Tier 1 is unchanged: the same-prefix move never holds a Tier 1 released premerge.
+      const tier1Facts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: prMoved, attempt: attemptFact(),
+      });
+      expect(decide(record({ tier: 1 }), tier1Facts)).toEqual({
+        kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      });
+    });
+
     it('RM3: a head move after premerge success re-enters gating (G7 unchanged), and the new head posts pending, never success', () => {
       const movedFacts = baseFacts({
         state: 'merging', head12: OTHER, acceptedHead12: HEAD, preMerge: 'none', premergePost: 'success',

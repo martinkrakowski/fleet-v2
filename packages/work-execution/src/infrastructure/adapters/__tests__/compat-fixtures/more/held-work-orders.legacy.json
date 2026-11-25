@@ -1,0 +1,14 @@
+[
+  {
+    "version": 1,
+    "stage": "held",
+    "intentId": "intent-example-1",
+    "workOrderId": "wo-example-1",
+    "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "briefRequestRef": null,
+    "blockerKind": "active-work-order",
+    "blockerId": "wo-example-0",
+    "pathCode": "path-abababababab",
+    "heldAtIso": "2026-01-01T00:00:00.000Z"
+  }
+]

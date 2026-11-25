@@ -22,7 +22,7 @@ import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.
 
 import { checkGhAuthNonInteractive } from './gh-binary.js';
 import type { DoctorLine, DoctorStatus } from './types.js';
-import type { DoctorProbes } from './probes.js';
+import type { DoctorProbes, DiskQuotaUsage } from './probes.js';
 
 /** A trimmed, lowercase hex git commit id of 7–40 characters. */
 const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
@@ -338,6 +338,101 @@ async function ciRunnerSlotLines(
 /** Marker: the injected probes carry no `loginShell` method. */
 const NO_SHELL_PROBE = Symbol('no-login-shell-probe');
 
+/** The minimum fraction of the disk quota that must remain free. */
+export const DISK_QUOTA_MIN_HEADROOM = 0.1;
+
+/** Marker: the injected probes carry no `diskQuotaUsage` method. */
+const NO_DISK_QUOTA_PROBE = Symbol('no-disk-quota-probe');
+
+/**
+ * Read one probe answer's two numbers. `O(1)`: only the probe result's own
+ * data descriptors `'usedBytes'` and `'totalBytes'` are inspected, never a
+ * getter (a getter is refused, not invoked), never a prototype property,
+ * never anything else on the object. Anything else is `undefined`.
+ */
+export function readDiskQuotaUsage(raw: unknown): DiskQuotaUsage | undefined {
+  try {
+    if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
+      return undefined;
+    }
+    const readings: [string, number | undefined][] = [];
+    for (const key of ['usedBytes', 'totalBytes'] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(raw, key);
+      if (
+        descriptor === undefined ||
+        !('value' in descriptor) ||
+        typeof descriptor.value !== 'number' ||
+        !Number.isSafeInteger(descriptor.value)
+      ) {
+        return undefined;
+      }
+      readings.push([key, descriptor.value]);
+    }
+    const usedBytes = readings[0][1];
+    const totalBytes = readings[1][1];
+    if (
+      usedBytes === undefined ||
+      totalBytes === undefined ||
+      totalBytes <= 0 ||
+      usedBytes < 0 ||
+      usedBytes > totalBytes
+    ) {
+      return undefined;
+    }
+    return { usedBytes, totalBytes };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Status and detail of the host's disk-quota line; anything hostile is UNKNOWN. */
+function diskQuotaVerdict(
+  raw: unknown,
+  probeHost: string,
+): readonly [DoctorStatus, string] {
+  if (raw === NO_DISK_QUOTA_PROBE) {
+    return ['UNKNOWN', 'disk quota probe not available'];
+  }
+  const usage = readDiskQuotaUsage(raw);
+  if (usage === undefined) {
+    return ['UNKNOWN', `disk quota could not be read via ${shownHost(probeHost)}`];
+  }
+  const headroom = (usage.totalBytes - usage.usedBytes) / usage.totalBytes;
+  const pct = (Math.floor(headroom * 1000) / 10).toFixed(1);
+  if (headroom >= DISK_QUOTA_MIN_HEADROOM) {
+    return ['PASS', `disk quota headroom ${pct}% via ${shownHost(probeHost)}`];
+  }
+  return [
+    'FAIL',
+    `disk quota headroom ${pct}% below ${Math.round(DISK_QUOTA_MIN_HEADROOM * 100)}% minimum via ${shownHost(probeHost)}`,
+  ];
+}
+
+/**
+ * One disk-quota line per ssh host that declares a runner. The port read,
+ * the call and the answer all happen inside `safely`, so a throwing getter,
+ * a throwing or rejecting probe and a hostile answer are UNKNOWN, never a
+ * crash. Details carry the probe host only.
+ */
+async function diskQuotaLine(
+  name: string,
+  host: HostModel,
+  probeHost: string,
+  probes: DoctorProbes,
+): Promise<DoctorLine | undefined> {
+  if (host.transport !== 'ssh' || host.runner === undefined) {
+    return undefined;
+  }
+  const raw: unknown = await safely(async () => {
+    const probe = probes.diskQuotaUsage;
+    return typeof probe === 'function'
+      ? await probe.call(probes, probeHost)
+      : NO_DISK_QUOTA_PROBE;
+  });
+  const [status, detail] = diskQuotaVerdict(raw, probeHost);
+  return line('host', name, 'disk-quota', status, detail);
+}
+
 /** Detail of every unprobed line of a host whose login shell failed the canary. */
 const NOT_PROBED_DETAIL = 'not probed: login shell failed the canary';
 
@@ -440,6 +535,9 @@ function skippedHostLines(name: string, host: HostModel): DoctorLine[] {
   for (const slot of host.ciRunnerSlots ?? []) {
     lines.push(skipped(`ci-runner-${slot.name}`));
   }
+  if (host.transport === 'ssh' && host.runner !== undefined) {
+    lines.push(skipped('disk-quota'));
+  }
   return lines;
 }
 
@@ -534,6 +632,10 @@ async function hostLines(
 
     lines.push(...runnerConfigLines(name, host));
     lines.push(...(await ciRunnerSlotLines(name, host, probeHost, probes)));
+    const diskQuota = await diskQuotaLine(name, host, probeHost, probes);
+    if (diskQuota !== undefined) {
+      lines.push(diskQuota);
+    }
   }
   return lines;
 }

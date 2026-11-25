@@ -1161,7 +1161,7 @@ describe('StartLaneRunUseCase', () => {
     expect(reason.length).toBeLessThanOrEqual('brief-rejected'.length + 2 + 200);
   });
 
-  it('test 4g: duplicate acceptanceChecks names are refused with the brief refusal reason before the reserve, with zero capacity calls, no worktree or brief call and no start-incomplete fact', async () => {
+  it('test 4j: duplicate acceptanceChecks names are refused with the brief refusal reason before the reserve, with zero capacity calls, no worktree or brief call and no start-incomplete fact', async () => {
     const harness = makeHarness();
     const result = await harness.useCase.startLaneRun(
       requestFixture({
@@ -1189,7 +1189,7 @@ describe('StartLaneRunUseCase', () => {
     });
   });
 
-  it('test 4h: an acceptance-spec-shell refusal from the static brief check keeps the brief-acceptance-spec-shell class and reserves nothing', async () => {
+  it('test 4k: an acceptance-spec-shell refusal from the static brief check keeps the brief-acceptance-spec-shell class and reserves nothing', async () => {
     const harness = makeHarness();
     const result = await harness.useCase.startLaneRun(
       requestFixture({
@@ -1211,7 +1211,7 @@ describe('StartLaneRunUseCase', () => {
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
-  it('test 4i: a worktree-dependent brief refusal still holds the reservation with one capacity call', async () => {
+  it('test 4l: a worktree-dependent brief refusal still holds the reservation with one capacity call', async () => {
     const harness = makeHarness();
     harness.setBriefAnswers([{ outcome: 'rejected', reason: 'example brief rejection' }]);
     const result = await harness.useCase.startLaneRun(requestFixture());

@@ -32,6 +32,7 @@ import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { LaneDiffCheckPort } from '../ports/out/LaneDiffCheckPort.out-port.js';
 import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import type {
   CommitEditOnlyAttemptRequest,
@@ -163,6 +164,101 @@ function safeInspectionSnapshot(inspection: unknown): {
     untrackedPaths: collected[1]!,
   };
 }
+
+/**
+ * CB8: the bounds of one diff-findings journal detail. `readBoundedDenseArray`
+ * refuses a length above the cap in O(1) before any traversal; at most five
+ * findings are formatted (O(min(N, 5)) after the O(1) length check) and the
+ * whole detail stays within 300 characters.
+ */
+const DIFF_FINDINGS_CAP = 4096;
+const DIFF_FINDINGS_DETAIL_MAX_ENTRIES = 5;
+const DIFF_FINDINGS_DETAIL_MAX_CHARS = 300;
+
+/** A path or rule written into the journal detail: plain path/token characters only. */
+const DETAIL_PATH_PATTERN = /^[A-Za-z0-9._/@-]+$/;
+const DETAIL_RULE_PATTERN = /^[A-Za-z0-9._/@:-]+$/;
+
+/** The fixed detail for a malformed findings value: never a pass, never a throw. */
+const MALFORMED_FINDINGS_DETAIL = 'edit-only commit refused: diff-findings (malformed-findings)';
+
+/**
+ * CB8: a finding's path as the journal detail may carry it — the path text
+ * itself only when it is plain path characters and matches no secret shape
+ * (a path could carry a secret-shaped token); `<path-omitted>` otherwise.
+ * Never a matched value, never line content.
+ */
+function findingPathForDetail(path: string): string {
+  if (!DETAIL_PATH_PATTERN.test(path)) {
+    return '<path-omitted>';
+  }
+  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+    // A `g`/`y` flag would keep `lastIndex` across `.test()` calls, so one
+    // clean copy serves every check (the registry itself carries none).
+    const matcher = new RegExp(pattern.regex.source, pattern.regex.flags.replace(/[gy]/g, ''));
+    if (matcher.test(path)) {
+      return '<path-omitted>';
+    }
+  }
+  return path;
+}
+
+/**
+ * CB8: the refused collect journal entry's detail for a `diff-findings`
+ * verdict — the finding rules and paths only (never matched text, never line
+ * content), bounded to five findings and 300 characters. A hostile
+ * `findings` value — null, undefined, a non-array, an array-like, an array
+ * hole, an enormous length, a non-object element, a getter (never invoked),
+ * a Proxy (its consistent-trap residual is what the descriptors report), or
+ * a prototype-polluting key — never throws and never passes silently: it
+ * falls back to the fixed `malformed-findings` detail.
+ */
+export function diffFindingsDetail(findings: unknown): string {
+  const dense = readBoundedDenseArray(findings, DIFF_FINDINGS_CAP);
+  if (dense === null) {
+    return MALFORMED_FINDINGS_DETAIL;
+  }
+  const prefix = 'edit-only commit refused: diff-findings (';
+  const parts: string[] = [];
+  const limit = Math.min(dense.length, DIFF_FINDINGS_DETAIL_MAX_ENTRIES);
+  for (let index = 0; index < limit; index += 1) {
+    let snap: Record<string, unknown> | null;
+    try {
+      snap = snapshotPlainDataRecord(dense.array[index]);
+    } catch {
+      snap = null;
+    }
+    if (snap === null) {
+      return MALFORMED_FINDINGS_DETAIL;
+    }
+    const rule = dataStringValue(snap, 'rule');
+    const path = dataStringValue(snap, 'path');
+    if (rule === null || path === null) {
+      return MALFORMED_FINDINGS_DETAIL;
+    }
+    parts.push(
+      (DETAIL_RULE_PATTERN.test(rule) ? rule : '<rule-omitted>') +
+        '@' +
+        findingPathForDetail(path),
+    );
+  }
+  let body = '';
+  let consumed = 0;
+  for (; consumed < parts.length; consumed += 1) {
+    const next = body === '' ? parts[consumed]! : body + ', ' + parts[consumed]!;
+    const closed = prefix + next + '...)';
+    if (closed.length > DIFF_FINDINGS_DETAIL_MAX_CHARS) {
+      break;
+    }
+    body = next;
+  }
+  // Anything not formatted — a finding beyond the entry cap or beyond the
+  // character budget — is named with a trailing ellipsis, never dropped
+  // silently.
+  const truncated = consumed < dense.length;
+  return prefix + body + (truncated ? '...)' : ')');
+}
+
 
 export class CommitEditOnlyAttemptUseCase {
   constructor(private readonly deps?: CommitEditOnlyAttemptDependencies) {}
@@ -335,6 +431,10 @@ export class CommitEditOnlyAttemptUseCase {
       return { outcome: 'unknown', reason: 'the lane diff check could not run' };
     }
     if (diffVerdict.outcome === 'findings') {
+      // CB8: the detail carries the finding rules and paths only (never a
+      // matched value, never line content), bounded to five findings and
+      // 300 characters; a hostile findings value falls back to the fixed
+      // malformed-findings detail instead of throwing or passing silently.
       await appendEditOnlyJournalEntry(
         deps.journal,
         attempt,
@@ -342,9 +442,7 @@ export class CommitEditOnlyAttemptUseCase {
         attempt.sessionId ?? null,
         nowIso,
         'refused',
-        'edit-only commit refused: ' +
-          diffVerdict.findings.length +
-          ' diff-check finding(s)',
+        diffFindingsDetail(diffVerdict.findings),
       );
       return {
         outcome: 'refused',

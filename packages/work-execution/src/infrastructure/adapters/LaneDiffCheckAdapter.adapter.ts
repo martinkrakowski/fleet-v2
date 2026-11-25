@@ -200,10 +200,9 @@ function contentLines(content: string): { line: number; text: string }[] {
 }
 
 /**
- * The worktree and index scans of one path both number lines from 1, so a
- * (line, text) pair seen in both scans is kept once. Different texts at the
- * same line — the worktree changed since staging — are all kept, so a secret
- * in either version is scanned.
+ * Whole content as 1-based numbered lines with duplicate suppression by
+ * (line, text). Used by the commit-range scan, whose single blob per path
+ * never merges two versions of a file.
  */
 function mergeContentLines(
   merged: Map<number, Set<string>>,
@@ -463,7 +462,22 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     const worktreeDeleted = new Set<string>();
     this.collectStatusEntries(status.stdout, changed, worktreeDeleted);
 
-    const addedLines = new Map<string, { line: number; text: string }[]>();
+    // CB8: the two scanned versions of one path, kept separate. The worktree
+    // bytes and the index blob are different versions of the file (the
+    // conductor scans an unstaged worktree, where the index still holds
+    // HEAD), so a line inserted ABOVE a base fixture shifts it in one
+    // version but not the other. Merging both versions into one line set
+    // made the shifted fixture count twice against a base count of one and
+    // reported a finding for a line the base already had. Each version is
+    // scanned on its own against the FULL base counts instead, and the
+    // findings are unioned.
+    const contentVersions = new Map<
+      string,
+      {
+        worktree?: { line: number; text: string }[];
+        index?: { line: number; text: string }[];
+      }
+    >();
     // The base version's lines per path (null = unknown: no base blob, a
     // read failure, or a NUL byte in the base blob or the scanned content —
     // excuse nothing, fail closed).
@@ -527,7 +541,10 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     // never a silent truncation.
     for (const entry of changed.values()) {
       if (entry.status === "deleted") continue;
-      const merged = new Map<number, Set<string>>();
+      const versions: {
+        worktree?: { line: number; text: string }[];
+        index?: { line: number; text: string }[];
+      } = {};
       // The raw scanned content and the raw base blob, kept only to detect a
       // NUL byte: some line splitters cut a line at a NUL, so two different
       // lines could compare equal and a NUL on either side excuses nothing.
@@ -593,7 +610,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
               "lane diff check: could not read a changed file's worktree content",
           };
         }
-        mergeContentLines(merged, worktree.stdout);
+        versions.worktree = contentLines(worktree.stdout);
         scannedHasNul = worktree.stdout.includes("\u0000");
       }
       if (entry.status !== "untracked") {
@@ -614,7 +631,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
           "read a changed file's index blob",
         );
         if (!index.ok) return { outcome: "error", reason: index.reason };
-        mergeContentLines(merged, index.stdout);
+        versions.index = contentLines(index.stdout);
         if (index.stdout.includes("\u0000")) scannedHasNul = true;
         if (mode === "trusted") {
         // The base version of the same path, for the base-line allowance:
@@ -643,7 +660,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         }
         }
       }
-      addedLines.set(entry.path, flattenContentLines(merged));
+      contentVersions.set(entry.path, versions);
       baseLinesByPath.set(
         entry.path,
         baseRaw !== null && !baseRaw.includes("\u0000") && !scannedHasNul
@@ -671,20 +688,37 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
       ? `${configKeys.stdout}\0${worktreeKeys.stdout}`
       : configKeys.stdout;
 
-    const changedPaths: LaneDiffChangedPath[] = [...changed.values()].map(
-      (entry) => ({
-        ...entry,
-        ...(addedLines.has(entry.path)
-          ? { addedLines: addedLines.get(entry.path) }
-          : {}),
-        ...(baseLinesByPath.has(entry.path)
-          ? { baseLines: baseLinesByPath.get(entry.path) }
-          : {}),
-        ...(isSymlinkByPath.get(entry.path) === true
-          ? { isSymlink: true }
-          : {}),
-      }),
-    );
+    // One changed-path entry per scanned version (CB8): the worktree content
+    // and the index content are each matched by the pure check against the
+    // FULL base counts of the path, so a base fixture shifted by an edit
+    // above it is excused once per version instead of counted twice. A path
+    // scanned from the index alone (the worktree copy is gone) or from the
+    // worktree alone (untracked) yields one entry; a path with no scanned
+    // content (a deletion) keeps its plain entry so the prefix and protected
+    // path rules still see it.
+    const changedPaths: LaneDiffChangedPath[] = [];
+    for (const entry of changed.values()) {
+      const versions = contentVersions.get(entry.path);
+      const scanned: { line: number; text: string }[][] = [];
+      if (versions !== undefined) {
+        if (versions.worktree !== undefined) scanned.push(versions.worktree);
+        if (versions.index !== undefined) scanned.push(versions.index);
+      }
+      if (scanned.length === 0) {
+        changedPaths.push({ ...entry });
+        continue;
+      }
+      const baseLines = baseLinesByPath.get(entry.path);
+      const isSymlink = isSymlinkByPath.get(entry.path) === true;
+      for (const lines of scanned) {
+        changedPaths.push({
+          ...entry,
+          addedLines: lines,
+          ...(baseLines === undefined ? {} : { baseLines }),
+          ...(isSymlink ? { isSymlink: true } : {}),
+        });
+      }
+    }
 
     const verdict = checkLaneDiff({
       changedPaths,
@@ -700,11 +734,10 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
               this.options?.secretPatterns ?? defaultSecretPatterns(),
           }),
     });
-    // Both content scans of a path can yield the same (line, text) pair;
-    // the domain already merges identical (line, text) pairs, and identical
-    // (path, line, rule) findings — the same secret shape matched by two
-    // scans of different text at one line — collapse here. Findings carry
-    // path, line and rule only, never a matched value.
+    // One finding per scanned version: identical (path, line, rule) findings
+    // from the two versions of a path (the same content scanned twice, or
+    // the same rule fired in both) collapse here. Findings carry path, line
+    // and rule only, never a matched value.
     if (verdict.ok) return { outcome: "clean" };
     return { outcome: "findings", findings: dedupeFindings(verdict.findings) };
   }

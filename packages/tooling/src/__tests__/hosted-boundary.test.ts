@@ -16,7 +16,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   dependencyNames,
   hostedPackageName,
-  INVALID_ROOT_FILE,
   isHostedSpecifier,
   listScannedTargets,
   scanHostedBoundary,
@@ -424,11 +423,11 @@ describe('scanHostedBoundary root refusal', () => {
     const hostileRoots: unknown[] = [null, undefined, 42, true, [], { length: 3 }, ''];
     for (const root of hostileRoots) {
       expect(scanHostedBoundary(root as string)).toEqual([
-        { file: INVALID_ROOT_FILE, kind: 'unreadable', specifier: '' },
+        { file: '<root>', kind: 'unreadable', specifier: '' },
       ]);
     }
     expect(scanHostedBoundary(join(tmpdir(), 'hosted-boundary-missing-root'))).toEqual([
-      { file: INVALID_ROOT_FILE, kind: 'unreadable', specifier: '' },
+      { file: '<root>', kind: 'unreadable', specifier: '' },
     ]);
   });
 
@@ -442,7 +441,7 @@ describe('scanHostedBoundary root refusal', () => {
     for (const root of [getterRoot, new Proxy({}, {}), new String('/tmp')]) {
       const violations = scanHostedBoundary(root as unknown as string);
       expect(violations).toHaveLength(1);
-      expect(violations[0]).toEqual({ file: INVALID_ROOT_FILE, kind: 'unreadable', specifier: '' });
+      expect(violations[0]).toEqual({ file: '<root>', kind: 'unreadable', specifier: '' });
     }
   });
 
@@ -451,6 +450,6 @@ describe('scanHostedBoundary root refusal', () => {
     writeFileSync(file, 'not a directory\n');
     createdDirectories.push(file);
     const violations = scanHostedBoundary(file);
-    expect(violations).toEqual([{ file: INVALID_ROOT_FILE, kind: 'unreadable', specifier: '' }]);
+    expect(violations).toEqual([{ file: '<root>', kind: 'unreadable', specifier: '' }]);
   });
 });

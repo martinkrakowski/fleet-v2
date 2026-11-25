@@ -373,7 +373,14 @@ function collectScannedTargets(state: ScanState, root: string): readonly string[
  * `apps/cli`, `apps/mcp` and `apps/web`. `apps/api` is exempt.
  */
 export function listScannedTargets(root: string): readonly string[] {
-  if (typeof root !== 'string' || root === '' || !lstatSync(root).isDirectory()) {
+  if (typeof root !== 'string' || root === '') {
+    return [];
+  }
+  try {
+    if (!lstatSync(root).isDirectory()) {
+      return [];
+    }
+  } catch {
     return [];
   }
   return collectScannedTargets({ violations: [], targets: [] }, root);

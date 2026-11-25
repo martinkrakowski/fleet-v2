@@ -39,12 +39,12 @@ describe('serverModelIds', () => {
   });
 
   it('does not pollute Object.prototype or throw on __proto__ and constructor model keys', () => {
-    const stdout = JSON.parse('{"data":{"models":{"__proto__":{},"constructor":{}}}}');
+    const stdout = '{"data":{"models":{"__proto__":{},"constructor":{}}}}';
     expect(() => serverModelIds(stdout)).not.toThrow();
-    const result = serverModelIds(stdout);
-    expect(result).toStrictEqual(['__proto__', 'constructor']);
-    expect(({} as Record<string, unknown>).hasOwnProperty('polluted')).toBe(false);
-    expect(Object.getPrototypeOf({})).toBe(Object.prototype);  });
+    expect(serverModelIds(stdout)).toStrictEqual(['__proto__', 'constructor']);
+    expect(Object.hasOwn({}, 'polluted')).toBe(false);
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+  });
 
   it('expands 2000 models with 5 variants each into 12000 ids within O(models * variants) linear work', () => {
     const models: Record<string, { variants: string[] }> = {};
@@ -118,15 +118,27 @@ describe('serverModelIds', () => {
   });
 
   it('returns undefined without running getters or throwing on hostile non-string inputs', () => {
+    let getterRuns = 0;
     const hostile: readonly unknown[] = [
       null,
       undefined,
-      { toString() { throw new Error('getter'); } },
-      new Proxy({}, { get() { throw new Error('proxy'); } }),
+      {
+        toString() {
+          getterRuns += 1;
+          throw new Error('getter');
+        },
+      },
+      new Proxy({}, {
+        get() {
+          getterRuns += 1;
+          throw new Error('proxy');
+        },
+      }),
     ];
     for (const value of hostile) {
       expect(() => serverModelIds(value as string)).not.toThrow();
       expect(serverModelIds(value as string)).toBeUndefined();
     }
+    expect(getterRuns).toBe(0);
   });
 });

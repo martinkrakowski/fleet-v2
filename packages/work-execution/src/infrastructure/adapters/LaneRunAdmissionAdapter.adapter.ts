@@ -28,6 +28,7 @@ import { laneRunOwnedPathsOverlap } from '../../domain/lane-run-packages.js';
 import type { ForgeReadPort } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type {
   LaneRunAdmissionBlockers,
+  LaneRunAdmissionOverlap,
   LaneRunAdmissionPort,
   LaneRunAdmissionRequest,
   LaneRunAdmissionResult,
@@ -453,7 +454,131 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     }
   }
 
-  /** The runs and in-flight attempts whose work order overlaps `thisOrder`, sorted, deduped. */
+  /** The marker recorded when an overlap is package-level or fail closed:
+   *  no single declared owned path names it. */
+  private static readonly WHOLE_WORK_ORDER = '(whole work order)';
+
+  /** The longest `ownedPaths` array the overlap scan reads; a longer array is
+   *  hostile input and fails closed. This bounds the scan's cost. */
+  private static readonly MAX_OWNED_PATHS = 1024;
+
+  /**
+   * A safe, plain view of an order's owned paths for the overlap scan, in
+   * declared order: only a real array within the length bound whose entries
+   * are all own string data properties. A hole, a getter (never run — read
+   * from the property descriptor, not the entry), a non-string entry, an
+   * enormous length, or anything a read throws on (a hostile or revoked
+   * `Proxy`) yields null, so the caller fails closed. A `Proxy` that lies
+   * consistently in every trap is an accepted residual. Cost: one descriptor
+   * read per entry, bounded by `MAX_OWNED_PATHS`; the input is never invoked.
+   */
+  private static safeOwnedPathsView(ownedPaths: unknown): readonly string[] | null {
+    // `Array.isArray` on a revoked `Proxy` throws, and a `Proxy`'s `get` trap
+    // for `length` can throw too; both are hostile input, so the shape check
+    // is guarded and the length is snapshotted once instead of re-read per
+    // entry (a trap that varies between reads cannot extend the scan).
+    let length: number;
+    try {
+      if (!Array.isArray(ownedPaths)) {
+        return null;
+      }
+      // Snapshot the length once and reuse it for the loop below: a `Proxy`
+      // could report a small `length` here and a huge one on a second read,
+      // so the bound that was checked is the only length the scan may use.
+      length = ownedPaths.length;
+      if (length > LaneRunAdmissionAdapter.MAX_OWNED_PATHS) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    const paths: string[] = [];
+    try {
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(ownedPaths, index);
+        if (descriptor === undefined || descriptor.get !== undefined || typeof descriptor.value !== 'string') {
+          return null;
+        }
+        paths.push(descriptor.value);
+      }
+    } catch {
+      return null;
+    }
+    return paths;
+  }
+
+  /**
+   * The first owned path of `thisOrder` (in declared order) that overlaps
+   * `other`, or null when the two work orders do not overlap. The domain
+   * check decides overlap; the package fallback (either side naming no usable
+   * owned root), the dot-segment fail closed rule, and any hostile
+   * `ownedPaths` shape record the whole work order instead of a single path:
+   * no single declared path names the overlap. Fail closed: unreadable input
+   * still blocks. Pure; never throws. Cost: one bounded pass per side over
+   * the owned paths plus at most one domain overlap check per candidate path
+   * of `thisOrder`.
+   */
+  private static firstOverlappingOwnedPath(
+    thisOrder: { readonly repository: string; readonly ownedPaths: readonly string[] },
+    other: { readonly repository: string; readonly ownedPaths: readonly string[] },
+  ): string | null {
+    if (thisOrder.repository !== other.repository) {
+      return null;
+    }
+    const whole = LaneRunAdmissionAdapter.WHOLE_WORK_ORDER;
+    const thisPaths = LaneRunAdmissionAdapter.safeOwnedPathsView(thisOrder.ownedPaths);
+    const otherPaths = LaneRunAdmissionAdapter.safeOwnedPathsView(other.ownedPaths);
+    if (thisPaths === null || otherPaths === null) {
+      // Fail closed: the shape cannot be read safely (a getter is never run,
+      // a non-array, an array hole, a non-string entry or an enormous length
+      // is refused), so the orders are treated as overlapping and no single
+      // declared path is named. A `Proxy` that lies consistently in every
+      // trap is an accepted residual.
+      return whole;
+    }
+    const thisOrderOf = { repository: thisOrder.repository, ownedPaths: thisPaths };
+    const otherOf = { repository: other.repository, ownedPaths: otherPaths };
+    if (!laneRunOwnedPathsOverlap(otherOf, thisOrderOf)) {
+      return null;
+    }
+    const hasDotSegment = (ownedPath: string): boolean =>
+      ownedPath.trim().split('/').some((segment) => segment === '.' || segment === '..');
+    const rootOf = (ownedPath: string): string | null => {
+      const trimmed = ownedPath.trim();
+      if (trimmed === '' || trimmed === '..') {
+        return null;
+      }
+      const root = trimmed.replace(/\/+$/u, '').replace(/\/\*\*$|\/\*$|\*$/u, '');
+      return root === '' ? null : root;
+    };
+    if (
+      thisPaths.some(hasDotSegment) ||
+      otherPaths.some(hasDotSegment) ||
+      thisPaths.every((ownedPath) => rootOf(ownedPath) === null) ||
+      otherPaths.every((ownedPath) => rootOf(ownedPath) === null)
+    ) {
+      // Package-level fallback or dot-segment fail closed: no declared path
+      // of `thisOrder` names the overlap on its own.
+      return whole;
+    }
+    for (const entry of thisPaths) {
+      if (rootOf(entry) === null) {
+        continue;
+      }
+      if (laneRunOwnedPathsOverlap(otherOf, { repository: thisOrder.repository, ownedPaths: [entry] })) {
+        return entry;
+      }
+    }
+    return whole;
+  }
+
+  /**
+   * The runs and in-flight attempts whose work order overlaps `thisOrder`,
+   * sorted, deduped, with the overlapping owned path per blocker and the
+   * blockers whose work order could not be read (fail closed: still blockers,
+   * with no overlap entry). Global-cap and project-cap blockers never carry
+   * `overlaps` or `unreadable`; only this method's result does.
+   */
   private async overlapBlockersOf(
     candidates: readonly ActiveRun[],
     inFlight: readonly InFlightReservation[],
@@ -472,17 +597,45 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     );
     const runIds: string[] = [];
     const attemptIds: string[] = [];
+    const unreadable: string[] = [];
+    const overlaps: LaneRunAdmissionOverlap[] = [];
+    const seenOverlaps = new Set<string>();
     for (let index = 0; index < sources.length; index += 1) {
+      const source = sources[index];
       const other = orders[index];
-      if (other === null || laneRunOwnedPathsOverlap(other, thisOrder)) {
-        if (sources[index].kind === 'run') {
-          runIds.push(sources[index].id);
-        } else {
-          attemptIds.push(sources[index].id);
-        }
+      const blockedIds = source.kind === 'run' ? runIds : attemptIds;
+      if (other === null) {
+        // Fail closed: the blocker stays, is named unreadable, and no overlap
+        // entry is recorded (no path can be read).
+        blockedIds.push(source.id);
+        unreadable.push(source.id);
+        continue;
+      }
+      const path = LaneRunAdmissionAdapter.firstOverlappingOwnedPath(thisOrder, other);
+      if (path === null) {
+        continue;
+      }
+      blockedIds.push(source.id);
+      const overlap: LaneRunAdmissionOverlap = {
+        kind: source.kind === 'run' ? 'run' : 'attempt',
+        id: source.id,
+        path,
+      };
+      const key = overlap.kind + '\u0000' + overlap.id + '\u0000' + overlap.path;
+      if (!seenOverlaps.has(key)) {
+        seenOverlaps.add(key);
+        overlaps.push(overlap);
       }
     }
-    return { runIds: [...new Set(runIds)].sort((left, right) => left.localeCompare(right)), attemptIds: [...new Set(attemptIds)].sort((left, right) => left.localeCompare(right)) };
+    const sortedUnique = (values: readonly string[]): string[] =>
+      [...new Set(values)].sort((left, right) => left.localeCompare(right));
+    overlaps.sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path));
+    return {
+      runIds: sortedUnique(runIds),
+      attemptIds: sortedUnique(attemptIds),
+      unreadable: sortedUnique(unreadable),
+      overlaps,
+    };
   }
 
   /**

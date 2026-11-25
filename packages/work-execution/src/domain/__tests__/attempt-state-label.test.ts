@@ -93,6 +93,69 @@ describe('AttemptState.create', () => {
     expect(accepted.value?.getValue()).toBe('ended');
   });
 
+  it('accepts every declared state and reads back that exact value', () => {
+    expect(ATTEMPT_STATES).toHaveLength(8);
+    for (const state of ATTEMPT_STATES) {
+      const accepted = AttemptState.create(state);
+      expect(accepted.success).toBe(true);
+      expect(accepted.error).toBeUndefined();
+      expect(accepted.value?.getValue()).toBe(state);
+    }
+  });
+
+  it("refuses near-miss, empty, 'unknown', and prototype-polluting strings with an Invalid attempt state error", () => {
+    for (const value of ['Ended', ' ended', 'ended ', 'ended\n', '', 'unknown', 'constructor', '__proto__', 'toString']) {
+      const refused = AttemptState.create(value);
+      expect(refused.success).toBe(false);
+      expect(refused.value).toBeUndefined();
+      expect(refused.error?.message.startsWith('Invalid attempt state:')).toBe(true);
+    }
+  });
+
+  it('refuses every non-string shape (primitives, wrappers, symbols, arrays, array-likes, objects) with an Invalid attempt state error', () => {
+    for (const value of [
+      null,
+      undefined,
+      0,
+      1,
+      true,
+      Symbol('ended'),
+      ['ended'],
+      {},
+      new String('ended'),
+      // Array with a hole at index 0 (built at runtime to keep this file lint-clean).
+      (() => {
+        const holey = ['ended'];
+        delete holey[0];
+        return holey;
+      })(),
+      { length: 1, 0: 'ended' },
+      { length: 1e9 },
+    ]) {
+      const refused = AttemptState.create(value);
+      expect(refused.success).toBe(false);
+      expect(refused.value).toBeUndefined();
+      expect(refused.error?.message.startsWith('Invalid attempt state:')).toBe(true);
+    }
+  });
+
+  it('refuses an object carrying a throwing getter on a key unrelated to string coercion, without evaluating that getter', () => {
+    // Narrowed guard: `create`'s refusal must not evaluate properties it does
+    // not need. A getter on a coercion key (`toString`, `valueOf`,
+    // `Symbol.toPrimitive`) or a trapping `Proxy` is deliberately not pinned
+    // here — those are refused only after the value object stops coercing the
+    // refused input, which is outside this file's ownership.
+    const unrelatedGetter = {
+      get payload() {
+        throw new Error('unrelated getter must never run');
+      },
+    };
+    const refused = AttemptState.create(unrelatedGetter);
+    expect(refused.success).toBe(false);
+    expect(refused.value).toBeUndefined();
+    expect(refused.error?.message.startsWith('Invalid attempt state:')).toBe(true);
+  });
+
   it("never treats 'unknown' as success", () => {
     const refused = AttemptState.create('unknown');
     expect(refused.success).toBe(false);

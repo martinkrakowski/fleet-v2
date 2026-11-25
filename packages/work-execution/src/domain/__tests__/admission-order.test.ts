@@ -612,6 +612,75 @@ describe('FC8B: decideFairAdmission refuses hostile inputs with typed reasons', 
     ).toEqual({ ok: false, reason: 'too-large' });
   });
 
+  it('refuses a total over the budget by length pre-gate before copying the counted arrays', () => {
+    // The review's exact shape: one group whose repositories array holds
+    // 10_000 entries (each within the single-array cap) plus the group itself
+    // is a 10_001-element total. The budget is checked against the peeked
+    // length before `readBoundedDenseArray` copies any of the 10_000 entries.
+    // The proof is a trap counter on a Proxy standing in for the repositories
+    // array: the O(1) length peek reads exactly one descriptor, while a copy
+    // would enumerate every key and descriptor. `deepFreeze` touches the
+    // Proxy while preparing the input; the recorded count must grow by
+    // exactly one during the decision itself, never by 10_001.
+    const manyRepos = [];
+    for (let ri = 0; ri < 10_000; ri += 1) {
+      manyRepos.push(repo('r' + ri.toString(10), 1, 0, []));
+    }
+    let trapCount = 0;
+    const { proxy, revoke } = Proxy.revocable(manyRepos, {
+      getOwnPropertyDescriptor(t, key) {
+        trapCount += 1;
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+      ownKeys(t) {
+        trapCount += 1;
+        return Reflect.ownKeys(t);
+      },
+    });
+    const input = frozenInput({
+      groups: [group('g', 1, 0, proxy)],
+      lastServedAtIso: {},
+      freeSlots: 1,
+      nowIso: NOW_ISO,
+    });
+    const trapsBeforeDecision = trapCount;
+    expect(
+      decideFairAdmission(input),
+    ).toEqual({ ok: false, reason: 'too-large' });
+    // Exactly one descriptor read: the O(1) length peek. No enumeration.
+    expect(trapCount - trapsBeforeDecision).toBe(1);
+    revoke();
+  });
+
+  it('never joins opaque group and repository keys, so distinct pairs cannot collide on a park reason', () => {
+    // Old keying joined group + NUL + repository, so the pairs
+    // ('a', 'b\u0000c') and ('a\u0000b', 'c') collided onto one key. One slot
+    // is free: group 'a' takes it through repo 'b\u0000c'. Group 'a\u0000b' and
+    // repo 'c' each have capacity but no slot left, so run-2 must park with
+    // 'no-capacity'. With the joined key, repo 'c' reads the other pair's
+    // count and wrongly reports 'repository-cap'.
+    const nul = '\u0000';
+    const result = decideFairAdmission(
+      frozenInput({
+        groups: [
+          group('a', 2, 0, [repo('b' + nul + 'c', 1, 0, [waitingRun(1, 0)])]),
+          group('a' + nul + 'b', 2, 0, [repo('c', 1, 0, [waitingRun(2, 1)])]),
+        ],
+        lastServedAtIso: {},
+        freeSlots: 1,
+        nowIso: NOW_ISO,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.admit).toEqual([
+      { runId: 'run-1', groupId: 'a', repository: 'b' + nul + 'c' },
+    ]);
+    expect(result.parked).toEqual([{ runId: 'run-2', reason: 'no-capacity' }]);
+  });
+
   it('refuses negative, fractional, NaN, and Infinity numeric fields', () => {
     const badNumbers = [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
     for (const bad of badNumbers) {

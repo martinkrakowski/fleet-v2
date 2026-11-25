@@ -136,6 +136,39 @@ function refused(reason: FairAdmissionRefusalReason): FairAdmissionResult {
 }
 
 /**
+ * O(1) pre-gate: the raw array's `length` when it is a genuine array whose
+ * `length` is a plain data property `<= cap`, null otherwise. Reads only the
+ * `length` descriptor — no key enumeration, no per-element copy — so the
+ * budget can be checked before `readBoundedDenseArray` copies anything. A
+ * null here means the array is invalid (wrong shape or a forbidden length),
+ * which is exactly what `readBoundedDenseArray` would refuse again.
+ */
+function peekBoundedArrayLength(value: unknown, cap: number): number | null {
+  let isArray: boolean;
+  let lengthDescriptor: PropertyDescriptor | undefined;
+  try {
+    isArray = Array.isArray(value);
+    lengthDescriptor = isArray ? Object.getOwnPropertyDescriptor(value, 'length') : undefined;
+  } catch {
+    return null;
+  }
+  if (
+    !isArray ||
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number'
+  ) {
+    return null;
+  }
+  const length = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length >= 2 ** 32 - 1 || length > cap) {
+    return null;
+  }
+  return length;
+}
+
+/**
  * Validate the whole hostile input through descriptor-based readers. Returns
  * the refusal reason on failure, or the validated internal shape. Never
  * invokes a getter or a Proxy `get` trap; any trap throw is caught by the
@@ -197,18 +230,23 @@ function validateFairAdmission(
   }
 
   // `groups`: a single bounded dense array; a length over the single-array
-  // cap is `invalid-input`, a total over the budget is `too-large`.
-  const rawGroups = readBoundedDenseArray(top.groups, SINGLE_ARRAY_CAP);
-  if (rawGroups === null) {
+  // cap is `invalid-input`, a total over the budget is `too-large`. The
+  // budget is checked against the peeked length before the array is copied.
+  const rawGroupsLength = peekBoundedArrayLength(top.groups, SINGLE_ARRAY_CAP);
+  if (rawGroupsLength === null) {
     return { ok: false, reason: 'invalid-input' };
   }
   // The budget covers groups + repositories + waiting runs only; the
   // `lastServedAtIso` key count is a separate cap, checked above.
-  let elementTotal = rawGroups.length;
+  let elementTotal = rawGroupsLength;
   // Over-budget inputs are refused as soon as the count exceeds the budget,
   // before any of the counted elements are traversed or copied.
   if (elementTotal > ELEMENT_BUDGET) {
     return { ok: false, reason: 'too-large' };
+  }
+  const rawGroups = readBoundedDenseArray(top.groups, SINGLE_ARRAY_CAP);
+  if (rawGroups === null) {
+    return { ok: false, reason: 'invalid-input' };
   }
 
   const groupIds = new Set<string>();
@@ -231,13 +269,18 @@ function validateFairAdmission(
     if (!isNonNegativeSafeInteger(groupRecord.groupCap) || !isNonNegativeSafeInteger(groupRecord.running)) {
       return { ok: false, reason: 'invalid-input' };
     }
+    // Budget pre-gate on the repositories' length before the copy.
+    const rawRepositoriesLength = peekBoundedArrayLength(groupRecord.repositories, SINGLE_ARRAY_CAP);
+    if (rawRepositoriesLength === null) {
+      return { ok: false, reason: 'invalid-input' };
+    }
+    elementTotal += rawRepositoriesLength;
+    if (elementTotal > ELEMENT_BUDGET) {
+      return { ok: false, reason: 'too-large' };
+    }
     const rawRepositories = readBoundedDenseArray(groupRecord.repositories, SINGLE_ARRAY_CAP);
     if (rawRepositories === null) {
       return { ok: false, reason: 'invalid-input' };
-    }
-    elementTotal += rawRepositories.length;
-    if (elementTotal > ELEMENT_BUDGET) {
-      return { ok: false, reason: 'too-large' };
     }
 
     const repositoryIds = new Set<string>();
@@ -258,13 +301,18 @@ function validateFairAdmission(
       if (!isNonNegativeSafeInteger(repositoryRecord.maxConcurrent) || !isNonNegativeSafeInteger(repositoryRecord.running)) {
         return { ok: false, reason: 'invalid-input' };
       }
+      // Budget pre-gate on the waiting runs' length before the copy.
+      const rawWaitingLength = peekBoundedArrayLength(repositoryRecord.waiting, SINGLE_ARRAY_CAP);
+      if (rawWaitingLength === null) {
+        return { ok: false, reason: 'invalid-input' };
+      }
+      elementTotal += rawWaitingLength;
+      if (elementTotal > ELEMENT_BUDGET) {
+        return { ok: false, reason: 'too-large' };
+      }
       const rawWaiting = readBoundedDenseArray(repositoryRecord.waiting, SINGLE_ARRAY_CAP);
       if (rawWaiting === null) {
         return { ok: false, reason: 'invalid-input' };
-      }
-      elementTotal += rawWaiting.length;
-      if (elementTotal > ELEMENT_BUDGET) {
-        return { ok: false, reason: 'too-large' };
       }
 
       const waiting: ValidatedWaitingRun[] = [];
@@ -548,13 +596,21 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
   }
 
   // Per-group and per-repo admission counts for the park-reason classification.
+  // The per-repo counts live in a nested Map (group -> repository -> count):
+  // opaque group and repository strings are joined by structure, never by a
+  // separator, so distinct pairs can never collide.
   const admittedRunIds = new Set<string>();
   const admittedByGroup = new Map<string, number>();
-  const admittedByRepo = new Map<string, number>();
+  const admittedByRepo = new Map<string, Map<string, number>>();
   for (const entry of admit) {
     admittedRunIds.add(entry.runId);
     admittedByGroup.set(entry.groupId, (admittedByGroup.get(entry.groupId) ?? 0) + 1);
-    admittedByRepo.set(entry.groupId + '\u0000' + entry.repository, (admittedByRepo.get(entry.groupId + '\u0000' + entry.repository) ?? 0) + 1);
+    let perRepo = admittedByRepo.get(entry.groupId);
+    if (perRepo === undefined) {
+      perRepo = new Map<string, number>();
+      admittedByRepo.set(entry.groupId, perRepo);
+    }
+    perRepo.set(entry.repository, (perRepo.get(entry.repository) ?? 0) + 1);
   }
 
   // All un-admitted runs, in deterministic (groupId, repository,
@@ -564,7 +620,7 @@ function decideFromValidated(validated: ValidatedInput): FairAdmissionResult {
     const groupAdmitted = admittedByGroup.get(group.groupId) ?? 0;
     const groupExhausted = group.groupCap === 0 || group.running + groupAdmitted >= group.groupCap;
     for (const repository of group.repositories) {
-      const repoAdmitted = admittedByRepo.get(group.groupId + '\u0000' + repository.repository) ?? 0;
+      const repoAdmitted = admittedByRepo.get(group.groupId)?.get(repository.repository) ?? 0;
       const repoExhausted =
         repository.maxConcurrent === 0 || repository.running + repoAdmitted >= repository.maxConcurrent;
       let reason: AdmissionParkReason;

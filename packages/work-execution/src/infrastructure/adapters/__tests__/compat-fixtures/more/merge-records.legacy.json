@@ -1,0 +1,11 @@
+[
+  {
+    "repository": "example-owner/example-repo",
+    "number": 1,
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mergedAtIso": "2026-01-01T00:00:00.000Z",
+    "firstSeenAtIso": "2026-01-01T00:00:00.000Z",
+    "source": "forge-observation",
+    "merger": "unknown"
+  }
+]

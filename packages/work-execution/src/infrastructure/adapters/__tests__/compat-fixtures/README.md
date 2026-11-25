@@ -17,9 +17,22 @@ without rewriting or quarantining anything.
 | `journal.legacy.json` | `ExecutionJournalAdapter` | `journal.json` | `ActionJournalEntryRecord` (`domain/execution-records.ts`) |
 | `reservations.legacy.json` | `ExecutionJournalAdapter` | `reservations.json` | `CapacityReservationRecord` (`domain/execution-records.ts`) |
 
+The three `more/` fixtures (FC1A) live in a subdirectory so
+`compat-corpus.test.ts`'s non-recursive count guard over the top level keeps
+pinning the original five fixtures untouched; the companion suite
+`compat-corpus-more-stores.test.ts` guards them with the same per-store rules.
+
+| Fixture | Adapter | State file | Record shape |
+| --- | --- | --- | --- |
+| `more/merge-records.legacy.json` | `MergeRecordRepositoryAdapter` | `merge-records.json` | `MergeRecordRecord` (`domain/entities/MergeRecord.ts`) |
+| `more/seat-tickets.legacy.json` | `SeatTicketRepositoryAdapter` | `seat-tickets.json` | `SeatTicketRecord` (`domain/execution-records.ts`) |
+| `more/held-work-orders.legacy.json` | `HeldWorkOrderRepositoryAdapter` | `held-work-orders.json` | `HeldWorkOrderRecord` (`domain/held-work-order.ts`) |
+
 Each fixture is the minimal valid record the Q5b tests
 (`schema-version-stores.test.ts`) already build, with the `schemaVersion`
-key removed — exactly the bytes an older build wrote. Values are synthetic
+key removed — exactly the bytes an older build wrote. The three `more/`
+fixtures are the bytes the current writers produce with the `schemaVersion`
+key removed from every record. Values are synthetic
 (`wo-1`, `attempt-example-1`, ulid-shaped run ids); nothing here is real
 operational data.
 

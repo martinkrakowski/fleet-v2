@@ -213,6 +213,15 @@ export function jsonPaths(value: unknown): string[] {
       if (nodes + arr.length > MAX_NODES) {
         throw new NodeBudgetExceededError();
       }
+      let arrProto: unknown;
+      try {
+        arrProto = Object.getPrototypeOf(arr);
+      } catch {
+        throw new UnsupportedObjectError();
+      }
+      if (arrProto !== Array.prototype) {
+        throw new UnsupportedObjectError();
+      }
       nodes += arr.length;
     }
     if (activeAncestors.has(frame.value)) {
@@ -368,6 +377,17 @@ function assertPathList(label: string, value: unknown): readonly string[] {
   // enumeration (and before any `Reflect.ownKeys` allocation).
   if (1 + value.length > MAX_NODES) {
     throw new NodeBudgetExceededError();
+  }
+  // A subclass or re-prototyped array could run a `Symbol.species` getter in
+  // a later array method; only a true `Array.prototype` array is accepted.
+  let listProto: unknown;
+  try {
+    listProto = Object.getPrototypeOf(value);
+  } catch {
+    throw new UnsupportedObjectError();
+  }
+  if (listProto !== Array.prototype) {
+    throw new UnsupportedObjectError();
   }
   // Remaining own keys are enumerated lazily, one at a time, and charged as
   // they are found; the budget refusal fires during this walk, before any
@@ -919,6 +939,27 @@ describe("jsonPaths", () => {
 });
 
 describe("compareFieldPaths hostilities", () => {
+  it("refuses an Array subclass and a re-prototyped array without running Symbol.species", () => {
+    let speciesReads = 0;
+    class Sub extends Array<string> {
+      static get [Symbol.species](): ArrayConstructor {
+        speciesReads += 1;
+        throw new Error("species getter invoked");
+      }
+    }
+    const sub = Sub.from(["result.code"]);
+    expect(() => compareFieldPaths("f.json", sub, ["result.code"])).toThrow(
+      UnsupportedObjectError,
+    );
+    const swapped: string[] = ["result.code"];
+    Object.setPrototypeOf(swapped, Sub.prototype);
+    expect(() =>
+      compareFieldPaths("f.json", swapped, ["result.code"]),
+    ).toThrow(UnsupportedObjectError);
+    expect(() => jsonPaths({ list: swapped })).toThrow(UnsupportedObjectError);
+    expect(speciesReads).toBe(0);
+  });
+
   it("refuses a path list with an own data constructor key before any array method runs", () => {
     let speciesReads = 0;
     let constructed = 0;

@@ -26,6 +26,7 @@
  */
 
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { extname, join } from 'node:path';
 
 import * as ts from 'typescript';
@@ -121,10 +122,13 @@ export function isHostedSpecifier(specifier: unknown): boolean {
  * found, or `'unreadable'` when the field must be refused.
  */
 export function dependencyNames(value: unknown): readonly string[] | 'unreadable' {
-  if (!isPlainRecord(value)) {
-    return 'unreadable';
-  }
   try {
+    // Checked inside the try: `isPlainRecord` touches `Object.getPrototypeOf`,
+    // and a Proxy whose `getPrototypeOf` trap throws (or a revoked Proxy) must
+    // be refused, never allowed to escape.
+    if (!isPlainRecord(value)) {
+      return 'unreadable';
+    }
     // Descriptors are inspected, never invoked: a getter is a refusal, not data.
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const keys = Reflect.ownKeys(descriptors);
@@ -278,16 +282,34 @@ function declaredPackageName(root: string, directoryRelative: string): string | 
   }
 }
 
-function visitDirectory(state: ScanState, root: string, directoryRelative: string): void {
-  const directoryAbsolute = join(root, directoryRelative);
-  let entries;
+/** Reads one directory's entries, recording an unreadable violation on failure. */
+function readDirectoryEntries(
+  state: ScanState,
+  root: string,
+  directoryRelative: string,
+): readonly Dirent[] {
   try {
-    entries = readdirSync(directoryAbsolute, { withFileTypes: true });
+    // lstat first: a symlink at this path is never followed, so no read can
+    // escape the scanned tree. A missing or unreadable directory is a refusal,
+    // never a thrown error.
+    const stat = lstatSync(join(root, directoryRelative));
+    if (stat.isSymbolicLink()) {
+      return [];
+    }
+    if (!stat.isDirectory()) {
+      // A non-directory impersonating this path is a refusal, not a pass.
+      state.violations.push(unreadableViolation(directoryRelative));
+      return [];
+    }
+    return readdirSync(join(root, directoryRelative), { withFileTypes: true });
   } catch {
     state.violations.push(unreadableViolation(directoryRelative));
-    return;
+    return [];
   }
-  for (const entry of entries) {
+}
+
+function visitDirectory(state: ScanState, root: string, directoryRelative: string): void {
+  for (const entry of readDirectoryEntries(state, root, directoryRelative)) {
     if (entry.isSymbolicLink()) {
       // Symlinks are never followed; out-of-tree reads cannot happen.
       continue;
@@ -314,17 +336,15 @@ function visitDirectory(state: ScanState, root: string, directoryRelative: strin
 }
 
 /**
- * The set of top-level targets the scanner covers, as sorted paths relative to
- * `root`: every `packages/*` directory except a hosted package directory, plus
- * `apps/cli`, `apps/mcp` and `apps/web`. `apps/api` is exempt.
+ * Collects the top-level scanned targets into `state` and returns them sorted.
+ * The `packages` directory is `lstat`ed before being read: a symlink there is
+ * never followed (so no out-of-tree read can happen), and a missing or
+ * unreadable `packages` directory records an `unreadable` violation in `state`
+ * instead of throwing. The self-host apps are still scanned in that case.
  */
-export function listScannedTargets(root: string): readonly string[] {
+function collectScannedTargets(state: ScanState, root: string): readonly string[] {
   const targets: string[] = [];
-  if (typeof root !== 'string' || root === '' || !lstatSync(root).isDirectory()) {
-    return targets;
-  }
-  const packagesDirectory = join(root, 'packages');
-  for (const entry of readdirSync(packagesDirectory, { withFileTypes: true })) {
+  for (const entry of readDirectoryEntries(state, root, 'packages')) {
     if (entry.isSymbolicLink() || !entry.isDirectory()) {
       continue;
     }
@@ -345,6 +365,18 @@ export function listScannedTargets(root: string): readonly string[] {
     }
   }
   return targets.sort((left, right) => left.localeCompare(right));
+}
+
+/**
+ * The set of top-level targets the scanner covers, as sorted paths relative to
+ * `root`: every `packages/*` directory except a hosted package directory, plus
+ * `apps/cli`, `apps/mcp` and `apps/web`. `apps/api` is exempt.
+ */
+export function listScannedTargets(root: string): readonly string[] {
+  if (typeof root !== 'string' || root === '' || !lstatSync(root).isDirectory()) {
+    return [];
+  }
+  return collectScannedTargets({ violations: [], targets: [] }, root);
 }
 
 /**
@@ -371,7 +403,7 @@ export function scanHostedBoundary(root: string): HostedScanResult {
     return violations;
   }
   const state: ScanState = { violations, targets: [] };
-  for (const target of listScannedTargets(root)) {
+  for (const target of collectScannedTargets(state, root)) {
     state.targets.push(target);
     visitDirectory(state, root, target);
   }

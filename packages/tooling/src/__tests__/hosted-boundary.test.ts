@@ -132,6 +132,21 @@ describe('dependencyNames refusal behaviour', () => {
     expect(dependencyNames(new Proxy(getterField, {}))).toBe('unreadable');
   });
 
+  it('refuses a proxy whose getPrototypeOf trap throws, and a revoked proxy, as unreadable', () => {
+    const prototypeProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error('the scanner must refuse, not crash');
+        },
+      },
+    );
+    expect(dependencyNames(prototypeProxy)).toBe('unreadable');
+    const { proxy, revoke } = Proxy.revocable({ [HOSTED_TENANCY]: '1.0.0' }, {});
+    revoke();
+    expect(dependencyNames(proxy)).toBe('unreadable');
+  });
+
   it('refuses enormous dependency fields and prototype-polluting keys as unreadable', () => {
     const enormous: Record<string, string> = {};
     for (let index = 0; index < 100_000; index += 1) {
@@ -368,6 +383,39 @@ describe('scanHostedBoundary import findings', () => {
     symlinkSync(outside, join(root, 'packages/core/linkdir'));
     expect(scanHostedBoundary(root)).toEqual([]);
     expect(lstatSync(join(root, 'packages/core/link.ts')).isSymbolicLink()).toBe(true);
+  });
+
+  it('does not follow a symlink at the packages directory', () => {
+    const root = makeRoot();
+    const outsidePackages = join(tmpdir(), `hosted-boundary-outside-pkgs-${Date.now()}`);
+    mkdirSync(outsidePackages);
+    createdDirectories.push(outsidePackages);
+    writeFileSync(
+      join(outsidePackages, 'package.json'),
+      JSON.stringify({ name: '@fleet/outsider', dependencies: { [HOSTED_TENANCY]: '1.0.0' } }),
+    );
+    rmSync(join(root, 'packages'), { recursive: true });
+    symlinkSync(outsidePackages, join(root, 'packages'));
+    // Following the symlink would read the out-of-tree manifest above and flag
+    // its @fleet/tenancy dependency; refusing to follow keeps the scan clean.
+    expect(scanHostedBoundary(root)).toEqual([]);
+    expect(lstatSync(join(root, 'packages')).isSymbolicLink()).toBe(true);
+  });
+
+  it('records an unreadable violation for a missing or non-directory packages path', () => {
+    const missingPackagesRoot = join(tmpdir(), `hosted-boundary-no-pkgs-${Date.now()}`);
+    mkdirSync(join(missingPackagesRoot, 'apps'), { recursive: true });
+    createdDirectories.push(missingPackagesRoot);
+    expect(scanHostedBoundary(missingPackagesRoot)).toEqual([
+      { file: 'packages', kind: 'unreadable', specifier: '' },
+    ]);
+
+    const filePackagesRoot = makeRoot();
+    rmSync(join(filePackagesRoot, 'packages'), { recursive: true });
+    writeFileSync(join(filePackagesRoot, 'packages'), 'not a directory\n');
+    expect(scanHostedBoundary(filePackagesRoot)).toEqual([
+      { file: 'packages', kind: 'unreadable', specifier: '' },
+    ]);
   });
 });
 

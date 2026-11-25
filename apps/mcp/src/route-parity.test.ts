@@ -463,6 +463,32 @@ describe("MCP-to-API mutation route parity", () => {
     }
   });
 
+  it("charges the match budget on the final-segment visit too, so leaf visits alone push distinct tool paths over the limit", () => {
+    // Per query the trie visits internal nodes plus one leaf node per
+    // literal/param combination. The path count is sized so that internal
+    // visits alone stay under MAX_MATCH_STEPS and only the visits at
+    // `index === segments.length` push the total over it.
+    const depth = 6;
+    const rules: ParsedRouteRule[] = [];
+    for (let mask = 0; mask < 1 << depth; mask++) {
+      const segments: string[] = [];
+      for (let i = 0; i < depth; i++) {
+        segments.push((mask >> i) & 1 ? ":param" : `a${i}`);
+      }
+      rules.push(makeRule("POST", `/v1/${segments.join("/")}/leaf`, "operate"));
+    }
+    const prefix = Array.from({ length: depth }, (_, i) => `a${i}`).join("/");
+    const paths: RouteKey[] = Array.from({ length: 700 }, (_, i) => ({
+      method: "POST",
+      path: `/v1/${prefix}/leaf?x_${i}`,
+    }));
+    const result = checkRouteParity(rules, paths, []);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("match-budget-exceeded");
+    }
+  });
+
   it("parses only the real declaration when a comment holds a fake MUTATION_ROUTE_RULES assignment", () => {
     const realRules = syntheticRules("message", 45);
     const spoofed =

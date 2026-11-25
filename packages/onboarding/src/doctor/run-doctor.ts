@@ -356,15 +356,11 @@ export function readDiskQuotaUsage(raw: unknown): DiskQuotaUsage | undefined {
     if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
       return undefined;
     }
-    // An array-like is refused too: any own numeric `length`, safe or not,
-    // finite or not, marks an array-like. It is read through the own
-    // descriptor so no getter is ever invoked.
+    // An array-like is refused too: any own `length` property, data or
+    // accessor, whatever its value, marks an array-like. Only the descriptor
+    // is inspected, so no getter is ever invoked.
     const lengthDescriptor = Object.getOwnPropertyDescriptor(raw, 'length');
-    if (
-      lengthDescriptor !== undefined &&
-      'value' in lengthDescriptor &&
-      typeof lengthDescriptor.value === 'number'
-    ) {
+    if (lengthDescriptor !== undefined) {
       return undefined;
     }
     const readings: [string, number | undefined][] = [];

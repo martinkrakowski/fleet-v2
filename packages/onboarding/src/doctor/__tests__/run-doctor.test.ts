@@ -2205,6 +2205,15 @@ describe('runDoctor disk quota headroom (OPQ1)', () => {
       [100, 1000],
       // An array-like passes typeof 'object' but is refused all the same.
       { 0: 1, 1: 10, length: 2, usedBytes: 1, totalBytes: 10 },
+      // An own `length` accessor is refused too, and its getter is never run.
+      Object.defineProperty({ usedBytes: 1, totalBytes: 10 }, 'length', {
+        get: () => {
+          throw new Error('length getter must not run');
+        },
+        enumerable: true,
+      }),
+      Object.defineProperty({ usedBytes: 1, totalBytes: 10 }, 'length', { get: () => 2 }),
+      { usedBytes: 1, totalBytes: 10, length: '2' },
       '100 1000',
       42,
       true,

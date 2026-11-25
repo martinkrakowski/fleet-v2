@@ -587,6 +587,12 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
       ? { kind: 'enter', to: outcome.to }
       : { kind: 'park', reason: outcome.reason, qualifier: null, parkedFrom: facts.state };
   }
+  // RM3: a Tier 2 `released` hold never posts success while the PR's head has
+  // moved off the lane's head: the pending post waits until a receipt for the
+  // PR's head exists. A lane head move is G7's re-gating, not this guard.
+  if (record.tier === 2 && hold.kind === 'released' && facts.pr !== null && facts.pr.head12 !== facts.head12) {
+    return { kind: 'wait', reason: 'premerge-pending' };
+  }
   if (hold.kind === 'released' && facts.premergePost === 'success') {
     return null;
   }

@@ -34,6 +34,7 @@ export {
   type PremergeMode,
 };
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
+import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../../domain/plain-record-reads.js';
 import { buildLaneRunStepKey, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
@@ -149,7 +150,163 @@ function blockingFindingsCountOf(findings: readonly { readonly severity: string 
   return findings.filter((finding) => finding.severity === 'blocker' || finding.severity === 'major').length;
 }
 
-/** The re-read receipt's verdict at the exact head, like `preMergeFactOf` (RV3: severity-derived). */
+/**
+ * RM3: the receiver's own data property `key`, read through its property
+ * descriptor — a getter or setter is never run (`undefined` instead). Total
+ * and `O(1)`: one descriptor read, `undefined` on a missing key, an
+ * accessor, a `null`/primitive source, or a throwing trap.
+ */
+function ownDataProp(source: unknown, key: string): unknown {
+  try {
+    if (source === null || typeof source !== 'object') {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    return descriptor.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A plain object (prototype `Object.prototype` or `null`); anything else is hostile. */
+function isPlainObjectValue(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** The findings count above which a receipt is refused (`O(1)` before any element read). */
+const RM3_FINDINGS_MAX = 999;
+
+/**
+ * RM3: the Tier 2 release gate over the merge hold. `true` for Tier 1
+ * (unchanged). For Tier 2 it requires, in `O(1)` fixed descriptor reads (no
+ * iteration, no getter run):
+ * - the run is not parked `owner-merge`;
+ * - the automated pre-merge review either did not run or passed
+ *   (correction 8: `preMergeReview.verdict` is `none` or `passed`; any other
+ *   verdict waits);
+ * - an accepted owner receipt (`requestId === null`) at the exact head exists;
+ * - the PR's current head is the candidate head (`facts.pr.head12`).
+ * Without them the hold stays `wait`/`pending` — `premerge` `success` is
+ * never published while parked `owner-merge` or without the exact-head owner
+ * receipt.
+ */
+function tier2OwnerPremergeReleased(
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  headSha: string,
+  receipt: ReviewReceiptOfKind | null,
+): boolean {
+  if (record.tier !== 2) {
+    return true;
+  }
+  if (
+    record.parked !== null &&
+    record.parked !== undefined &&
+    ownDataProp(record.parked, 'reason') === 'owner-merge'
+  ) {
+    return false;
+  }
+  const reviewVerdict =
+    gathered.facts.preMergeReview === undefined
+      ? 'none'
+      : ownDataProp(gathered.facts.preMergeReview, 'verdict');
+  if (reviewVerdict !== 'none' && reviewVerdict !== 'passed') {
+    return false;
+  }
+  if (
+    receipt === null ||
+    ownDataProp(receipt, 'requestId') !== null ||
+    ownDataProp(receipt, 'candidateHeadSha') !== headSha
+  ) {
+    return false;
+  }
+  if (gathered.facts.pr === null || ownDataProp(gathered.facts.pr, 'head12') !== headSha.slice(0, 12)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * RM3: the receipt's findings as a fresh dense snapshot of plain data objects,
+ * read only through property descriptors — no getter ever runs. `O(1)` to
+ * refuse a non-array, an accessor-backed or huge `length` (the same 999 bound
+ * as the fail-hold check), then the accepted engine bound of
+ * `readBoundedDenseArray` plus `O(findings)` element snapshots. A hole, an
+ * accessor, a non-plain finding, a Proxy lie, or a `__proto__` key refuses
+ * with null; the caller publishes no success on null.
+ */
+function findingsSnapshotOf(
+  receipt: Record<string, unknown>,
+): readonly Record<string, unknown>[] | null {
+  const findings = readBoundedDenseArray(receipt.findings, RM3_FINDINGS_MAX);
+  if (findings === null) {
+    return null;
+  }
+  const snapshot: Record<string, unknown>[] = [];
+  for (const finding of findings.array) {
+    const plain = snapshotPlainDataRecord(finding);
+    if (plain === null) {
+      return null;
+    }
+    snapshot.push(plain);
+  }
+  return snapshot;
+}
+
+/**
+ * RM3: the receipt's typed shape rebuilt from the snapshot, so every field
+ * downstream (`receiptId` for the fail-hold grant, `findings` for the count)
+ * is data-only. A missing or wrong-typed field refuses with null.
+ */
+function typedReceiptOf(
+  snapshot: Record<string, unknown>,
+  findings: readonly Record<string, unknown>[],
+): ReviewReceiptOfKind | null {
+  const receiptId = ownDataProp(snapshot, 'receiptId');
+  const requestId = ownDataProp(snapshot, 'requestId');
+  const reviewerModel = ownDataProp(snapshot, 'reviewerModel');
+  const candidateHeadSha = ownDataProp(snapshot, 'candidateHeadSha');
+  const verdict = ownDataProp(snapshot, 'verdict');
+  const unknownReason = ownDataProp(snapshot, 'unknownReason');
+  if (
+    typeof receiptId !== 'string' ||
+    (requestId !== null && typeof requestId !== 'string') ||
+    typeof reviewerModel !== 'string' ||
+    typeof candidateHeadSha !== 'string' ||
+    (verdict !== 'passed' && verdict !== 'failed' && verdict !== 'unknown')
+  ) {
+    return null;
+  }
+  return {
+    receiptId,
+    requestId,
+    kind: 'pre-merge',
+    reviewerModel,
+    candidateHeadSha,
+    verdict,
+    findings: findings as unknown as ReviewReceiptOfKind['findings'],
+    ...(typeof unknownReason === 'string'
+      ? { unknownReason: unknownReason as ReviewReceiptOfKind['unknownReason'] }
+      : {}),
+  };
+}
+
+/**
+ * The re-read receipt's verdict at the exact head, like `preMergeFactOf` (RV3:
+ * severity-derived). Every field of the port's answer is read through its own
+ * property descriptor (`O(1)` per field, no getter ever runs); the receipt is
+ * snapshotted once (`O(own keys)`, the accepted engine bound) and its findings
+ * through `findingsSnapshotOf` (RM3, `O(≤ 999)`). Any getter-backed,
+ * malformed, sparse, wrong-primitive, `__proto__`-keyed or Proxy-lying shape
+ * refuses with `{ receipt: null, verdict: 'unknown' }` — never a pass.
+ */
 async function premergeVerdictOf(
   ctx: AdvanceStepContext,
   latest: { readonly id: string },
@@ -165,16 +322,35 @@ async function premergeVerdictOf(
       candidateHeadSha: headSha,
       kind: 'pre-merge',
     });
-    if (read.outcome === 'found') {
-      // A receipt of another kind or head never authorises a post on this head.
-      if (read.receipt.kind !== 'pre-merge' || read.receipt.candidateHeadSha !== headSha) {
-        return { receipt: null, verdict: 'unknown' };
-      }
-      // RV3: the severity outcome decides — a minor-only `failed` receipt
-      // releases the hold, a 0-finding `failed` receipt is unknown.
-      return { receipt: read.receipt, verdict: decideConductorReviewOutcome(read.receipt).outcome };
+    const outcome = ownDataProp(read, 'outcome');
+    if (outcome !== 'found') {
+      return { receipt: null, verdict: outcome === 'not-found' ? 'none' : 'unknown' };
     }
-    return { receipt: null, verdict: read.outcome === 'not-found' ? 'none' : 'unknown' };
+    const receipt = ownDataProp(read, 'receipt');
+    if (!isPlainObjectValue(receipt)) {
+      return { receipt: null, verdict: 'unknown' };
+    }
+    const snapshot = snapshotPlainDataRecord(receipt);
+    if (snapshot === null) {
+      return { receipt: null, verdict: 'unknown' };
+    }
+    // A receipt of another kind or head never authorises a post on this head.
+    if (ownDataProp(snapshot, 'kind') !== 'pre-merge' || ownDataProp(snapshot, 'candidateHeadSha') !== headSha) {
+      return { receipt: null, verdict: 'unknown' };
+    }
+    const findings = findingsSnapshotOf(snapshot);
+    if (findings === null) {
+      return { receipt: null, verdict: 'unknown' };
+    }
+    const typed = typedReceiptOf(snapshot, findings);
+    if (typed === null) {
+      return { receipt: null, verdict: 'unknown' };
+    }
+    // RV3: the severity outcome decides — a minor-only `failed` receipt
+    // releases the hold, a 0-finding `failed` receipt is unknown. Only the
+    // data-only snapshot reaches the decider (RM3): a getter that replaces an
+    // index with a finding can never run.
+    return { receipt: typed, verdict: decideConductorReviewOutcome({ ...snapshot, findings }).outcome };
   } catch {
     return { receipt: null, verdict: 'unknown' };
   }
@@ -319,7 +495,15 @@ export async function performPremerge(
   // AP1: the mode gate applies after the ambiguity checks, so a corrupt or
   // ambiguous receipt still parks in both modes; only a released Tier 2 hold
   // downgrades to `wait` under `human-gate`.
-  const hold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
+  const modeHold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
+  // RM3: on top of the mode gate, a Tier 2 `released` hold publishes success
+  // only with the exact-head owner receipt and no parked `owner-merge`; a
+  // Tier 1 hold is unchanged (the gate reads `true`). Without it the hold
+  // stays `wait`/`pending` in both modes.
+  const hold =
+    modeHold.kind === 'released' && !tier2OwnerPremergeReleased(record, gathered, headSha, read.receipt)
+      ? ({ kind: 'wait', status: 'pending' } as LaneRunMergeHold)
+      : modeHold;
   const receiptId = await premergeAuthorisationReceiptIdOf(ctx, latest, record, headSha, hold, read.receipt);
   if (receiptId === null) {
     return refuseKeyedPremerge(ctx, request, decision, 'grant-refused');
@@ -490,6 +674,11 @@ export async function reconcilePremerge(
   if (rawFactHold.kind === 'park') {
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
   }
+  // RM3: a Tier 2 run parked `owner-merge` never publishes success: it keeps
+  // waiting on the exact-head owner receipt with no grant and no forge call.
+  if (record.tier === 2 && record.parked !== null && record.parked.reason === 'owner-merge') {
+    return { outcome: 'waiting', reason: 'premerge-pending' };
+  }
   // AP1: the mode gate applies on the gathered fact hold too, so a pending
   // intent under a released fact stays `premerge-pending` under `human-gate`.
   const factHold = effectivePremergeHold(rawFactHold, record.tier, ctx.deps.premergeMode);
@@ -528,7 +717,14 @@ export async function reconcilePremerge(
   }
   // AP1: the re-read hold is gated the same way as the fact hold; a released
   // Tier 2 hold under `human-gate` keeps waiting with no grant and no post.
-  const hold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
+  const modeHold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
+  // RM3: the same Tier 2 owner-receipt gate as the act, on top of the mode
+  // gate: a released Tier 2 hold without the exact-head owner receipt keeps
+  // waiting with no grant and no forge call.
+  const hold =
+    modeHold.kind === 'released' && !tier2OwnerPremergeReleased(record, gathered, headSha, read.receipt)
+      ? ({ kind: 'wait', status: 'pending' } as LaneRunMergeHold)
+      : modeHold;
   if (hold.kind === 'wait') {
     return { outcome: 'waiting', reason: 'premerge-pending' };
   }

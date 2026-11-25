@@ -2237,6 +2237,32 @@ describe('runDoctor disk quota headroom (OPQ1)', () => {
     }
   });
 
+  it('reports UNKNOWN, never PASS or WARN, for a negative, fractional, NaN, infinite, unsafe, zero-total or used-above-total answer', async () => {
+    for (const answer of [
+      { usedBytes: -100, totalBytes: 1000 },
+      { usedBytes: 0.5, totalBytes: 1 },
+      { usedBytes: Number.NaN, totalBytes: 1000 },
+      { usedBytes: 1, totalBytes: Number.NaN },
+      { usedBytes: 1, totalBytes: Number.MAX_SAFE_INTEGER + 2 },
+      { usedBytes: 10, totalBytes: 0 },
+      { usedBytes: 2000, totalBytes: 1000 },
+      { usedBytes: 1, totalBytes: Number.POSITIVE_INFINITY },
+      { usedBytes: Number.NEGATIVE_INFINITY, totalBytes: 1000 },
+    ]) {
+      const { probes } = fakeProbes({ diskQuotaUsage: async () => answer });
+      const lines = await collect(loadedResult(runnerModel()), probes);
+      expect(diskQuotaLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'disk-quota',
+          status: 'UNKNOWN',
+          detail: 'disk quota could not be read via ci-alias',
+        },
+      ]);
+    }
+  });
+
   it('reports UNKNOWN without invoking getters when diskQuotaUsage or its result has a throwing or side-effecting getter', async () => {
     const sideEffects: string[] = [];
     const resultWithGetter = {

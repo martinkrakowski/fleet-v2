@@ -183,9 +183,13 @@ export function jsonPaths(value: unknown): string[] {
       continue;
     }
     nodes += 1;
-    // O(1) budget refusal for an enormous array length, before any
-    // per-property walk.
-    if (Array.isArray(frame.value) && frame.value.length > MAX_NODES) {
+    // Budget-first, O(1): an array's own keys always include one per
+    // canonical index, and `nodes` already charges this node itself, so
+    // `nodes + length` is a lower bound on the node charge. Refusing here
+    // avoids the full `Reflect.ownKeys` walk and its key-array allocation
+    // for any array that cannot fit in the budget, whether because of its
+    // length alone or because of nodes already spent.
+    if (Array.isArray(frame.value) && nodes + frame.value.length > MAX_NODES) {
       throw new NodeBudgetExceededError();
     }
     const keys = Reflect.ownKeys(frame.value);
@@ -378,16 +382,19 @@ export function parseFieldPathsSnapshot(
         `snapshot entry for ${key} must be an array`,
       );
     }
+    // Budget-first: charge the entry against the shared budget BEFORE
+    // iterating its paths, so a single oversized path list is refused in
+    // O(1) via its length instead of being traversed.
+    total += 1 + entry.length;
+    if (total > MAX_NODES) {
+      throw new NodeBudgetExceededError();
+    }
     for (const path of entry) {
       if (typeof path !== "string") {
         throw new SnapshotFormatError(
           `snapshot path for ${key} must be a string`,
         );
       }
-    }
-    total += 1 + entry.length;
-    if (total > MAX_NODES) {
-      throw new NodeBudgetExceededError();
     }
   }
   return parsed as Record<string, string[]>;
@@ -646,6 +653,20 @@ describe("jsonPaths", () => {
     expect(jsonPaths(justUnderKeys)).toHaveLength(MAX_NODES - 1);
   });
 
+  it("refuses an array whose many extra own keys exceed the budget, charged before any child walk", () => {
+    // Budget-first: nodes(1) + length(1) alone stays under MAX_NODES, so only
+    // the extra own keys push the charge over; the refusal still names
+    // NodeBudgetExceededError rather than walking any child.
+    const withExtras: string[] = ["only"];
+    for (let i = 0; i < MAX_NODES - 1; i += 1) {
+      Object.defineProperty(withExtras, `extra${i}`, {
+        value: "x",
+        enumerable: true,
+      });
+    }
+    expect(() => jsonPaths(withExtras)).toThrow(NodeBudgetExceededError);
+  });
+
   it("refuses an enormous array length above the budget in constant time, before any walk", () => {
     const enormous = new Array<number>(10 * MAX_NODES);
     enormous[0] = 1;
@@ -817,5 +838,18 @@ describe("parseFieldPathsSnapshot budget", () => {
       NodeBudgetExceededError,
     );
     expect(() => parseFieldPathsSnapshot(justUnder)).not.toThrow();
+  });
+
+  it("refuses a single oversized snapshot path list by its length before iterating any path", () => {
+    // Budget-first: the entry's length is charged against the shared budget
+    // before the per-path walk, so one oversized list is refused even though
+    // the earlier entries stay tiny.
+    const oversizeSingle = JSON.stringify({
+      "f.json": ["result.code"],
+      "g.json": new Array<string>(MAX_NODES).fill("result.code"),
+    });
+    expect(() => parseFieldPathsSnapshot(oversizeSingle)).toThrow(
+      NodeBudgetExceededError,
+    );
   });
 });

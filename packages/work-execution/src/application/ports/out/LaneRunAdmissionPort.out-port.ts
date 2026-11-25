@@ -18,12 +18,30 @@ export interface LaneRunAdmissionRequest {
   readonly nowIso: string;
 }
 
+/** One overlapping blocker named with the owned path that collided: the kind
+ *  of reservation (`run` or in-flight `attempt`), the blocker's id, and the
+ *  first owned path of the requested work order (in declared order) that
+ *  overlaps, or `'(whole work order)'` when the overlap is package-level or
+ *  fail closed and no single declared path names it. */
+export interface LaneRunAdmissionOverlap {
+  readonly kind: 'run' | 'attempt';
+  readonly id: string;
+  readonly path: string;
+}
+
 /** Which runs and in-flight reservations made an admission check fail (KS5). */
 export interface LaneRunAdmissionBlockers {
   /** Non-terminal runs that made the check fail, sorted, deduped. */
   readonly runIds: readonly string[];
   /** In-flight reservations (no run) that did, sorted, deduped. */
   readonly attemptIds: readonly string[];
+  /** Blockers whose work order could not be read (fail closed): still
+   *  blockers, with no `overlaps` entry. Absent on global-cap and
+   *  project-cap blockers. */
+  readonly unreadable?: readonly string[];
+  /** How each blocker overlaps the requested work order's owned paths.
+   *  Absent on global-cap and project-cap blockers. */
+  readonly overlaps?: readonly LaneRunAdmissionOverlap[];
 }
 
 export type LaneRunAdmissionResult =

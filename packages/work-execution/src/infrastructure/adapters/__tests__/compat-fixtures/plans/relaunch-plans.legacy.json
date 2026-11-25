@@ -1,0 +1,66 @@
+[
+  {
+    "planDigest": "39e12ca7e3e7325d919b54218471eb40e05f9a8f50f5f42594c8efb73ba54c64",
+    "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "createdAtIso": "2026-11-23T10:00:00Z",
+    "hostFilter": null,
+    "maxActiveRuns": 3,
+    "dispatchStaggerMs": 250,
+    "conductor": {
+      "halted": true,
+      "driverLease": "lapsed",
+      "runCount": 2
+    },
+    "lanes": [
+      {
+        "laneId": "lane-1",
+        "hostName": "host-a",
+        "projectId": null,
+        "population": "conducted",
+        "runnerState": "running",
+        "runId": null,
+        "attemptId": null,
+        "workOrderId": null,
+        "baseBranch": "main",
+        "chainHead": true,
+        "dependsOnLaneIds": [],
+        "admissionWave": 0,
+        "dispatchEndpointKey": null,
+        "staggerOffsetMs": null,
+        "steps": []
+      },
+      {
+        "laneId": "lane-2",
+        "hostName": "host-b",
+        "projectId": "proj-1",
+        "population": "unrecorded",
+        "runnerState": "idle",
+        "runId": null,
+        "attemptId": null,
+        "workOrderId": "wo-9",
+        "baseBranch": "chain/relaunch-2",
+        "chainHead": false,
+        "dependsOnLaneIds": [
+          "lane-1"
+        ],
+        "admissionWave": 1,
+        "dispatchEndpointKey": "opencode:host-b:4321",
+        "staggerOffsetMs": 0,
+        "steps": [
+          {
+            "step": "save",
+            "idempotencyKey": "relaunch/39e12ca7e3e7325d919b54218471eb40e05f9a8f50f5f42594c8efb73ba54c64/lane-2/save"
+          },
+          {
+            "step": "adopt",
+            "idempotencyKey": "relaunch/39e12ca7e3e7325d919b54218471eb40e05f9a8f50f5f42594c8efb73ba54c64/lane-2/adopt"
+          },
+          {
+            "step": "redispatch",
+            "idempotencyKey": "relaunch/39e12ca7e3e7325d919b54218471eb40e05f9a8f50f5f42594c8efb73ba54c64/lane-2/redispatch"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,13 @@
+[
+  {
+    "version": 1,
+    "observationId": "obs-example-1",
+    "seatId": "seat-example-1",
+    "outcome": "rate-limited",
+    "observedAtIso": "2026-11-06T00:00:00.000Z",
+    "subject": {
+      "attemptId": "attempt-example-1"
+    },
+    "via": "cli"
+  }
+]

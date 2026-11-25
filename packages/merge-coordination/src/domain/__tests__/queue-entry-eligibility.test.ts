@@ -95,6 +95,75 @@ describe('validateQueueEntryEligibility', () => {
     });
   });
 
+  describe('proxy inputs', () => {
+    it('trusts a Proxy whose get trap lies and accepts it as eligible', () => {
+      // Pinned behaviour: the validator reads `eligibility.kind` through the
+      // Proxy's get trap with no own-property or target checks, so a Proxy
+      // that lies consistently (every get returns 'eligible') is an accepted
+      // residual. The returned value is a fresh stripped object, not the proxy.
+      const target = { kind: 'blocked', reason: 'nope' };
+      const lying = new Proxy(target, {
+        get: () => 'eligible',
+      });
+      const result = validateQueueEntryEligibility(lying);
+      expect(result).toStrictEqual({ ok: true, value: { kind: 'eligible' } });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error('expected acceptance');
+      expect(result.value).not.toBe(lying);
+    });
+
+    it('passes a truthful Proxy over a blocked entry through with the reason verbatim', () => {
+      const target = { kind: 'blocked', reason: 'why' };
+      const truthful = new Proxy(target, {
+        get: (t, key) => (t as Record<string, unknown>)[key as string],
+      });
+      const result = validateQueueEntryEligibility(truthful);
+      expect(result).toStrictEqual({ ok: true, value: { kind: 'blocked', reason: 'why' } });
+    });
+  });
+
+  describe('array holes', () => {
+    it('refuses an array with holes via the plain-object reason and never reads the holes', () => {
+      // Pinned behaviour: Array.isArray fires before any element access, so a
+      // holey array is refused as "not a plain object" and the holes are never
+      // read (no prototype lookups for the hole slots can occur).
+      const holey: unknown[] = new Array(3);
+      expect(validateQueueEntryEligibility(holey)).toStrictEqual({
+        ok: false as const,
+        reason: 'queue entry eligibility must be a plain object',
+      });
+      const withHoles: unknown[] = [{ kind: 'eligible' }];
+      withHoles[2] = { kind: 'blocked', reason: 'why' }; // index 1 stays a hole
+      expect(validateQueueEntryEligibility(withHoles)).toStrictEqual({
+        ok: false as const,
+        reason: 'queue entry eligibility must be a plain object',
+      });
+    });
+  });
+
+  describe('array-like with enormous length', () => {
+    it('ignores an enormous length on an array-like and refuses it on the kind reason', () => {
+      // Pinned behaviour: the validator checks only typeof and Array.isArray,
+      // never `length`, so an array-like with Number.MAX_SAFE_INTEGER length is
+      // treated as a plain object and refused on its missing kind. A getter
+      // counter proves length is never read, so the cost is O(1) regardless of
+      // the claimed length.
+      let lengthReads = 0;
+      const input = {
+        get length(): number {
+          lengthReads += 1;
+          return Number.MAX_SAFE_INTEGER;
+        },
+      };
+      const result = validateQueueEntryEligibility(input);
+      expect(result).toStrictEqual({
+        ok: false as const,
+        reason: 'queue entry eligibility kind must be "eligible" or "blocked"',
+      });
+      expect(lengthReads).toBe(0);
+    });
+  });
+
   describe('unknown or missing kind', () => {
     it('refuses missing or unknown kind with the kind reason', () => {
       const expected = {

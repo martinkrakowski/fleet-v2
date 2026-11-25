@@ -9,7 +9,13 @@
 import { describe, expect, it } from 'vitest';
 
 import type { CoordinationRequestRecord } from './coordination-records.js';
-import { isSignedDecisionRequired, parseShadowImportGrant, verifySignedDecisionBinding } from './coordination-records.js';
+import {
+  isSignedDecisionRequired,
+  parseShadowImportGrant,
+  readReleaseRoot,
+  releaseRootsAgree,
+  verifySignedDecisionBinding,
+} from './coordination-records.js';
 
 function requestRecord(overrides: Partial<CoordinationRequestRecord> = {}): CoordinationRequestRecord {
   return {
@@ -594,5 +600,128 @@ describe('parseShadowImportGrant boundary refusals', () => {
       expect(Object.isFrozen(read.value)).toBe(true);
       expect(read.value).not.toBe(validGrant());
     }
+  });
+});
+
+describe('readReleaseRoot and releaseRootsAgree', () => {
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a number', 5],
+    ['a string', '/srv/a'],
+    ['a boolean', true],
+    ['a bigint', 1n],
+    ['a symbol', Symbol('s')],
+    ['a function', () => undefined],
+  ])('reads %s as invalid, never absent', (_label, input) => {
+    expect(readReleaseRoot(input)).toEqual({ state: 'invalid' });
+  });
+
+  it('reads a primitive as invalid even when its boxed prototype carries a releaseRoot', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(Number.prototype, 'releaseRoot');
+    Object.defineProperty(Number.prototype, 'releaseRoot', { value: '/srv/leak', configurable: true });
+    try {
+      expect(readReleaseRoot(5)).toEqual({ state: 'invalid' });
+    } finally {
+      delete (Number.prototype as unknown as Record<string, unknown>).releaseRoot;
+      if (descriptor !== undefined) Object.defineProperty(Number.prototype, 'releaseRoot', descriptor);
+    }
+  });
+
+  it('reads genuine objects without a releaseRoot, or with an undefined data one, as absent', () => {
+    expect(readReleaseRoot({})).toEqual({ state: 'absent' });
+    expect(readReleaseRoot({ releaseRoot: undefined })).toEqual({ state: 'absent' });
+    expect(readReleaseRoot(Object.create(null))).toEqual({ state: 'absent' });
+  });
+
+  it('reads a valid absolute root as valid with its exact value', () => {
+    expect(readReleaseRoot({ releaseRoot: '/srv/a' })).toEqual({ state: 'valid', value: '/srv/a' });
+  });
+
+  it.each([
+    ['a non-string', 5],
+    ['an empty string', ''],
+    ['a relative path', 'srv/a'],
+    ['a dot-dot segment', '/srv/../a'],
+    ['a control character', '/srv/a\u0000b'],
+    ['an oversized path', '/' + 'a'.repeat(4096)],
+    ['null', null],
+  ])('reads a releaseRoot that is %s as invalid', (_label, value) => {
+    expect(readReleaseRoot({ releaseRoot: value })).toEqual({ state: 'invalid' });
+  });
+
+  it('never runs a releaseRoot getter and reads it as invalid', () => {
+    let calls = 0;
+    const record = Object.defineProperty({}, 'releaseRoot', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return '/srv/a';
+      },
+    });
+    expect(readReleaseRoot(record)).toEqual({ state: 'invalid' });
+    expect(calls).toBe(0);
+  });
+
+  it('reads a Proxy whose descriptor trap throws, and a revoked Proxy, as invalid without throwing', () => {
+    const hostile = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error('trap');
+      },
+    });
+    expect(readReleaseRoot(hostile)).toEqual({ state: 'invalid' });
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    expect(readReleaseRoot(revocable.proxy)).toEqual({ state: 'invalid' });
+  });
+
+  it('reads arrays, sparse arrays, array-likes and an enormous-length array as absent in O(1)', () => {
+    expect(readReleaseRoot([])).toEqual({ state: 'absent' });
+    expect(readReleaseRoot(new Array(1))).toEqual({ state: 'absent' });
+    expect(readReleaseRoot({ length: 1, 0: '/srv/a' })).toEqual({ state: 'absent' });
+    const huge: unknown[] = [];
+    huge.length = 2 ** 32 - 1;
+    expect(readReleaseRoot(huge)).toEqual({ state: 'absent' });
+  });
+
+  it('reads a JSON-parsed own __proto__ key as absent, and an invalid releaseRoot beside it as invalid, without polluting Object.prototype', () => {
+    expect(readReleaseRoot(JSON.parse('{"__proto__":{"releaseRoot":"/srv/a"}}'))).toEqual({ state: 'absent' });
+    expect(readReleaseRoot(JSON.parse('{"__proto__":{},"releaseRoot":5}'))).toEqual({ state: 'invalid' });
+    expect(({} as Record<string, unknown>).releaseRoot).toBeUndefined();
+  });
+
+  it('does not read an inherited releaseRoot', () => {
+    expect(readReleaseRoot(Object.create({ releaseRoot: '/srv/a' }))).toEqual({ state: 'absent' });
+  });
+
+  it('agrees only for two absent reads or two valid reads with equal values', () => {
+    expect(releaseRootsAgree({ state: 'absent' }, { state: 'absent' })).toBe(true);
+    expect(releaseRootsAgree({ state: 'valid', value: '/srv/a' }, { state: 'valid', value: '/srv/a' })).toBe(true);
+    expect(releaseRootsAgree({ state: 'valid', value: '/srv/a' }, { state: 'valid', value: '/srv/b' })).toBe(false);
+    expect(releaseRootsAgree({ state: 'absent' }, { state: 'valid', value: '/srv/a' })).toBe(false);
+    expect(releaseRootsAgree({ state: 'valid', value: '/srv/a' }, { state: 'absent' })).toBe(false);
+  });
+
+  it('never agrees when either side, or both, is invalid', () => {
+    const invalid = { state: 'invalid' } as const;
+    expect(releaseRootsAgree(invalid, invalid)).toBe(false);
+    expect(releaseRootsAgree(invalid, { state: 'absent' })).toBe(false);
+    expect(releaseRootsAgree({ state: 'absent' }, invalid)).toBe(false);
+    expect(releaseRootsAgree(invalid, { state: 'valid', value: '/srv/a' })).toBe(false);
+    expect(releaseRootsAgree({ state: 'valid', value: '/srv/a' }, invalid)).toBe(false);
+  });
+
+  it('never agrees when a side carries an unknown state', () => {
+    const unknown = { state: 'bogus' } as never;
+    expect(releaseRootsAgree(unknown, unknown)).toBe(false);
+    expect(releaseRootsAgree(unknown, { state: 'absent' })).toBe(false);
+    expect(releaseRootsAgree({ state: 'absent' }, unknown)).toBe(false);
+    expect(releaseRootsAgree({ state: 'valid', value: '/srv/a' }, unknown)).toBe(false);
+  });
+
+  it('pairs readReleaseRoot with releaseRootsAgree so two non-object records never agree', () => {
+    expect(releaseRootsAgree(readReleaseRoot(5), readReleaseRoot(5))).toBe(false);
+    expect(releaseRootsAgree(readReleaseRoot(5), readReleaseRoot({}))).toBe(false);
+    expect(releaseRootsAgree(readReleaseRoot({}), readReleaseRoot({}))).toBe(true);
   });
 });

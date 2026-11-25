@@ -608,9 +608,17 @@ export function checkRouteParity(
   );
 
   // Which message/operate patterns does the live tool surface already reach?
+  // The trie stores the NORMALIZED pattern (`:param` form) so a concrete tool
+  // path that matches a parameterized rule yields exactly the same key the
+  // mutationPatterns set and the exclusion keys use — a raw `:id` pattern
+  // stored here would never equal a normalized `:param` key.
   const trie = newTrieNode();
   for (const rule of mutationRules) {
-    insertPattern(trie, rule.method.toUpperCase(), rule.pattern);
+    insertPattern(
+      trie,
+      rule.method.toUpperCase(),
+      normalizeRoutePattern(rule.pattern) ?? rule.pattern,
+    );
   }
   const covered = new Set<string>();
   const budget = { steps: 0 };

@@ -197,6 +197,9 @@ describe("MCP-to-API mutation route parity", () => {
         `${name} must call exactly one /v1 route`,
       ).toHaveLength(1);
       const call = made[0];
+      if (!call) {
+        throw new Error(`${name} must call exactly one /v1 route`);
+      }
       expect(call.path.startsWith("/v1/")).toBe(true);
       expect(result.isError).toBe(true);
       callsByName.set(name, call);
@@ -412,16 +415,48 @@ describe("MCP-to-API mutation route parity", () => {
     }
   });
 
+  it("a concrete tool path covers a parameterized message route and its exclusion is redundant", () => {
+    // A tool calls POST /v1/attempts/att-1/stop; the rule stores the
+    // parameterized POST /v1/attempts/:id/stop. Coverage must key on the
+    // normalized :param form, so the route is covered without any exclusion
+    // and an exclusion for it is rejected as redundant.
+    const rules = [makeRule("POST", "/v1/attempts/:id/stop", "operate")];
+    const toolRoutes = [{ method: "POST", path: "/v1/attempts/att-1/stop" }];
+    expect(checkRouteParity(rules, toolRoutes, [])).toEqual({ ok: true });
+    const result = checkRouteParity(rules, toolRoutes, [
+      {
+        method: "POST",
+        pattern: "/v1/attempts/:id/stop",
+        reason: "FVM3 owns the stop tool.",
+      },
+    ]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("redundant-exclusion");
+    }
+  });
+
   it("refuses matching when about 2000 tool paths plus repeated wildcard rules exhaust the match budget", () => {
-    const wildcardRules: ParsedRouteRule[] = Array.from(
-      { length: 2000 },
-      (_, i) => makeRule("POST", `/v1/t/:branch-${i}/leaf`, "operate"),
-    );
+    // After normalization every `:name` collapses to `:param`, so the trie's
+    // fan-out per level is one literal child plus one param child. A rule set
+    // holding every literal/param combination over 10 segments therefore makes
+    // one concrete query visit sum(2^d) nodes; repeated queries exhaust the
+    // shared budget and the check must end in the typed refusal.
+    const depth = 10;
+    const comboRules: ParsedRouteRule[] = [];
+    for (let mask = 0; mask < 1 << depth; mask++) {
+      const segments: string[] = [];
+      for (let i = 0; i < depth; i++) {
+        segments.push((mask >> i) & 1 ? ":param" : `a${i}`);
+      }
+      comboRules.push(makeRule("POST", `/v1/${segments.join("/")}/leaf`, "operate"));
+    }
+    const queryPath = `/v1/${Array.from({ length: depth }, (_, i) => `a${i}`).join("/")}/leaf`;
     const manyPaths: RouteKey[] = Array.from(
       { length: 2000 },
-      (_, i) => ({ method: "POST", path: `/v1/t/x-${i}/leaf` }),
+      () => ({ method: "POST", path: queryPath }),
     );
-    const result = checkRouteParity(wildcardRules, manyPaths, []);
+    const result = checkRouteParity(comboRules, manyPaths, []);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe("match-budget-exceeded");

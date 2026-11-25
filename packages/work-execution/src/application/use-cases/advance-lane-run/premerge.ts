@@ -192,7 +192,11 @@ const RM3_FINDINGS_MAX = 999;
  *   (correction 8: `preMergeReview.verdict` is `none` or `passed`; any other
  *   verdict waits);
  * - an accepted owner receipt (`requestId === null`) at the exact head exists;
- * - the PR's current head is the candidate head (`facts.pr.head12`).
+ * - the PR's current head is the candidate head at full sha precision
+ *   (`facts.pr.headSha === headSha`, fix round 1: a 12-character prefix alone
+ *   passes for distinct heads that share it, so the full forge-reported head
+ *   sha is required; a pr fact without `headSha` reads as unknown and never
+ *   releases).
  * Without them the hold stays `wait`/`pending` — `premerge` `success` is
  * never published while parked `owner-merge` or without the exact-head owner
  * receipt.
@@ -227,7 +231,11 @@ function tier2OwnerPremergeReleased(
   ) {
     return false;
   }
-  if (gathered.facts.pr === null || ownDataProp(gathered.facts.pr, 'head12') !== headSha.slice(0, 12)) {
+  // Fix round 1: compare the PR head at full sha precision. `headSha` is a
+  // validated 40-hex read (`O(1)` descriptor read, no getter); a pr fact
+  // without it, or with a different head — even one sharing the 12-character
+  // prefix — never releases the hold.
+  if (gathered.facts.pr === null || ownDataProp(gathered.facts.pr, 'headSha') !== headSha) {
     return false;
   }
   return true;

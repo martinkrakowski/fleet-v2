@@ -414,7 +414,13 @@ export interface LaneRunFacts {
   /** GB4: a final `ci` result with reason `ci-failed` is already recorded at this head in this round; absent reads as false. */
   readonly ciFailureRecorded?: boolean;
   /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
+  readonly pr: {
+    readonly state: 'open' | 'merged' | 'closed';
+    readonly head12: string;
+    /** The snapshot's full head sha when the forge read carries it; absent reads as unknown (never a match). */
+    readonly headSha?: string;
+    readonly containsLaneHead: boolean;
+  } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
   /** An unreadable door reads true; `policyGrant` per AM4a (K6). KS7b: the branch and the train belong to the merge queue. */

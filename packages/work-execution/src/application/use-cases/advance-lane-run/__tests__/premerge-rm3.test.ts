@@ -546,6 +546,30 @@ describe('premerge RM3: Tier 2 never publishes success without the exact-head ow
     expect(successStatuses(prMoved)).toHaveLength(0);
   });
 
+  it('keeps Tier 2 pending when the PR moved to a head sharing only the 12-character prefix, and publishes success at the exact head', async () => {
+    // Fix round 1: the PR-head check used to compare only `head12`, so two
+    // distinct heads sharing the first 12 hex characters passed as equal. The
+    // gate now requires the full forge-reported PR head sha.
+    const sharedPrefix = 'a'.repeat(12) + 'b'.repeat(28);
+    const prMoved = await mergingHarness({ premergeMode: 'auto-attest', prHeadSha: sharedPrefix });
+    prMoved.setReceiptAnswer(ownerReceipt());
+    const movedResult = await advance(prMoved);
+    expect(movedResult).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    expect(successStatuses(prMoved)).toHaveLength(0);
+
+    const exactHead = await mergingHarness({ premergeMode: 'auto-attest', prHeadSha: COMMIT });
+    exactHead.setReceiptAnswer(ownerReceipt());
+    const exactResult = await advance(exactHead);
+    expect(exactResult).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(successStatuses(exactHead)).toHaveLength(1);
+  });
+
   it('keeps Tier 2 pending while parked owner-merge, never posting success', async () => {
     const harness = await makeHarness(
       runRecord({

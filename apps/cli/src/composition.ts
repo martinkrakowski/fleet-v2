@@ -490,7 +490,19 @@ export interface RunnerTunnelTarget {
 const POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  // Only an exactly plain prototype is accepted, so a class instance or an
+  // object with a custom prototype (whose inherited fields and getters would
+  // otherwise be reachable) is refused. A Proxy's `getPrototypeOf` trap is
+  // never allowed to escape: a throwing trap simply refuses the value.
+  try {
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    return false;
+  }
 }
 
 /** True when the own property is an accessor: its getter is never invoked. */
@@ -523,12 +535,22 @@ function rolesIncludeLaneRunner(roles: readonly unknown[]): boolean {
 }
 
 export function resolveRunnerTunnelTargets(installation?: FleetInstallation): readonly RunnerTunnelTarget[] {
-  // Hostile input, cost O(Object.keys(hosts).length): nothing here invokes a
-  // getter or a Proxy trap on untrusted data.
+  // Hostile input, cost O(Object.keys(hosts).length): nothing here lets a
+  // getter or a Proxy trap escape — an accessor is refused unread, and a
+  // throwing trap only refuses (or skips) the input instead of propagating.
   if (installation === undefined || !isPlainObject(installation)) {
     return [];
   }
-  if (installation.schemaVersion !== 2) {
+  if (isAccessor(installation, 'schemaVersion')) {
+    return [];
+  }
+  let schemaVersion: unknown;
+  try {
+    schemaVersion = installation.schemaVersion;
+  } catch {
+    return [];
+  }
+  if (schemaVersion !== 2) {
     return [];
   }
   if (isAccessor(installation, 'hosts')) {
@@ -538,49 +560,91 @@ export function resolveRunnerTunnelTargets(installation?: FleetInstallation): re
   if (!isPlainObject(hosts)) {
     return [];
   }
+  let hostNames: readonly string[];
+  try {
+    hostNames = Object.keys(hosts);
+  } catch {
+    return [];
+  }
   const targets: RunnerTunnelTarget[] = [];
-  for (const hostName of Object.keys(hosts)) {
-    if (POLLUTING_KEYS.has(hostName) || isAccessor(hosts, hostName)) {
+  for (const hostName of hostNames) {
+    if (POLLUTING_KEYS.has(hostName)) {
       continue;
     }
-    const host = hosts[hostName];
+    let host: unknown;
+    try {
+      if (isAccessor(hosts, hostName)) {
+        continue;
+      }
+      host = hosts[hostName];
+    } catch {
+      // A hostile `getOwnPropertyDescriptor` or `get` trap skips the entry.
+      continue;
+    }
     if (!isPlainObject(host)) {
       continue;
     }
+    const entry = readHostEntry(host);
+    if (entry !== null) {
+      targets.push({ hostName, sshHost: entry.trimmedAlias, remotePort: entry.port });
+    }
+  }
+  return targets;
+}
+
+/**
+ * Read one host entry of an installation's `hosts` section. Every read is
+ * guarded: an accessor descriptor on any read field skips the entry (its
+ * getter is never invoked) and a throwing Proxy trap skips the entry instead
+ * of escaping. Cost O(1) reads per entry. Returns `null` for every entry that
+ * yields no tunnel target.
+ */
+function readHostEntry(host: Record<string, unknown>): { readonly trimmedAlias: string; readonly port: number } | null {
+  try {
     if (
       isAccessor(host, 'roles') ||
       isAccessor(host, 'transport') ||
       isAccessor(host, 'sshAlias') ||
       isAccessor(host, 'runner')
     ) {
-      continue;
+      return null;
     }
     const roles = host.roles;
     if (!Array.isArray(roles) || !rolesIncludeLaneRunner(roles)) {
-      continue;
+      return null;
     }
     if (host.transport !== 'ssh') {
-      continue;
+      return null;
     }
     const alias = host.sshAlias;
     if (typeof alias !== 'string') {
-      continue;
+      return null;
     }
     const trimmedAlias = alias.trim();
     if (trimmedAlias === '' || !isUsableSshHost(trimmedAlias)) {
-      continue;
+      return null;
+    }
+    if (!isPlainObject(host.runner)) {
+      return null;
     }
     const runner = host.runner;
-    if (!isPlainObject(runner) || runner.kind !== 'opencode') {
-      continue;
+    // The runner's own fields are guarded too: an accessor on `kind` or
+    // `port` skips the entry without ever invoking the getter.
+    if (isAccessor(runner, 'kind') || isAccessor(runner, 'port')) {
+      return null;
+    }
+    if (runner.kind !== 'opencode') {
+      return null;
     }
     const port = runner.port;
     if (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 1 || port > 65534) {
-      continue;
+      return null;
     }
-    targets.push({ hostName, sshHost: trimmedAlias, remotePort: port });
+    return { trimmedAlias, port };
+  } catch {
+    // Any hostile trap on the entry's record refuses the entry, never escapes.
+    return null;
   }
-  return targets;
 }
 
 /**

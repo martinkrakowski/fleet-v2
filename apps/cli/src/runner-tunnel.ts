@@ -325,26 +325,44 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
   private readonly members: readonly RunnerTunnelAdapter[];
 
   constructor(members: readonly RunnerTunnelAdapter[]) {
-    // Hostile input, cost O(members.length) capped at 1024: only dense arrays
-    // of real adapters are accepted, and every index is read through its own
-    // property descriptor (a getter is never invoked).
+    // Hostile input, cost O(members.length) capped at 1024: only dense, real
+    // (non-Proxy) arrays of real adapters are accepted, and every index is
+    // read through its own property descriptor (a getter is never invoked).
+    // Any hostile trap the validation touches refuses the input as a
+    // TypeError instead of escaping.
     if (!Array.isArray(members)) {
       throw new TypeError('RunnerTunnelSetAdapter: members must be an array');
     }
-    if (members.length > MAX_TUNNEL_MEMBERS) {
-      throw new TypeError(`RunnerTunnelSetAdapter: more than ${MAX_TUNNEL_MEMBERS} members`);
-    }
-    for (let i = 0; i < members.length; i += 1) {
-      if (!(i in members)) {
-        throw new TypeError(`RunnerTunnelSetAdapter: hole at index ${i}`);
+    try {
+      // Proxy guard: a plain Array prototype is the only accepted shape, so a
+      // Proxy-wrapped array (whose traps `Object.keys`, descriptor checks and
+      // element reads would otherwise invoke) is refused here.
+      const proto = Object.getPrototypeOf(members);
+      if (proto !== Array.prototype) {
+        throw new TypeError('RunnerTunnelSetAdapter: members must be a plain array');
       }
-      const descriptor = Object.getOwnPropertyDescriptor(members, i);
-      if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
-        throw new TypeError(`RunnerTunnelSetAdapter: accessor at index ${i}`);
+      if (members.length > MAX_TUNNEL_MEMBERS) {
+        throw new TypeError(`RunnerTunnelSetAdapter: more than ${MAX_TUNNEL_MEMBERS} members`);
       }
-      if (!(descriptor?.value instanceof RunnerTunnelAdapter)) {
-        throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} is not a RunnerTunnelAdapter`);
+      for (let i = 0; i < members.length; i += 1) {
+        if (!(i in members)) {
+          throw new TypeError(`RunnerTunnelSetAdapter: hole at index ${i}`);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(members, i);
+        if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+          throw new TypeError(`RunnerTunnelSetAdapter: accessor at index ${i}`);
+        }
+        if (!(descriptor?.value instanceof RunnerTunnelAdapter)) {
+          throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} is not a RunnerTunnelAdapter`);
+        }
       }
+    } catch (error: unknown) {
+      if (error instanceof TypeError) {
+        throw error;
+      }
+      // A hostile trap (getPrototypeOf, has, getOwnPropertyDescriptor, get)
+      // threw: refuse the input as a TypeError instead of letting it escape.
+      throw new TypeError('RunnerTunnelSetAdapter: hostile members input');
     }
     // Copy by validated index, never by spread (a Proxy's traps stay uninvoked).
     const copy: RunnerTunnelAdapter[] = [];

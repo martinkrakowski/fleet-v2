@@ -1077,3 +1077,90 @@ describe('conductor run tunnel wiring (G2)', () => {
     expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelSetAdapter);
   });
 });
+
+describe('hostile Proxy, subclass and accessor input (fix round 1)', () => {
+  const asMembers = (value: unknown): readonly RunnerTunnelAdapter[] =>
+    value as readonly RunnerTunnelAdapter[];
+  const asInstallation = (value: unknown): FleetInstallation | undefined =>
+    value as FleetInstallation | undefined;
+
+  it('RunnerTunnelSetAdapter refuses Proxy-wrapped and custom-prototype members arrays instead of touching their traps', () => {
+    const adapter = new RunnerTunnelAdapter({});
+    // A Proxy whose `getPrototypeOf` trap throws: refused as a TypeError, never escaped.
+    const throwingTrap = new Proxy([adapter], {
+      getPrototypeOf(): never {
+        throw new Error('the members getPrototypeOf trap must not escape');
+      },
+    });
+    expect(() => new RunnerTunnelSetAdapter(asMembers(throwingTrap))).toThrow(TypeError);
+    // A Proxy whose `getPrototypeOf` trap answers a non-Array prototype: refused.
+    const foreignProto = new Proxy([adapter], {
+      getPrototypeOf: () => Object.prototype,
+    });
+    expect(() => new RunnerTunnelSetAdapter(asMembers(foreignProto))).toThrow(TypeError);
+    // An Array subclass instance carries a custom prototype: refused.
+    class MemberList extends Array<RunnerTunnelAdapter> {}
+    const subclassed = new MemberList();
+    subclassed.push(adapter);
+    expect(() => new RunnerTunnelSetAdapter(asMembers(subclassed))).toThrow(TypeError);
+    // A plain, real array of real adapters is still accepted.
+    expect(() => new RunnerTunnelSetAdapter([adapter])).not.toThrow();
+  });
+
+  it('resolveRunnerTunnelTargets refuses class instances, Proxy traps, and schemaVersion and runner accessors without invoking them', () => {
+    // A class instance (custom prototype) is refused even with a valid shape.
+    class Installation {
+      readonly schemaVersion = 2;
+      readonly hosts = { 'runner-a': sshHostFixture('alias-a', 4166) };
+    }
+    expect(resolveRunnerTunnelTargets(new Installation() as unknown as FleetInstallation)).toEqual([]);
+    // A Proxy installation whose `getPrototypeOf` trap throws yields [] instead of escaping.
+    const throwingInstallation = new Proxy({ schemaVersion: 2, hosts: {} }, {
+      getPrototypeOf(): never {
+        throw new Error('the installation getPrototypeOf trap must not escape');
+      },
+    });
+    expect(resolveRunnerTunnelTargets(asInstallation(throwingInstallation))).toEqual([]);
+    // A Proxy `hosts` whose `ownKeys` trap throws yields [] instead of escaping.
+    const throwingHosts = new Proxy(
+      { 'runner-a': sshHostFixture('alias-a', 4166) } as Record<string, unknown>,
+      {
+        ownKeys(): never {
+          throw new Error('the hosts ownKeys trap must not escape');
+        },
+      },
+    );
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: throwingHosts }))).toEqual([]);
+    // A `schemaVersion` accessor is refused without invoking its getter.
+    const getterSchema: Record<string, unknown> = {
+      hosts: { 'runner-a': sshHostFixture('alias-a', 4166) },
+    };
+    Object.defineProperty(getterSchema, 'schemaVersion', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('the schemaVersion getter must never run');
+      },
+    });
+    expect(resolveRunnerTunnelTargets(asInstallation(getterSchema))).toEqual([]);
+    // A host whose runner `kind` (or `port`) is an accessor is skipped, never invoked.
+    for (const field of ['kind', 'port']) {
+      const hostileRunner: Record<string, unknown> = { kind: 'opencode', port: 4166 };
+      Object.defineProperty(hostileRunner, field, {
+        enumerable: true,
+        configurable: true,
+        get: () => {
+          throw new Error(`the runner ${field} getter must never run`);
+        },
+      });
+      const hostileHost = { ...sshHostFixture('alias-a', 4166), runner: hostileRunner };
+      expect(
+        resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': hostileHost } })),
+      ).toEqual([]);
+    }
+    // A host whose runner fields are plain still yields its target.
+    expect(resolveRunnerTunnelTargets(installationWithHosts({ 'runner-a': sshHostFixture('alias-a', 4166) }))).toEqual([
+      { hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 },
+    ]);
+  });
+});

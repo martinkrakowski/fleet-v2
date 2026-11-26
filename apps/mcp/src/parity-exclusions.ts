@@ -706,6 +706,19 @@ export function checkRouteParity(
   return { ok: true };
 }
 
+function excluded(
+  method: string,
+  pattern: string,
+  followUp: string,
+  tool: string,
+): ParityExclusion {
+  return {
+    method,
+    pattern,
+    reason: `Excluded until ${followUp} lands the ${tool} MCP tool; the MCP surface stays read-only today.`,
+  };
+}
+
 /**
  * The explicit exclusion list. On the base revision every mutating route is
  * uncovered: the MCP surface ships read tools only, so all 34 `message` (7)
@@ -715,176 +728,40 @@ export function checkRouteParity(
  */
 export const PARITY_EXCLUSIONS: readonly ParityExclusion[] = [
   // message scope — owner questions and relays; tools land with FVM1.
-  {
-    method: "POST",
-    pattern: "/v1/questions",
-    reason: "Excluded until FVM1 lands the owner-question MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/questions/:id/answers",
-    reason: "Excluded until FVM1 lands the answer MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/questions/:id/acknowledgement",
-    reason: "Excluded until FVM1 lands the acknowledgement MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/questions/sync",
-    reason: "Excluded until FVM1 lands the question-sync MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/questions/expire",
-    reason: "Excluded until FVM1 lands the question-expiry MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/relays",
-    reason: "Excluded until FVM1 lands the relay MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/relays/:id/acknowledgement",
-    reason: "Excluded until FVM1 lands the relay-acknowledgement MCP tool; the MCP surface stays read-only today.",
-  },
+  excluded("POST", "/v1/questions", "FVM1", "owner-question"),
+  excluded("POST", "/v1/questions/:id/answers", "FVM1", "answer"),
+  excluded("POST", "/v1/questions/:id/acknowledgement", "FVM1", "acknowledgement"),
+  excluded("POST", "/v1/questions/sync", "FVM1", "question-sync"),
+  excluded("POST", "/v1/questions/expire", "FVM1", "question-expiry"),
+  excluded("POST", "/v1/relays", "FVM1", "relay"),
+  excluded("POST", "/v1/relays/:id/acknowledgement", "FVM1", "relay-acknowledgement"),
   // operate scope — conductor run control; tools land with FVM3.
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/stop",
-    reason: "Excluded until FVM3 lands the attempt-stop MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/runs/halt",
-    reason: "Excluded until FVM3 lands the run-halt MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/runs/:id/stop",
-    reason: "Excluded until FVM3 lands the run-stop MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/reconcile",
-    reason: "Excluded until FVM3 lands the attempt-reconcile MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/fix",
-    reason: "Excluded until FVM3 lands the attempt-fix MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/acceptance",
-    reason: "Excluded until FVM3 lands the acceptance MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/cancel-prepared",
-    reason: "Excluded until FVM3 lands the cancel-prepared MCP tool; the MCP surface stays read-only today.",
-  },
+  excluded("POST", "/v1/attempts/:id/stop", "FVM3", "attempt-stop"),
+  excluded("POST", "/v1/runs/halt", "FVM3", "run-halt"),
+  excluded("POST", "/v1/runs/:id/stop", "FVM3", "run-stop"),
+  excluded("POST", "/v1/attempts/:id/reconcile", "FVM3", "attempt-reconcile"),
+  excluded("POST", "/v1/attempts/:id/fix", "FVM3", "attempt-fix"),
+  excluded("POST", "/v1/attempts/:id/acceptance", "FVM3", "acceptance"),
+  excluded("POST", "/v1/attempts/:id/cancel-prepared", "FVM3", "cancel-prepared"),
   // operate scope — stewardship writes; tools land with FVM4.
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/artifacts",
-    reason: "Excluded until FVM4 lands the artifact MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/attempts/:id/notes",
-    reason: "Excluded until FVM4 lands the attempt-note MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/owner-items/:id/resolution",
-    reason: "Excluded until FVM4 lands the owner-item MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/verifications",
-    reason: "Excluded until FVM4 lands the verification MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/verifications/:id/receipt",
-    reason: "Excluded until FVM4 lands the verification-receipt MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/observations",
-    reason: "Excluded until FVM4 lands the observation MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/findings/:id/disposition",
-    reason: "Excluded until FVM4 lands the finding-disposition MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/work-orders",
-    reason: "Excluded until FVM4 lands the work-order MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/heads/:sha/assessment",
-    reason: "Excluded until FVM4 lands the head-assessment MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/checks",
-    reason: "Excluded until FVM4 lands the knowledge-check MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/:id/disposition",
-    reason: "Excluded until FVM4 lands the knowledge-disposition MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/:id/publish",
-    reason: "Excluded until FVM4 lands the knowledge-publish MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/:id/reuse",
-    reason: "Excluded until FVM4 lands the knowledge-reuse MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/:id/supersede",
-    reason: "Excluded until FVM4 lands the knowledge-supersede MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/proposals",
-    reason: "Excluded until FVM4 lands the knowledge-proposal MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/knowledge/selections",
-    reason: "Excluded until FVM4 lands the knowledge-selection MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/projects",
-    reason: "Excluded until FVM4 lands the project MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/projects/:id/retire",
-    reason: "Excluded until FVM4 lands the project-retire MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "POST",
-    pattern: "/v1/projects/:id/probe",
-    reason: "Excluded until FVM4 lands the project-probe MCP tool; the MCP surface stays read-only today.",
-  },
-  {
-    method: "PATCH",
-    pattern: "/v1/projects/:id",
-    reason: "Excluded until FVM4 lands the project-update MCP tool; the MCP surface stays read-only today.",
-  },
+  excluded("POST", "/v1/attempts/:id/artifacts", "FVM4", "artifact"),
+  excluded("POST", "/v1/attempts/:id/notes", "FVM4", "attempt-note"),
+  excluded("POST", "/v1/owner-items/:id/resolution", "FVM4", "owner-item"),
+  excluded("POST", "/v1/verifications", "FVM4", "verification"),
+  excluded("POST", "/v1/verifications/:id/receipt", "FVM4", "verification-receipt"),
+  excluded("POST", "/v1/observations", "FVM4", "observation"),
+  excluded("POST", "/v1/findings/:id/disposition", "FVM4", "finding-disposition"),
+  excluded("POST", "/v1/work-orders", "FVM4", "work-order"),
+  excluded("POST", "/v1/heads/:sha/assessment", "FVM4", "head-assessment"),
+  excluded("POST", "/v1/knowledge/checks", "FVM4", "knowledge-check"),
+  excluded("POST", "/v1/knowledge/:id/disposition", "FVM4", "knowledge-disposition"),
+  excluded("POST", "/v1/knowledge/:id/publish", "FVM4", "knowledge-publish"),
+  excluded("POST", "/v1/knowledge/:id/reuse", "FVM4", "knowledge-reuse"),
+  excluded("POST", "/v1/knowledge/:id/supersede", "FVM4", "knowledge-supersede"),
+  excluded("POST", "/v1/knowledge/proposals", "FVM4", "knowledge-proposal"),
+  excluded("POST", "/v1/knowledge/selections", "FVM4", "knowledge-selection"),
+  excluded("POST", "/v1/projects", "FVM4", "project"),
+  excluded("POST", "/v1/projects/:id/retire", "FVM4", "project-retire"),
+  excluded("POST", "/v1/projects/:id/probe", "FVM4", "project-probe"),
+  excluded("PATCH", "/v1/projects/:id", "FVM4", "project-update"),
 ];

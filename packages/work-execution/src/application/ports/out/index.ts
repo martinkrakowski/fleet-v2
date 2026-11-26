@@ -88,6 +88,7 @@ export * from "./ReviewAssessmentPort.out-port.js";
 export * from "./ReviewRequestPort.out-port.js";
 export * from "./ReviewThreadHelperPort.out-port.js";
 export * from "./RunnerForAttemptPort.out-port.js";
+export * from "./RunnerForHostNamePort.out-port.js";
 export * from "./RunnerSelectorPort.out-port.js";
 export * from "./RunTelemetryMarkPort.out-port.js";
 export * from "./RunTelemetryPort.out-port.js";

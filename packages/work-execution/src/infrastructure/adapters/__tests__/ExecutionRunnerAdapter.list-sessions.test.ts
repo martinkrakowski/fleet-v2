@@ -189,6 +189,26 @@ describe('ExecutionRunnerAdapter.listSessions', () => {
     expect(floodStatus.sessions).toEqual(ids.slice(0, 1024));
   });
 
+  it('exit 3 with a JSON payload listing no sessions returns unreadable instead of masking the active session', async () => {
+    const { adapter } = idleAdapter([
+      { exitCode: 3, stdout: '{"sessions": []}', stderr: '' },
+      { exitCode: 3, stdout: '[]', stderr: '' },
+    ]);
+    const emptyJson = await adapter.listSessions({ worktreePath: runnerWorktreePath, runner: runnerRecord });
+    expect(emptyJson).toEqual({
+      ok: false,
+      error: 'unreadable',
+      reason: 'status exit 3 with JSON payload listing no sessions',
+    });
+
+    const emptyArray = await adapter.listSessions({ worktreePath: runnerWorktreePath, runner: runnerRecord });
+    expect(emptyArray).toEqual({
+      ok: false,
+      error: 'unreadable',
+      reason: 'status exit 3 with JSON payload listing no sessions',
+    });
+  });
+
   it('malformed JSON stdout returns unreadable', async () => {
     const { adapter } = idleAdapter([
       { exitCode: 0, stdout: '{"sessions": [ses_a}', stderr: '' },

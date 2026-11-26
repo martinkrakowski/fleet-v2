@@ -1325,7 +1325,23 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       const trimmed = stdout.trim();
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
         try {
-          return parseListSessionsPayload(JSON.parse(trimmed), types.isProxy);
+          const parsed = parseListSessionsPayload(JSON.parse(trimmed), types.isProxy);
+          // Exit 3 means the runner reported at least one active session, so
+          // the payload must agree: a well-formed but empty `sessions` list
+          // contradicts the exit code and is treated as unreadable rather
+          // than masking the runner-reported session from callers.
+          // Exit 3 means the runner reported at least one active session, so
+          // the payload must agree: a well-formed but empty `sessions` list
+          // contradicts the exit code and is treated as unreadable rather
+          // than masking the runner-reported session from callers.
+          if (parsed.ok && parsed.sessions.length === 0) {
+            return {
+              ok: false,
+              error: 'unreadable',
+              reason: 'status exit 3 with JSON payload listing no sessions',
+            };
+          }
+          return parsed;
         } catch {
           return { ok: false, error: 'unreadable', reason: 'Malformed JSON in runner status output' };
         }

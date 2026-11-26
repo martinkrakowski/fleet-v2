@@ -34,10 +34,10 @@ import {
 const isProxy = types.isProxy as (value: unknown) => boolean;
 
 /**
- * The production validators require a proxy detector (their reflection
- * operations are guarded by it), so every call below injects the Node
- * `types.isProxy` detector; a test that omits it exercises the refusal of
- * a missing detector.
+ * The detector is optional in production; the wrappers below inject the
+ * Node `types.isProxy` detector by default so tests exercise the detected
+ * Proxy path, and the `*Impl` functions are called directly where the
+ * detector-less contract is tested.
  */
 function validateMembershipRecord(value: unknown, detector?: unknown) {
   return validateMembershipRecordImpl(value, (detector ?? isProxy) as (v: unknown) => boolean);
@@ -383,37 +383,36 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     expect(trapRan).toBe(false);
   });
 
-  it("refuses validators called without a proxy detector or with a throwing one", () => {
-    // Without a detector the reflection operations could run hostile
-    // Proxy traps, so the detector is required: an omitted or
-    // non-function detector is a typed refusal, never a pass.
-    const rec = validateMembershipRecordImpl(record(), undefined as never);
+  it("works without a detector (three-argument decide) and refuses a non-function or throwing detector", () => {
+    // The three-argument contract decideMembershipChange(members, change, nowIso).
+    const ok = decideMembershipChangeImpl(
+      members(OWNER()),
+      change("add", { actingActor: "alice", actor: "eve", role: "viewer" }),
+      NOW,
+    );
+    expect(ok.ok).toBe(true);
+    if (ok.ok) {
+      expect(ok.members.map((entry) => entry.actor)).toEqual(["alice", "eve"]);
+    }
+    expect(validateMembershipRecordImpl(record()).ok).toBe(true);
+    expect(validateMembersListImpl([record()]).ok).toBe(true);
+    expect(validateMembershipChangeImpl(change("add")).ok).toBe(true);
+    // A supplied detector that is not a function is refused.
+    const rec = validateMembershipRecordImpl(record(), 42 as never);
     expect(rec.ok).toBe(false);
     if (!rec.ok) {
       expect(rec.reason).toBe("proxy-detector-required");
-    }
-    const list = validateMembersListImpl([record()], 42 as never);
-    expect(list.ok).toBe(false);
-    if (!list.ok) {
-      expect(list.reason).toBe("proxy-detector-required");
-    }
-    const changed = validateMembershipChangeImpl(change("add"), null as never);
-    expect(changed.ok).toBe(false);
-    if (!changed.ok) {
-      expect(changed.reason).toBe("proxy-detector-required");
     }
     const decided = decideMembershipChangeImpl(
       [record()],
       change("add", { actor: "eve", role: "viewer" }),
       NOW,
-      undefined as never,
+      null as never,
     );
     expect(decided.ok).toBe(false);
     if (!decided.ok) {
       expect(decided.reason).toBe("proxy-detector-required");
     }
-    // A throwing detector is also refused, and the trap never becomes a
-    // silent pass.
     const throwing = () => {
       throw new Error("detector exploded");
     };
@@ -422,6 +421,83 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     if (!recThrow.ok) {
       expect(recThrow.reason).toBe("detector-threw");
     }
+  });
+
+  it("refuses a Proxy with throwing traps as a typed result when no detector is supplied", () => {
+    const throwingTraps = {
+      getPrototypeOf() {
+        throw new Error("trap");
+      },
+      ownKeys() {
+        throw new Error("trap");
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error("trap");
+      },
+    };
+    const hostileRecord = new Proxy(record(), throwingTraps);
+    const hostileChange = new Proxy(change("add"), throwingTraps);
+    const hostileList = new Proxy([record()], throwingTraps);
+    for (const result of [
+      validateMembershipRecordImpl(hostileRecord),
+      validateMembershipChangeImpl(hostileChange),
+      validateMembersListImpl(hostileList),
+      decideMembershipChangeImpl([record()], hostileChange, NOW),
+      decideMembershipChangeImpl(hostileList, change("add"), NOW),
+    ]) {
+      expect(result.ok).toBe(false);
+    }
+  });
+
+  it("refuses a detectable Proxy passed to validateMembershipChange and as the change of decideMembershipChange, and canActAs never reads a Proxy role", () => {
+    let trapRan = false;
+    const hostile = new Proxy(change("remove", { actor: "bob" }), {
+      get() {
+        trapRan = true;
+        return "alice";
+      },
+      ownKeys() {
+        trapRan = true;
+        return [];
+      },
+      getOwnPropertyDescriptor() {
+        trapRan = true;
+        return undefined;
+      },
+    });
+    const parsed = validateMembershipChange(hostile, isProxy);
+    expect(parsed.ok).toBe(false);
+    const decided = decideMembershipChange(members(OWNER(), VIEWER()), hostile, NOW, isProxy);
+    expect(decided.ok).toBe(false);
+    expect(trapRan).toBe(false);
+    const roleProxy = new Proxy(new String("owner"), {});
+    expect(canActAs(roleProxy, "manage-members")).toBe(false);
+    expect(canActAs("owner", roleProxy)).toBe(false);
+  });
+
+  it("refuses an array whose prototype supplies a getter at a missing index without invoking the getter", () => {
+    let getterRan = false;
+    const hole: unknown[] = new Array(1);
+    const proto = Object.create(Array.prototype);
+    Object.defineProperty(proto, "0", {
+      get() {
+        getterRan = true;
+        throw new Error("inherited getter ran");
+      },
+    });
+    Object.setPrototypeOf(hole, proto);
+    const list = validateMembersList(hole);
+    expect(list.ok).toBe(false);
+    if (!list.ok) {
+      expect(list.reason).toBe("sparse-members-list");
+    }
+    const decided = decideMembershipChange(
+      hole,
+      change("add", { actor: "eve", role: "viewer" }),
+      NOW,
+    );
+    expect(decided.ok).toBe(false);
+    expect(getterRan).toBe(false);
   });
 
   it("refuses prototype-polluting keys", () => {
@@ -701,6 +777,16 @@ describe("decideMembershipChange accepts every valid transition", () => {
       if (!result.ok) {
         expect(result.reason).toBe("not-permitted");
       }
+    }
+    // A maintainer attempting to remove a non-last owner is refused.
+    const maintainerRemovesOwner = decideMembershipChange(
+      members(OWNER(), member("mallory", "owner"), MAINTAINER()),
+      change("remove", { actingActor: "carol", actor: "mallory" }),
+      NOW,
+    );
+    expect(maintainerRemovesOwner.ok).toBe(false);
+    if (!maintainerRemovesOwner.ok) {
+      expect(maintainerRemovesOwner.reason).toBe("not-permitted");
     }
     // A maintainer attempting to demote a non-last owner is refused.
     const maintainerDemotesOwner = decideMembershipChange(

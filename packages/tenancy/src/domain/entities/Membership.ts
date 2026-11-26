@@ -13,13 +13,15 @@
  * are each refused with a typed `{ ok: false, reason }` result, never a
  * throw and never a pass.
  *
- * The proxy detector is a REQUIRED argument on every exported validator.
- * Reflection operations such as `Object.getPrototypeOf` and
- * `Reflect.ownKeys` can run hostile Proxy traps or throw, so no validator
- * ever runs without one: an absent or non-function detector is itself a
- * typed refusal (`proxy-detector-required`), and a detector that throws is
- * refused as `detector-threw`. With the detector in place, a detectable
- * Proxy is refused before any reflection operation runs.
+ * The proxy detector is an OPTIONAL last argument on every exported
+ * validator, so the three-argument `decideMembershipChange(members, change,
+ * nowIso)` contract works. When a detector is supplied, a detectable Proxy
+ * is refused before any reflection operation runs; a supplied value that is
+ * not a function is refused (`proxy-detector-required`) and a detector that
+ * throws is refused as `detector-threw`. Without a detector, every
+ * reflection operation is itself guarded, so a throwing Proxy trap becomes
+ * a typed refusal (a Proxy that lies consistently in every trap is an
+ * accepted residual).
  *
  * Cost bound: `decideMembershipChange` is O(n) over `members` (one
  * validation pass plus one indexing pass), bounded by
@@ -122,6 +124,9 @@ function screenProxy(
   isProxy: unknown,
   value: unknown,
 ): { ok: true; isProxy: boolean } | { ok: false; reason: string } {
+  if (isProxy === undefined) {
+    return { ok: true, isProxy: false };
+  }
   if (typeof isProxy !== "function") {
     return { ok: false, reason: "proxy-detector-required" };
   }
@@ -136,11 +141,24 @@ function screenProxy(
 
 /** True when the value is a plain, non-array object (already screened). */
 function isPlainObject(value: unknown): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
     return false;
   }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+}
+
+/** Array.isArray that refuses (false) instead of throwing on a revoked Proxy. */
+function safeIsArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -153,6 +171,17 @@ function isPlainObject(value: unknown): boolean {
  * set sizes (at most 6 for a record, 5 for a change).
  */
 function inspectOwnKeys(
+  value: object,
+  allowedKeys: ReadonlySet<string>,
+): string | null {
+  try {
+    return inspectOwnKeysUnguarded(value, allowedKeys);
+  } catch {
+    return "invalid-input";
+  }
+}
+
+function inspectOwnKeysUnguarded(
   value: object,
   allowedKeys: ReadonlySet<string>,
 ): string | null {
@@ -218,7 +247,7 @@ function checkRecordFields(record: Record<string, unknown>): string | null {
  */
 export function validateMembershipRecord(
   value: unknown,
-  isProxy: IsProxy,
+  isProxy?: IsProxy,
 ): { ok: true; record: MembershipRecord } | { ok: false; reason: string } {
   const screened = screenProxy(isProxy, value);
   if (!screened.ok) {
@@ -266,13 +295,13 @@ export function validateMembershipRecord(
  */
 export function validateMembersList(
   members: unknown,
-  isProxy: IsProxy,
+  isProxy?: IsProxy,
 ): { ok: true; members: readonly MembershipRecord[] } | { ok: false; reason: string } {
   const listScreen = screenProxy(isProxy, members);
   if (!listScreen.ok) {
     return { ok: false, reason: listScreen.reason };
   }
-  if (typeof members !== "object" || members === null || !Array.isArray(members)) {
+  if (typeof members !== "object" || members === null || !safeIsArray(members)) {
     return { ok: false, reason: "invalid-members-list" };
   }
   if (listScreen.isProxy) {
@@ -287,30 +316,46 @@ export function validateMembersList(
   // descriptor and never invoked. `length` is a built-in own
   // non-enumerable property and is skipped; the scan is O(n + k), still
   // bounded by MAX_MEMBERS plus any extra own keys.
-  for (const key of Reflect.ownKeys(array as object)) {
-    if (typeof key !== "string") {
-      return { ok: false, reason: "invalid-members-list" };
+  try {
+    for (const key of Reflect.ownKeys(array as object)) {
+      if (typeof key !== "string") {
+        return { ok: false, reason: "invalid-members-list" };
+      }
+      if (key === "length") {
+        continue;
+      }
+      if (FORBIDDEN_KEY_SET.has(key)) {
+        return { ok: false, reason: "forbidden-key" };
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(array, key);
+      if (descriptor !== undefined && "get" in descriptor) {
+        return { ok: false, reason: "getter-not-allowed" };
+      }
     }
-    if (key === "length") {
-      continue;
-    }
-    if (FORBIDDEN_KEY_SET.has(key)) {
-      return { ok: false, reason: "forbidden-key" };
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(array, key);
-    if (descriptor !== undefined && "get" in descriptor) {
-      return { ok: false, reason: "getter-not-allowed" };
-    }
+  } catch {
+    return { ok: false, reason: "invalid-members-list" };
   }
   // Length is already bounded above, so this single pass is O(n) with
   // n <= MAX_MEMBERS. Each element becomes a frozen validated copy; the
   // caller's array and its elements are never mutated.
   const validated: MembershipRecord[] = [];
   for (let i = 0; i < array.length; i += 1) {
-    if (!(i in array)) {
+    // Read through the OWN property descriptor only: `i in array` is true
+    // for an index supplied by the prototype, and `array[i]` would then run
+    // an inherited getter. An index with no own descriptor is a hole.
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(array, i);
+    } catch {
+      return { ok: false, reason: "invalid-members-list" };
+    }
+    if (descriptor === undefined) {
       return { ok: false, reason: "sparse-members-list" };
     }
-    const element = validateMembershipRecord(array[i], isProxy);
+    if (!("value" in descriptor)) {
+      return { ok: false, reason: "getter-not-allowed" };
+    }
+    const element = validateMembershipRecord(descriptor.value, isProxy);
     if (!element.ok) {
       return {
         ok: false,
@@ -331,7 +376,7 @@ export function validateMembersList(
  */
 export function validateMembershipChange(
   change: unknown,
-  isProxy: IsProxy,
+  isProxy?: IsProxy,
 ): { ok: true; change: MembershipChange } | { ok: false; reason: string } {
   const screened = screenProxy(isProxy, change);
   if (!screened.ok) {
@@ -409,7 +454,7 @@ export function decideMembershipChange(
   members: unknown,
   change: unknown,
   nowIso: unknown,
-  isProxy: IsProxy,
+  isProxy?: IsProxy,
 ): MembershipDecision {
   const detectorCheck = screenProxy(isProxy, null);
   if (!detectorCheck.ok) {

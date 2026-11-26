@@ -9,7 +9,8 @@
  *
  * Hostile-input posture: the manifest content is untrusted file content. The
  * test refuses non-object parses (null, arrays, primitives) explicitly and
- * reads `dependencies` only through a plain-object check, so a malformed
+ * reads `dependencies` only through a plain-object check that also refuses
+ * array-like shapes (an own `length` key or array-index keys), so a malformed
  * manifest is a failed assertion, never a pass. A dependencies map carrying a
  * prototype-polluting own key (`__proto__`, `constructor` or `prototype`) is
  * refused with a named error, never silently filtered away. No getter or
@@ -43,12 +44,34 @@ const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set([
   "prototype",
 ]);
 
+// A canonical array-index own key (`"0"`, `"1"`, ...) marks an array-like
+// shape. The check costs one O(k) pass over the k own keys with a
+// constant-time test per key.
+const ARRAY_INDEX_KEY = /^(?:0|[1-9]\d*)$/;
+
 function fleetDependencyNames(pkg: Record<string, unknown>): string[] {
   const dependencies = pkg.dependencies;
   if (!isPlainObject(dependencies)) {
     throw new Error("package.json dependencies is not a plain object");
   }
   const names = Object.keys(dependencies);
+  // An array-like dependencies map (own `length`, with or without array-index
+  // keys) is refused outright: the scan must not treat a host object wearing
+  // an array shape as a dependency map, and the `length` field must never be
+  // silently ignored. This costs one O(k) pass over the own keys with a
+  // constant-time test per key.
+  if (Object.prototype.hasOwnProperty.call(dependencies, "length")) {
+    throw new Error(
+      "package.json dependencies is array-like (own length key), not a plain dependency map",
+    );
+  }
+  for (const name of names) {
+    if (ARRAY_INDEX_KEY.test(name)) {
+      throw new Error(
+        `package.json dependencies is array-like (own array-index key ${name})`,
+      );
+    }
+  }
   for (const name of names) {
     if (PROTOTYPE_POLLUTING_KEYS.has(name)) {
       throw new Error(
@@ -95,6 +118,33 @@ describe("@fleet/tenancy scaffold", () => {
           ),
         );
       }
+    },
+  );
+
+  it(
+    "the dependency scan refuses an array-like dependencies map (own length key, with or without array-index keys, including an enormous length) as a named error instead of ignoring the length field and passing",
+    () => {
+      expect.assertions(4);
+      // Built at runtime: JSON.parse defines real own data properties, the
+      // shape a hostile manifest would carry.
+      expect(() =>
+        fleetDependencyNames({ dependencies: JSON.parse(`{"length": 3}`) }),
+      ).toThrowError(/dependencies is array-like \(own length key\)/);
+      expect(() =>
+        fleetDependencyNames({
+          dependencies: JSON.parse(`{"length": ${"9".repeat(30)}}`),
+        }),
+      ).toThrowError(/dependencies is array-like \(own length key\)/);
+      expect(() =>
+        fleetDependencyNames({
+          dependencies: JSON.parse(`{"0": "@fleet/rogue"}`),
+        }),
+      ).toThrowError(/dependencies is array-like \(own array-index key 0\)/);
+      expect(() =>
+        fleetDependencyNames({
+          dependencies: JSON.parse(`{"length": 2, "0": "@fleet/rogue"}`),
+        }),
+      ).toThrowError(/dependencies is array-like \(own length key\)/);
     },
   );
 

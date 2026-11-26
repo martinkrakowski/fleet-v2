@@ -107,16 +107,17 @@ export function describeProjectRepositoryContract(
       expect(unchanged.revision).toBe(0);
     });
 
-    it('refuses saveProject with invalid-record when expectedRevision is the largest safe integer because revision + 1 would overflow', async () => {
+    it('refuses saveProject with stale-revision when expectedRevision is the largest safe integer but the stored revision does not match', async () => {
       const port = createPort();
       await port.createProject(makeProject());
       const stored = (await port.findProject('org-a', 'proj-1'))!;
-      // The increment `MAX_SAFE_INTEGER + 1` would leave the safe-integer
-      // range, so the compare-and-swap is refused before any state changes —
-      // regardless of the stored revision (here 0).
+      // A mismatched revision is a stale-revision refusal, never
+      // invalid-record: the overflow guard only applies when the stored
+      // revision actually equals expectedRevision (see the file-mode test
+      // seeding the store at the overflow boundary).
       expect(await port.saveProject(stored.record, Number.MAX_SAFE_INTEGER)).toEqual({
         status: 'refused',
-        reason: 'invalid-record',
+        reason: 'stale-revision',
       });
       const unchanged = (await port.findProject('org-a', 'proj-1'))!;
       expect(unchanged.record.displayName).toBe('Project 1');

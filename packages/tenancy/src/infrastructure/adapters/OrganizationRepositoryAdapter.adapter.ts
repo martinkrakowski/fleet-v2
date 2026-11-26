@@ -500,13 +500,6 @@ export class OrganizationRepositoryAdapter implements OrganizationRepositoryPort
       // Cost bound: O(1) — fixed numeric checks.
       return { status: 'refused', reason: 'invalid-record' };
     }
-    if (expectedRevision === Number.MAX_SAFE_INTEGER) {
-      // Overflow guard: the compare-and-swap would store `expectedRevision + 1`,
-      // which leaves the safe-integer range — a revision that is persisted but
-      // rejected on read. Refuse before the in-memory map or the store file is
-      // touched. Cost bound: O(1) — one comparison.
-      return { status: 'refused', reason: 'invalid-record' };
-    }
     const snapshot = snapshotProjectInput(record);
     if (!snapshot.ok) {
       return { status: 'refused', reason: 'invalid-record' };
@@ -554,6 +547,14 @@ export class OrganizationRepositoryAdapter implements OrganizationRepositoryPort
       if (stored.revision !== expectedRevision) {
         return { status: 'refused', reason: 'stale-revision' };
       }
+      if (expectedRevision === Number.MAX_SAFE_INTEGER) {
+        // Overflow guard: the compare-and-swap would store `expectedRevision + 1`,
+        // which leaves the safe-integer range — a revision that is persisted but
+        // rejected on read. Refuse only when the revision actually matches, so a
+        // mismatched revision still reports stale-revision. Cost bound: O(1) —
+        // one comparison.
+        return { status: 'refused', reason: 'invalid-record' };
+      }
       revision = expectedRevision + 1;
     }
     // Store copies so a caller retaining a mutable alias cannot change the
@@ -594,6 +595,12 @@ export class OrganizationRepositoryAdapter implements OrganizationRepositoryPort
         }
         if (stored.revision !== expectedRevision) {
           outcome = { status: 'refused', reason: 'stale-revision' };
+          return;
+        }
+        if (expectedRevision === Number.MAX_SAFE_INTEGER) {
+          // Overflow guard: see writeProjectInMemory — refuse only on a
+          // matching revision, before touching disk. Cost bound: O(1).
+          outcome = { status: 'refused', reason: 'invalid-record' };
           return;
         }
         revision = expectedRevision + 1;

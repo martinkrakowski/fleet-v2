@@ -26,6 +26,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
-    "@fleet/shared": "workspace:*"
+    "@fleet/shared": "workspace:*",
+    "@fleet/work-execution": "workspace:*"
   }
 }

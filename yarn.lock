@@ -467,6 +467,7 @@ __metadata:
   dependencies:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/shared": "workspace:*"
+    "@fleet/work-execution": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"
@@ -591,6 +592,7 @@ __metadata:
   dependencies:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/installation": "workspace:*"
+    "@fleet/shared": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

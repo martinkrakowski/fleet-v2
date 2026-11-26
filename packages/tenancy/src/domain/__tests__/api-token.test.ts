@@ -417,6 +417,21 @@ describe("hostile inputs", () => {
     }
   });
 
+  it("refuses a null, primitive, or array record branch as invalid-record without throwing", () => {
+    // `snapshotPlainData` accepts null, primitives and arrays at the
+    // `record` branch; reaching Reflect.ownKeys on one of them would throw.
+    for (const record of [null, undefined, 42, "record", true, []]) {
+      expect(decideApiTokenUse(useInput({ record }))).toEqual({
+        outcome: "refused",
+        reason: "invalid-record",
+      });
+      expect(decideApiTokenRotation(rotationInput({ record }))).toEqual({
+        outcome: "refused",
+        reason: "invalid-record",
+      });
+    }
+  });
+
   it("refuses non-array, non-iterable, and array-like scopes", () => {
     for (const scopes of [{ length: 1, 0: "read" }, "read", 42, {}]) {
       const record = validRecord({ scopes });

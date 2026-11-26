@@ -146,6 +146,19 @@ const WRAPPER_LIMITS = Object.freeze({
   maxStringLength: MAX_STRING_LENGTH,
 });
 
+/**
+ * Narrow a wrapper's `record` branch: `snapshotPlainData` accepts `null`,
+ * primitives and arrays, so the branch is verified to be a non-null
+ * non-array plain object before `buildRecord` screens its own keys.
+ * Returns null otherwise. Cost bound: O(1).
+ */
+function wrapperRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
 /** `parseApiTokenRecord`: any snapshot path is `invalid-record`. */
 const INVALID_RECORD: ApiTokenParseResult = { outcome: "refused", reason: "invalid-record" };
 const INVALID_INPUT: ApiTokenRefusalReason = "invalid-input";
@@ -395,7 +408,11 @@ export function decideApiTokenUse(input: unknown, isProxy?: IsProxy): ApiTokenUs
   if (!isValidTimestamp(snapRecord.nowIso)) {
     return { outcome: "refused", reason: INVALID_INPUT };
   }
-  const record = buildRecord(snapRecord.record as Record<string, unknown>);
+  const recordSnap = wrapperRecord(snapRecord.record);
+  if (recordSnap === null) {
+    return { outcome: "refused", reason: "invalid-record" };
+  }
+  const record = buildRecord(recordSnap);
   if (record === null) {
     return { outcome: "refused", reason: "invalid-record" };
   }
@@ -470,7 +487,11 @@ export function decideApiTokenRotation(input: unknown, isProxy?: IsProxy): ApiTo
   if (!isValidActorId(snapRecord.newTokenId)) {
     return { outcome: "refused", reason: INVALID_INPUT };
   }
-  const record = buildRecord(snapRecord.record as Record<string, unknown>);
+  const recordSnap = wrapperRecord(snapRecord.record);
+  if (recordSnap === null) {
+    return { outcome: "refused", reason: "invalid-record" };
+  }
+  const record = buildRecord(recordSnap);
   if (record === null) {
     return { outcome: "refused", reason: "invalid-record" };
   }

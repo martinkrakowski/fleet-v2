@@ -48,7 +48,13 @@ export interface AcceptanceFacts {
   readonly acceptanceRejection: 'review-findings' | 'other';
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
+  readonly pr: {
+    readonly state: 'open' | 'merged' | 'closed';
+    readonly head12: string;
+    /** The snapshot's full head sha, as the forge reported it (fix round 1: the 12-char prefix alone cannot distinguish heads). */
+    readonly headSha?: string;
+    readonly containsLaneHead: boolean;
+  } | null;
   readonly merge: MergeFacts;
 }
 
@@ -417,7 +423,7 @@ async function prFactOf(
       containsLaneHead = await containsLaneHeadOf(ancestry, laneHeadSha, read.pullRequest.headSha);
     }
     return {
-      pr: { state: read.pullRequest.state, head12, containsLaneHead },
+      pr: { state: read.pullRequest.state, head12, headSha: read.pullRequest.headSha, containsLaneHead },
     };
   } catch {
     return { pr: null };

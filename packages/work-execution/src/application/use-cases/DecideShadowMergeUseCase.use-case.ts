@@ -22,6 +22,7 @@ import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.o
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
+import { isSupersedablePredecessor } from '../../domain/merge-queue-operations.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
@@ -303,9 +304,12 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
   }
 
   /**
-   * Read-only peek at the real merge queue: `queued` when an entry in state
-   * `queued` exists for this exact repository, pull request and head,
-   * `not-queued` when none does (parked, dropped, another head, or absent),
+   * Read-only peek at the real merge queue: `queued` when a live entry exists
+   * for this repository and pull request: `queued` or `ready` at the requested
+   * head, or `queued`, `ready` or `parked` with reason `update-refused` at a
+   * different head (superseded by the requested head, by the same predicate
+   * `decideMergeEnqueue` uses). `not-queued` when none does (any other parked
+   * reason, dropped, merged, superseded, unknown state, or absent),
    * `unreadable` when the peek fails or is malformed (fail closed).
    */
   private async queueEntryState(
@@ -331,11 +335,16 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     const found = (records as readonly unknown[]).some((record) => {
       try {
         const entry = record as MergeQueueEntryRecord;
-        return (
-          entry.state === 'queued' &&
-          entry.repoDigest === request.repoDigest &&
-          sameMergeQueueIdentity(entry, target)
-        );
+        if (entry.repoDigest !== request.repoDigest) {
+          return false;
+        }
+        const live = entry.state === 'queued' || entry.state === 'ready';
+        if (live && sameMergeQueueIdentity(entry, target)) {
+          return true;
+        }
+        const supersedable =
+          live || (entry.state === 'parked' && entry.reason === 'update-refused');
+        return supersedable && isSupersedablePredecessor(entry, target);
       } catch {
         return false;
       }

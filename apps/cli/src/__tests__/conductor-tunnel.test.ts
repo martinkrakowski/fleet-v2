@@ -14,14 +14,20 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { RunConductorPassResult } from '@fleet/work-execution';
-import { resolveConductorPolicy } from '@fleet/installation';
+import { resolveConductorPolicy, type FleetInstallation } from '@fleet/installation';
 
-import { createFleetCliRuntime, resolveRunnerTunnelTarget, type FleetCliRuntime } from '../composition.js';
+import {
+  createFleetCliRuntime,
+  resolveRunnerTunnelTarget,
+  resolveRunnerTunnelTargets,
+  type FleetCliRuntime,
+} from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import type { ConductorDriver } from '../conductor-wiring.js';
 import {
   RunnerTunnelAdapter,
+  RunnerTunnelSetAdapter,
   type RunnerTunnelPort,
   type RunnerTunnelStartOutcome,
   type TunnelChild,
@@ -683,5 +689,391 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(result.stderr.filter((line) => line.includes('the runner tunnel child exited'))).toHaveLength(1);
     await tunnel.stop();
     expect(child.killCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G2: one tunnel per ssh lane-runner host (RunnerTunnelSetAdapter)
+// ---------------------------------------------------------------------------
+
+const RUNNER_CAPABILITIES = {
+  networkEgressRestricted: true,
+  cpuAndMemoryLimited: true,
+  processTreeTermination: true,
+  filesystemScope: 'scoped-worktree',
+} as const;
+
+/** A sunrise-shaped ssh opencode lane-runner host on its own port. */
+function sshHostFixture(alias: string, port: number): Record<string, unknown> {
+  return {
+    transport: 'ssh',
+    sshAlias: alias,
+    worktreeRoot: `/tmp/fleet-g2-${alias}-worktrees`,
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+  };
+}
+
+/** A local host that also runs lanes (opencode runner, as the real files carry). */
+function localLaneRunnerFixture(): Record<string, unknown> {
+  return {
+    transport: 'local',
+    worktreeRoot: '/tmp/fleet-g2-local-worktrees',
+    roles: ['orchestrator', 'lane-runner'],
+    runner: { kind: 'opencode', port: 4166, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+  };
+}
+
+function installationWithHosts(hosts: Record<string, unknown>): FleetInstallation {
+  return {
+    schemaVersion: 2,
+    hosts,
+    forge: { mode: 'none' },
+  } as FleetInstallation;
+}
+
+/** A member adapter that opens its forward: probe answers closed once, then open. */
+function openingMember(
+  sshHost: string,
+  remotePort: number,
+  argvs: string[][],
+  probed: number[],
+): { readonly adapter: RunnerTunnelAdapter; readonly child: FakeChild } {
+  const child = fakeChild();
+  let probes = 0;
+  const adapter = new RunnerTunnelAdapter({
+    sshHost,
+    remotePort,
+    isPortListening: async (port) => {
+      probed.push(port);
+      probes += 1;
+      return probes > 1;
+    },
+    spawner: (argv) => {
+      argvs.push([...argv]);
+      return child;
+    },
+    sleep: async () => undefined,
+  });
+  return { adapter, child };
+}
+
+describe('RunnerTunnelSetAdapter (G2)', () => {
+  it('two ssh opencode lane-runner hosts on ports 4166 and 4266 yield two targets and each forward dials its own alias and port pair', async () => {
+    const installation = installationWithHosts({
+      'runner-a': sshHostFixture('alias-a', 4166),
+      'runner-b': sshHostFixture('alias-b', 4266),
+    });
+    expect(resolveRunnerTunnelTargets(installation)).toEqual([
+      { hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 },
+      { hostName: 'runner-b', sshHost: 'alias-b', remotePort: 4266 },
+    ]);
+    const argvs: string[][] = [];
+    const probed: number[] = [];
+    const set = new RunnerTunnelSetAdapter([
+      openingMember('alias-a', 4166, argvs, probed).adapter,
+      openingMember('alias-b', 4266, argvs, probed).adapter,
+    ]);
+    expect(await set.ensureTunnel()).toBe('opened');
+    expect(set.owned).toBe(true);
+    // The set probed (and opened) exactly the two dial ports 4167 and 4267.
+    expect([...new Set(probed)].sort((a, b) => a - b)).toEqual([4167, 4267]);
+    expect(argvs).toEqual([
+      [
+        'ssh',
+        '-N',
+        '-o',
+        'ExitOnForwardFailure=yes',
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'ServerAliveInterval=30',
+        '-o',
+        'ServerAliveCountMax=3',
+        '-L',
+        '127.0.0.1:4167:127.0.0.1:4166',
+        '--',
+        'alias-a',
+      ],
+      [
+        'ssh',
+        '-N',
+        '-o',
+        'ExitOnForwardFailure=yes',
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'ServerAliveInterval=30',
+        '-o',
+        'ServerAliveCountMax=3',
+        '-L',
+        '127.0.0.1:4267:127.0.0.1:4266',
+        '--',
+        'alias-b',
+      ],
+    ]);
+    await set.stop();
+    expect(set.owned).toBe(false);
+  });
+
+  it('failure of the second member makes ensureTunnel answer failed, stops the first, and never spawns a third', async () => {
+    const argvs: string[][] = [];
+    const probed: number[] = [];
+    const first = openingMember('alias-a', 4166, argvs, probed);
+    // The second member refuses before spawning (an option-shaped alias), so a
+    // spawn on it would itself be a bug; the third must never even be asked.
+    const second = new RunnerTunnelAdapter({
+      sshHost: '-oProxyCommand=x',
+      remotePort: 4266,
+      isPortListening: async () => {
+        probed.push(4267);
+        return false;
+      },
+      spawner: () => {
+        throw new Error('the failing member must never spawn');
+      },
+      sleep: async () => undefined,
+    });
+    const third = openingMember('alias-c', 4366, argvs, probed);
+    const set = new RunnerTunnelSetAdapter([first.adapter, second, third.adapter]);
+    expect(await set.ensureTunnel()).toBe('failed');
+    // The first member's owned child was stopped (not orphaned) ...
+    expect(first.child.killCalls).toHaveLength(1);
+    expect(set.owned).toBe(false);
+    // ... and the third member was never asked to spawn anything.
+    expect(argvs).toHaveLength(1);
+    expect(probed.filter((port) => port === 4367)).toHaveLength(0);
+  });
+
+  it('an empty RunnerTunnelSetAdapter answers not-applicable', async () => {
+    const set = new RunnerTunnelSetAdapter([]);
+    expect(await set.ensureTunnel()).toBe('not-applicable');
+    expect(set.owned).toBe(false);
+    await expect(set.stop()).resolves.toBeUndefined();
+    await expect(set.release()).resolves.toBeUndefined();
+  });
+
+  it('refuses two members with the same dial port without spawning', async () => {
+    let spawns = 0;
+    const memberOf = (): RunnerTunnelAdapter =>
+      new RunnerTunnelAdapter({
+        sshHost: 'alias-a',
+        remotePort: 4166,
+        isPortListening: async () => false,
+        spawner: () => {
+          spawns += 1;
+          return fakeChild();
+        },
+        sleep: async () => undefined,
+      });
+    const set = new RunnerTunnelSetAdapter([memberOf(), memberOf()]);
+    expect(await set.ensureTunnel()).toBe('failed');
+    expect(spawns).toBe(0);
+    expect(set.owned).toBe(false);
+  });
+
+  it('stop and release reach every member even when the first throws', async () => {
+    const first = new RunnerTunnelAdapter({});
+    const second = new RunnerTunnelAdapter({});
+    const calls: string[] = [];
+    Object.defineProperty(first, 'stop', {
+      value: async () => {
+        calls.push('first-stop');
+        throw new Error('stop blew up');
+      },
+    });
+    Object.defineProperty(second, 'stop', {
+      value: async () => {
+        calls.push('second-stop');
+      },
+    });
+    Object.defineProperty(first, 'release', {
+      value: async () => {
+        calls.push('first-release');
+        throw new Error('release blew up');
+      },
+    });
+    Object.defineProperty(second, 'release', {
+      value: async () => {
+        calls.push('second-release');
+      },
+    });
+    const set = new RunnerTunnelSetAdapter([first, second]);
+    await expect(set.stop()).resolves.toBeUndefined();
+    await expect(set.release()).resolves.toBeUndefined();
+    expect(calls).toEqual(['first-stop', 'second-stop', 'first-release', 'second-release']);
+  });
+
+  it('RunnerTunnelSetAdapter refuses non-arrays, array holes, getters, non-adapters, and oversized inputs', () => {
+    const adapter = new RunnerTunnelAdapter({});
+    const asMembers = (value: unknown): readonly RunnerTunnelAdapter[] => value as readonly RunnerTunnelAdapter[];
+    expect(() => new RunnerTunnelSetAdapter(asMembers(null))).toThrow(TypeError);
+    expect(() => new RunnerTunnelSetAdapter(asMembers(undefined))).toThrow(TypeError);
+    expect(() => new RunnerTunnelSetAdapter(asMembers('ab'))).toThrow(TypeError);
+    expect(() => new RunnerTunnelSetAdapter(asMembers({ length: 2 }))).toThrow(TypeError);
+    const sparse: RunnerTunnelAdapter[] = new Array(3);
+    sparse[0] = adapter;
+    sparse[2] = adapter;
+    expect(() => new RunnerTunnelSetAdapter(sparse)).toThrow(TypeError);
+    const withGetter: RunnerTunnelAdapter[] = [adapter];
+    Object.defineProperty(withGetter, 0, {
+      enumerable: true,
+      get: () => adapter,
+    });
+    expect(() => new RunnerTunnelSetAdapter(withGetter)).toThrow(TypeError);
+    expect(() => new RunnerTunnelSetAdapter(asMembers(['not-an-adapter']))).toThrow(TypeError);
+    expect(() => new RunnerTunnelSetAdapter(new Array(1025).fill(adapter))).toThrow(TypeError);
+  });
+});
+
+describe('resolveRunnerTunnelTargets (G2)', () => {
+  it('one ssh host plus one local host yields one target; agy and unusable alias or port yield none', () => {
+    const installation = installationWithHosts({
+      'runner-a': sshHostFixture('alias-a', 4166),
+      here: localLaneRunnerFixture(),
+      agyHost: {
+        transport: 'ssh',
+        sshAlias: 'alias-c',
+        worktreeRoot: '/tmp/fleet-g2-agy-worktrees',
+        roles: ['lane-runner'],
+        runner: { kind: 'agy', port: 4366, agyMode: 'edit-only' },
+      },
+      badAlias: sshHostFixture('-bad alias', 4466),
+      notRunner: {
+        transport: 'ssh',
+        sshAlias: 'alias-e',
+        worktreeRoot: '/tmp/fleet-g2-not-runner-worktrees',
+        roles: ['orchestrator', 'verifier'],
+        runner: { kind: 'opencode', port: 4566, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+      },
+    });
+    expect(resolveRunnerTunnelTargets(installation)).toEqual([
+      { hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 },
+    ]);
+    for (const port of [0, 65535, 1.5, Number.NaN]) {
+      expect(resolveRunnerTunnelTargets(installationWithHosts({ badPort: sshHostFixture('alias-d', port) }))).toEqual([]);
+    }
+  });
+
+  it('one opencode ssh lane-runner host plus one agy ssh lane-runner host yields one target, and the runtime keeps a single adapter', () => {
+    const installation = installationWithHosts({
+      'runner-a': sshHostFixture('alias-a', 4166),
+      agyHost: {
+        transport: 'ssh',
+        sshAlias: 'alias-b',
+        worktreeRoot: '/tmp/fleet-g2-agy-worktrees',
+        roles: ['lane-runner'],
+        runner: { kind: 'agy', port: 4266, agyMode: 'edit-only' },
+      },
+    });
+    expect(resolveRunnerTunnelTargets(installation)).toEqual([
+      { hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 },
+    ]);
+    const runtime = createFleetCliRuntime({
+      stateDir: tempStateDir(),
+      installation,
+      runSubprocess: () => {
+        throw new Error('the conductor must never dispatch a subprocess');
+      },
+    });
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelAdapter);
+    expect(runtime.runnerTunnel).not.toBeInstanceOf(RunnerTunnelSetAdapter);
+  });
+
+  it('v1 and absent installations yield no tunnel targets', () => {
+    expect(resolveRunnerTunnelTargets({ schemaVersion: 1 } as FleetInstallation)).toEqual([]);
+    expect(resolveRunnerTunnelTargets()).toEqual([]);
+  });
+
+  it('resolveRunnerTunnelTargets refuses null, non-objects, prototype-polluting keys, and getters without invoking them', () => {
+    const asInstallation = (value: unknown): FleetInstallation | undefined =>
+      value as FleetInstallation | undefined;
+    expect(resolveRunnerTunnelTargets(asInstallation(null))).toEqual([]);
+    expect(resolveRunnerTunnelTargets(asInstallation(42))).toEqual([]);
+    expect(resolveRunnerTunnelTargets(asInstallation('nope'))).toEqual([]);
+    expect(resolveRunnerTunnelTargets(asInstallation([]))).toEqual([]);
+    // A hosts section that is not a plain object (string or array) yields none.
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: 'no' }))).toEqual([]);
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: [] }))).toEqual([]);
+    // Prototype-polluting keys are skipped, never read.
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      const hosts: Record<string, unknown> = {};
+      Object.defineProperty(hosts, key, {
+        enumerable: true,
+        writable: true,
+        configurable: true,
+        value: sshHostFixture('alias-a', 4166),
+      });
+      expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts }))).toEqual([]);
+    }
+    // A getter on a hosts key (and on `hosts` itself) is never invoked.
+    const getterHosts: Record<string, unknown> = {};
+    Object.defineProperty(getterHosts, 'runner-a', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('the hosts getter must never run');
+      },
+    });
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: getterHosts }))).toEqual([]);
+    const getterInstallation: Record<string, unknown> = { schemaVersion: 2 };
+    Object.defineProperty(getterInstallation, 'hosts', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('the installation hosts getter must never run');
+      },
+    });
+    expect(resolveRunnerTunnelTargets(asInstallation(getterInstallation))).toEqual([]);
+    // A getter on a host entry's own field skips that entry.
+    const hostileHost: Record<string, unknown> = { ...sshHostFixture('alias-a', 4166) };
+    Object.defineProperty(hostileHost, 'transport', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('the host transport getter must never run');
+      },
+    });
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': hostileHost } }))).toEqual(
+      [],
+    );
+  });
+});
+
+describe('conductor run tunnel wiring (G2)', () => {
+  function runtimeOfInstallation(installation: FleetInstallation): FleetCliRuntime {
+    return createFleetCliRuntime({
+      stateDir: tempStateDir(),
+      installation,
+      runSubprocess: () => {
+        throw new Error('the conductor must never dispatch a subprocess');
+      },
+    });
+  }
+
+  it('two-host ssh opencode v2 installation gives the set adapter', () => {
+    const runtime = runtimeOfInstallation(
+      installationWithHosts({
+        'runner-a': sshHostFixture('alias-a', 4166),
+        'runner-b': sshHostFixture('alias-b', 4266),
+      }),
+    );
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelSetAdapter);
+  });
+
+  it('single-host ssh opencode v2 installation gives the single adapter', () => {
+    const runtime = runtimeOfInstallation(installationWithHosts({ 'runner-a': sshHostFixture('alias-a', 4166) }));
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelAdapter);
+    expect(runtime.runnerTunnel).not.toBeInstanceOf(RunnerTunnelSetAdapter);
+  });
+
+  it('local-first plus ssh-second opencode v2 installation gives the set adapter', () => {
+    const runtime = runtimeOfInstallation(
+      installationWithHosts({
+        here: localLaneRunnerFixture(),
+        'runner-b': sshHostFixture('alias-b', 4266),
+      }),
+    );
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelSetAdapter);
   });
 });

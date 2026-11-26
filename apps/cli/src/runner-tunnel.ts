@@ -84,7 +84,7 @@ const DEFAULT_POLL_MS = 250;
  * (mirrors `bin/ocm-run`'s own `OCM_HOST` check). `-oProxyCommand=…` is the
  * shape this refuses.
  */
-function isUsableSshHost(host: string): boolean {
+export function isUsableSshHost(host: string): boolean {
   if (host.startsWith('-') || /\s/u.test(host)) {
     return false;
   }
@@ -168,6 +168,11 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
   /** Whether an owned child is currently held. */
   get owned(): boolean {
     return this.child !== null;
+  }
+
+  /** The dial port this member would forward, or null without a usable target. */
+  resolvedDialPort(): number | null {
+    return this.dialPort();
   }
 
   /** One probe that never throws: a failing probe reads as "not listening". */
@@ -302,5 +307,112 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     // running for the detached lanes and later drivers find it listening.
     this.child = null;
     child.release();
+  }
+}
+
+/** The member cap: a bound on the constructor's validation cost, O(members.length). */
+const MAX_TUNNEL_MEMBERS = 1024;
+
+/**
+ * G2: every `ssh` `opencode` `lane-runner` host of a v2 installation gets one
+ * `ssh -N -L` forward, not only the selected one. The members arrive already
+ * built (each with its own target and injected test seams); this set starts
+ * them one after another, refuses before spawning anything when two members
+ * would bind the same dial port, and on the first failing member stops every
+ * member it already opened so no child is orphaned.
+ */
+export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
+  private readonly members: readonly RunnerTunnelAdapter[];
+
+  constructor(members: readonly RunnerTunnelAdapter[]) {
+    // Hostile input, cost O(members.length) capped at 1024: only dense arrays
+    // of real adapters are accepted, and every index is read through its own
+    // property descriptor (a getter is never invoked).
+    if (!Array.isArray(members)) {
+      throw new TypeError('RunnerTunnelSetAdapter: members must be an array');
+    }
+    if (members.length > MAX_TUNNEL_MEMBERS) {
+      throw new TypeError(`RunnerTunnelSetAdapter: more than ${MAX_TUNNEL_MEMBERS} members`);
+    }
+    for (let i = 0; i < members.length; i += 1) {
+      if (!(i in members)) {
+        throw new TypeError(`RunnerTunnelSetAdapter: hole at index ${i}`);
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(members, i);
+      if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+        throw new TypeError(`RunnerTunnelSetAdapter: accessor at index ${i}`);
+      }
+      if (!(descriptor?.value instanceof RunnerTunnelAdapter)) {
+        throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} is not a RunnerTunnelAdapter`);
+      }
+    }
+    // Copy by validated index, never by spread (a Proxy's traps stay uninvoked).
+    const copy: RunnerTunnelAdapter[] = [];
+    for (let i = 0; i < members.length; i += 1) {
+      copy.push(members[i] as RunnerTunnelAdapter);
+    }
+    this.members = copy;
+  }
+
+  /** Whether any member currently holds an owned child. */
+  get owned(): boolean {
+    return this.members.some((member) => member.owned);
+  }
+
+  async ensureTunnel(
+    handlers: { readonly onEarlyExit?: () => void } = {},
+  ): Promise<RunnerTunnelStartOutcome> {
+    if (this.members.length === 0) {
+      return 'not-applicable';
+    }
+    // Every dial port is resolved before anything spawns: two members aimed at
+    // the same dial port would fight over one bind, so the set refuses first.
+    const seenPorts = new Set<number>();
+    for (const member of this.members) {
+      const dial = member.resolvedDialPort();
+      if (dial === null) {
+        continue;
+      }
+      if (seenPorts.has(dial)) {
+        return 'failed';
+      }
+      seenPorts.add(dial);
+    }
+    let opened = 0;
+    let listening = 0;
+    for (const member of this.members) {
+      let outcome: RunnerTunnelStartOutcome;
+      try {
+        outcome = await member.ensureTunnel(handlers);
+      } catch {
+        outcome = 'failed';
+      }
+      if (outcome === 'failed') {
+        // Best-effort cleanup: no earlier member's child may be orphaned.
+        await this.stop().catch(() => undefined);
+        return 'failed';
+      }
+      if (outcome === 'opened') {
+        opened += 1;
+      }
+      if (outcome === 'already-listening') {
+        listening += 1;
+      }
+    }
+    if (opened > 0) {
+      return 'opened';
+    }
+    if (listening > 0) {
+      return 'already-listening';
+    }
+    return 'not-applicable';
+  }
+
+  async stop(): Promise<void> {
+    await Promise.allSettled(this.members.map((member) => Promise.resolve().then(() => member.stop())));
+  }
+
+  async release(): Promise<void> {
+    await Promise.allSettled(this.members.map((member) => Promise.resolve().then(() => member.release())));
   }
 }

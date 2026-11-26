@@ -24,7 +24,12 @@ import { join } from 'node:path';
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
 import { parseConfiguredCliPath } from './release.js';
-import { RunnerTunnelAdapter } from './runner-tunnel.js';
+import {
+  isUsableSshHost,
+  RunnerTunnelAdapter,
+  RunnerTunnelSetAdapter,
+  type RunnerTunnelPort,
+} from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
 import { recordedHostOf } from './relaunch.js';
@@ -466,6 +471,117 @@ export function resolveRunnerTunnelTarget(
 
 /** Deterministic identity of the acceptance assessment bound to one attempt. */
 export { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
+
+/**
+ * G2: one `ssh -N -L` forward per `ssh` `opencode` `lane-runner` host of a v2
+ * installation. `hostName` is the installation's own host key, `sshHost` the
+ * trimmed alias the forward dials and `remotePort` the server port behind it
+ * (the dial port is one above). Local hosts, `agy` runners, hosts without the
+ * `lane-runner` role, unusable aliases and unusable ports yield no entry; a
+ * v1 or absent installation yields none at all.
+ */
+export interface RunnerTunnelTarget {
+  readonly hostName: string;
+  readonly sshHost: string;
+  readonly remotePort: number;
+}
+
+/** Keys that must never be read off untrusted records. */
+const POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** True when the own property is an accessor: its getter is never invoked. */
+function isAccessor(record: Record<string, unknown>, key: string): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
+}
+
+/** Array membership without ever calling a method or a getter on the array. */
+function rolesIncludeLaneRunner(roles: readonly unknown[]): boolean {
+  // Proxy guard: a plain Array prototype is the only accepted shape.
+  if (Object.getPrototypeOf(roles) !== Array.prototype) {
+    return false;
+  }
+  // Cost O(roles.length), capped at 1024; holes and accessors are skipped.
+  const bound = Math.min(roles.length, 1024);
+  for (let i = 0; i < bound; i += 1) {
+    if (!(i in roles)) {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(roles, i);
+    if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
+      continue;
+    }
+    if (descriptor?.value === 'lane-runner') {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resolveRunnerTunnelTargets(installation?: FleetInstallation): readonly RunnerTunnelTarget[] {
+  // Hostile input, cost O(Object.keys(hosts).length): nothing here invokes a
+  // getter or a Proxy trap on untrusted data.
+  if (installation === undefined || !isPlainObject(installation)) {
+    return [];
+  }
+  if (installation.schemaVersion !== 2) {
+    return [];
+  }
+  if (isAccessor(installation, 'hosts')) {
+    return [];
+  }
+  const hosts = installation.hosts;
+  if (!isPlainObject(hosts)) {
+    return [];
+  }
+  const targets: RunnerTunnelTarget[] = [];
+  for (const hostName of Object.keys(hosts)) {
+    if (POLLUTING_KEYS.has(hostName) || isAccessor(hosts, hostName)) {
+      continue;
+    }
+    const host = hosts[hostName];
+    if (!isPlainObject(host)) {
+      continue;
+    }
+    if (
+      isAccessor(host, 'roles') ||
+      isAccessor(host, 'transport') ||
+      isAccessor(host, 'sshAlias') ||
+      isAccessor(host, 'runner')
+    ) {
+      continue;
+    }
+    const roles = host.roles;
+    if (!Array.isArray(roles) || !rolesIncludeLaneRunner(roles)) {
+      continue;
+    }
+    if (host.transport !== 'ssh') {
+      continue;
+    }
+    const alias = host.sshAlias;
+    if (typeof alias !== 'string') {
+      continue;
+    }
+    const trimmedAlias = alias.trim();
+    if (trimmedAlias === '' || !isUsableSshHost(trimmedAlias)) {
+      continue;
+    }
+    const runner = host.runner;
+    if (!isPlainObject(runner) || runner.kind !== 'opencode') {
+      continue;
+    }
+    const port = runner.port;
+    if (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 1 || port > 65534) {
+      continue;
+    }
+    targets.push({ hostName, sshHost: trimmedAlias, remotePort: port });
+  }
+  return targets;
+}
 
 /**
  * Read one flat JSON record file as a plain object. ENOENT means {};
@@ -972,9 +1088,11 @@ export interface FleetCliRuntime {
   /**
    * KF-35: the runner tunnel the conductor driver holds for its lifetime,
    * resolved from the runtime's own environment object's `OCM_HOST` and
-   * `OCM_REMOTE_PORT`. Absent values mean the driver opens nothing.
+   * `OCM_REMOTE_PORT`. Absent values mean the driver opens nothing. G2: a v2
+   * installation with more than one ssh runner host (or a selected non-ssh
+   * host beside one) gets the set adapter forwarding every ssh host at once.
    */
-  readonly runnerTunnel: RunnerTunnelAdapter;
+  readonly runnerTunnel: RunnerTunnelPort & { readonly owned: boolean };
   readonly telemetry: {
     /** Telemetry's own read-only receipt read (OT2b); OT2c/OT4b consume it. */
     readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
@@ -1462,14 +1580,26 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
-  // KF-35: the driver's one runner tunnel, aimed at the same target the runner
+  // KF-35: the driver's runner tunnel, aimed at the same target the runner
   // dispatches to: the installation's selected lane-runner host for v2, else the
   // resolved runner settings (which read the runtime's own environment object,
   // never the process environment when a test supplies one). Nothing is spawned
   // here; the conductor driver opens the forward before its first pass and stops
   // it in the same finally that releases its leases.
-  const tunnelTarget = resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort });
-  const runnerTunnel = new RunnerTunnelAdapter(tunnelTarget);
+  // G2: a v2 installation's every `ssh` `opencode` `lane-runner` host gets its
+  // own forward through the set adapter — including when a `local` host is the
+  // selected runner host beside an ssh host. A single ssh host that is the
+  // selected one (or v1/absent installations) keeps the single-target adapter.
+  const tunnelTargets = resolveRunnerTunnelTargets(options?.installation);
+  const runnerTunnel =
+    tunnelTargets.length >= 2 ||
+    (tunnelTargets.length === 1 && tunnelTargets[0]!.hostName !== runnerHost?.hostName)
+      ? new RunnerTunnelSetAdapter(
+          tunnelTargets.map(
+            (target) => new RunnerTunnelAdapter({ sshHost: target.sshHost, remotePort: target.remotePort }),
+          ),
+        )
+      : new RunnerTunnelAdapter(resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort }));
 
   // CO25: the merge-readiness forge read (DT5) behind the same reviewed gh
   // subprocess as the other forge reads. Without forge mode github the

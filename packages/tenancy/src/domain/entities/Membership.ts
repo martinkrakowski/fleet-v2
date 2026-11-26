@@ -494,14 +494,28 @@ export function decideMembershipChange(
   if (target.role === "owner" && decided.role !== "owner" && ownerCount === 1) {
     return { ok: false, reason: "last-owner" };
   }
-  const changed: MembershipRecord = Object.freeze({
-    schemaVersion: target.schemaVersion,
-    organizationId: target.organizationId,
-    actor: target.actor,
-    role: decided.role,
-    addedAtIso: target.addedAtIso,
-    addedBy: target.addedBy,
-  });
+  // Preserve the target's schemaVersion without writing an own
+  // `schemaVersion: undefined` property: an explicit undefined own key
+  // would fail validateMembershipRecord with `invalid-schema-version`
+  // downstream, so the key is present only when the target carries it.
+  const changed: MembershipRecord = Object.freeze(
+    target.schemaVersion === 1
+      ? {
+          schemaVersion: 1 as const,
+          organizationId: target.organizationId,
+          actor: target.actor,
+          role: decided.role,
+          addedAtIso: target.addedAtIso,
+          addedBy: target.addedBy,
+        }
+      : {
+          organizationId: target.organizationId,
+          actor: target.actor,
+          role: decided.role,
+          addedAtIso: target.addedAtIso,
+          addedBy: target.addedBy,
+        },
+  );
   return {
     ok: true,
     members: Object.freeze(

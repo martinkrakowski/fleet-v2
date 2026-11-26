@@ -624,6 +624,39 @@ describe("decideMembershipChange accepts every valid transition", () => {
     }
   });
 
+  it("change-role writes no own schemaVersion key when the target record has none, and preserves it as 1 when present", () => {
+    // A target without schemaVersion must yield a changed record whose own
+    // keys exclude schemaVersion entirely — an own `schemaVersion: undefined`
+    // property would fail validateMembershipRecord downstream.
+    const withoutVersion = decideMembershipChange(
+      members(OWNER(), member("bob", "viewer", { addedAtIso: EARLIER })),
+      change("change-role", { actor: "bob", role: "maintainer" }),
+      NOW,
+    );
+    expect(withoutVersion.ok).toBe(true);
+    if (withoutVersion.ok) {
+      const changed = withoutVersion.members[1];
+      expect(Object.hasOwn(changed, "schemaVersion")).toBe(false);
+      const validated = validateMembershipRecord(changed as unknown, isProxy);
+      expect(validated.ok).toBe(true);
+      expect(changed.role).toBe("maintainer");
+    }
+    // A target carrying schemaVersion 1 keeps it as 1.
+    const withVersion = decideMembershipChange(
+      members(
+        OWNER(),
+        member("bob", "viewer", { addedAtIso: EARLIER, schemaVersion: 1 }),
+      ),
+      change("change-role", { actor: "bob", role: "maintainer" }),
+      NOW,
+    );
+    expect(withVersion.ok).toBe(true);
+    if (withVersion.ok) {
+      expect(Object.hasOwn(withVersion.members[1], "schemaVersion")).toBe(true);
+      expect(withVersion.members[1].schemaVersion).toBe(1);
+    }
+  });
+
   it("allows an owner to remove a non-last member and drops exactly that record", () => {
     const result = decideMembershipChange(
       members(OWNER(), VIEWER()),

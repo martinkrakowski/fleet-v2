@@ -45,6 +45,7 @@ import {
   LocalExecutor,
   MergeGrantAdapter,
   MergeQueueRepositoryAdapter,
+  AuthorityEventJournalAdapter,
   PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -61,6 +62,8 @@ import {
   readGateDeclaredEnvironmentDigest,
   readGateToolchainVersions,
   sha256HexDigest,
+  flagAuditGap,
+  withStopAuthorityEvents,
   type AgyRunnerAdapter,
   type AttemptArtifactAdapter,
   type AttemptRecord,
@@ -188,6 +191,14 @@ export function composeExecution(input: ComposeExecutionInput) {
     editOnlyModeOf,
     readJsonRecord,
   } = input;
+
+  // One shared read of the input is enough for both destructure blocks; the
+  // authority event sink is built here so every stop use case below emits
+  // through the same journal (FC12B fix round 2).
+  const authorityEventSink = new AuthorityEventJournalAdapter(
+    stateDir === undefined ? {} : { stateDir },
+  );
+  const stopAuthorityContext = { actor: 'cli', organizationId: null } as const;
 
   // Live registry of acceptance receipts per candidate head: the acceptance
   // delegate records entries and the merge gate consumes them, so a merge is
@@ -703,6 +714,13 @@ export function composeExecution(input: ComposeExecutionInput) {
       runner,
       runnerSelector,
       ...(agyRunner !== undefined ? { agyRunner } : {}),
+      // G1: a reservation held on a second lane-runner host dispatches
+      // through that host's own runner when the installation names it;
+      // an unknown host resolves to null and the dispatch refuses.
+      runnerForHost: (hostName) => {
+        const resolved = runnerForAttempt.runnerForHostName(hostName);
+        return resolved.ok ? resolved.runner : null;
+      },
       observation: executionObservation,
       artifactPort: attemptArtifact,
       computeDigest: sha256HexDigest,
@@ -733,13 +751,32 @@ export function composeExecution(input: ComposeExecutionInput) {
       runner,
       runnerForAttempt,
     }),
-    stopAttempt: new StopAttemptUseCase({
-      attemptRepo: attemptRepository,
-      journal: executionJournal,
-      runner,
-      runnerForAttempt,
-      processTreeTermination,
-    }),
+    // FC12B fix round 2: the stop use case is wrapped with the authority
+    // event emission; the audited wrapper's outcome is flattened back to the
+    // plain port surface the driver and the command table consume. A gap
+    // (the sink refused or was absent) is not representable on that surface:
+    // the stop's own journal record stays authoritative, and a same-key
+    // retry re-emits the identical event id to the idempotent sink.
+    stopAttempt: (() => {
+      const audited = withStopAuthorityEvents(
+        new StopAttemptUseCase({
+          attemptRepo: attemptRepository,
+          journal: executionJournal,
+          runner,
+          runnerForAttempt,
+          processTreeTermination,
+        }),
+        authorityEventSink,
+        stopAuthorityContext,
+      );
+      return {
+        stopAttempt: async (
+          request: Parameters<typeof audited.stopAttempt>[0],
+        ) =>
+          // A missed audit write is surfaced on the result itself, never dropped.
+          flagAuditGap(await audited.stopAttempt(request)),
+      };
+    })(),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo: attemptRepository,
       journal: executionJournal,

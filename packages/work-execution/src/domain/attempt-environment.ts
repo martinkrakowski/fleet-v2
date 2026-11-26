@@ -150,7 +150,7 @@ function isValidId(value: unknown): value is string {
   return ID_PATTERN.test(value);
 }
 
-/** A non-empty string of at most 512 characters with no control character and
+/** A non-empty relative string of at most 512 characters with no control character and
  * no `..` path segment on either separator.
  */
 function isValidWorktreeRef(value: unknown): value is string {
@@ -162,6 +162,11 @@ function isValidWorktreeRef(value: unknown): value is string {
     return false;
   }
   if (CONTROL_CHARACTER_PATTERN.test(value)) {
+    return false;
+  }
+  // A worktree reference is relative: an absolute host path (POSIX root, a
+  // backslash root or a drive letter) must never cross the port.
+  if (/^(?:[\\/]|[A-Za-z]:)/.test(value)) {
     return false;
   }
   const segments = value.split(/[\\/]/);

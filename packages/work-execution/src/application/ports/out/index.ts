@@ -8,6 +8,7 @@ export * from "./AllowedSeatPort.out-port.js";
 export * from "./AttemptArtifactPort.out-port.js";
 export * from "./AttemptOwnerDecisionPort.out-port.js";
 export * from "./AttemptRepositoryPort.out-port.js";
+export * from "./AuthorityEventSinkPort.out-port.js";
 export * from "./AutoMergeOwnerRoutingPort.out-port.js";
 export * from "./AutoMergeSettingsPort.out-port.js";
 export * from "./BriefAuthoringPort.out-port.js";

@@ -341,7 +341,7 @@ describe('decideEnvironmentStep', () => {
     });
 
     it('refuses invalid worktreeRef values with control chars, traversal, or excessive length', () => {
-      const invalid = ['', 'a/'.repeat(300), 'worktrees/../../etc', 'bad\tref', 'bad\nref', 'bad\u007fref', 7, null];
+      const invalid = ['', 'a/'.repeat(300), 'worktrees/../../etc', 'bad\tref', 'bad\nref', 'bad\u007fref', 7, null, '/home/operator/worktrees/attempt-1', '\\\\host\\share\\wt', 'C:\\worktrees\\a', 'c:/worktrees/a'];
       for (const worktreeRef of invalid) {
         const result = decideEnvironmentStep(createdState(), injectEvent({ worktreeRef: worktreeRef as string }));
         expect(result).toEqual({ ok: false, reason: 'invalid-worktree-ref' });

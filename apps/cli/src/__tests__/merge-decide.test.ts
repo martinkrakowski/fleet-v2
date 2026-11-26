@@ -298,7 +298,7 @@ describe('merge decide', () => {
       }
       return { exitCode: 1, stdout: '', stderr: 'unexpected gh call' };
     };
-    const { runtime } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forgeGhRunner);
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forgeGhRunner);
     await seedQueueEntry(runtime);
 
     const started = Date.now();
@@ -310,6 +310,14 @@ describe('merge decide', () => {
     const printed = JSON.parse(result.out) as Record<string, unknown>;
     expect(['budget-exhausted', 'not-ready', 'refused']).toContain(printed['outcome']);
     expect(elapsedMs).toBeLessThan(15_000);
+
+    // The timed-out pass left no orphan intent: the merge-pr key holds either
+    // nothing, or exactly one intent closed by one shadow-intent-closed result.
+    const rows = await journalRowsFor(stateDir, JOURNAL_KEY);
+    if (rows.length > 0) {
+      expect(rows.map((row) => row.kind).sort()).toEqual(['intent', 'result']);
+      expect(rows.find((row) => row.kind === 'result')?.reasonCode).toBe('shadow-intent-closed');
+    }
   });
 
   it('leaves exactly one intent and one would-merge result for the key when two identical decides race', async () => {

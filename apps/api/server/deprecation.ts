@@ -132,7 +132,7 @@ function checkTimestampField(
 
 function validateRegistry(
   registry: unknown,
-): { ok: true; length: number } | { ok: false; reason: string } {
+): { ok: true; length: number; routeKeys: readonly string[] } | { ok: false; reason: string } {
   // `Array.isArray` itself can throw on a revoked Proxy, so it is inside the
   // guarded region too: a Proxy that cannot be interrogated is hostile input,
   // never a propagated exception.
@@ -163,7 +163,7 @@ function validateRegistry(
   // The validated length is returned and reused by the caller: re-reading
   // `registry.length` through a Proxy could diverge from what was validated
   // (bypassing the 500-entry bound) or throw outside any guard.
-  return { ok: true, length };
+  return { ok: true, length, routeKeys: Array.from(seenRouteKeys) };
 }
 
 function validateEntry(
@@ -362,6 +362,7 @@ export function deprecationHeadersFor(
   // the bounded re-read keeps lookup `O(n)`, `n <= MAX_DEPRECATIONS`.
   const list = registry as unknown[];
   const validatedLength = registryResult.length;
+  const validatedRouteKeys = registryResult.routeKeys;
   let match: {
     readonly routeKey: string;
     readonly deprecatedAtIso: string;
@@ -380,7 +381,7 @@ export function deprecationHeadersFor(
       }
       const entry = elementDescriptor.value;
       if (typeof entry !== "object" || entry === null) {
-        continue;
+        return { ok: false, reason: "hostile-input" };
       }
       const target = entry as object;
       const routeKeyDescriptor = Object.getOwnPropertyDescriptor(target, "routeKey");
@@ -388,7 +389,10 @@ export function deprecationHeadersFor(
         return { ok: false, reason: "hostile-input" };
       }
       routeKeyValue = routeKeyDescriptor.value;
-      if (typeof routeKeyValue !== "string" || routeKeyValue !== routeKey) {
+      if (routeKeyValue !== validatedRouteKeys[index]) {
+        return { ok: false, reason: "hostile-input" };
+      }
+      if (routeKeyValue !== routeKey) {
         continue;
       }
       const deprecatedDescriptor = Object.getOwnPropertyDescriptor(target, "deprecatedAtIso");

@@ -593,3 +593,53 @@ describe("deprecationHeadersFor — field value refusals", () => {
     ).toEqual({ ok: false, reason: "invalid-entry" });
   });
 });
+
+describe("deprecationHeadersFor — re-read consistency", () => {
+  it("refuses with hostile-input when an element read as an entry during validation reads back as a primitive during lookup", () => {
+    const key = routeKeyOf("teams");
+    let reads = 0;
+    const flipping = new Proxy([entry()], {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === "0") {
+          reads += 1;
+          if (reads > 1) {
+            return { value: 7, writable: true, enumerable: true, configurable: true };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    expect(deprecationHeadersFor(flipping, key, GOOD_NOW)).toEqual({
+      ok: false,
+      reason: "hostile-input",
+    });
+    expect(reads).toBeGreaterThan(1);
+  });
+
+  it("refuses with hostile-input when a routeKey validated as one string reads back as another during lookup", () => {
+    const key = routeKeyOf("teams");
+    const base = entry();
+    let reads = 0;
+    const flippingEntry = new Proxy(base, {
+      getOwnPropertyDescriptor(target, prop) {
+        if (prop === "routeKey") {
+          reads += 1;
+          if (reads > 1) {
+            return {
+              value: routeKeyOf("other"),
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+    expect(deprecationHeadersFor([flippingEntry], key, GOOD_NOW)).toEqual({
+      ok: false,
+      reason: "hostile-input",
+    });
+    expect(reads).toBeGreaterThan(1);
+  });
+});

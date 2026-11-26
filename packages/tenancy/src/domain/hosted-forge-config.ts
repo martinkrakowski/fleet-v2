@@ -35,7 +35,7 @@ export interface HostedForgeConfig {
   readonly appId?: string;
   /** Optional; 1–39 chars, `/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/`. */
   readonly owner?: string;
-  /** Optional; 1–512 chars, `https://` prefix, no credentials, no control chars. */
+  /** Optional; 1–512 chars, `https://` prefix, no credentials, no whitespace (ASCII or Unicode) or control chars. */
   readonly apiBaseUrl?: string;
 }
 
@@ -178,10 +178,16 @@ function isValidApiBaseUrl(value: unknown): value is string {
     return false;
   }
   // Reject embedded `username:password@` credentials and any whitespace or
-  // control character.
+  // control character. The code-point scan covers ASCII whitespace/controls,
+  // DEL, and C1 controls; the `\p{White_Space}` check covers Unicode
+  // whitespace (e.g. U+00A0). One scan each, O(n) with n bounded by the
+  // 512-char limit.
+  if (/[\p{White_Space}]/u.test(value)) {
+    return false;
+  }
   for (let i = 0; i < value.length; i += 1) {
     const code = value.charCodeAt(i);
-    if (code <= 0x20 || code === 0x7f) {
+    if (code <= 0x20 || (code >= 0x7e && code <= 0x9f)) {
       return false;
     }
   }

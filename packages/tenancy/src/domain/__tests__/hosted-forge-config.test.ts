@@ -234,6 +234,23 @@ describe("validateHostedForgeConfig", () => {
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "apiBaseUrl" });
   });
 
+  it("refuses apiBaseUrl containing Unicode whitespace (e.g. U+00A0), not only ASCII whitespace", () => {
+    expect(
+      validateHostedForgeConfig({
+        kind: "github-app",
+        installationId: "1",
+        apiBaseUrl: "https://host/\u00a0",
+      }),
+    ).toEqual({ ok: false, reason: "invalid-forge-config", field: "apiBaseUrl" });
+    expect(
+      validateHostedForgeConfig({
+        kind: "github-app",
+        installationId: "1",
+        apiBaseUrl: "https://ho\u2028st",
+      }),
+    ).toEqual({ ok: false, reason: "invalid-forge-config", field: "apiBaseUrl" });
+  });
+
   it("refuses unknown top-level keys without echoing key name or value", () => {
     const result = validateHostedForgeConfig({
       kind: "github-app",

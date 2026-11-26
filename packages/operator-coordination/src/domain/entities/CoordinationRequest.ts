@@ -12,6 +12,7 @@
  */
 
 import { GRANT_RECORD_VERSION } from '../coordination-records.js';
+import { describeRejectedValue } from '../record-input.js';
 import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
@@ -135,11 +136,11 @@ export class CoordinationRequest {
     }
     const kind = CoordinationKind.create(record.kind);
     if (!kind.success || kind.value === undefined) {
-      throw new Error(`CoordinationRequest has an invalid kind: ${String(record.kind)}`);
+      throw new Error('CoordinationRequest has an invalid kind: ' + describeRejectedValue(record.kind));
     }
     const state = CoordinationState.create(record.state);
     if (!state.success || state.value === undefined) {
-      throw new Error(`CoordinationRequest has an invalid state: ${String(record.state)}`);
+      throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(record.state));
     }
     const policyGrant = CoordinationRequest.readPolicyGrant(record);
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
@@ -165,7 +166,7 @@ export class CoordinationRequest {
     }
     const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
     if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
-      throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
+      throw new Error('CoordinationRequest has an invalid delivery status: ' + describeRejectedValue(record.deliveryStatus));
     }
     if (record.deliveryStatus === 'delivery-gap') {
       if (typeof record.deliveryGapReason !== 'string' || record.deliveryGapReason.length === 0) {

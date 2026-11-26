@@ -5,6 +5,8 @@
  * unknown, expired or cancelled request never grants authority.
  */
 
+import { describeRejectedValue } from '../record-input.js';
+
 export const COORDINATION_STATES = [
   'proposed',
   'awaiting-decision',
@@ -28,7 +30,7 @@ export class CoordinationState {
 
   static create(value: unknown): { success: boolean; value?: CoordinationState; error?: Error } {
     if (typeof value !== 'string' || !COORDINATION_STATE_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid coordination state: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid coordination state: ' + describeRejectedValue(value)) };
     }
     return { success: true, value: new CoordinationState(value as CoordinationStateValue) };
   }

@@ -1,0 +1,28 @@
+[
+  {
+    "version": 1,
+    "projectId": "example-project",
+    "planId": "plan-example-1",
+    "revision": 1,
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "doc": "docs/plan.md",
+    "lanes": [
+      {
+        "laneId": "lane-example-1",
+        "aliases": [],
+        "scope": "Example planned lane",
+        "packages": ["work-execution"],
+        "sharedFiles": [],
+        "tier": 1,
+        "after": [],
+        "decisions": [],
+        "status": "planned",
+        "brief": null,
+        "mergedPr": null
+      }
+    ],
+    "decisions": [],
+    "exclusiveOrder": [],
+    "importedAtIso": "2026-01-01T00:00:00.000Z"
+  }
+]

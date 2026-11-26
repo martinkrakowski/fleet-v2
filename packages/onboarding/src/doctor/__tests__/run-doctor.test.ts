@@ -157,6 +157,10 @@ function fakeProbes(
       calls.push(`loginShell:${host}`);
       return 'intact';
     },
+    diskQuotaUsage: async (host) => {
+      calls.push(`diskQuotaUsage:${host}`);
+      return { usedBytes: 100, totalBytes: 1000 };
+    },
     ...overrides,
   };
   return { probes, calls };
@@ -1999,6 +2003,7 @@ describe('runDoctor login-shell canary (SHP1)', () => {
       'runner-capabilities:PASS',
       'gate-slot:PASS',
       'ci-runner-slot-1:UNKNOWN',
+      'disk-quota:UNKNOWN',
       // The runner host's opencode server answer is not gated by the canary
       // (that is SHP1b); it is a host line for `main` and follows the slots.
       'server-answers:PASS',
@@ -2116,6 +2121,279 @@ describe('runDoctor login-shell canary (SHP1)', () => {
     for (const doctorLine of lines) {
       expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
     }
+  });
+});
+
+describe('runDoctor disk quota headroom (OPQ1)', () => {
+  const runnerModel = () =>
+    sampleModel({
+      host: { transport: 'ssh', sshAlias: 'ci-alias' },
+    });
+  const diskQuotaLines = (lines: readonly DoctorLine[]) =>
+    lines.filter(
+      (doctorLine) =>
+        doctorLine.scope === 'host' &&
+        doctorLine.check === 'disk-quota' &&
+        doctorLine.subject === 'main',
+    );
+  const hostChecks = (lines: readonly DoctorLine[], subject: string) =>
+    lines
+      .filter((doctorLine) => doctorLine.scope === 'host' && doctorLine.subject === subject)
+      .map((doctorLine) => `${doctorLine.check}:${doctorLine.status}`);
+
+  it('reports PASS at or above 10% disk-quota headroom and FAIL below 10% naming percentage and host alias', async () => {
+    for (const [usage, status, detail] of [
+      [{ usedBytes: 900, totalBytes: 1000 }, 'PASS', 'disk quota headroom 10.0% via ci-alias'],
+      [{ usedBytes: 0, totalBytes: 1000 }, 'PASS', 'disk quota headroom 100.0% via ci-alias'],
+      [{ usedBytes: 9001, totalBytes: 10000 }, 'FAIL', 'disk quota headroom 9.9% below 10% minimum via ci-alias'],
+      [{ usedBytes: 1000, totalBytes: 1000 }, 'FAIL', 'disk quota headroom 0.0% below 10% minimum via ci-alias'],
+    ] as const) {
+      const { probes } = fakeProbes({ diskQuotaUsage: async () => usage });
+      const lines = await collect(loadedResult(runnerModel()), probes);
+      expect(diskQuotaLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'disk-quota',
+          status,
+          detail,
+        },
+      ]);
+    }
+  });
+
+  it('emits no disk-quota line for a local host or an ssh host without a runner', async () => {
+    const noRunner: HostModel = {
+      transport: 'ssh',
+      sshAlias: 'ci-alias',
+      roles: ['verifier'],
+    };
+    const models: FleetInstallationModel[] = [
+      sampleModel(),
+      sampleModel({ host: { transport: 'local' } }),
+      sampleModel({ host: { runner: undefined } }),
+      { ...runnerModel(), hosts: { main: noRunner } },
+    ];
+    for (const model of models) {
+      const { probes, calls } = fakeProbes();
+      const lines = await collect(loadedResult(model), probes);
+      expect(lines.some((doctorLine) => doctorLine.check === 'disk-quota')).toBe(false);
+      expect(calls.some((call) => call.startsWith('diskQuotaUsage:'))).toBe(false);
+    }
+  });
+
+  it('reports UNKNOWN for disk-quota when the probe returns undefined', async () => {
+    const { probes } = fakeProbes({ diskQuotaUsage: async () => undefined });
+    const lines = await collect(loadedResult(runnerModel()), probes);
+    expect(diskQuotaLines(lines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'disk-quota',
+        status: 'UNKNOWN',
+        detail: 'disk quota could not be read via ci-alias',
+      },
+    ]);
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports UNKNOWN when diskQuotaUsage returns null, undefined, an array, an array-like, or a wrong primitive', async () => {
+    for (const answer of [
+      null,
+      undefined,
+      [],
+      [100, 1000],
+      // An array-like passes typeof 'object' but is refused all the same.
+      { 0: 1, 1: 10, length: 2, usedBytes: 1, totalBytes: 10 },
+      // An own `length` accessor is refused too, and its getter is never run.
+      Object.defineProperty({ usedBytes: 1, totalBytes: 10 }, 'length', {
+        get: () => {
+          throw new Error('length getter must not run');
+        },
+        enumerable: true,
+      }),
+      Object.defineProperty({ usedBytes: 1, totalBytes: 10 }, 'length', { get: () => 2 }),
+      { usedBytes: 1, totalBytes: 10, length: '2' },
+      '100 1000',
+      42,
+      true,
+      // An inherited (prototype-only) reading is not an own observation.
+      Object.assign(Object.create({ usedBytes: 100, totalBytes: 1000 }), {}),
+      Object.create({ usedBytes: 1, totalBytes: 10 }),
+    ]) {
+      const { probes } = fakeProbes({
+        diskQuotaUsage: async () => answer as { usedBytes: number; totalBytes: number },
+      });
+      const lines = await collect(loadedResult(runnerModel()), probes);
+      expect(diskQuotaLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'disk-quota',
+          status: 'UNKNOWN',
+          detail: 'disk quota could not be read via ci-alias',
+        },
+      ]);
+    }
+  });
+
+  it('reports UNKNOWN, never PASS or WARN, for a negative, fractional, NaN, infinite, unsafe, zero-total or used-above-total answer', async () => {
+    for (const answer of [
+      { usedBytes: -100, totalBytes: 1000 },
+      { usedBytes: 0.5, totalBytes: 1 },
+      { usedBytes: Number.NaN, totalBytes: 1000 },
+      { usedBytes: 1, totalBytes: Number.NaN },
+      { usedBytes: 1, totalBytes: Number.MAX_SAFE_INTEGER + 2 },
+      { usedBytes: 10, totalBytes: 0 },
+      { usedBytes: 2000, totalBytes: 1000 },
+      { usedBytes: 1, totalBytes: Number.POSITIVE_INFINITY },
+      { usedBytes: Number.NEGATIVE_INFINITY, totalBytes: 1000 },
+    ]) {
+      const { probes } = fakeProbes({ diskQuotaUsage: async () => answer });
+      const lines = await collect(loadedResult(runnerModel()), probes);
+      expect(diskQuotaLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'disk-quota',
+          status: 'UNKNOWN',
+          detail: 'disk quota could not be read via ci-alias',
+        },
+      ]);
+    }
+  });
+
+  it('reports UNKNOWN without invoking getters when diskQuotaUsage or its result has a throwing or side-effecting getter', async () => {
+    const sideEffects: string[] = [];
+    const resultWithGetter = {
+      get usedBytes(): number {
+        sideEffects.push('usedBytes');
+        throw new Error('boom');
+      },
+      totalBytes: 1000,
+    };
+    const probesWithThrowingResult = fakeProbes({
+      diskQuotaUsage: async () => resultWithGetter,
+    });
+    const lines = await collect(loadedResult(runnerModel()), probesWithThrowingResult.probes);
+    expect(sideEffects).toEqual([]);
+    expect(diskQuotaLines(lines)[0]?.status).toBe('UNKNOWN');
+    expect(doctorExitCode(lines)).toBe(1);
+
+    const probeReads: string[] = [];
+    const hostile = {
+      ...fakeProbes().probes,
+      get diskQuotaUsage(): never {
+        probeReads.push('probe');
+        throw new Error('boom');
+      },
+    } as unknown as DoctorProbes;
+    const hostileLines = await collect(loadedResult(runnerModel()), hostile);
+    // The port property is read through its own descriptor, so the throwing
+    // getter is refused without ever being invoked; the result is UNKNOWN.
+    expect(probeReads).toEqual([]);
+    expect(diskQuotaLines(hostileLines)[0]?.status).toBe('UNKNOWN');
+  });
+
+  it('reports UNKNOWN when diskQuotaUsage returns a throwing Proxy', async () => {
+    const hostile = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('boom');
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error('boom');
+        },
+        has() {
+          throw new Error('boom');
+        },
+      },
+    );
+    const { probes } = fakeProbes({
+      diskQuotaUsage: async () => hostile as { usedBytes: number; totalBytes: number },
+    });
+    const lines = await collect(loadedResult(runnerModel()), probes);
+    expect(diskQuotaLines(lines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'disk-quota',
+        status: 'UNKNOWN',
+        detail: 'disk quota could not be read via ci-alias',
+      },
+    ]);
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports UNKNOWN when diskQuotaUsage probe is absent or not a function', async () => {
+    const base = fakeProbes();
+    const { diskQuotaUsage: _omitted, ...withoutProbe } = base.probes;
+    void _omitted;
+    const missing = await collect(loadedResult(runnerModel()), withoutProbe as DoctorProbes);
+    expect(diskQuotaLines(missing)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'disk-quota',
+        status: 'UNKNOWN',
+        detail: 'disk quota probe not available',
+      },
+    ]);
+    expect(doctorExitCode(missing)).toBe(1);
+
+    const { probes, calls } = fakeProbes({
+      diskQuotaUsage: 'nope' as unknown as DoctorProbes['diskQuotaUsage'],
+    });
+    const notAFunction = await collect(loadedResult(runnerModel()), probes);
+    expect(diskQuotaLines(notAFunction)[0]?.detail).toBe('disk quota probe not available');
+    expect(calls.some((call) => call.startsWith('diskQuotaUsage:'))).toBe(false);
+  });
+
+  it('never echoes raw probe output in disk-quota details', async () => {
+    const sentinel = ['sentinel', 'quota', '9f2c'].join('-');
+    const { probes } = fakeProbes({
+      diskQuotaUsage: async () => sentinel as unknown as { usedBytes: number; totalBytes: number },
+    });
+    const lines = await collect(loadedResult(runnerModel()), probes);
+    expect(diskQuotaLines(lines)[0]?.status).toBe('UNKNOWN');
+    for (const doctorLine of lines) {
+      expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
+    }
+  });
+
+  it('masks an unsafe ssh alias on disk-quota lines', async () => {
+    const alias = 'bad host';
+    const model = sampleModel({ host: { transport: 'ssh', sshAlias: alias } });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+    expect(diskQuotaLines(lines)[0]?.detail).toBe(
+      'disk quota headroom 90.0% via [unsafe ssh alias]',
+    );
+    expect(calls).toContain(`diskQuotaUsage:${alias}`);
+  });
+
+  it('skips disk-quota with the same check name when the login shell fails the canary', async () => {
+    const model = sampleModel({
+      host: {
+        transport: 'ssh',
+        sshAlias: 'ci-alias',
+        ciRunnerSlots: [{ name: 'slot-1', unit: 'fleet-ci@1.service' }],
+      },
+    });
+    const mangled = fakeProbes({
+      loginShell: async (host) => (host === 'ci-alias' ? 'mangled' : 'intact'),
+    });
+    const lines = await collect(loadedResult(model), mangled.probes);
+    expect(mangled.calls.some((call) => call.startsWith('diskQuotaUsage:'))).toBe(false);
+    expect(hostChecks(lines, 'main')).toContain('disk-quota:UNKNOWN');
+    expect(hostChecks(lines, 'main').indexOf('disk-quota:UNKNOWN')).toBe(
+      hostChecks(lines, 'main').indexOf('ci-runner-slot-1:UNKNOWN') + 1,
+    );
+    const diskQuota = lines.find(
+      (doctorLine) => doctorLine.subject === 'main' && doctorLine.check === 'disk-quota',
+    );
+    expect(diskQuota?.detail).toBe('not probed: login shell failed the canary');
   });
 });
 

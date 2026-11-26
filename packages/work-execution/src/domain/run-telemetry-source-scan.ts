@@ -179,11 +179,17 @@ function readAttributeValue(
  * The scan: refuses any telemetry span whose attribute keys or values exceed
  * 256 characters or contain source-text markers. Never throws, never echoes
  * a rejected value; any unexpected throw maps to `invalid-span`.
+ *
+ * The `isProxy` detector is required and must be supplied explicitly: there
+ * is no default detector, because a caller that omits one would install an
+ * "always not a Proxy" read that lets a hostile Proxy run reflection traps
+ * and present clean attributes. Omitting or passing `undefined` (or any
+ * non-function) is refused with `invalid-detector`.
  */
 export function scanSpanForSourceText(
   span: unknown,
   markers: unknown,
-  isProxy: IsProxy = () => false,
+  isProxy: IsProxy,
 ): SpanSourceScanResult {
   try {
     // Step 1: O(1) detector gate, before anything else is read.

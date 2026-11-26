@@ -67,27 +67,31 @@ function expectNoEcho(offending: string, ...results: unknown[]): void {
 describe('scanSpanForSourceText', () => {
   it('accepts a clean TelemetrySpan with its checked attribute count', () => {
     const span = cleanSpan();
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: true, checkedAttributes: 3 });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: true, checkedAttributes: 3 });
   });
 
   it('accepts a clean plain-object span with its checked attribute count', () => {
     const span = cleanSpanInput();
     span.attributes = { alpha: 'one', beta: ['x', 'y'], gamma: 7 };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: true, checkedAttributes: 3 });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: true, checkedAttributes: 3 });
   });
 
   it('accepts 256-character keys and values (exactly at the cap) and numbers', () => {
     const atCap = 'k'.repeat(MAX_SPAN_ATTRIBUTE_VALUE_LENGTH);
     const span = cleanSpanInput();
     span.attributes = { [atCap]: atCap, ['arr']: [atCap], ['n']: 42 };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: true, checkedAttributes: 3 });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: true, checkedAttributes: 3 });
   });
 
-  it('refuses non-function isProxy detectors with invalid-detector', () => {
+  it('refuses non-function and omitted isProxy detectors with invalid-detector', () => {
     const span = cleanSpanInput();
-    // `undefined` takes the `() => false` default and passes; every other
-    // non-function value is refused.
-    expect(scanSpanForSourceText(span, MARKERS, undefined)).toEqual({ ok: true, checkedAttributes: 1 });
+    // There is no default detector: an omitted or `undefined` detector would
+    // silently read Proxies as plain data, so it is refused like any other
+    // non-function value.
+    expect(scanSpanForSourceText(span, MARKERS, undefined as never)).toEqual({
+      ok: false,
+      reason: 'invalid-detector',
+    });
     for (const isProxy of [null, 123, {}, 'fn', true]) {
       expect(scanSpanForSourceText(span, MARKERS, isProxy as never)).toEqual({
         ok: false,
@@ -136,17 +140,17 @@ describe('scanSpanForSourceText', () => {
       [{ length: 1, 0: '/wt/' }, 'array-like'],
     ];
     for (const [markers, label] of hostile) {
-      expect(scanSpanForSourceText(span, markers), label).toEqual({ ok: false, reason: 'invalid-markers' });
+      expect(scanSpanForSourceText(span, markers, types.isProxy), label).toEqual({ ok: false, reason: 'invalid-markers' });
     }
     expect(gettersRun).toEqual([]);
     expect(scanSpanForSourceText(span, new Proxy({ worktreePrefixes: ['/wt/'] }, {}), types.isProxy as never))
       .toEqual({ ok: false, reason: 'invalid-markers' });
     const polluted = { worktreePrefixes: ['/wt/'] } as Record<string, unknown>;
     Object.defineProperty(polluted, '__proto__', { value: {}, enumerable: true, configurable: true });
-    expect(scanSpanForSourceText(span, polluted)).toEqual({ ok: false, reason: 'invalid-markers' });
+    expect(scanSpanForSourceText(span, polluted, types.isProxy)).toEqual({ ok: false, reason: 'invalid-markers' });
     const pollutedConstructor = { worktreePrefixes: ['/wt/'] } as Record<string, unknown>;
     Object.defineProperty(pollutedConstructor, 'constructor', { value: 1, enumerable: true, configurable: true });
-    expect(scanSpanForSourceText(span, pollutedConstructor)).toEqual({ ok: false, reason: 'invalid-markers' });
+    expect(scanSpanForSourceText(span, pollutedConstructor, types.isProxy)).toEqual({ ok: false, reason: 'invalid-markers' });
   });
 
   it('refuses null, undefined, primitives, getters, Proxies, oversized objects, and prototype-polluting keys on span with invalid-span', () => {
@@ -194,7 +198,7 @@ describe('scanSpanForSourceText', () => {
     for (const bad of [true, false, null, undefined, { nested: 1 }, Number.NaN, Infinity, -0, ['a', 2]]) {
       const span = cleanSpanInput();
       span.attributes = { key: bad };
-      expect(scanSpanForSourceText(span, MARKERS), JSON.stringify(bad)).toEqual({
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), JSON.stringify(bad)).toEqual({
         ok: false,
         reason: 'invalid-attribute',
       });
@@ -203,10 +207,10 @@ describe('scanSpanForSourceText', () => {
     delete sparse[1];
     let value = cleanSpanInput();
     value.attributes = { key: sparse };
-    expect(scanSpanForSourceText(value, MARKERS)).toEqual({ ok: false, reason: 'invalid-attribute' });
+    expect(scanSpanForSourceText(value, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'invalid-attribute' });
     value = cleanSpanInput();
     value.attributes = { key: { length: 1, 0: 'a' } };
-    expect(scanSpanForSourceText(value, MARKERS)).toEqual({ ok: false, reason: 'invalid-attribute' });
+    expect(scanSpanForSourceText(value, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'invalid-attribute' });
     const getterValue = Object.defineProperty({}, 'key', {
       get() {
         throw new Error('the attribute getter must never run');
@@ -216,7 +220,7 @@ describe('scanSpanForSourceText', () => {
     });
     const getterSpan = cleanSpanInput();
     getterSpan.attributes = getterValue;
-    expect(scanSpanForSourceText(getterSpan, MARKERS)).toEqual({ ok: false, reason: 'invalid-attribute' });
+    expect(scanSpanForSourceText(getterSpan, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'invalid-attribute' });
     const getterElement = Object.defineProperty(['a'], '0', {
       get() {
         throw new Error('the element getter must never run');
@@ -226,13 +230,13 @@ describe('scanSpanForSourceText', () => {
     });
     const getterElementSpan = cleanSpanInput();
     getterElementSpan.attributes = { key: getterElement };
-    expect(scanSpanForSourceText(getterElementSpan, MARKERS)).toEqual({ ok: false, reason: 'invalid-attribute' });
+    expect(scanSpanForSourceText(getterElementSpan, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'invalid-attribute' });
     for (const pollutingKey of ['__proto__', 'constructor', 'prototype']) {
       const holder = {} as Record<string, unknown>;
       Object.defineProperty(holder, pollutingKey, { value: 'x', enumerable: true, configurable: true });
       const span = cleanSpanInput();
       span.attributes = holder;
-      expect(scanSpanForSourceText(span, MARKERS), pollutingKey).toEqual({
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), pollutingKey).toEqual({
         ok: false,
         reason: 'invalid-attribute',
       });
@@ -243,19 +247,19 @@ describe('scanSpanForSourceText', () => {
     const long = 'x'.repeat(MAX_SPAN_ATTRIBUTE_VALUE_LENGTH + 1);
     let span = cleanSpanInput();
     span.attributes = { [long]: 'ok' };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: false, reason: 'value-too-long' });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'value-too-long' });
     span = cleanSpanInput();
     span.attributes = { key: long };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: false, reason: 'value-too-long' });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'value-too-long' });
     span = cleanSpanInput();
     span.attributes = { key: [long] };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: false, reason: 'value-too-long' });
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'value-too-long' });
     // Above 16_384 the snapshot itself refuses with too-long, still mapped to value-too-long.
     const enormous = 'y'.repeat(16_385);
     span = cleanSpanInput();
     span.attributes = { key: enormous };
-    expect(scanSpanForSourceText(span, MARKERS)).toEqual({ ok: false, reason: 'value-too-long' });
-    expectNoEcho(long, scanSpanForSourceText(span, MARKERS));
+    expect(scanSpanForSourceText(span, MARKERS, types.isProxy)).toEqual({ ok: false, reason: 'value-too-long' });
+    expectNoEcho(long, scanSpanForSourceText(span, MARKERS, types.isProxy));
   });
 
   it('refuses diff headers in attribute keys, strings, and string-arrays with diff-header without echoing the value', () => {
@@ -263,14 +267,14 @@ describe('scanSpanForSourceText', () => {
     for (const header of headers) {
       let span = cleanSpanInput();
       span.attributes = { key: header };
-      expect(scanSpanForSourceText(span, MARKERS), header).toEqual({ ok: false, reason: 'diff-header' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), header).toEqual({ ok: false, reason: 'diff-header' });
       span = cleanSpanInput();
       span.attributes = { [header]: 'ok' };
-      expect(scanSpanForSourceText(span, MARKERS), header).toEqual({ ok: false, reason: 'diff-header' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), header).toEqual({ ok: false, reason: 'diff-header' });
       span = cleanSpanInput();
       span.attributes = { key: ['clean', header] };
-      expect(scanSpanForSourceText(span, MARKERS), header).toEqual({ ok: false, reason: 'diff-header' });
-      expectNoEcho(header, scanSpanForSourceText(span, MARKERS));
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), header).toEqual({ ok: false, reason: 'diff-header' });
+      expectNoEcho(header, scanSpanForSourceText(span, MARKERS, types.isProxy));
     }
   });
 
@@ -278,14 +282,14 @@ describe('scanSpanForSourceText', () => {
     for (const fence of ['```ts', 'text ~~~ text']) {
       let span = cleanSpanInput();
       span.attributes = { key: fence };
-      expect(scanSpanForSourceText(span, MARKERS), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
       span = cleanSpanInput();
       span.attributes = { [fence]: 'ok' };
-      expect(scanSpanForSourceText(span, MARKERS), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
       span = cleanSpanInput();
       span.attributes = { key: ['a', fence] };
-      expect(scanSpanForSourceText(span, MARKERS), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
-      expectNoEcho(fence, scanSpanForSourceText(span, MARKERS));
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), fence).toEqual({ ok: false, reason: 'fenced-code-block' });
+      expectNoEcho(fence, scanSpanForSourceText(span, MARKERS, types.isProxy));
     }
   });
 
@@ -294,19 +298,19 @@ describe('scanSpanForSourceText', () => {
     for (const path of paths) {
       let span = cleanSpanInput();
       span.attributes = { key: path };
-      expect(scanSpanForSourceText(span, MARKERS), path).toEqual({ ok: false, reason: 'worktree-path' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), path).toEqual({ ok: false, reason: 'worktree-path' });
       span = cleanSpanInput();
       span.attributes = { [path]: 'ok' };
-      expect(scanSpanForSourceText(span, MARKERS), path).toEqual({ ok: false, reason: 'worktree-path' });
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), path).toEqual({ ok: false, reason: 'worktree-path' });
       span = cleanSpanInput();
       span.attributes = { key: ['clean', path] };
-      expect(scanSpanForSourceText(span, MARKERS), path).toEqual({ ok: false, reason: 'worktree-path' });
-      expectNoEcho(path, scanSpanForSourceText(span, MARKERS));
+      expect(scanSpanForSourceText(span, MARKERS, types.isProxy), path).toEqual({ ok: false, reason: 'worktree-path' });
+      expectNoEcho(path, scanSpanForSourceText(span, MARKERS, types.isProxy));
     }
     // A segment match works even with markers that do not cover it.
     const span = cleanSpanInput();
     span.attributes = { key: 'a/.worktrees/q' };
-    expect(scanSpanForSourceText(span, { worktreePrefixes: ['unrelated'] })).toEqual({
+    expect(scanSpanForSourceText(span, { worktreePrefixes: ['unrelated'] }, types.isProxy)).toEqual({
       ok: false,
       reason: 'worktree-path',
     });

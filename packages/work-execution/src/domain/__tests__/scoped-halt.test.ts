@@ -22,6 +22,23 @@ function revokedProxy(): unknown {
   return proxy;
 }
 
+/**
+ * Every call passes the trusted `types.isProxy` detector explicitly: the
+ * deciders have no permissive default, so a snapshot can never be taken
+ * without one.
+ */
+function haltRequest(input: unknown) {
+  return decideHaltRequest(input, types.isProxy);
+}
+
+function scopedHalt(input: unknown) {
+  return decideScopedHalt(input, types.isProxy);
+}
+
+function dispatchHalted(halts: unknown, target: unknown): boolean {
+  return isDispatchHalted(halts, target, types.isProxy);
+}
+
 const ORG_A = 'org-a-1111';
 const ORG_B = 'org-b-2222';
 const CELL_1 = 'cell-1-3333';
@@ -89,36 +106,60 @@ describe('decideHaltRequest', () => {
       requested: { scope: 'org', id: ORG_A, halted: true },
       halts: [],
     });
-    const seen = JSON.stringify(decideHaltRequest(revokedProxy()));
+    const seen = JSON.stringify(haltRequest(revokedProxy()));
     expect(seen).not.toContain(ORG_A);
     const proxied = new Proxy(hostile(), {});
     expect(types.isProxy(proxied)).toBe(true);
-    const result = decideHaltRequest(proxied, types.isProxy);
+    const result = haltRequest(proxied);
     expect(result).toEqual({ ok: false, reason: 'invalid-input' });
     expect(JSON.stringify(result)).not.toContain(ORG_A);
   });
 
+  it('fails closed when no detector is supplied: a non-function or omitted isProxy refuses or reports halted', () => {
+    const clean = () => ({
+      actorKind: 'org-admin',
+      actorOrganizationId: ORG_A,
+      requested: { scope: 'org', id: ORG_A, halted: true },
+      halts: [],
+    });
+    // A JS caller bypassing the required-parameter type passes undefined.
+    expect(decideHaltRequest(clean(), undefined as never)).toEqual({
+      ok: false,
+      reason: 'invalid-input',
+    });
+    expect(decideScopedHalt(clean(), undefined as never)).toEqual({
+      ok: false,
+      reason: 'invalid-input',
+      dispatchHalted: true,
+    });
+    expect(isDispatchHalted([orgEntry(true)], TARGET_A, undefined as never)).toBe(true);
+    expect(isDispatchHalted([orgEntry(true)], TARGET_A, () => true)).toBe(true);
+    // Even a permissive constant detector cannot hide the halt itself: with
+    // the trusted detector the same input halts dispatch by content.
+    expect(dispatchHalted([orgEntry(true)], TARGET_A)).toBe(true);
+  });
+
   it('refuses null, undefined, primitives, non-iterables, array-likes, and wrong prototypes', () => {
     for (const bad of [null, undefined, 7, 'x', true, { length: 1, 0: 2 }, () => 1, new Date(), Object.setPrototypeOf({}, Array.prototype)]) {
-      expect(decideHaltRequest(bad)).toEqual({ ok: false, reason: 'invalid-input' });
+      expect(haltRequest(bad)).toEqual({ ok: false, reason: 'invalid-input' });
     }
   });
 
   it('refuses halts array exceeding 1000 entries by failing closed to halted true and invalid-halts', () => {
     const many: unknown[] = Array.from({ length: MAX_SCOPED_HALTS + 1 }, () => orgEntry(true));
-    expect(isDispatchHalted(many, TARGET_A)).toBe(true);
+    expect(dispatchHalted(many, TARGET_A)).toBe(true);
     const request = orgAdminRequest({});
     (request as Record<string, unknown>).halts = many;
-    expect(decideHaltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
   });
 
   it('refuses sparse halts array with holes by failing closed to halted true', () => {
     const sparse: unknown[] = [orgEntry(true), orgEntry(false)];
     delete sparse[1];
-    expect(isDispatchHalted(sparse, TARGET_A)).toBe(true);
+    expect(dispatchHalted(sparse, TARGET_A)).toBe(true);
     const request = orgAdminRequest({});
     (request as Record<string, unknown>).halts = sparse;
-    expect(decideHaltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
   });
 
   it('refuses getter properties without invoking them', () => {
@@ -131,57 +172,57 @@ describe('decideHaltRequest', () => {
       enumerable: true,
       configurable: true,
     });
-    expect(isDispatchHalted([entry], TARGET_A)).toBe(true);
+    expect(dispatchHalted([entry], TARGET_A)).toBe(true);
     expect(getterRuns).toBe(0);
     const request = orgAdminRequest({});
     (request as Record<string, unknown>).halts = [entry];
-    expect(decideHaltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest(request)).toEqual({ ok: false, reason: 'invalid-halts' });
     expect(getterRuns).toBe(0);
   });
 
   it('refuses prototype-polluting, symbol, and extra unknown keys', () => {
     const polluting: Record<string, unknown> = { scope: 'org', id: ORG_A, halted: true, imposedBy: 'operator' };
     Object.defineProperty(polluting, '__proto__', { value: null, enumerable: true, configurable: true });
-    expect(isDispatchHalted([polluting], TARGET_A)).toBe(true);
+    expect(dispatchHalted([polluting], TARGET_A)).toBe(true);
     const withSymbol: Record<string, unknown> = { scope: 'org', id: ORG_A, halted: true, imposedBy: 'operator' };
     const symbolKey = Symbol('extra');
     Object.defineProperty(withSymbol, symbolKey, { value: 1, enumerable: true, configurable: true });
-    expect(isDispatchHalted([withSymbol], TARGET_A)).toBe(true);
+    expect(dispatchHalted([withSymbol], TARGET_A)).toBe(true);
     const extra = { scope: 'org', id: ORG_A, halted: true, imposedBy: 'operator', note: 'extra' };
-    expect(isDispatchHalted([extra], TARGET_A)).toBe(true);
+    expect(dispatchHalted([extra], TARGET_A)).toBe(true);
     const rootExtra = { ...orgAdminRequest({}), extra: 1 };
-    expect(decideHaltRequest(rootExtra)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(haltRequest(rootExtra)).toEqual({ ok: false, reason: 'invalid-input' });
     const requestedExtra = orgAdminRequest({});
     (requestedExtra as Record<string, unknown>).requested = {
       scope: 'org', id: ORG_A, halted: true, note: 'extra',
     };
-    expect(decideHaltRequest(requestedExtra)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest(requestedExtra)).toEqual({ ok: false, reason: 'invalid-request' });
   });
 
   it('refuses malformed actor, actorOrganizationId, requested, halts, and target with exact path reasons and fail-closed dispatchHalted', () => {
     // Root null and root refusals map to invalid-input.
-    expect(decideScopedHalt(null)).toEqual({ ok: false, reason: 'invalid-input', dispatchHalted: true });
+    expect(scopedHalt(null)).toEqual({ ok: false, reason: 'invalid-input', dispatchHalted: true });
     // Missing actorKind: its own field's reason.
     const noActor = { requested: { scope: 'org', id: ORG_A, halted: true }, halts: [orgEntry(true)] };
-    expect(decideHaltRequest(noActor)).toEqual({ ok: false, reason: 'invalid-actor' });
-    expect(decideScopedHalt(noActor)).toEqual({ ok: false, reason: 'invalid-actor', dispatchHalted: true });
-    expect(decideHaltRequest({})).toEqual({ ok: false, reason: 'invalid-actor' });
+    expect(haltRequest(noActor)).toEqual({ ok: false, reason: 'invalid-actor' });
+    expect(scopedHalt(noActor)).toEqual({ ok: false, reason: 'invalid-actor', dispatchHalted: true });
+    expect(haltRequest({})).toEqual({ ok: false, reason: 'invalid-actor' });
     // Bad actorKind value.
     const badActor = { ...noActor, actorKind: 'root' };
-    expect(decideHaltRequest(badActor)).toEqual({ ok: false, reason: 'invalid-actor' });
+    expect(haltRequest(badActor)).toEqual({ ok: false, reason: 'invalid-actor' });
     // Missing actorOrganizationId for org-admin.
     const noActorOrg = {
       actorKind: 'org-admin',
       requested: { scope: 'org', id: ORG_A, halted: true },
       halts: [],
     };
-    expect(decideHaltRequest(noActorOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
+    expect(haltRequest(noActorOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
     // actorOrganizationId present for operator.
     const operatorWithOrg = {
       ...operatorRequest({}),
       actorOrganizationId: ORG_A,
     };
-    expect(decideHaltRequest(operatorWithOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
+    expect(haltRequest(operatorWithOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
     // Blank actorOrganizationId.
     const blankOrg = {
       actorKind: 'org-admin',
@@ -189,35 +230,35 @@ describe('decideHaltRequest', () => {
       requested: { scope: 'org', id: ORG_A, halted: true },
       halts: [],
     };
-    expect(decideHaltRequest(blankOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
+    expect(haltRequest(blankOrg)).toEqual({ ok: false, reason: 'invalid-actor-organization' });
     // Missing requested, bad scope, missing halted, bad id shape.
-    expect(decideHaltRequest({ actorKind: 'operator', halts: [] })).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest({ actorKind: 'operator', halts: [] })).toEqual({ ok: false, reason: 'invalid-request' });
     const badScope = orgAdminRequest({ scope: 'zone' });
-    expect(decideHaltRequest(badScope)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest(badScope)).toEqual({ ok: false, reason: 'invalid-request' });
     const noHalted = orgAdminRequest({});
     (noHalted as Record<string, unknown>).requested = { scope: 'org', id: ORG_A };
-    expect(decideHaltRequest(noHalted)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest(noHalted)).toEqual({ ok: false, reason: 'invalid-request' });
     const globalWithId = orgAdminRequest({ scope: 'global', id: ORG_A });
-    expect(decideHaltRequest(globalWithId)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest(globalWithId)).toEqual({ ok: false, reason: 'invalid-request' });
     // Missing halts: its own field's reason.
     const noHalts = {
       actorKind: 'operator',
       requested: { scope: 'org', id: ORG_A, halted: true },
     };
-    expect(decideHaltRequest(noHalts)).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest(noHalts)).toEqual({ ok: false, reason: 'invalid-halts' });
     // Non-array halts and missing imposedBy.
-    expect(decideHaltRequest({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: 'nope' })).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: 'nope' })).toEqual({ ok: false, reason: 'invalid-halts' });
     const noImposedBy = { scope: 'org', id: ORG_A, halted: true };
-    expect(decideHaltRequest({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: [noImposedBy] })).toEqual({ ok: false, reason: 'invalid-halts' });
+    expect(haltRequest({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: [noImposedBy] })).toEqual({ ok: false, reason: 'invalid-halts' });
     // decideScopedHalt target: missing, malformed, blank, extra key — invalid-target, dispatchHalted true.
-    expect(decideScopedHalt({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: [orgEntry(true)] })).toEqual({ ok: false, reason: 'invalid-target', dispatchHalted: true });
+    expect(scopedHalt({ actorKind: 'operator', requested: { scope: 'org', id: ORG_A, halted: true }, halts: [orgEntry(true)] })).toEqual({ ok: false, reason: 'invalid-target', dispatchHalted: true });
     const blankTarget = {
       actorKind: 'operator',
       requested: { scope: 'org', id: ORG_A, halted: true },
       halts: [],
       target: { organizationId: ORG_A, cellId: '' },
     };
-    expect(decideScopedHalt(blankTarget)).toEqual({ ok: false, reason: 'invalid-target', dispatchHalted: true });
+    expect(scopedHalt(blankTarget)).toEqual({ ok: false, reason: 'invalid-target', dispatchHalted: true });
     // A getter inside requested is a snapshot refusal at 'requested...' with dispatchHalted true.
     let getterRuns = 0;
     const requestedWithGetter = Object.defineProperty(
@@ -238,7 +279,7 @@ describe('decideHaltRequest', () => {
       halts: [],
       target: TARGET_A,
     };
-    expect(decideScopedHalt(scopedGetterRequest)).toEqual({ ok: false, reason: 'invalid-request', dispatchHalted: true });
+    expect(scopedHalt(scopedGetterRequest)).toEqual({ ok: false, reason: 'invalid-request', dispatchHalted: true });
     expect(getterRuns).toBe(0);
     // A clean input with a refused permission reports the evaluated dispatch state, not fail-closed.
     const refusedWithCleanState = {
@@ -248,30 +289,30 @@ describe('decideHaltRequest', () => {
       halts: [globalEntry(true)],
       target: TARGET_A,
     };
-    expect(decideScopedHalt(refusedWithCleanState)).toEqual({ ok: false, reason: 'not-permitted', dispatchHalted: true });
+    expect(scopedHalt(refusedWithCleanState)).toEqual({ ok: false, reason: 'not-permitted', dispatchHalted: true });
     const refusedIdle = {
       ...refusedWithCleanState,
       halts: [],
       target: TARGET_A,
     };
-    expect(decideScopedHalt(refusedIdle)).toEqual({ ok: false, reason: 'not-permitted', dispatchHalted: false });
+    expect(scopedHalt(refusedIdle)).toEqual({ ok: false, reason: 'not-permitted', dispatchHalted: false });
   });
 
   it('org-admin cannot halt or lift a cell, global, or another org', () => {
-    expect(decideHaltRequest(orgAdminRequest({ scope: 'cell', id: CELL_1 }))).toEqual({ ok: false, reason: 'not-permitted' });
-    expect(decideHaltRequest(orgAdminRequest({ scope: 'global', omitId: true }))).toEqual({ ok: false, reason: 'not-permitted' });
-    expect(decideHaltRequest(orgAdminRequest({ scope: 'org', id: ORG_B }))).toEqual({ ok: false, reason: 'not-permitted' });
-    expect(decideHaltRequest(orgAdminRequest({ scope: 'cell', id: CELL_1, halted: false }))).toEqual({ ok: false, reason: 'not-permitted' });
+    expect(haltRequest(orgAdminRequest({ scope: 'cell', id: CELL_1 }))).toEqual({ ok: false, reason: 'not-permitted' });
+    expect(haltRequest(orgAdminRequest({ scope: 'global', omitId: true }))).toEqual({ ok: false, reason: 'not-permitted' });
+    expect(haltRequest(orgAdminRequest({ scope: 'org', id: ORG_B }))).toEqual({ ok: false, reason: 'not-permitted' });
+    expect(haltRequest(orgAdminRequest({ scope: 'cell', id: CELL_1, halted: false }))).toEqual({ ok: false, reason: 'not-permitted' });
   });
 
   it('org-admin cannot lift an operator-imposed halt on its own org', () => {
     const lifting = orgAdminRequest({ halted: false });
     (lifting as Record<string, unknown>).halts = [orgEntry(true, 'operator')];
-    expect(decideHaltRequest(lifting)).toEqual({ ok: false, reason: 'not-permitted' });
+    expect(haltRequest(lifting)).toEqual({ ok: false, reason: 'not-permitted' });
     // But it can lift its own org-admin-imposed halt.
     const ownLift = orgAdminRequest({ halted: false });
     (ownLift as Record<string, unknown>).halts = [orgEntry(true, 'org-admin')];
-    expect(decideHaltRequest(ownLift)).toEqual({
+    expect(haltRequest(ownLift)).toEqual({
       ok: true,
       scope: 'org',
       id: ORG_A,
@@ -282,9 +323,9 @@ describe('decideHaltRequest', () => {
 
   it('operator global lift requires confirmGlobalLift true', () => {
     const lift = operatorRequest({ scope: 'global', omitId: true, halted: false });
-    expect(decideHaltRequest(lift)).toEqual({ ok: false, reason: 'global-lift-confirmation-required' });
-    expect(decideHaltRequest({ ...lift, requested: { scope: 'global', halted: false, confirmGlobalLift: 'yes' } })).toEqual({ ok: false, reason: 'invalid-request' });
-    expect(decideHaltRequest({ ...lift, requested: { scope: 'global', halted: false, confirmGlobalLift: true } })).toEqual({
+    expect(haltRequest(lift)).toEqual({ ok: false, reason: 'global-lift-confirmation-required' });
+    expect(haltRequest({ ...lift, requested: { scope: 'global', halted: false, confirmGlobalLift: 'yes' } })).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(haltRequest({ ...lift, requested: { scope: 'global', halted: false, confirmGlobalLift: true } })).toEqual({
       ok: true,
       scope: 'global',
       halted: false,
@@ -293,26 +334,26 @@ describe('decideHaltRequest', () => {
   });
 
   it('operator can halt and lift org, cell, and global when confirmed', () => {
-    expect(decideHaltRequest(operatorRequest({ scope: 'org', id: ORG_A, halted: true }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'org', id: ORG_A, halted: true }))).toEqual({
       ok: true, scope: 'org', id: ORG_A, halted: true, imposedBy: 'operator',
     });
-    expect(decideHaltRequest(operatorRequest({ scope: 'org', id: ORG_A, halted: false }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'org', id: ORG_A, halted: false }))).toEqual({
       ok: true, scope: 'org', id: ORG_A, halted: false, imposedBy: 'operator',
     });
-    expect(decideHaltRequest(operatorRequest({ scope: 'cell', id: CELL_1, halted: true }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'cell', id: CELL_1, halted: true }))).toEqual({
       ok: true, scope: 'cell', id: CELL_1, halted: true, imposedBy: 'operator',
     });
-    expect(decideHaltRequest(operatorRequest({ scope: 'cell', id: CELL_1, halted: false }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'cell', id: CELL_1, halted: false }))).toEqual({
       ok: true, scope: 'cell', id: CELL_1, halted: false, imposedBy: 'operator',
     });
-    expect(decideHaltRequest(operatorRequest({ scope: 'global', omitId: true, halted: true }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'global', omitId: true, halted: true }))).toEqual({
       ok: true, scope: 'global', halted: true, imposedBy: 'operator',
     });
-    expect(decideHaltRequest(operatorRequest({ scope: 'global', omitId: true, halted: false, confirmGlobalLift: true }))).toEqual({
+    expect(haltRequest(operatorRequest({ scope: 'global', omitId: true, halted: false, confirmGlobalLift: true }))).toEqual({
       ok: true, scope: 'global', halted: false, imposedBy: 'operator',
     });
     // A global permit result omits id entirely.
-    const globalPermit = decideHaltRequest(operatorRequest({ scope: 'global', omitId: true, halted: true }));
+    const globalPermit = haltRequest(operatorRequest({ scope: 'global', omitId: true, halted: true }));
     expect(Object.hasOwn(globalPermit, 'id')).toBe(false);
   });
 
@@ -323,13 +364,13 @@ describe('decideHaltRequest', () => {
       halts: [globalEntry(true)],
       target: TARGET_A,
     };
-    expect(decideScopedHalt(request)).toEqual({
+    expect(scopedHalt(request)).toEqual({
       ok: true,
       requestDecision: { scope: 'cell', id: CELL_1, halted: true, imposedBy: 'operator' },
       dispatchHalted: true,
     });
     const idle = { ...request, halts: [] };
-    expect(decideScopedHalt(idle)).toEqual({
+    expect(scopedHalt(idle)).toEqual({
       ok: true,
       requestDecision: { scope: 'cell', id: CELL_1, halted: true, imposedBy: 'operator' },
       dispatchHalted: false,
@@ -339,38 +380,38 @@ describe('decideHaltRequest', () => {
 
 describe('isDispatchHalted', () => {
   it('org halt blocks only its own org and never another org', () => {
-    expect(isDispatchHalted([orgEntry(true)], TARGET_A)).toBe(true);
-    expect(isDispatchHalted([orgEntry(true)], TARGET_B)).toBe(false);
-    expect(isDispatchHalted([orgEntry(true), orgEntry(false)], TARGET_A)).toBe(true);
-    expect(isDispatchHalted([{ scope: 'org', id: ORG_B, halted: true, imposedBy: 'operator' }], TARGET_A)).toBe(false);
+    expect(dispatchHalted([orgEntry(true)], TARGET_A)).toBe(true);
+    expect(dispatchHalted([orgEntry(true)], TARGET_B)).toBe(false);
+    expect(dispatchHalted([orgEntry(true), orgEntry(false)], TARGET_A)).toBe(true);
+    expect(dispatchHalted([{ scope: 'org', id: ORG_B, halted: true, imposedBy: 'operator' }], TARGET_A)).toBe(false);
   });
 
   it('cell halt blocks every org in that cell and not other cells', () => {
-    expect(isDispatchHalted([cellEntry(CELL_1, true)], { organizationId: ORG_A, cellId: CELL_1 })).toBe(true);
-    expect(isDispatchHalted([cellEntry(CELL_1, true)], { organizationId: ORG_B, cellId: CELL_1 })).toBe(true);
-    expect(isDispatchHalted([cellEntry(CELL_1, true)], TARGET_B)).toBe(false);
-    expect(isDispatchHalted([cellEntry(CELL_1, false)], TARGET_A)).toBe(false);
+    expect(dispatchHalted([cellEntry(CELL_1, true)], { organizationId: ORG_A, cellId: CELL_1 })).toBe(true);
+    expect(dispatchHalted([cellEntry(CELL_1, true)], { organizationId: ORG_B, cellId: CELL_1 })).toBe(true);
+    expect(dispatchHalted([cellEntry(CELL_1, true)], TARGET_B)).toBe(false);
+    expect(dispatchHalted([cellEntry(CELL_1, false)], TARGET_A)).toBe(false);
   });
 
   it('global halt blocks all targets', () => {
-    expect(isDispatchHalted([globalEntry(true)], TARGET_A)).toBe(true);
-    expect(isDispatchHalted([globalEntry(true)], TARGET_B)).toBe(true);
-    expect(isDispatchHalted([{ scope: 'global', halted: false, imposedBy: 'operator' }], TARGET_A)).toBe(false);
+    expect(dispatchHalted([globalEntry(true)], TARGET_A)).toBe(true);
+    expect(dispatchHalted([globalEntry(true)], TARGET_B)).toBe(true);
+    expect(dispatchHalted([{ scope: 'global', halted: false, imposedBy: 'operator' }], TARGET_A)).toBe(false);
   });
 
   it('duplicate or contradictory entries for one scope resolve to halted when any says halted', () => {
-    expect(isDispatchHalted([orgEntry(false), orgEntry(true)], TARGET_A)).toBe(true);
-    expect(isDispatchHalted([globalEntry(false), globalEntry(true)], TARGET_B)).toBe(true);
-    expect(isDispatchHalted([cellEntry(CELL_1, false), cellEntry(CELL_1, true)], TARGET_A)).toBe(true);
-    expect(isDispatchHalted([orgEntry(false), orgEntry(false)], TARGET_A)).toBe(false);
+    expect(dispatchHalted([orgEntry(false), orgEntry(true)], TARGET_A)).toBe(true);
+    expect(dispatchHalted([globalEntry(false), globalEntry(true)], TARGET_B)).toBe(true);
+    expect(dispatchHalted([cellEntry(CELL_1, false), cellEntry(CELL_1, true)], TARGET_A)).toBe(true);
+    expect(dispatchHalted([orgEntry(false), orgEntry(false)], TARGET_A)).toBe(false);
   });
 
   it('refuses malformed targets by failing closed to halted true', () => {
     for (const badTarget of [null, undefined, 7, {}, { organizationId: ORG_A }, { organizationId: ORG_A, cellId: CELL_1, extra: 1 }, { organizationId: ORG_A, cellId: 5 }]) {
-      expect(isDispatchHalted([orgEntry(true)], badTarget)).toBe(true);
+      expect(dispatchHalted([orgEntry(true)], badTarget)).toBe(true);
     }
-    expect(isDispatchHalted('nope', TARGET_A)).toBe(true);
-    expect(isDispatchHalted([orgEntry(true)], revokedProxy())).toBe(true);
-    expect(isDispatchHalted(revokedProxy(), TARGET_A)).toBe(true);
+    expect(dispatchHalted('nope', TARGET_A)).toBe(true);
+    expect(dispatchHalted([orgEntry(true)], revokedProxy())).toBe(true);
+    expect(dispatchHalted(revokedProxy(), TARGET_A)).toBe(true);
   });
 });

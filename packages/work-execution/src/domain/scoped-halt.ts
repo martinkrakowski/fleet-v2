@@ -334,9 +334,13 @@ function snapshotInput(input: unknown, isProxy: IsProxy): PlainDataSnapshot {
  * Decide a halt or lift request on its own, without a dispatch target.
  * Reads `input` once through `snapshotPlainData` with `SCOPED_HALT_LIMITS`,
  * then validates the exact key set in `O(own keys), one enumeration` per
- * record. Never throws, never echoes a value or ID.
+ * record. Never throws, never echoes a value or ID. `isProxy` is a required,
+ * trusted, side-effect-free detector (in production the `types.isProxy`
+ * predicate passed by infrastructure); there is no permissive default — a
+ * caller that omits it fails closed, because `snapshotPlainData` refuses a
+ * non-function detector and the refusals below are typed refusals.
  */
-export function decideHaltRequest(input: unknown, isProxy: IsProxy = () => false): ScopedHaltDecision {
+export function decideHaltRequest(input: unknown, isProxy: IsProxy): ScopedHaltDecision {
   const snapshot = snapshotInput(input, isProxy);
   if (!snapshot.ok) {
     return { ok: false, reason: reasonForSnapshotPath(snapshot.path, false) };
@@ -412,9 +416,11 @@ export function decideHaltRequest(input: unknown, isProxy: IsProxy = () => false
  * fail-closed: every malformed or hostile read — a snapshot refusal, a
  * non-array, more than `MAX_SCOPED_HALTS` entries, a sparse hole, a
  * malformed entry or target, an own `__proto__` key, a missing required or
- * an extra unknown key — answers `true` (halted), never a pass.
+ * an extra unknown key — answers `true` (halted), never a pass. `isProxy` is
+ * a required trusted detector: an omitted or non-function detector refuses
+ * the snapshot, which fails closed to `true`.
  */
-export function isDispatchHalted(halts: unknown, target: unknown, isProxy: IsProxy = () => false): boolean {
+export function isDispatchHalted(halts: unknown, target: unknown, isProxy: IsProxy): boolean {
   const haltsSnapshot = snapshotPlainData(halts, isProxy, SCOPED_HALT_LIMITS);
   if (!haltsSnapshot.ok) {
     return true;
@@ -442,7 +448,7 @@ export function isDispatchHalted(halts: unknown, target: unknown, isProxy: IsPro
  * `dispatchHalted: true`; once every read is clean, a request refusal
  * reports the evaluated dispatch state instead of assuming one.
  */
-export function decideScopedHalt(input: unknown, isProxy: IsProxy = () => false): ScopedHaltWithDispatchDecision {
+export function decideScopedHalt(input: unknown, isProxy: IsProxy): ScopedHaltWithDispatchDecision {
   const snapshot = snapshotInput(input, isProxy);
   if (!snapshot.ok) {
     return { ok: false, reason: reasonForSnapshotPath(snapshot.path, true), dispatchHalted: true };

@@ -218,6 +218,14 @@ describe("extractScopeList", () => {
       'export const FROZEN_SCOPES = ["read"]\nconst OTHER = 1;',
       // A duplicate element.
       'export const FROZEN_SCOPES = ["read", "read"];',
+      // Two declarations of the same name.
+      'export const FROZEN_SCOPES = ["read"];\nexport const FROZEN_SCOPES = ["tail"];',
+      // Empty and multi-line elements.
+      'export const FROZEN_SCOPES = ["read", ""];',
+      'export const FROZEN_SCOPES = ["re\nad"];',
+      // A declaration inside a block comment or a template literal.
+      '/*\nexport const FROZEN_SCOPES = ["read"];\n*/',
+      'const x = `\nexport const FROZEN_SCOPES = ["read"];\n`;',
       // A declaration that sits inside a line comment, not at a line start.
       '// export const FROZEN_SCOPES = ["read"];',
     ]) {
@@ -304,7 +312,35 @@ describe("extractScopeList", () => {
   });
 });
 
+describe("extractScopeList cost", () => {
+  it("parses a large in-bound list with distinct elements within a generous time bound", () => {
+    const elements: string[] = [];
+    for (let i = 0; i < 60_000; i += 1) elements.push(`"s${i}"`);
+    const text = `export const BIG = [${elements.join(",")}] as const;`;
+    expect(text.length).toBeLessThan(1_000_000);
+    const started = Date.now();
+    const result = extractScopeList(text, "BIG");
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.scopes.length).toBe(60_000);
+  });
+
+  it("ignores a commented-out declaration and reads the real one", () => {
+    const result = extractScopeList(
+      '/* export const L = ["x"];\n*/\nexport const L = ["read"];',
+      "L",
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect([...result.scopes]).toEqual(["read"]);
+  });
+});
+
 describe("drift guard", () => {
+  const diff = (listName: string, actual: readonly string[], expected: readonly string[]) => ({
+    list: listName,
+    missing: expected.filter((s) => !actual.includes(s)),
+    extra: actual.filter((s) => !expected.includes(s)),
+  });
   /**
    * Resolve the repo root by walking up from this file's directory until
    * the two frozen scope sources exist (never `process.cwd()`). Bounded to
@@ -349,12 +385,22 @@ describe("drift guard", () => {
     expect(frozen.ok).toBe(true);
     expect(mintable.ok).toBe(true);
     if (!frozen.ok || !mintable.ok) return;
+    expect(diff("FROZEN_SCOPES", HOSTED_SCOPES, frozen.scopes)).toEqual({
+      list: "FROZEN_SCOPES",
+      missing: [],
+      extra: [],
+    });
     expect(
-      sameScopes(HOSTED_SCOPES, frozen.scopes),
-    ).toBe(true);
-    expect(
-      sameScopes(HOSTED_SCOPES, [...mintable.scopes, "orchestrate"]),
-    ).toBe(true);
+      diff("MINTABLE_SESSION_SCOPES + orchestrate", HOSTED_SCOPES, [
+        ...mintable.scopes,
+        "orchestrate",
+      ]),
+    ).toEqual({
+      list: "MINTABLE_SESSION_SCOPES + orchestrate",
+      missing: [],
+      extra: [],
+    });
+    expect(HOSTED_SCOPES.length).toBe(new Set(HOSTED_SCOPES).size);
   });
 
   it("every scope granted to any role is mintable for a session", () => {

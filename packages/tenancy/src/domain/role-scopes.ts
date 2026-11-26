@@ -82,6 +82,50 @@ const SCOPE_LIST_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SCOPE_LIST_NAME_MAX_LENGTH = 128;
 const SOURCE_TEXT_MAX_LENGTH = 1_000_000;
 
+/**
+ * One linear pass returning `text` with block comments, line comments and
+ * template-literal spans replaced by spaces (newlines kept), so indices are
+ * unchanged. Quoted strings are tracked but kept. O(L) time and space.
+ */
+function blankCommentsAndTemplates(text: string): string {
+  const out: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i] as string;
+    const n = text[i + 1];
+    let stop = -1;
+    let blank = false;
+    if (c === "/" && n === "*") {
+      const close = text.indexOf("*/", i + 2);
+      stop = close === -1 ? text.length : close + 2;
+      blank = true;
+    } else if (c === "/" && n === "/") {
+      const nl = text.indexOf("\n", i);
+      stop = nl === -1 ? text.length : nl;
+      blank = true;
+    } else if (c === "`") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== "`") j += text[j] === "\\" ? 2 : 1;
+      stop = Math.min(j + 1, text.length);
+      blank = true;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c && text[j] !== "\n") {
+        j += text[j] === "\\" ? 2 : 1;
+      }
+      stop = Math.min(j + 1, text.length);
+    } else {
+      out.push(c);
+      i += 1;
+      continue;
+    }
+    const span = text.slice(i, stop);
+    out.push(blank ? span.replace(/[^\n]/g, " ") : span);
+    i = stop;
+  }
+  return out.join("");
+}
+
 /** True when `text` continues at `from` with `[ as const];` and nothing else on the statement. */
 function isDeclarationEnd(text: string, from: number): boolean {
   const tail = text.slice(from, text.indexOf("\n", from) === -1 ? undefined : text.indexOf("\n", from));
@@ -93,8 +137,8 @@ function isDeclarationEnd(text: string, from: number): boolean {
  * declaration from source text. Returns a typed refusal for every invalid
  * or unparseable input; nothing throws.
  *
- * Cost bound: O(L) time in the source length for two `indexOf` scans and
- * one bounded slice — never a nested-quantifier regex on untrusted input —
+ * Cost bound: O(L) time in the source length for one blanking pass, a few
+ * `indexOf` scans, one bounded slice and Set-based duplicate checks — never a nested-quantifier regex on untrusted input —
  * and O(k) space for the k extracted scope strings.
  */
 export function extractScopeList(
@@ -115,18 +159,26 @@ export function extractScopeList(
     return { ok: false, reason: "source text exceeds size bound" };
   }
   const declaration = `export const ${name} = [`;
-  const start = text.indexOf(declaration);
-  // The declaration must begin a line, so a commented-out copy never matches.
-  if (start === -1 || (start > 0 && text[start - 1] !== "\n")) {
+  // Comments and template literals are blanked first, so a declaration
+  // inside either never matches; indices still line up with `text`.
+  const code = blankCommentsAndTemplates(text);
+  const start = code.indexOf(declaration);
+  // The declaration must begin a line and be the only one.
+  if (
+    start === -1 ||
+    (start > 0 && code[start - 1] !== "\n") ||
+    code.indexOf(declaration, start + 1) !== -1
+  ) {
     return { ok: false, reason: "could not parse scope list" };
   }
   const elementsStart = start + declaration.length;
   const end = text.indexOf("]", elementsStart);
-  if (end === -1 || !isDeclarationEnd(text, end + 1)) {
+  if (end === -1 || !isDeclarationEnd(code, end + 1)) {
     return { ok: false, reason: "could not parse scope list" };
   }
   const body = text.slice(elementsStart, end);
   const scopes: string[] = [];
+  const seen = new Set<string>();
   /**
    * Element scan: one pass over the bounded body, no regex. The grammar is
    * strict so a malformed declaration is refused rather than accepted:
@@ -154,10 +206,17 @@ export function extractScopeList(
         return { ok: false, reason: "could not parse scope list" };
       }
       const element = body.slice(index + 1, closing);
-      if (scopes.includes(element)) {
-        // A duplicate grant is drift, not a list.
+      // An empty element, a multi-line element or a duplicate grant is
+      // drift, not a list. The Set keeps the duplicate check O(1) per element.
+      if (
+        element.length === 0 ||
+        element.includes("\n") ||
+        element.includes("\r") ||
+        seen.has(element)
+      ) {
         return { ok: false, reason: "could not parse scope list" };
       }
+      seen.add(element);
       scopes.push(element);
       index = closing + 1;
       afterElement = true;

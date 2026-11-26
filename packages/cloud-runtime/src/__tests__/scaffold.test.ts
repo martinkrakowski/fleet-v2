@@ -29,7 +29,7 @@ function readManifest(): Record<string, unknown> {
 }
 
 describe("@fleet/cloud-runtime scaffold", () => {
-  it("package.json declares name @fleet/cloud-runtime, private true, license MIT and exactly @fleet/shared among @fleet/* dependencies", () => {
+  it("package.json declares name @fleet/cloud-runtime, private true, license MIT and exactly @fleet/shared and @fleet/work-execution among @fleet/* dependencies", () => {
     const manifest = readManifest();
     expect(manifest.name).toBe("@fleet/cloud-runtime");
     expect(manifest.private).toBe(true);
@@ -41,7 +41,7 @@ describe("@fleet/cloud-runtime scaffold", () => {
     const fleetNames = Object.keys(dependencies)
       .filter((name) => name.startsWith("@fleet/"))
       .sort();
-    expect(fleetNames).toEqual(["@fleet/shared"]);
+    expect(fleetNames).toEqual(["@fleet/shared", "@fleet/work-execution"]);
   });
 
   it("package.json has no own prototype-polluting key at the top level or in dependencies", () => {

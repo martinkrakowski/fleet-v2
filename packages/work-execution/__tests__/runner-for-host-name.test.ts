@@ -2,7 +2,7 @@
 // current installation host by name alone, from that host's OWN declared
 // port, auth file and capabilities, with every refusal naming the cause and
 // never falling back to another host, port, auth file or capability profile.
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import type {
   RunnerIsolationCapabilities,
@@ -13,7 +13,7 @@ import type {
   StopRunnerSessionResult,
 } from "../src/application/ports/out/ExecutionRunnerPort.out-port.js";
 import type { SubprocessResult, SubprocessRunner } from "../src/infrastructure/adapters/ExecutionRunnerAdapter.adapter.js";
-import type { RunnerForHostNamePort } from "../src/application/ports/out/RunnerForAttemptPort.out-port.js";
+import type { RunnerForHostNamePort } from "../src/application/ports/out/RunnerForHostNamePort.out-port.js";
 import { RunnerForAttemptAdapter } from "../src/infrastructure/adapters/RunnerForAttemptAdapter.adapter.js";
 
 /** A runner-b-shaped declared capability profile (distinct from runner-a's). */
@@ -562,6 +562,134 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
     expect(invoked).toBe(false);
   });
 
+  it("refuses capabilities whose own fields are accessors (capabilities itself, each flag, filesystemScope and source) without invoking any getter", () => {
+    let invoked = false;
+    const throwingGetter = (): never => {
+      invoked = true;
+      throw new Error("getter must never run");
+    };
+    // Each host declares one accessor in a different position of the
+    // capabilities declaration; every variant must refuse without running it.
+    const hosts: Record<string, unknown> = {
+      "capabilities-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          get capabilities() {
+            return throwingGetter();
+          },
+        },
+      },
+      "filesystemScope-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          capabilities: {
+            ...runnerBCapabilities,
+            get filesystemScope() {
+              return throwingGetter();
+            },
+          },
+        },
+      },
+      "networkEgressRestricted-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          capabilities: {
+            ...runnerBCapabilities,
+            get networkEgressRestricted() {
+              return throwingGetter();
+            },
+          },
+        },
+      },
+      "cpuAndMemoryLimited-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          capabilities: {
+            ...runnerBCapabilities,
+            get cpuAndMemoryLimited() {
+              return throwingGetter();
+            },
+          },
+        },
+      },
+      "processTreeTermination-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          capabilities: {
+            ...runnerBCapabilities,
+            get processTreeTermination() {
+              return throwingGetter();
+            },
+          },
+        },
+      },
+      "source-getter": {
+        transport: "ssh",
+        sshAlias: "b.example",
+        roles: ["lane-runner"],
+        runner: {
+          kind: "opencode",
+          port: 4266,
+          authFile: "/auth/b",
+          capabilities: {
+            ...runnerBCapabilities,
+            get source() {
+              return throwingGetter();
+            },
+          },
+        },
+      },
+    };
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: hosts as never,
+      legacyRunner: {
+        describeCapabilities: () => expectedRunnerBOverride,
+        async startSession() {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+        async inspectSession(): Promise<RunnerSessionStatus> {
+          throw new Error("legacy stub");
+        },
+        async stopSession(): Promise<StopRunnerSessionResult> {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+      },
+    });
+    for (const host of Object.keys(hosts)) {
+      const result = adapter.runnerForHostName(host);
+      expect(result.ok, host).toBe(false);
+      if (!result.ok) {
+        expect(result.reason, host).toContain("capabilities");
+      }
+    }
+    expect(invoked).toBe(false);
+  });
+
   it("refuses a host without the lane-runner role (including non-array, sparse array, and array-like roles)", () => {
     const make = (roles: unknown): RunnerForAttemptAdapter =>
       new RunnerForAttemptAdapter({
@@ -802,10 +930,38 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
 });
 
 describe("RunnerForHostNamePort", () => {
-  it("is an application port the adapter satisfies, so callers need not import the adapter", () => {
-    expectTypeOf<RunnerForAttemptAdapter>().toMatchTypeOf<RunnerForHostNamePort>();
-    const port: RunnerForHostNamePort = new RunnerForAttemptAdapter({ hosts: {} });
-    expect(port.runnerForHostName("runner-b").ok).toBe(false);
+  it("resolves the named current host through the port and refuses an absent host", () => {
+    const legacyRunner = {
+      describeCapabilities: () => expectedRunnerBOverride,
+      async startSession() {
+        return { outcome: "refused", reason: "legacy stub" };
+      },
+      async inspectSession(): Promise<RunnerSessionStatus> {
+        throw new Error("legacy stub");
+      },
+      async stopSession(): Promise<StopRunnerSessionResult> {
+        return { outcome: "refused", reason: "legacy stub" };
+      },
+    };
+    const port: RunnerForHostNamePort = new RunnerForAttemptAdapter({
+      hosts: baseHosts() as never,
+      legacyRunner,
+    });
+    const resolved = port.runnerForHostName("runner-b");
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      expect(resolved.runner).toBeDefined();
+    }
+
+    // An empty hosts map refuses the same name with the absent-host reason.
+    const empty: RunnerForHostNamePort = new RunnerForAttemptAdapter({
+      hosts: {},
+      legacyRunner,
+    });
+    expect(empty.runnerForHostName("runner-b")).toEqual({
+      ok: false,
+      reason: "host runner-b is not present in installation hosts",
+    });
   });
 });
 

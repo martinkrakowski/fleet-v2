@@ -29,8 +29,8 @@ import type {
   RunnerForAttemptPort,
   RunnerForAttemptRequest,
   RunnerForAttemptResult,
-  RunnerForHostNamePort,
 } from "../../application/ports/out/RunnerForAttemptPort.out-port.js";
+import type { RunnerForHostNamePort } from "../../application/ports/out/RunnerForHostNamePort.out-port.js";
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
   AttemptRecord,
@@ -491,7 +491,8 @@ export class RunnerForAttemptAdapter
     }
 
     const sourceRead = readOwnDataProp(capsObj, "source");
-    const source = sourceRead.ok ? sourceRead.value : undefined;
+    if (!sourceRead.ok) return null;
+    const source = sourceRead.value;
     if (source !== undefined && source !== "declared") return null;
 
     return {

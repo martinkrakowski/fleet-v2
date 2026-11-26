@@ -100,7 +100,7 @@ describe('decideEnvironmentStep', () => {
   describe('destroy and fail legality', () => {
     it('destroys from created, loaded, sealed and failed states', () => {
       for (const status of ['created', 'loaded', 'sealed', 'failed'] as const) {
-        const state = createdState(status === 'loaded' ? { status, worktreeRef: WORKTREE_REF } : { status });
+        const state = createdState(status === 'loaded' || status === 'sealed' ? { status, worktreeRef: WORKTREE_REF } : { status });
         const result = decideEnvironmentStep(state, destroyEvent());
         expect(result.ok).toBe(true);
         if (result.ok) expect(result.state.status).toBe('destroyed');
@@ -109,7 +109,7 @@ describe('decideEnvironmentStep', () => {
 
     it('fails from created, loaded and sealed states into failed', () => {
       for (const status of ['created', 'loaded', 'sealed'] as const) {
-        const state = createdState(status === 'loaded' ? { status, worktreeRef: WORKTREE_REF } : { status });
+        const state = createdState(status === 'loaded' || status === 'sealed' ? { status, worktreeRef: WORKTREE_REF } : { status });
         const result = decideEnvironmentStep(state, failEvent());
         expect(result.ok).toBe(true);
         if (result.ok) expect(result.state.status).toBe('failed');
@@ -147,7 +147,7 @@ describe('decideEnvironmentStep', () => {
   describe('duplicate and re-creation refusals', () => {
     it('refuses a second environment for an active attempt with duplicate-attempt', () => {
       for (const status of ['created', 'loaded', 'sealed'] as const) {
-        const state = createdState(status === 'loaded' ? { status, worktreeRef: WORKTREE_REF } : { status });
+        const state = createdState(status === 'loaded' || status === 'sealed' ? { status, worktreeRef: WORKTREE_REF } : { status });
         expect(decideEnvironmentStep(state, createEvent())).toEqual({ ok: false, reason: 'duplicate-attempt' });
       }
     });
@@ -190,6 +190,48 @@ describe('decideEnvironmentStep', () => {
       const created = createdState();
       expect(decideEnvironmentStep(created, sealEvent())).toEqual({ ok: false, reason: 'invalid-transition' });
       expect(created.status).toBe('created');
+    });
+  });
+
+  describe('status-field consistency', () => {
+    it('refuses a loaded state without an injected worktree, so seal can never succeed without injection', () => {
+      const loadedWithoutWorktree = createdState({ status: 'loaded', worktreeRef: null });
+      expect(decideEnvironmentStep(loadedWithoutWorktree, sealEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      expect(decideEnvironmentStep(loadedWithoutWorktree, injectEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
+    it('refuses a sealed state without an injected worktree', () => {
+      const sealedWithoutWorktree = createdState({ status: 'sealed', worktreeRef: null });
+      expect(decideEnvironmentStep(sealedWithoutWorktree, destroyEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
+    it('refuses a created state that already carries a worktree reference', () => {
+      const createdWithWorktree = createdState({ worktreeRef: WORKTREE_REF });
+      expect(decideEnvironmentStep(createdWithWorktree, injectEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
+    it('refuses a none state that carries any handle field', () => {
+      for (const key of ['attemptId', 'environmentId', 'isolation', 'worktreeRef'] as const) {
+        const polluted: Record<string, unknown> = { status: 'none', attemptId: null, environmentId: null, isolation: null, worktreeRef: null };
+        polluted[key] = key === 'worktreeRef' ? WORKTREE_REF : key === 'isolation' ? 'microvm' : ATTEMPT_ID;
+        expect(decideEnvironmentStep(polluted, createEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      }
+    });
+
+    it('refuses an active status whose handle fields are missing', () => {
+      for (const status of ['created', 'loaded', 'sealed', 'failed', 'destroyed'] as const) {
+        for (const key of ['attemptId', 'environmentId', 'isolation'] as const) {
+          const incomplete: Record<string, unknown> = {
+            status,
+            attemptId: status === 'loaded' || status === 'sealed' ? ATTEMPT_ID : ATTEMPT_ID,
+            environmentId: ENVIRONMENT_ID,
+            isolation: 'microvm',
+            worktreeRef: status === 'loaded' || status === 'sealed' ? WORKTREE_REF : null,
+          };
+          incomplete[key] = null;
+          expect(decideEnvironmentStep(incomplete, sealEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+        }
+      }
     });
   });
 

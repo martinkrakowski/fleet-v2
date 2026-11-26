@@ -12,8 +12,10 @@
  *
  * Hostile-input rule: state and event are read through their own property
  * descriptors only (no getter ever runs), a plain object profile is required
- * (`Object.prototype` or `null` prototype, never an array), prototype-polluting
- * keys and extra keys are refused, and every refusal is a typed
+ * (`Object.prototype` or `null` prototype, never an array), the state's fields
+ * must be consistent with its status (a `none` state carries no handle, every
+ * active status carries a full handle, and a `loaded`/`sealed` state carries
+ * the injected worktree), prototype-polluting keys and extra keys are refused, and every refusal is a typed
  * `{ ok: false, reason }` result. A `Proxy` that lies consistently in every
  * trap is an accepted residual; a `Proxy` detectable through its array target,
  * its reported descriptors, its prototype or a throwing
@@ -231,6 +233,32 @@ export function decideEnvironmentStep(state: unknown, event: unknown): AttemptEn
   for (const key of ['attemptId', 'environmentId', 'isolation', 'worktreeRef'] as const) {
     const value = stateRecord[key];
     if (value !== null && !isValidOptionalStateField(key, value)) {
+      return { ok: false, reason: 'invalid-input' };
+    }
+  }
+  // Status-field consistency (review fix round 2, item 1): each field must
+  // agree with the status, not merely be valid in isolation. A `none` state
+  // must carry no handle at all; every other status must carry a full handle
+  // (attemptId, environmentId, isolation); a `loaded` or `sealed` state must
+  // carry the injected worktree, and `created` must not have one yet. A
+  // `loaded` state without a worktree can therefore never reach `seal`.
+  if (status === 'none') {
+    if (
+      stateRecord['attemptId'] !== null ||
+      stateRecord['environmentId'] !== null ||
+      stateRecord['isolation'] !== null ||
+      stateRecord['worktreeRef'] !== null
+    ) {
+      return { ok: false, reason: 'invalid-input' };
+    }
+  } else {
+    if (stateRecord['attemptId'] === null || stateRecord['environmentId'] === null || stateRecord['isolation'] === null) {
+      return { ok: false, reason: 'invalid-input' };
+    }
+    if ((status === 'loaded' || status === 'sealed') && stateRecord['worktreeRef'] === null) {
+      return { ok: false, reason: 'invalid-input' };
+    }
+    if (status === 'created' && stateRecord['worktreeRef'] !== null) {
       return { ok: false, reason: 'invalid-input' };
     }
   }

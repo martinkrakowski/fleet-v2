@@ -203,17 +203,22 @@ function isValidApiBaseUrl(value: unknown): value is string {
  * Validate untrusted hosted forge configuration input. `isProxy` is always a
  * separate positional parameter (never a field of an options object);
  * infrastructure callers pass `types.isProxy`.
+ *
+ * The detector is mandatory: the zero-trap guarantee holds only with a
+ * trusted, accurate detector, so an omitted or non-function detector is
+ * refused with `proxy-detector-required` instead of being defaulted to an
+ * always-false detector that would let a Proxy's traps run.
  */
 export function validateHostedForgeConfig(
   raw: unknown,
   isProxy?: IsProxy,
 ): HostedForgeValidationResult {
-  if (isProxy !== undefined && typeof isProxy !== "function") {
+  if (isProxy === undefined || typeof isProxy !== "function") {
     return refused("proxy-detector-required");
   }
   // Read the untrusted value exactly once: zero getter or Proxy trap
   // execution, bounded by `HOSTED_FORGE_LIMITS`.
-  const snapshot = snapshotPlainData(raw, isProxy ?? (() => false), HOSTED_FORGE_LIMITS);
+  const snapshot = snapshotPlainData(raw, isProxy, HOSTED_FORGE_LIMITS);
   if (!snapshot.ok) {
     const field = snapshot.path === null ? undefined : fieldForPath(snapshot.path);
     return refused("invalid-forge-config", field);

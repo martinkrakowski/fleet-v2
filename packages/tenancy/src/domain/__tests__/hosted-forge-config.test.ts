@@ -10,9 +10,24 @@ function jsonOf(result: HostedForgeValidationResult): string {
   return JSON.stringify(result);
 }
 
+/**
+ * Every validation that is not specifically about the detector itself runs
+ * with the trusted `node:util` `types.isProxy` detector, which the now
+ * mandatory detector parameter requires.
+ */
+function validate(
+  raw: unknown,
+  isProxy: unknown = types.isProxy,
+): HostedForgeValidationResult {
+  return validateHostedForgeConfig(
+    raw,
+    isProxy as Parameters<typeof validateHostedForgeConfig>[1],
+  );
+}
+
 describe("validateHostedForgeConfig", () => {
   it("accepts a minimal github-app config and returns a frozen config object", () => {
-    const result = validateHostedForgeConfig({ kind: "github-app", installationId: "12345" });
+    const result = validate({ kind: "github-app", installationId: "12345" });
     expect(result).toEqual({
       ok: true,
       config: { kind: "github-app", installationId: "12345" },
@@ -21,7 +36,7 @@ describe("validateHostedForgeConfig", () => {
   });
 
   it("accepts a full github-app config and returns a frozen config object", () => {
-    const result = validateHostedForgeConfig({
+    const result = validate({
       kind: "github-app",
       installationId: "12345",
       appId: "678",
@@ -42,7 +57,7 @@ describe("validateHostedForgeConfig", () => {
   });
 
   it("refuses personal-token kind with personal-credential-refused and field kind", () => {
-    const result = validateHostedForgeConfig({
+    const result = validate({
       kind: "personal-token",
       installationId: "12345",
     });
@@ -51,10 +66,10 @@ describe("validateHostedForgeConfig", () => {
 
   it("refuses missing or unsupported forge kind with unsupported-forge-kind and field kind", () => {
     for (const kind of ["oauth", "ssh", "", 123, null]) {
-      const result = validateHostedForgeConfig({ kind, installationId: "12345" });
+      const result = validate({ kind, installationId: "12345" });
       expect(result).toEqual({ ok: false, reason: "unsupported-forge-kind", field: "kind" });
     }
-    expect(validateHostedForgeConfig({ installationId: "12345" })).toEqual({
+    expect(validate({ installationId: "12345" })).toEqual({
       ok: false,
       reason: "unsupported-forge-kind",
       field: "kind",
@@ -70,7 +85,7 @@ describe("validateHostedForgeConfig", () => {
       { kind: "github-app", installationId: "1", items: [{ auth_token: "x" }] },
     ];
     for (const input of inputs) {
-      const result = validateHostedForgeConfig(input);
+      const result = validate(input);
       expect(result).toEqual({ ok: false, reason: "personal-credential-refused" });
       const text = jsonOf(result);
       expect(text).not.toContain("x");
@@ -79,18 +94,18 @@ describe("validateHostedForgeConfig", () => {
   });
 
   it("refuses arrays, nested sparse arrays, and inherited keys with invalid-forge-config", () => {
-    expect(validateHostedForgeConfig([])).toEqual({ ok: false, reason: "invalid-forge-config" });
+    expect(validate([])).toEqual({ ok: false, reason: "invalid-forge-config" });
     const holey: unknown[] = new Array(1);
     const sparseParent = { kind: "github-app", installationId: "1", items: holey };
-    expect(validateHostedForgeConfig(sparseParent)).toEqual({
+    expect(validate(sparseParent)).toEqual({
       ok: false,
       reason: "invalid-forge-config",
     });
     expect(
-      validateHostedForgeConfig(Object.create({ token: "x", kind: "github-app", installationId: "1" })),
+      validate(Object.create({ token: "x", kind: "github-app", installationId: "1" })),
     ).toEqual({ ok: false, reason: "invalid-forge-config" });
     const proto = { kind: "github-app", installationId: "1" };
-    expect(validateHostedForgeConfig(Object.create(proto))).toEqual({
+    expect(validate(Object.create(proto))).toEqual({
       ok: false,
       reason: "invalid-forge-config",
     });
@@ -99,7 +114,7 @@ describe("validateHostedForgeConfig", () => {
   it("refuses Proxy inputs via injected isProxy detector without running traps", () => {
     const target = { kind: "github-app", installationId: "12345" };
     const proxied = new Proxy(target, {});
-    expect(validateHostedForgeConfig(proxied, types.isProxy)).toEqual({
+    expect(validate(proxied, types.isProxy)).toEqual({
       ok: false,
       reason: "invalid-forge-config",
     });
@@ -114,8 +129,8 @@ describe("validateHostedForgeConfig", () => {
         throw new Error("trap");
       },
     });
-    expect(() => validateHostedForgeConfig(throwing, types.isProxy)).not.toThrow();
-    expect(validateHostedForgeConfig(throwing, types.isProxy)).toEqual({
+    expect(() => validate(throwing, types.isProxy)).not.toThrow();
+    expect(validate(throwing, types.isProxy)).toEqual({
       ok: false,
       reason: "invalid-forge-config",
     });
@@ -123,16 +138,37 @@ describe("validateHostedForgeConfig", () => {
   });
 
   it("refuses non-function isProxy detector with proxy-detector-required", () => {
-    const result = validateHostedForgeConfig(
+    const result = validate(
       { kind: "github-app", installationId: "12345" },
-      "not-a-function" as unknown as () => boolean,
+      "not-a-function",
     );
     expect(result).toEqual({ ok: false, reason: "proxy-detector-required" });
   });
 
+  it("refuses an omitted isProxy detector with proxy-detector-required without running Proxy traps", () => {
+    let trapRan = false;
+    const target = { kind: "github-app", installationId: "12345" };
+    const hostile = new Proxy(target, {
+      get(): string {
+        trapRan = true;
+        return "github-app";
+      },
+      ownKeys(): ArrayLike<string | symbol> {
+        trapRan = true;
+        return Reflect.ownKeys(target);
+      },
+    });
+    expect(() => validateHostedForgeConfig(hostile)).not.toThrow();
+    expect(validateHostedForgeConfig(hostile)).toEqual({
+      ok: false,
+      reason: "proxy-detector-required",
+    });
+    expect(trapRan).toBe(false);
+  });
+
   it("refuses null, undefined, and non-object primitives without throwing", () => {
     for (const input of [null, undefined, 42, true, "github-app", Symbol("s"), 10n]) {
-      expect(validateHostedForgeConfig(input as unknown)).toEqual({
+      expect(validate(input as unknown)).toEqual({
         ok: false,
         reason: "invalid-forge-config",
       });
@@ -149,84 +185,84 @@ describe("validateHostedForgeConfig", () => {
         return "x";
       },
     };
-    expect(() => validateHostedForgeConfig(input)).not.toThrow();
-    expect(validateHostedForgeConfig(input)).toEqual({ ok: false, reason: "invalid-forge-config" });
+    expect(() => validate(input)).not.toThrow();
+    expect(validate(input)).toEqual({ ok: false, reason: "invalid-forge-config" });
     expect(getterRan).toBe(false);
   });
 
   it("refuses plain-object array-likes with unsupported-forge-kind or unknown-key", () => {
-    expect(validateHostedForgeConfig({ length: 1000000000 })).toEqual({
+    expect(validate({ length: 1000000000 })).toEqual({
       ok: false,
       reason: "unsupported-forge-kind",
       field: "kind",
     });
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "12345", length: 1000000000 }),
+      validate({ kind: "github-app", installationId: "12345", length: 1000000000 }),
     ).toEqual({ ok: false, reason: "unknown-key" });
   });
 
   it("refuses oversized strings, cycles, symbol keys, non-enumerable keys, and over-limit objects", () => {
     const long = "a".repeat(5000);
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", owner: long }),
+      validate({ kind: "github-app", installationId: "1", owner: long }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "owner" });
     const cycle: Record<string, unknown> = { kind: "github-app", installationId: "1" };
     cycle.self = cycle;
-    expect(validateHostedForgeConfig(cycle)).toEqual({ ok: false, reason: "invalid-forge-config" });
+    expect(validate(cycle)).toEqual({ ok: false, reason: "invalid-forge-config" });
     const sym = Symbol("k");
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", [sym]: "x" }),
+      validate({ kind: "github-app", installationId: "1", [sym]: "x" }),
     ).toEqual({ ok: false, reason: "invalid-forge-config" });
     const nonEnum = { kind: "github-app", installationId: "1" };
     Object.defineProperty(nonEnum, "hidden", { value: "x", enumerable: false });
-    expect(validateHostedForgeConfig(nonEnum)).toEqual({ ok: false, reason: "invalid-forge-config" });
+    expect(validate(nonEnum)).toEqual({ ok: false, reason: "invalid-forge-config" });
     const tooManyKeys: Record<string, unknown> = { kind: "github-app", installationId: "1" };
     for (let i = 0; i < 40; i += 1) {
       tooManyKeys[`extra${i}`] = i;
     }
-    expect(validateHostedForgeConfig(tooManyKeys)).toEqual({ ok: false, reason: "invalid-forge-config" });
+    expect(validate(tooManyKeys)).toEqual({ ok: false, reason: "invalid-forge-config" });
   });
 
   it("refuses prototype-polluting keys at root and nested levels with forbidden-key", () => {
     for (const key of ["__proto__", "constructor", "prototype"]) {
       const root: Record<string, unknown> = { kind: "github-app", installationId: "1" };
       Object.defineProperty(root, key, { value: "x", enumerable: true, writable: true, configurable: true });
-      expect(validateHostedForgeConfig(root)).toEqual({ ok: false, reason: "forbidden-key" });
+      expect(validate(root)).toEqual({ ok: false, reason: "forbidden-key" });
       const nested = { kind: "github-app", installationId: "1", nested: { [key]: "x" } };
-      expect(validateHostedForgeConfig(nested)).toEqual({ ok: false, reason: "forbidden-key" });
+      expect(validate(nested)).toEqual({ ok: false, reason: "forbidden-key" });
     }
   });
 
   it("refuses invalid installationId and invalid optional github-app fields", () => {
-    expect(validateHostedForgeConfig({ kind: "github-app" })).toEqual({
+    expect(validate({ kind: "github-app" })).toEqual({
       ok: false,
       reason: "invalid-forge-config",
       field: "installationId",
     });
-    expect(validateHostedForgeConfig({ kind: "github-app", installationId: "" })).toEqual({
+    expect(validate({ kind: "github-app", installationId: "" })).toEqual({
       ok: false,
       reason: "invalid-forge-config",
       field: "installationId",
     });
-    expect(validateHostedForgeConfig({ kind: "github-app", installationId: "a b" })).toEqual({
+    expect(validate({ kind: "github-app", installationId: "a b" })).toEqual({
       ok: false,
       reason: "invalid-forge-config",
       field: "installationId",
     });
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", appId: "bad id" }),
+      validate({ kind: "github-app", installationId: "1", appId: "bad id" }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "appId" });
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", owner: "-bad-" }),
+      validate({ kind: "github-app", installationId: "1", owner: "-bad-" }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "owner" });
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", owner: "a".repeat(40) }),
+      validate({ kind: "github-app", installationId: "1", owner: "a".repeat(40) }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "owner" });
     expect(
-      validateHostedForgeConfig({ kind: "github-app", installationId: "1", apiBaseUrl: "http://x" }),
+      validate({ kind: "github-app", installationId: "1", apiBaseUrl: "http://x" }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "apiBaseUrl" });
     expect(
-      validateHostedForgeConfig({
+      validate({
         kind: "github-app",
         installationId: "1",
         apiBaseUrl: "https://user:pass@host",
@@ -236,14 +272,14 @@ describe("validateHostedForgeConfig", () => {
 
   it("refuses apiBaseUrl containing Unicode whitespace (e.g. U+00A0), not only ASCII whitespace", () => {
     expect(
-      validateHostedForgeConfig({
+      validate({
         kind: "github-app",
         installationId: "1",
         apiBaseUrl: "https://host/\u00a0",
       }),
     ).toEqual({ ok: false, reason: "invalid-forge-config", field: "apiBaseUrl" });
     expect(
-      validateHostedForgeConfig({
+      validate({
         kind: "github-app",
         installationId: "1",
         apiBaseUrl: "https://ho\u2028st",
@@ -252,7 +288,7 @@ describe("validateHostedForgeConfig", () => {
   });
 
   it("refuses unknown top-level keys without echoing key name or value", () => {
-    const result = validateHostedForgeConfig({
+    const result = validate({
       kind: "github-app",
       installationId: "12345",
       sneakyExtra: "value",

@@ -4,6 +4,7 @@ import {
   decideMergeEnqueue,
   decideMergeDrop,
   decideMergeRetry,
+  isSupersedablePredecessor,
 } from '../merge-queue-operations.js';
 import type { MergeEnqueueInput } from '../merge-queue-operations.js';
 import {
@@ -524,5 +525,44 @@ describe('decideMergeRetry', () => {
       enqueuedAtIso: '2026-11-01T12:00:00.000Z',
     });
     expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
+  });
+});
+
+describe('isSupersedablePredecessor', () => {
+  const target = { repository: { owner: 'fleet', repo: 'v2' }, pullRequest: 7, headOid: HEAD_B };
+
+  it('is true for the same repository and PR at a different head', () => {
+    expect(isSupersedablePredecessor(makeEntry({ headOid: HEAD_A }), target)).toBe(true);
+  });
+
+  it('is false for the same head', () => {
+    expect(isSupersedablePredecessor(makeEntry({ headOid: HEAD_B }), target)).toBe(false);
+  });
+
+  it('is false for another PR, another owner or another repo', () => {
+    expect(isSupersedablePredecessor(makeEntry({ pullRequest: 8 }), target)).toBe(false);
+    expect(
+      isSupersedablePredecessor(makeEntry({ repository: { owner: 'other', repo: 'v2' } }), target),
+    ).toBe(false);
+    expect(
+      isSupersedablePredecessor(makeEntry({ repository: { owner: 'fleet', repo: 'other' } }), target),
+    ).toBe(false);
+  });
+
+  it('is false rather than throwing when a getter throws', () => {
+    const bad = makeEntry();
+    Object.defineProperty(bad, 'headOid', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(isSupersedablePredecessor(bad, target)).toBe(false);
+    const badTarget = { ...target };
+    Object.defineProperty(badTarget, 'pullRequest', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(isSupersedablePredecessor(makeEntry(), badTarget)).toBe(false);
   });
 });

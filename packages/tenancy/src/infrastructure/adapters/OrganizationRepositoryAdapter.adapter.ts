@@ -104,6 +104,37 @@ function snapshotOrganizationInput(
 }
 
 /**
+ * Split one persisted element into its plain record fields and its revision
+ * (an absent `revision` reads as 0). An accessor, symbol key or non-safe
+ * revision answers null; no getter ever runs. Cost bound: O(k) over the
+ * element's own keys.
+ */
+function splitStoredEnvelope(
+  raw: unknown,
+): { plain: Record<string, unknown>; revision: number } | null {
+  const descriptors = Object.getOwnPropertyDescriptors(raw as object);
+  const plain: Record<string, unknown> = {};
+  let revision: unknown = 0;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[key as string];
+    if (typeof key !== 'string' || descriptor === undefined || !('value' in descriptor)) {
+      return null;
+    }
+    if (key === 'revision') {
+      revision = descriptor.value;
+    } else if (key !== 'schemaVersion') {
+      Object.defineProperty(plain, key, {
+        value: descriptor.value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  return isNonNegativeSafeInteger(revision) ? { plain, revision } : null;
+}
+
+/**
  * The versioned reader's record parser, shared with the store's inspection:
  * the `schemaVersion` check runs first, then the envelope validation. Pure
  * and never throws. The returned record carries no `schemaVersion` key — it
@@ -120,31 +151,14 @@ export function parseVersionedOrganizationStateRecord(
     if (versionCheck.status !== 'ok') {
       return versionCheck;
     }
-    // `raw` is a JSON-parsed element. Copy every own data property except
-    // the two storage keys; validateOrganizationRecord then refuses any
+    // `raw` is a JSON-parsed element; the shared helper copies every own data
+    // property except the two storage keys, and the validator then refuses any
     // extra key, accessor or hostile shape in its own single snapshot.
-    const descriptors = Object.getOwnPropertyDescriptors(raw as object);
-    const plain: Record<string, unknown> = {};
-    let revision: unknown = 0;
-    for (const key of Reflect.ownKeys(descriptors)) {
-      const descriptor = descriptors[key as string];
-      if (typeof key !== 'string' || descriptor === undefined || !('value' in descriptor)) {
-        return { status: 'invalid' };
-      }
-      if (key === 'revision') {
-        revision = descriptor.value;
-      } else if (key !== 'schemaVersion') {
-        Object.defineProperty(plain, key, {
-          value: descriptor.value,
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        });
-      }
-    }
-    if (!isNonNegativeSafeInteger(revision)) {
+    const envelope = splitStoredEnvelope(raw);
+    if (envelope === null) {
       return { status: 'invalid' };
     }
+    const { plain, revision } = envelope;
     const validated = validateOrganizationRecord(plain);
     if (!validated.ok) {
       return { status: 'invalid' };
@@ -217,33 +231,14 @@ export function parseVersionedProjectStateRecord(
     if (versionCheck.status !== 'ok') {
       return versionCheck;
     }
-    // `raw` is a JSON-parsed element. Copy every own data property except
-    // the two storage keys; validateProjectRecord then refuses any extra
-    // key, accessor or hostile shape in its own single snapshot. Cost
-    // bound: O(k) over the element's own keys, never invoking a getter
-    // (accessor descriptors are refused outright).
-    const descriptors = Object.getOwnPropertyDescriptors(raw as object);
-    const plain: Record<string, unknown> = {};
-    let revision: unknown = 0;
-    for (const key of Reflect.ownKeys(descriptors)) {
-      const descriptor = descriptors[key as string];
-      if (typeof key !== 'string' || descriptor === undefined || !('value' in descriptor)) {
-        return { status: 'invalid' };
-      }
-      if (key === 'revision') {
-        revision = descriptor.value;
-      } else if (key !== 'schemaVersion') {
-        Object.defineProperty(plain, key, {
-          value: descriptor.value,
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        });
-      }
-    }
-    if (!isNonNegativeSafeInteger(revision)) {
+    // `raw` is a JSON-parsed element; the shared helper copies every own data
+    // property except the two storage keys, and the validator then refuses any
+    // extra key, accessor or hostile shape in its own single snapshot.
+    const envelope = splitStoredEnvelope(raw);
+    if (envelope === null) {
       return { status: 'invalid' };
     }
+    const { plain, revision } = envelope;
     const validated = validateProjectRecord(plain);
     if (!validated.ok) {
       return { status: 'invalid' };

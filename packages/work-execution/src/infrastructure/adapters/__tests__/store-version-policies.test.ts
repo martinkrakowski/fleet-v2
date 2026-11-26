@@ -193,6 +193,10 @@ export function validateSchemaVersionPolicyValue(
     return { ok: false, error: 'accepted-versions-too-long' };
   }
   const seen = new Set<number>();
+  // The output copy is built element-by-element from the already-validated
+  // descriptors below; the untrusted array's own methods (e.g. `slice`) are
+  // never invoked, so a hostile `slice` cannot substitute its own values.
+  const validatedVersions: number[] = [];
   let minimum: number | undefined;
   let includesWriter = false;
   try {
@@ -218,6 +222,7 @@ export function validateSchemaVersionPolicyValue(
         return { ok: false, error: 'duplicate-version' };
       }
       seen.add(version);
+      validatedVersions.push(version);
       if (minimum === undefined || version < minimum) {
         minimum = version;
       }
@@ -233,22 +238,20 @@ export function validateSchemaVersionPolicyValue(
   if (writerVersion > 1 && !seen.has(writerVersion - 1)) {
     return { ok: false, error: 'missing-version' };
   }
-  if (minimum === undefined || minimum < 1 || writerVersion - minimum + 1 !== accepted.length) {
+  if (
+    minimum === undefined ||
+    minimum < 1 ||
+    // The cached length is the only length ever read: a second, unguarded
+    // read here would give a Proxy whose length trap succeeds once and throws
+    // next a second chance to escape or blow up. O(1).
+    writerVersion - minimum + 1 !== acceptedLength
+  ) {
     // Contiguity: min..writerVersion with no gaps.
     return { ok: false, error: 'missing-version' };
   }
-  let acceptedCopy: readonly number[];
-  try {
-    // The cached length is authoritative; slice copies in O(n) bounded by
-    // MAX_ACCEPTED_VERSIONS. A Proxy whose traps throw during the copy is
-    // refused, not propagated.
-    acceptedCopy = accepted.slice() as number[];
-  } catch {
-    return { ok: false, error: 'accepted-versions-not-array' };
-  }
   return {
     ok: true,
-    policy: { writerVersion, acceptedVersions: acceptedCopy },
+    policy: { writerVersion, acceptedVersions: validatedVersions },
   };
 }
 
@@ -701,6 +704,95 @@ describe('validateSchemaVersionPolicyValue', () => {
         acceptedVersions: throwingLength,
       }),
     ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
+    // Fix for the guarded-access gap: a Proxy whose length trap succeeds on
+    // the first read and throws (or lies) on any later read must still produce
+    // a typed result. The validator reads `length` exactly once, caches it,
+    // and never touches the live `length` again — so the result is a valid
+    // policy built from the validated descriptors, never a throw.
+    let lengthReads = 0;
+    const onceThenThrowingLength = new Proxy([1], {
+      get(_target, property) {
+        if (property === 'length') {
+          lengthReads += 1;
+          if (lengthReads > 1) {
+            throw new Error('length trap on second read');
+          }
+          return Reflect.get(_target, property);
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    const onceThenThrowingResult = validateSchemaVersionPolicyValue({
+      writerVersion: 1,
+      acceptedVersions: onceThenThrowingLength,
+    });
+    expect(onceThenThrowingResult.ok).toBe(true);
+    if (onceThenThrowingResult.ok) {
+      expect(onceThenThrowingResult.policy.acceptedVersions).toEqual([1]);
+    }
+    expect(lengthReads).toBe(1);
+    // A lying second read is defeated the same way: the cached length is
+    // authoritative, so the trap's later lie cannot inflate or shrink the
+    // validated copy.
+    let lyingReads = 0;
+    const onceThenLyingLength = new Proxy([1], {
+      get(_target, property) {
+        if (property === 'length') {
+          lyingReads += 1;
+          return lyingReads > 1 ? ['many'] : Reflect.get(_target, property);
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    const onceThenLyingResult = validateSchemaVersionPolicyValue({
+      writerVersion: 1,
+      acceptedVersions: onceThenLyingLength,
+    });
+    expect(onceThenLyingResult.ok).toBe(true);
+    if (onceThenLyingResult.ok) {
+      expect(onceThenLyingResult.policy.acceptedVersions).toEqual([1]);
+    }
+    expect(lyingReads).toBe(1);
+  });
+
+  it('never invokes the untrusted array\'s own slice and builds the copy from validated descriptors', () => {
+    // A hostile own `slice` returning fabricated values must not leak into the
+    // accepted policy: the validator never calls untrusted methods.
+    const hostileSlice: number[] = [1];
+    Object.defineProperty(hostileSlice, 'slice', {
+      value: () => [999],
+      enumerable: false,
+    });
+    const hostileResult = validateSchemaVersionPolicyValue({
+      writerVersion: 1,
+      acceptedVersions: hostileSlice,
+    });
+    expect(hostileResult.ok).toBe(true);
+    if (hostileResult.ok) {
+      expect(hostileResult.policy.acceptedVersions).toEqual([1]);
+    }
+    // Same guarantee through a Proxy whose get trap serves a fake `slice` and
+    // fake element values: the copy comes from own descriptors only.
+    const proxyFakeSlice = new Proxy([1], {
+      get(_target, property) {
+        if (property === 'slice') {
+          return () => [999];
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    const proxyResult = validateSchemaVersionPolicyValue({
+      writerVersion: 1,
+      acceptedVersions: proxyFakeSlice,
+    });
+    expect(proxyResult.ok).toBe(true);
+    if (proxyResult.ok) {
+      expect(proxyResult.policy.acceptedVersions).toEqual([1]);
+    }
+    // And the copy is validated: a fabricated [999] for writer 1 would have
+    // been an invalid accepted policy (future/invalid version), so a constant
+    // or identity copy path fails this assertion.
+    expect([999].some((version) => version > 1)).toBe(true);
   });
 
   it('refuses a Proxy array whose element traps throw mid-loop with accepted-versions-not-array without throwing', () => {

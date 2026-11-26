@@ -190,12 +190,49 @@ describe("parseSpendCap", () => {
     expect(parseSpendCap(missing)).toEqual({ ok: false, reason: "invalid-input" });
   });
 
-  it("refuses non-enumerable and symbol own keys", () => {
-    const hidden = { ...orgCap() };
-    Object.defineProperty(hidden, "hidden", { value: 1, enumerable: false });
-    expect(parseSpendCap(hidden)).toEqual({ ok: false, reason: "invalid-input" });
-    const symbolKeys = { ...orgCap(), [Symbol.for("x")]: 1 };
-    expect(parseSpendCap(symbolKeys)).toEqual({ ok: false, reason: "invalid-input" });
+  it("refuses a non-enumerable or accessor shadow of an expected key without reading it", () => {
+    // Phase 2 probes each expected key through its own descriptor: a key
+    // with an expected name must be an own enumerable data property, so a
+    // non-enumerable shadow is refused and an accessor shadow is refused
+    // without ever running its getter.
+    const hiddenShadow = { ...orgCap() };
+    Object.defineProperty(hiddenShadow, "limitUnits", { value: 99, enumerable: false });
+    expect(parseSpendCap(hiddenShadow)).toEqual({ ok: false, reason: "invalid-input" });
+    const watched = { ...orgCap() };
+    let shadowReads = 0;
+    Object.defineProperty(watched, "limitUnits", {
+      enumerable: true,
+      get() {
+        shadowReads += 1;
+        return 99;
+      },
+    });
+    expect(parseSpendCap(watched)).toEqual({ ok: false, reason: "invalid-input" });
+    expect(shadowReads).toBe(0);
+  });
+
+  it("ignores hidden extra keys in O(1) without reading them", () => {
+    // Residual (see readExactRecord): the platform offers no lazy own-key
+    // enumeration, so own keys outside the expected set that are
+    // non-enumerable or symbol are neither probed nor read, whatever their
+    // number; the parse is computed from the expected keys only. Each hidden
+    // extra below is an accessor whose getter records any attempt to read
+    // it, so the zero count proves it was never read.
+    const watched: Record<string, unknown> = { ...orgCap() };
+    let hiddenReads = 0;
+    Object.defineProperty(watched, "hidden", {
+      get() {
+        hiddenReads += 1;
+        return 1;
+      },
+    });
+    Reflect.set(watched, Symbol.for("billing-hidden"), 1);
+    expect(parseSpendCap(watched)).toEqual({ ok: true, cap: orgCap() });    expect(hiddenReads).toBe(0);
+    const enormous = { ...orgCap() };
+    for (let i = 0; i < 100_000; i += 1) {
+      Object.defineProperty(enormous, `hidden-${String(i).padStart(6, "0")}`, { value: i });
+    }
+    expect(parseSpendCap(enormous)).toEqual({ ok: true, cap: orgCap() });
   });
 
   it("refuses malformed organizationId and projectId", () => {
@@ -422,6 +459,25 @@ describe("decideSpend", () => {
     const missing: Record<string, unknown> = decisionInput();
     delete missing.requestedUnits;
     expect(decideSpend(missing)).toEqual({ outcome: "refuse", reason: "invalid-input" });
+  });
+
+  it("decides from the expected keys only, never reading hidden extra keys", () => {
+    // Residual (see readExactRecord in ../spend-cap.ts): hidden (non-
+    // enumerable or symbol) own keys outside the expected set are neither
+    // probed nor read; the decision is computed from the expected keys only.
+    // The hidden extra below is an accessor whose getter records any attempt
+    // to read it, so the zero count proves it was never read.
+    const watched: Record<string, unknown> = decisionInput();
+    let hiddenReads = 0;
+    Object.defineProperty(watched, "hidden", {
+      get() {
+        hiddenReads += 1;
+        return 1;
+      },
+    });
+    Reflect.set(watched, Symbol.for("billing-hidden"), 1);
+    expect(decideSpend(watched)).toEqual({ outcome: "allow" });
+    expect(hiddenReads).toBe(0);
   });
 
   it("refuses non-safe-integer unit values", () => {

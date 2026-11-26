@@ -9,19 +9,24 @@
  * figure, currency symbol or rate appears anywhere in this module.
  *
  * Hostile-input posture: `parseSpendCap`, `periodKeyOf` and `decideSpend`
- * treat their inputs as untrusted. Every object read goes through own-property
- * descriptors only (`Reflect.ownKeys` bounded against the exact expected key
- * count, then `Object.getOwnPropertyDescriptor`), so no getter or setter ever
- * runs, non-enumerable and symbol keys are refused, prototype-polluting keys
- * (`__proto__`, `constructor`, `prototype`) and extra or missing keys are
- * refused, and non-plain objects (including arrays and class instances) are
- * refused. A hostile Proxy trap surfaces as a typed refusal, never a throw;
- * a Proxy that lies consistently in every trap is an accepted residual.
- * Every refusal is the typed reason `invalid-input`; no input value is ever
- * echoed back. Every check is O(1): the key census is bounded (see
- * `readExactRecord`), string lengths are bounded (63 for identifiers, 7 for a
- * period key, 64 for an ISO timestamp) and the arithmetic rests on single
- * safe-integer comparisons.
+ * treat their inputs as untrusted. Every object read goes through
+ * own-property descriptors only (a bounded enumerable-key census, then
+ * `Object.getOwnPropertyDescriptor` probed by each fixed expected key name),
+ * so no getter or setter ever runs. Missing keys, accessors, non-enumerable
+ * shadows of expected keys, prototype-polluting keys (`__proto__`,
+ * `constructor`, `prototype`) and extra enumerable keys are refused. Own
+ * keys outside the expected set that are hidden (non-enumerable or symbol)
+ * are an accepted residual: the platform offers no lazy own-key enumeration
+ * to count them in O(1), and only the fixed expected names are ever probed,
+ * so such a key is never read and cannot influence any decision (see
+ * `readExactRecord`). Non-plain objects (including arrays and class
+ * instances) are refused. A hostile Proxy trap surfaces as a typed refusal,
+ * never a throw; a Proxy that lies consistently in every trap is an accepted
+ * residual. Every refusal is the typed reason `invalid-input`; no input
+ * value is ever echoed back. Every check is O(1): the key census never
+ * enumerates hidden keys (see `readExactRecord`), string lengths are bounded
+ * (63 for identifiers, 7 for a period key, 64 for an ISO timestamp) and the
+ * arithmetic rests on single safe-integer comparisons.
  */
 
 /** The scope a cap applies to. An organization cap carries no project. */
@@ -102,31 +107,43 @@ type ReadResult =
  * Snapshot an unknown value into a frozen plain record with exactly the
  * expected keys, reading every own property through its descriptor.
  *
- * Cost bound: O(1). The key census runs in two bounded phases and never
- * materializes an unbounded key list before refusing an excess:
+ * Cost bound: O(1). No platform API enumerates own keys lazily:
+ * `Reflect.ownKeys`, `Object.getOwnPropertyNames` and
+ * `Object.getOwnPropertySymbols` all materialize the complete own-key list
+ * before it can be counted, so an input carrying the expected enumerable
+ * keys plus arbitrarily many hidden (non-enumerable or symbol) keys would
+ * make any full own-key census cost O(hidden keys) even when the count check
+ * runs first. The census therefore never enumerates hidden keys at all and
+ * rests on two bounded phases:
  *
  * 1. A lazy `for...in` census of the enumerable own string keys (the
  *    prototype is already pinned to `Object.prototype` or `null`, so nothing
  *    is inherited) bails out the moment the count exceeds the expected one.
- *    An input with any excess of enumerable keys is therefore refused after
- *    at most `expectedKeys.length + 1` iterations, never after enumerating
- *    all of them.
- * 2. Only when that bounded count matches exactly does the full own-key
- *    census (`Reflect.ownKeys`) run, refusing hidden extras (non-enumerable
- *    or symbol keys). Residual, same class as a Proxy that lies in every
- *    trap: an input deliberately built with exactly the expected enumerable
- *    keys plus an enormous number of *hidden* keys cannot be distinguished
- *    from a clean record without that full enumeration, because the platform
- *    offers no lazy own-key enumeration for hidden properties; building such
- *    an input already costs the attacker one write per hidden key, and no
- *    property of it is ever read beyond the expected keys' descriptors.
+ *    Any excess or unexpected enumerable key — including a
+ *    prototype-polluting key — is refused after at most
+ *    `expectedKeys.length + 1` iterations, never after enumerating all of
+ *    them.
+ * 2. Each *expected* key is probed by its fixed name through
+ *    `Object.getOwnPropertyDescriptor`, O(expectedKeys.length) probes with
+ *    no own-key enumeration anywhere: every expected key must be an own
+ *    enumerable data property, so a missing key, an accessor, or a
+ *    non-enumerable shadow of an expected key is refused without any getter
+ *    or setter running.
+ *
+ * Residual, same class as a Proxy that lies in every trap: own keys outside
+ * the expected set that are hidden (non-enumerable or symbol) are neither
+ * enumerated nor probed — refusing them would require materializing every
+ * own key, the exact unbounded cost this guard exists to avoid, because the
+ * platform offers no lazy own-key enumeration for hidden properties. Only
+ * the fixed expected names are ever probed, so a hidden extra is never read
+ * and cannot influence any decision; building such an input already costs
+ * the attacker one write per hidden key while nothing of it is ever touched.
  *
  * Refused, never thrown: non-objects, arrays, non-plain prototypes,
- * descriptor-read failures (hostile Proxy traps), excess enumerable keys
- * (bounded phase 1), key counts other than the exact expected one, unexpected
- * keys (including symbols, non-enumerable keys and prototype-polluting keys),
- * accessors and non-enumerable properties. A Proxy that lies consistently in
- * every trap is an accepted residual.
+ * descriptor-read failures (hostile Proxy traps), excess or unexpected
+ * enumerable keys (bounded phase 1), key counts other than the exact
+ * expected one, missing keys, accessors and non-enumerable properties. A
+ * Proxy that lies consistently in every trap is an accepted residual.
  */
 function readExactRecord(
   input: unknown,
@@ -142,7 +159,9 @@ function readExactRecord(
     }
     // Phase 1: lazy census of the enumerable own string keys, bailing out as
     // soon as the count exceeds the expected one, so excess keys are refused
-    // in O(expectedKeys.length + 1) without materializing them.
+    // in O(expectedKeys.length + 1) without materializing them. Symbols and
+    // non-enumerable keys are invisible here; hidden extras are the accepted
+    // residual documented above, never probed and never read.
     const expected: ReadonlySet<string> = new Set(expectedKeys);
     let enumerableCount = 0;
     for (const key in input) {
@@ -159,18 +178,13 @@ function readExactRecord(
     if (enumerableCount !== expectedKeys.length) {
       return { ok: false };
     }
-    // Phase 2: full own-key census, reached only when the bounded phase-1
-    // count already matched exactly; it refuses hidden extras (symbols and
-    // non-enumerable keys) and any key outside the expected set.
-    const keys = Reflect.ownKeys(input);
-    if (keys.length !== expectedKeys.length) {
-      return { ok: false };
-    }
+    // Phase 2: probe the fixed expected names through their own descriptors,
+    // O(expectedKeys.length) probes and no own-key enumeration anywhere, so
+    // no hidden extra is ever materialized. A missing expected key, an
+    // accessor, or a non-enumerable shadow of an expected key is refused
+    // here without running any getter or setter.
     const snapshot: Record<string, unknown> = {};
-    for (const key of keys) {
-      if (typeof key !== "string" || !expected.has(key) || FORBIDDEN_KEYS.has(key)) {
-        return { ok: false };
-      }
+    for (const key of expectedKeys) {
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
       if (
         descriptor === undefined ||
@@ -185,9 +199,10 @@ function readExactRecord(
     Object.freeze(snapshot);
     return { ok: true, value: snapshot };
   } catch {
-    // A hostile Proxy trap (ownKeys, getPrototypeOf, getOwnPropertyDescriptor)
-    // surfaces here as a typed refusal. No property value is ever read through
-    // a `get` trap, so a getter — the input's own or a trap's — never runs.
+    // A hostile Proxy trap (getPrototypeOf, getOwnPropertyDescriptor, or the
+    // ownKeys trap behind `for...in`) surfaces here as a typed refusal. No
+    // property value is ever read through a `get` trap, so a getter — the
+    // input's own or a trap's — never runs.
     return { ok: false };
   }
 }

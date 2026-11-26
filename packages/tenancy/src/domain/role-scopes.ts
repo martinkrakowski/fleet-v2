@@ -120,27 +120,47 @@ export function extractScopeList(
   }
   const body = text.slice(elementsStart, end);
   const scopes: string[] = [];
-  // Element scan: at most one pass over the bounded body, no regex.
+  /**
+   * Element scan: one pass over the bounded body, no regex. The grammar is
+   * strict so a malformed declaration is refused rather than accepted:
+   * `element (separator element)*` where `element` is a double-quoted
+   * string and `separator` is a single comma between elements. Whitespace
+   * is allowed anywhere and a single trailing comma is accepted (valid
+   * TypeScript); a missing separator (`"read" "tail"`), a hole
+   * (`"read",, "tail"`) and any non-string element are refusals.
+   */
   let index = 0;
+  let afterElement = false;
   while (index < body.length) {
     const char = body[index];
-    if (char === "," || char === " " || char === "\t" || char === "\n" || char === "\r") {
+    if (char === " " || char === "\t" || char === "\n" || char === "\r") {
       index += 1;
       continue;
     }
-    if (char === '"') {
+    if (!afterElement) {
+      if (char !== '"') {
+        // A bare word, digit or nested bracket: a non-string element.
+        return { ok: false, reason: "could not parse scope list" };
+      }
       const closing = body.indexOf('"', index + 1);
       if (closing === -1) {
         return { ok: false, reason: "could not parse scope list" };
       }
       scopes.push(body.slice(index + 1, closing));
       index = closing + 1;
+      afterElement = true;
       continue;
     }
-    // Anything else (bare words, digits, nested brackets) is a non-string
-    // element: refused.
-    return { ok: false, reason: "could not parse scope list" };
+    // After an element only a single separator comma may appear before the
+    // next element (or the closing bracket, handled by the slice).
+    if (char !== ",") {
+      return { ok: false, reason: "could not parse scope list" };
+    }
+    index += 1;
+    afterElement = false;
   }
+  // An empty element list is not a scope list: refused. A single trailing
+  // separator is accepted, as TypeScript allows it.
   if (scopes.length === 0) {
     return { ok: false, reason: "could not parse scope list" };
   }

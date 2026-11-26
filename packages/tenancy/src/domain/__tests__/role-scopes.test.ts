@@ -190,6 +190,16 @@ describe("extractScopeList", () => {
     expect(Object.isFrozen(result.scopes)).toBe(true);
   });
 
+  it("accepts a single trailing comma, as TypeScript style allows", () => {
+    const result = extractScopeList(
+      'export const FROZEN_SCOPES = ["read", "tail",];',
+      "FROZEN_SCOPES",
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(sameScopes(result.scopes, ["read", "tail"])).toBe(true);
+  });
+
   it("returns a typed refusal when source text cannot be parsed", () => {
     for (const text of [
       "",
@@ -197,6 +207,12 @@ describe("extractScopeList", () => {
       'export const FROZEN_SCOPES = [123];',
       'export const FROZEN_SCOPES = ["',
       'export const FROZEN_SCOPES = [];',
+      // Missing separator between elements.
+      'export const FROZEN_SCOPES = ["read" "tail"];',
+      // A hole between elements.
+      'export const FROZEN_SCOPES = ["read",, "tail"];',
+      // A bare-word element after a valid first element.
+      'export const FROZEN_SCOPES = ["read", tail];',
     ]) {
       const result = extractScopeList(text, "FROZEN_SCOPES");
       expect(result.ok).toBe(false);
@@ -223,7 +239,7 @@ describe("extractScopeList", () => {
     }
   });
 
-  it("refuses non-string, oversized, and adversarial inputs with a typed result without throwing or invoking traps", () => {
+  it("refuses non-string, oversized, and adversarial inputs with a typed reason without throwing or invoking traps", () => {
     const throwingGetter = {
       get toString(): string {
         throw new Error("boom");
@@ -237,19 +253,46 @@ describe("extractScopeList", () => {
         },
       },
     );
-    const cases: ReadonlyArray<[unknown, unknown]> = [
-      [null, "FROZEN_SCOPES"],
-      [undefined, "FROZEN_SCOPES"],
-      [42, "FROZEN_SCOPES"],
-      [SCOPE_TEXT, 42],
-      [throwingGetter, "FROZEN_SCOPES"],
-      [trap, "FROZEN_SCOPES"],
-      [{ length: 1e9 }, "FROZEN_SCOPES"],
-      ["x".repeat(1_000_001), "FROZEN_SCOPES"],
+    const cases: ReadonlyArray<[unknown, unknown, string]> = [
+      // Non-string text, including the remaining wrong primitives.
+      [null, "FROZEN_SCOPES", "invalid input"],
+      [undefined, "FROZEN_SCOPES", "invalid input"],
+      [42, "FROZEN_SCOPES", "invalid input"],
+      [true, "FROZEN_SCOPES", "invalid input"],
+      [BigInt(1), "FROZEN_SCOPES", "invalid input"],
+      [Symbol("read"), "FROZEN_SCOPES", "invalid input"],
+      // Arrays, array holes and array-likes are non-strings too: refused in
+      // O(1) without reading `.length` or iterating.
+      [["read"], "FROZEN_SCOPES", "invalid input"],
+      [new Array(1), "FROZEN_SCOPES", "invalid input"],
+      [{ length: 1e9 }, "FROZEN_SCOPES", "invalid input"],
+      // Non-string name, including the remaining wrong primitives.
+      [SCOPE_TEXT, null, "invalid input"],
+      [SCOPE_TEXT, undefined, "invalid input"],
+      [SCOPE_TEXT, 42, "invalid input"],
+      [SCOPE_TEXT, true, "invalid input"],
+      [SCOPE_TEXT, BigInt(1), "invalid input"],
+      [SCOPE_TEXT, Symbol("FROZEN_SCOPES"), "invalid input"],
+      [SCOPE_TEXT, ["FROZEN_SCOPES"], "invalid input"],
+      [SCOPE_TEXT, new Array(1), "invalid input"],
+      [SCOPE_TEXT, { length: 1e9, 0: "FROZEN_SCOPES" }, "invalid input"],
+      // Getters and Proxies: the typeof check short-circuits, so no trap or
+      // getter is ever invoked and nothing throws.
+      [throwingGetter, "FROZEN_SCOPES", "invalid input"],
+      [trap, "FROZEN_SCOPES", "invalid input"],
+      [SCOPE_TEXT, throwingGetter, "invalid input"],
+      [SCOPE_TEXT, trap, "invalid input"],
+      // Size bound and identifier bound, with their specific reasons.
+      ["x".repeat(1_000_001), "FROZEN_SCOPES", "source text exceeds size bound"],
+      [SCOPE_TEXT, "", "invalid scope list name"],
+      [SCOPE_TEXT, "a".repeat(129), "invalid scope list name"],
+      [SCOPE_TEXT, "1abc", "invalid scope list name"],
     ];
-    for (const [text, name] of cases) {
+    for (const [text, name, reason] of cases) {
       const result = extractScopeList(text, name);
       expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.reason).toBe(reason);
     }
   });
 });

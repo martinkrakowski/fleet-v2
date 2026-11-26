@@ -332,6 +332,7 @@ type Coverage = FixtureCoverage | ExemptCoverage;
 
 const EXPECTED_INVENTORY: readonly DiscoveredPolicy[] = [
   { file: 'packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts', exportName: 'ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY' },
+  { file: 'packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts', exportName: 'ORGANIZATION_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/AttemptRepositoryAdapter.adapter.ts', exportName: 'ATTEMPT_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/CutoverJournalAdapter.adapter.ts', exportName: 'CUTOVER_JOURNAL_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/CutoverJournalAdapter.adapter.ts', exportName: 'CUTOVER_SHADOW_PARK_JOURNAL_STORE_VERSION_POLICY' },
@@ -377,6 +378,7 @@ const COVERAGE: ReadonlyMap<string, Coverage> = new Map<string, Coverage>([
   ['packages/work-execution/src/infrastructure/adapters/RelaunchPlanRepositoryAdapter.adapter.ts::RELAUNCH_PLAN_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/SeatObservationRepositoryAdapter.adapter.ts::SEAT_OBSERVATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts::ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
 ]);
 
 const FIXTURE_DIR = path.join(

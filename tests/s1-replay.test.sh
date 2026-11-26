@@ -160,6 +160,14 @@ expect_pass 'refusal: --input with --repo-digest' 2 \
 expect_pass 'refusal: --input with --exclude-batch-merges' 2 \
   --input "$FIX/day-without-fleet-rows.json" --exclude-batch-merges
 expect_pass 'refusal: unknown flag' 2 --input "$FIX/day-without-fleet-rows.json" --wat
+run --token=secret-token --input "$FIX/day-without-fleet-rows.json"
+if [ "$rc" -ne 2 ] || [ -n "$stdout" ]; then
+  bad 'refusal: an unknown flag with a value exits 2 with no stdout'
+elif case $stderr in *secret*) true;; *) false;; esac; then
+  bad 'refusal: an unknown flag value is never echoed'
+else
+  ok 'refusal: an unknown flag value is never echoed'
+fi
 expect_pass 'refusal: missing flag value' 2 --input
 expect_pass 'refusal: non-integer synthesis seconds' 2 \
   --input "$FIX/day-without-fleet-rows.json" --synthesize-before-merge abc

@@ -43,6 +43,12 @@ function parseArgs(argv) {
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
+    const known = flag === "--input" || flag === "--events" || flag === "--day"
+      || flag === "--repo-digest" || flag === "--exclude-batch-merges"
+      || flag === "--synthesize-before-merge";
+    if (!known) {
+      return { error: "s1-replay: unknown flag" };
+    }
     const takesValue = flag !== "--exclude-batch-merges";
     let value = null;
     if (takesValue) {
@@ -65,7 +71,7 @@ function parseArgs(argv) {
     } else if (flag === "--synthesize-before-merge") {
       options.synthSeconds = value;
     } else {
-      return { error: `s1-replay: unknown flag ${flag}` };
+      return { error: "s1-replay: unknown flag" };
     }
   }
   return { options };

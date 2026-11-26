@@ -97,6 +97,38 @@ const DRILL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/;
 const PERCENTAGE_PATTERN = /(?<!\d)\d{1,3}(?:\.\d+)?%/g;
 
 /**
+ * A decimal percentage such as `99.9%` or `99.99%`: fractional precision is
+ * the shape of a published availability figure, so such a figure is an
+ * availability claim on its own.
+ */
+const DECIMAL_FIGURE_PATTERN = /\.\d+%$/;
+
+/**
+ * Availability wording that puts an integer percentage such as `99%` into an
+ * availability claim. Without this context an integer percentage is far more
+ * likely to be any other metric (CPU load, disk usage) and is not flagged.
+ */
+const AVAILABILITY_CONTEXT_PATTERN = /\b(?:availability|uptime|downtime|sla)\b/i;
+
+/** Characters of text on either side of a figure checked for that wording. */
+const AVAILABILITY_CONTEXT_WINDOW = 64;
+
+/**
+ * Decide whether one percentage match is an availability figure: either it
+ * carries fractional precision (`99.9%`) or it appears within
+ * {@link AVAILABILITY_CONTEXT_WINDOW} characters of availability wording.
+ * Cost is O(figure + window) per figure, linear in the text overall.
+ */
+function isAvailabilityFigure(text: string, start: number, end: number, figure: string): boolean {
+  if (DECIMAL_FIGURE_PATTERN.test(figure)) {
+    return true;
+  }
+  const from = Math.max(0, start - AVAILABILITY_CONTEXT_WINDOW);
+  const to = Math.min(text.length, end + AVAILABILITY_CONTEXT_WINDOW);
+  return AVAILABILITY_CONTEXT_PATTERN.test(text.slice(from, to));
+}
+
+/**
  * ID-shaped tokens of document text, scanned in linear time. Matching a
  * drill ID against this set is a token-boundary match: `'drill-1'` never
  * backs text that only contains `'drill-10'`.
@@ -209,18 +241,24 @@ export function findUnbackedAvailabilityClaims(
 
   const findings: AvailabilityClaimFinding[] = [];
   for (const doc of validatedDocs) {
-    const figures = doc.text.match(PERCENTAGE_PATTERN);
-    if (figures === null || figures.length === 0) {
-      continue;
-    }
     const tokens = new Set<string>();
     for (const match of doc.text.matchAll(TOKEN_PATTERN)) {
       tokens.add(match[0]);
     }
     const backed = drillIds.some((id) => tokens.has(id));
-    if (!backed) {
-      for (const figure of figures) {
-        findings.push({ docId: doc.id, figure });
+    if (backed) {
+      continue;
+    }
+    for (const match of doc.text.matchAll(PERCENTAGE_PATTERN)) {
+      if (
+        isAvailabilityFigure(
+          doc.text,
+          match.index,
+          match.index + match[0].length,
+          match[0],
+        )
+      ) {
+        findings.push({ docId: doc.id, figure: match[0] });
       }
     }
   }

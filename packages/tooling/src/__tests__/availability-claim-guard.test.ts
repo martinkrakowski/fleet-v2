@@ -77,6 +77,27 @@ describe('findUnbackedAvailabilityClaims', () => {
     expect(result).toEqual({ status: 'pass' });
   });
 
+  it('does not flag an integer percentage without availability context such as CPU load 80 percent', () => {
+    const result = findUnbackedAvailabilityClaims(
+      [{ id: 'doc-1', text: 'CPU load is 80% this hour.' }],
+      [DRILL],
+      isProxy,
+    );
+    expect(result).toEqual({ status: 'pass' });
+  });
+
+  it('flags an integer percentage that availability wording puts into an availability claim', () => {
+    const result = findUnbackedAvailabilityClaims(
+      [{ id: 'doc-1', text: 'Uptime was 99% last month.' }],
+      [DRILL],
+      isProxy,
+    );
+    expect(result).toEqual({
+      status: 'flagged',
+      findings: [{ docId: 'doc-1', figure: '99%' }],
+    });
+  });
+
   it('refuses null docs and null drillRecords with not-array', () => {
     expect(findUnbackedAvailabilityClaims(null, [DRILL], isProxy)).toEqual({
       status: 'refused',

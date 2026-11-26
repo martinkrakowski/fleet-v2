@@ -1736,7 +1736,10 @@ describe('the live wiring reaches no host in tests (K7-7)', () => {
       attemptId: ATTEMPT_ID,
       tier: 2,
       runPolicyRevision: 'policy:conductor@0123456789ab',
-      brief: briefFixture() as never,
+      // RB4: the static pre-reserve brief check replays prepare's request-only
+      // refusals, so the brief must be valid on its face for the no-host
+      // refusal to be reached.
+      brief: { ...briefFixture(), allowedPathPrefixes: ['packages/example/src'] } as never,
       nowIso: NOW,
     });
     expect(result).toEqual({ outcome: 'refused', reason: 'no-host' });

@@ -2195,9 +2195,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
             return { outcome: 'unavailable' as const };
           }
         },
-        // OD-1: the owner-accepted default is false, fail-closed; this use case
-        // only receives it.
-        settings: { excludeBatchMerges: false },
+        // Owner decision 2026-11-25: batch merges (batch-member merges and a
+        // batch PR's own merge) are excluded from S1's merge set. A
+        // batch-aware decider is the follow-up; until then the exclusion is
+        // unconditional.
+        settings: { excludeBatchMerges: true },
         });
       })()
     : undefined;

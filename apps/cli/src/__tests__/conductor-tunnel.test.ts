@@ -924,6 +924,55 @@ describe('RunnerTunnelSetAdapter (G2)', () => {
     expect(() => new RunnerTunnelSetAdapter(asMembers(['not-an-adapter']))).toThrow(TypeError);
     expect(() => new RunnerTunnelSetAdapter(new Array(1025).fill(adapter))).toThrow(TypeError);
   });
+
+  it('RunnerTunnelSetAdapter refuses a Proxy-wrapped member and a revoked Proxy member by identity, as TypeErrors', () => {
+    // A lying Proxy whose getPrototypeOf trap reports the real prototype: only
+    // `types.isProxy` can refuse it, without ever touching a trap.
+    const lying = new Proxy(new RunnerTunnelAdapter({}), {
+      getPrototypeOf: () => RunnerTunnelAdapter.prototype,
+    });
+    expect(
+      () => new RunnerTunnelSetAdapter([lying as unknown as RunnerTunnelAdapter]),
+    ).toThrow(TypeError);
+    const revocable = Proxy.revocable(new RunnerTunnelAdapter({}), {});
+    revocable.revoke();
+    expect(
+      () => new RunnerTunnelSetAdapter([revocable.proxy as unknown as RunnerTunnelAdapter]),
+    ).toThrow(TypeError);
+  });
+
+  it('a throwing resolvedDialPort makes set.ensureTunnel answer failed without calling any member ensureTunnel or spawner', async () => {
+    const calls: string[] = [];
+    const first = new RunnerTunnelAdapter({});
+    Object.defineProperty(first, 'resolvedDialPort', {
+      value: () => {
+        throw new Error('dial port blew up');
+      },
+    });
+    Object.defineProperty(first, 'ensureTunnel', {
+      value: () => {
+        calls.push('first-ensureTunnel');
+        return Promise.resolve('opened' as const);
+      },
+    });
+    const second = new RunnerTunnelAdapter({});
+    Object.defineProperty(second, 'ensureTunnel', {
+      value: () => {
+        calls.push('second-ensureTunnel');
+        return Promise.resolve('opened' as const);
+      },
+    });
+    Object.defineProperty(second, 'spawner', {
+      value: () => {
+        calls.push('second-spawner');
+        return fakeChild();
+      },
+    });
+    const set = new RunnerTunnelSetAdapter([first, second]);
+    expect(await set.ensureTunnel()).toBe('failed');
+    expect(calls).toEqual([]);
+    expect(set.owned).toBe(false);
+  });
 });
 
 describe('resolveRunnerTunnelTargets (G2)', () => {

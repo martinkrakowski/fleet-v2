@@ -10,8 +10,10 @@
  * Hostile-input posture: the manifest content is untrusted file content. The
  * test refuses non-object parses (null, arrays, primitives) explicitly and
  * reads `dependencies` only through a plain-object check, so a malformed
- * manifest is a failed assertion, never a pass. No getter or Proxy can reach
- * these assertions because JSON.parse cannot produce either.
+ * manifest is a failed assertion, never a pass. A dependencies map carrying a
+ * prototype-polluting own key (`__proto__`, `constructor` or `prototype`) is
+ * refused with a named error, never silently filtered away. No getter or
+ * Proxy can reach these assertions because JSON.parse cannot produce either.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -30,14 +32,31 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   );
 }
 
+// An own key with one of these names in a parsed dependencies map is a
+// prototype-polluting shape, so the scan refuses the whole map with a named
+// error instead of filtering the key away and passing. The set is
+// constant-sized, so the check costs one O(k) pass over the k own keys with
+// a constant-time membership test per key.
+const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
 function fleetDependencyNames(pkg: Record<string, unknown>): string[] {
   const dependencies = pkg.dependencies;
   if (!isPlainObject(dependencies)) {
     throw new Error("package.json dependencies is not a plain object");
   }
-  return Object.keys(dependencies).filter((name) =>
-    name.startsWith("@fleet/"),
-  );
+  const names = Object.keys(dependencies);
+  for (const name of names) {
+    if (PROTOTYPE_POLLUTING_KEYS.has(name)) {
+      throw new Error(
+        `package.json dependencies contains the prototype-polluting key ${name}`,
+      );
+    }
+  }
+  return names.filter((name) => name.startsWith("@fleet/"));
 }
 
 describe("@fleet/tenancy scaffold", () => {
@@ -56,6 +75,26 @@ describe("@fleet/tenancy scaffold", () => {
       expect(parsed.name).toBe("@fleet/tenancy");
       expect(parsed.private).toBe(true);
       expect(fleetDependencyNames(parsed)).toEqual(["@fleet/shared"]);
+    },
+  );
+
+  it(
+    "the dependency scan refuses a dependencies map with an own prototype-polluting key (__proto__, constructor, prototype) as a named error instead of filtering the key away",
+    () => {
+      // Built at runtime: JSON.parse defines a real own data property for
+      // each hostile key, the shape a hostile manifest would carry.
+      for (const hostileKey of ["__proto__", "constructor", "prototype"]) {
+        const hostile = JSON.parse(
+          `{"${hostileKey}": {"polluted": true}, "@fleet/shared": "workspace:*"}`,
+        ) as Record<string, unknown>;
+        expect(() =>
+          fleetDependencyNames({ dependencies: hostile }),
+        ).toThrowError(
+          new RegExp(
+            `dependencies contains the prototype-polluting key ${hostileKey}`,
+          ),
+        );
+      }
     },
   );
 

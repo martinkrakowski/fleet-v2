@@ -299,7 +299,10 @@ export function selectReviewSeat(input: {
   readonly unhealthySeatIds?: readonly string[];
   readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
   readonly rotationStart?: number;
+  /** Seat indexes spent at this head (RM2): skipped as `exhausted`, so the next eligible seat is chosen. */
+  readonly excludedSeatIndexes?: ReadonlySet<number>;
 }): SeatSelectionResult {
+  const excluded = input.excludedSeatIndexes ?? EMPTY_SEAT_INDEXES;
   const seats = input.plan.getSeats('review');
   if (seats.length === 0) {
     return { ok: false, reason: 'Seat plan has no review seats' };
@@ -310,8 +313,10 @@ export function selectReviewSeat(input: {
   const unhealthy = new Set(input.unhealthySeatIds ?? []);
   const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
   if (isSafeRotationStart(input.rotationStart)) {
-    const eligible = eligibleSeatsForRotation(seats, (seat) =>
-      isReviewSeatBlocked(seat, unhealthy, unavailable, input.implementerModels, input.sameFamily),
+    const eligible = eligibleSeatsForRotation(
+      seats,
+      (seat) => isReviewSeatBlocked(seat, unhealthy, unavailable, input.implementerModels, input.sameFamily),
+      excluded,
     );
     if (eligible.length > 0) {
       const chosen = eligible[(input.rotationStart + input.round) % eligible.length];
@@ -325,7 +330,9 @@ export function selectReviewSeat(input: {
     const seat = seats[seatIndex];
     const sharedWith = input.implementerModels.find((model) => input.sameFamily(seat.model, model));
     const availability = unavailable.get(seat.id);
-    if (unhealthy.has(seat.id)) {
+    if (excluded.has(seatIndex)) {
+      blocks.push(seat.id + ': exhausted');
+    } else if (unhealthy.has(seat.id)) {
       blocks.push(seat.id + ': unhealthy');
     } else if (availability !== undefined) {
       blocks.push(seat.id + ': ' + availability.reason);
@@ -384,7 +391,10 @@ export function selectPreMergeSeat(input: {
   readonly unhealthySeatIds?: readonly string[];
   readonly unavailable?: ReadonlyMap<string, SeatUnavailability>;
   readonly rotationStart?: number;
+  /** Seat indexes spent at this head (RM2): skipped as `exhausted`. */
+  readonly excludedSeatIndexes?: ReadonlySet<number>;
 }): PreMergeSeatSelectionResult {
+  const excluded = input.excludedSeatIndexes ?? EMPTY_SEAT_INDEXES;
   if (input.seats.length === 0) {
     return { ok: false, reason: 'No pre-merge seats' };
   }
@@ -395,8 +405,10 @@ export function selectPreMergeSeat(input: {
   const unhealthy = new Set(input.unhealthySeatIds ?? []);
   const unavailable = input.unavailable ?? new Map<string, SeatUnavailability>();
   if (isSafeRotationStart(input.rotationStart)) {
-    const eligible = eligibleSeatsForRotation(input.seats, (seat) =>
-      isPreMergeSeatBlocked(seat, unhealthy, unavailable, models.models, input.sameFamily),
+    const eligible = eligibleSeatsForRotation(
+      input.seats,
+      (seat) => isPreMergeSeatBlocked(seat, unhealthy, unavailable, models.models, input.sameFamily),
+      excluded,
     );
     if (eligible.length > 0) {
       const chosen = eligible[input.rotationStart % eligible.length];
@@ -405,7 +417,9 @@ export function selectPreMergeSeat(input: {
   }
   const blocks: string[] = [];
   for (const [seatIndex, seat] of input.seats.entries()) {
-    const block = preMergeSeatBlock(seat, unhealthy, unavailable, models.models, input.sameFamily);
+    const block = excluded.has(seatIndex)
+      ? seat.id + ': exhausted'
+      : preMergeSeatBlock(seat, unhealthy, unavailable, models.models, input.sameFamily);
     if (block === null) {
       return { ok: true, seatIndex, seat };
     }
@@ -456,15 +470,18 @@ function isSafeRotationStart(value: number | undefined): value is number {
   return value !== undefined && Number.isSafeInteger(value) && value >= 0;
 }
 
+const EMPTY_SEAT_INDEXES: ReadonlySet<number> = new Set<number>();
+
 /** The seats in plan order, without `on`, that the block predicate does not block. */
 function eligibleSeatsForRotation(
   seats: readonly SeatPlanSeat[],
   isBlocked: (seat: SeatPlanSeat) => boolean,
+  excluded: ReadonlySet<number> = EMPTY_SEAT_INDEXES,
 ): EligibleSeat[] {
   const eligible: EligibleSeat[] = [];
   for (let index = 0; index < seats.length; index += 1) {
     const seat = seats[index];
-    if (seat.on === undefined && !isBlocked(seat)) {
+    if (seat.on === undefined && !excluded.has(index) && !isBlocked(seat)) {
       eligible.push({ seat, index });
     }
   }

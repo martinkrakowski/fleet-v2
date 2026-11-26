@@ -1193,9 +1193,13 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: [OrganizationRepositoryPort]
+          out: [OrganizationRepositoryPort, MembershipRepositoryPort]
       infrastructure:
-        adapters: [OrganizationRepositoryAdapter]
+        adapters: [OrganizationRepositoryAdapter, MembershipRepositoryAdapter]
+    contracts:
+      MembershipRepositoryPort: "Store per-organisation membership as one {schemaVersion: 1, organizationId, revision, members} record per organisation: under the store's guard verify the stored revision, refuse a change naming another organisation, re-run the pure FC3B membership decider and write only an accepted list at the stored revision plus one, so the store never holds a list the decider would refuse; read an absent schemaVersion as 1, refuse an unknown one without quarantining or echoing a stored value, treat an unreadable or cross-organisation mismatched store as a named error (quarantined when writable, refused without writing when read-only), refuse every write on a read-only store before locking, answer reads with fresh copies, answer an absent or hostile organisation id with an empty list or null, answer hostile arguments with a typed invalid-record without invoking a getter or a Proxy trap, and expose no raw list save that bypasses the decider."
+    adapter_bindings:
+      - { adapter: MembershipRepositoryAdapter, implements: MembershipRepositoryPort, integration: local-transactional-store }
 
   - name: billing
     type: supporting

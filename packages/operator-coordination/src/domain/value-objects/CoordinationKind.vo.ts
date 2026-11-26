@@ -5,6 +5,8 @@
  * kind can never reach a proposal, a relay or an alert.
  */
 
+import { describeRejectedValue } from '../record-input.js';
+
 export const COORDINATION_KINDS = [
   'action-decision',
   'policy-proposal',
@@ -23,7 +25,7 @@ export class CoordinationKind {
 
   static create(value: unknown): { success: boolean; value?: CoordinationKind; error?: Error } {
     if (typeof value !== 'string' || !COORDINATION_KIND_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid coordination kind: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid coordination kind: ' + describeRejectedValue(value)) };
     }
     return { success: true, value: new CoordinationKind(value as CoordinationKindValue) };
   }

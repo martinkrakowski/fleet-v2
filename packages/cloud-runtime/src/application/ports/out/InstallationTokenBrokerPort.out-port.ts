@@ -27,10 +27,22 @@ export const MAX_INSTALLATION_TOKEN_TTL_SECONDS = 3600 as const;
 /** The longest any single broker string field may be (mirrors FC7A). */
 export const FORGE_CREDENTIAL_MAX_STRING_LENGTH = 300 as const;
 
-/** The exact permission set an installation token may carry (mirrors FC7A). */
-export const FORGE_CREDENTIAL_PERMISSIONS = ['read', 'push', 'status', 'merge'] as const;
+export type ForgeCredentialPermission = 'read' | 'push' | 'status' | 'merge';
 
-export type ForgeCredentialPermission = (typeof FORGE_CREDENTIAL_PERMISSIONS)[number];
+/**
+ * The exact permission set an installation token may carry (mirrors FC7A).
+ * `Object.freeze` makes the array immutable at runtime, not only at compile
+ * time: an `as const` tuple alone stays a mutable array once exported, so any
+ * code appending to it would have widened what `isForgePermission` accepts.
+ * The declared type is `readonly`, so a type cast to a mutable array is the
+ * only remaining (deliberate) route, and the runtime freeze blocks even that.
+ */
+export const FORGE_CREDENTIAL_PERMISSIONS: readonly ForgeCredentialPermission[] = Object.freeze([
+  'read',
+  'push',
+  'status',
+  'merge',
+]);
 
 /**
  * The secret-free view of a scoped forge credential, mirrored locally from

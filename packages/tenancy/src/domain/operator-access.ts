@@ -10,7 +10,9 @@
  * Hostile-input posture: null, undefined, primitives, arrays, array holes,
  * array-likes, non-plain prototypes, getters/setters (never read — the
  * snapshot reads own data descriptors only), detectable Proxies (via the
- * injected `isProxy`), symbol keys, oversized strings and
+ * required, caller-supplied `isProxy` detector — an absent or
+ * non-function detector is itself refused, never defaulted to
+ * "detects nothing"), symbol keys, oversized strings and
  * prototype-polluting own keys (`__proto__`, `constructor`, `prototype`,
  * `length`) are each refused with a typed result, never a throw and never
  * a pass.
@@ -106,23 +108,19 @@ const ENVELOPE_KEYS: ReadonlySet<string> = new Set(["grant", "organizationId", "
 const FORBIDDEN_KEYS: readonly string[] = ["__proto__", "constructor", "prototype", "length"];
 
 /**
- * A detector that detects nothing, used when the caller supplies none.
- * Mirrors the `Membership.ts` resolver: absent means no detection, a
- * non-function detector is refused, and a throwing detector is reported by
- * the snapshot it screens.
+ * The proxy detector is required and trusted: every caller must supply one
+ * explicitly. An absent (`undefined`) or non-function detector is refused —
+ * there is no silent "detects nothing" default, because a Proxy wrapping a
+ * valid grant could otherwise run reflection traps during snapshotting and
+ * be accepted.
  */
-const NO_DETECTOR: IsProxy = () => false;
-
 function resolveDetector(
-  isProxy: unknown,
+  isProxy: IsProxy,
 ): { ok: true; detector: IsProxy } | { ok: false } {
-  if (isProxy === undefined) {
-    return { ok: true, detector: NO_DETECTOR };
-  }
   if (typeof isProxy !== "function") {
     return { ok: false };
   }
-  return { ok: true, detector: isProxy as IsProxy };
+  return { ok: true, detector: isProxy };
 }
 
 /** A string matching ACTOR_PATTERN, length-checked before the regex. O(1). */
@@ -168,7 +166,7 @@ function subMillisDigits(iso: string): string {
  */
 export function parseOperatorAccessGrant(
   raw: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): ParseOperatorAccessGrantResult {
   const REFUSED: ParseOperatorAccessGrantResult = Object.freeze({
     outcome: "refused",
@@ -252,7 +250,7 @@ export function parseOperatorAccessGrant(
  *
  * Fixed order:
  *
- * 1. resolve the proxy detector (non-function is `invalid-input`);
+ * 1. resolve the proxy detector (absent or non-function is `invalid-input`);
  * 2. snapshot the envelope once — any snapshot failure at `grant` or
  *    `grant.*` maps to `invalid-grant`, any other failure to `invalid-input`;
  * 3. key-check the snapshotted envelope against `ENVELOPE_KEYS`
@@ -271,7 +269,7 @@ export function parseOperatorAccessGrant(
  */
 export function decideOperatorAccess(
   input: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): OperatorAccessDecisionResult {
   const UNKNOWN_AUDIT: OperatorAccessAuditRow = Object.freeze({
     actor: "unknown",

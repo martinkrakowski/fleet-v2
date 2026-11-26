@@ -1,14 +1,37 @@
 import { readFileSync } from "node:fs";
 
+import type { IsProxy } from "@fleet/shared";
 import { describe, expect, it } from "vitest";
 
 import {
   MAX_OPERATOR_REASON_LENGTH,
   OPERATOR_ACCESS_MAX_DURATION_MS,
-  decideOperatorAccess,
-  parseOperatorAccessGrant,
+  decideOperatorAccess as decideOperatorAccessRequired,
+  parseOperatorAccessGrant as parseOperatorAccessGrantRequired,
   type OperatorAccessGrant,
 } from "../operator-access.js";
+
+/**
+ * The proxy detector is a required, trusted argument. These wrappers supply
+ * a default "detects nothing" detector so each test states the detector it
+ * actually relies on; the required-argument behaviour is asserted
+ * explicitly in the detector tests below.
+ */
+const NO_PROXY: IsProxy = () => false;
+
+function parseOperatorAccessGrant(
+  raw: unknown,
+  isProxy?: IsProxy,
+): ReturnType<typeof parseOperatorAccessGrantRequired> {
+  return parseOperatorAccessGrantRequired(raw, isProxy === undefined ? NO_PROXY : isProxy);
+}
+
+function decideOperatorAccess(
+  input: unknown,
+  isProxy?: IsProxy,
+): ReturnType<typeof decideOperatorAccessRequired> {
+  return decideOperatorAccessRequired(input, isProxy === undefined ? NO_PROXY : isProxy);
+}
 
 const SOURCE = readFileSync(
   new URL("../operator-access.ts", import.meta.url),
@@ -111,8 +134,12 @@ describe("parseOperatorAccessGrant", () => {
     if (result.outcome !== "parsed") throw new Error("unreachable");
     expect(result.grant).toEqual(validGrant);
     expect(Object.isFrozen(result.grant)).toBe(true);
-    // No detector: a Proxy-free input still parses.
-    expect(parseOperatorAccessGrant({ ...validGrant }, undefined).outcome).toBe("parsed");
+    // The detector is required: an absent detector is refused, never a
+    // silent "detects nothing" default.
+    expect(
+      parseOperatorAccessGrantRequired({ ...validGrant }, undefined as never)
+        .outcome,
+    ).toBe("refused");
     expect(
       parseOperatorAccessGrant({ ...validGrant }, () => false).outcome,
     ).toBe("parsed");
@@ -173,10 +200,23 @@ describe("parseOperatorAccessGrant", () => {
         parseOperatorAccessGrant({ ...validGrant }, badDetector as never),
       );
     }
+    expectRefusedGrant(
+      parseOperatorAccessGrantRequired({ ...validGrant }, undefined as never),
+    );
     const throwing = (): boolean => {
       throw new Error("detector");
     };
     expectRefusedGrant(parseOperatorAccessGrant({ ...validGrant }, throwing));
+  });
+
+  it("refuses a Proxy wrapping a valid grant when the detector reports it as a Proxy", () => {
+    const grantProxy = new Proxy({ ...validGrant }, {});
+    const detector: IsProxy = (value) => value === grantProxy;
+    expectRefusedGrant(parseOperatorAccessGrant(grantProxy, detector));
+    expectRefused(
+      decideOperatorAccess({ ...validEnvelope(), grant: grantProxy }, detector),
+      "invalid-grant",
+    );
   });
 
   it("refuses invalid actor, organizationId, empty/oversized/control-char reason, and invalid timestamps as invalid-grant", () => {
@@ -472,6 +512,18 @@ describe("decideOperatorAccess", () => {
     };
     const result = decideOperatorAccess(validEnvelope(), throwing);
     expectRefused(result, "invalid-input");
+  });
+
+  it("refuses an absent isProxy detector as invalid-input with an all-unknown audit row", () => {
+    const result = decideOperatorAccessRequired(validEnvelope(), undefined as never);
+    expectRefused(result, "invalid-input");
+    if (result.outcome !== "refused") throw new Error("unreachable");
+    expect(result.audit).toEqual({
+      actor: "unknown",
+      organizationId: "unknown",
+      reason: "invalid-input",
+      atIso: "unknown",
+    });
   });
 
   it("emits one audit row per decision and never echoes grant reason or rejected values in any refusal", () => {

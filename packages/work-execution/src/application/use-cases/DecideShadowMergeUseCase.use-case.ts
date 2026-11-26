@@ -6,7 +6,7 @@
  * `RunMergePassUseCase` would reach, by running the real pass over a
  * single-entry in-memory queue. The entry is a v2 record carrying the pair's
  * own base branch, and the real queue is peeked read-only first so an
- * unreadable queue refuses. Any live queued entry is decided, head or not. No
+ * unreadable queue or a pair that is not a queued entry refuses. Any queued entry is decided, head or not. No
  * queue writes, no CLI, no live action.
  */
 
@@ -28,6 +28,7 @@ import { parseBaseBranch } from '../../domain/base-branch.js';
 import {
   MERGE_QUEUE_ENTRY_V2_VERSION,
   MERGE_QUEUE_ORDER_CAP,
+  sameMergeQueueIdentity,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
 import {
@@ -187,12 +188,16 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     }
     const expectedKey = built.key;
 
-    // Owner decision 2026-11-26: the decision is journaled for any live queued
-    // entry, not only the queue head. The real queue is still peeked so an
-    // unreadable queue fails closed (a refusal, never a would-merge).
-    const headState = await this.queueHeadState(request);
-    if (headState === 'unreadable') {
+    // Owner decision 2026-11-26: the decision is journaled for any queued
+    // entry, not only the queue head. The real queue is peeked: an unreadable
+    // queue fails closed, and a pair with no `queued` entry for this exact
+    // repository, pull request and head is refused (never a would-merge).
+    const queueState = await this.queueEntryState(request);
+    if (queueState === 'unreadable') {
       return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+    }
+    if (queueState === 'not-queued') {
+      return { outcome: 'refused', reasonCode: 'not-queued', journalKey: null };
     }
 
     const entry: MergeQueueEntryRecord = {
@@ -298,11 +303,14 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
   }
 
   /**
-   * Read-only peek at the real merge queue: `clear` when it is readable,
-   * `unreadable` when the peek fails or is malformed (fail closed: a refusal,
-   * never a would-merge). The queue head no longer gates the decision.
+   * Read-only peek at the real merge queue: `queued` when an entry in state
+   * `queued` exists for this exact repository, pull request and head,
+   * `not-queued` when none does (parked, dropped, another head, or absent),
+   * `unreadable` when the peek fails or is malformed (fail closed).
    */
-  private async queueHeadState(request: DecideShadowMergeRequest): Promise<'clear' | 'unreadable'> {
+  private async queueEntryState(
+    request: DecideShadowMergeRequest,
+  ): Promise<'queued' | 'not-queued' | 'unreadable'> {
     let records: unknown;
     try {
       records = await this.deps.queue.listMergeEntries({
@@ -315,7 +323,24 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     if (!Array.isArray(records) || records.length > MERGE_QUEUE_ORDER_CAP) {
       return 'unreadable';
     }
-    return 'clear';
+    const target = {
+      repository: request.repository,
+      pullRequest: request.pullRequest,
+      headOid: request.headOid,
+    };
+    const found = (records as readonly unknown[]).some((record) => {
+      try {
+        const entry = record as MergeQueueEntryRecord;
+        return (
+          entry.state === 'queued' &&
+          entry.repoDigest === request.repoDigest &&
+          sameMergeQueueIdentity(entry, target)
+        );
+      } catch {
+        return false;
+      }
+    });
+    return found ? 'queued' : 'not-queued';
   }
 
   /** S9: close an open intent on `expectedKey` with the closing result; already closed is fine. */

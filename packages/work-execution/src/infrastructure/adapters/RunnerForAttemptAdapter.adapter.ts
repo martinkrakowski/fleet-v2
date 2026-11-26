@@ -277,7 +277,10 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
       return { ok: false, reason: `invalid host name ${shown}` };
     }
 
-    const hosts = this.options?.hosts;
+    // `hosts` is read through `readOwnDataProp` so a throwing getter on the
+    // options object is refused instead of escaping this method.
+    const hostsRead = readOwnDataProp(this.options, "hosts");
+    const hosts = hostsRead.ok ? hostsRead.value : undefined;
     if (
       hosts === null ||
       typeof hosts !== "object" ||

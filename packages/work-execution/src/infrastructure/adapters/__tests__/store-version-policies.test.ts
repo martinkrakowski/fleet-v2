@@ -379,6 +379,7 @@ const COVERAGE: ReadonlyMap<string, Coverage> = new Map<string, Coverage>([
   ['packages/work-execution/src/infrastructure/adapters/SeatObservationRepositoryAdapter.adapter.ts::SEAT_OBSERVATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts::ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
 ]);
 
 const FIXTURE_DIR = path.join(

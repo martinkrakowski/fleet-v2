@@ -97,24 +97,17 @@ function isDataProperty(
 /**
  * True when `entry` is a non-null, non-array plain object (`Object.prototype`
  * or `null` prototype). `Array.isArray` and `Object.getPrototypeOf` can throw
- * for a revoked Proxy, so the whole inspection is wrapped: a throwing input is
- * not a plain object, and the caller turns a throw into `hostile-input`.
+ * for a hostile Proxy, so this function never catches: every throw propagates
+ * to the caller, whose guard maps any throw to `hostile-input` — a throwing
+ * `getPrototypeOf` trap must never be downgraded to the weaker
+ * `invalid-entry`.
  */
 function isPlainObject(entry: unknown): boolean {
-  try {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-      return false;
-    }
-    const proto = Object.getPrototypeOf(entry);
-    return proto === Object.prototype || proto === null;
-  } catch (error) {
-    if (error instanceof TypeError) {
-      // Revoked Proxy: rethrow so the caller's guard maps it to `hostile-input`
-      // rather than the weaker `invalid-entry`.
-      throw error;
-    }
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
     return false;
   }
+  const proto = Object.getPrototypeOf(entry);
+  return proto === Object.prototype || proto === null;
 }
 
 /** Validate one timestamp field; returns a refusal reason, or `null` with the parsed ms. */
@@ -139,7 +132,7 @@ function checkTimestampField(
 
 function validateRegistry(
   registry: unknown,
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true; length: number } | { ok: false; reason: string } {
   // `Array.isArray` itself can throw on a revoked Proxy, so it is inside the
   // guarded region too: a Proxy that cannot be interrogated is hostile input,
   // never a propagated exception.
@@ -167,7 +160,10 @@ function validateRegistry(
       return entryResult;
     }
   }
-  return { ok: true };
+  // The validated length is returned and reused by the caller: re-reading
+  // `registry.length` through a Proxy could diverge from what was validated
+  // (bypassing the 500-entry bound) or throw outside any guard.
+  return { ok: true, length };
 }
 
 function validateEntry(
@@ -197,6 +193,8 @@ function validateEntry(
   try {
     elementIsPlainObject = isPlainObject(element);
   } catch {
+    // Any throw here (including a non-TypeError from a Proxy's
+    // `getPrototypeOf` or `has` trap) is hostile input, never `invalid-entry`.
     return { ok: false, reason: "hostile-input" };
   }
   if (!elementIsPlainObject) {
@@ -357,15 +355,20 @@ export function deprecationHeadersFor(
   // validation-time inspection bypassed are not trusted here either, and a
   // Proxy may throw — or supply values that were never validated — on these
   // later reads. Every re-read field is therefore re-checked with the same
-  // field rules; any divergence from what validation saw is refused.
+  // field rules; any divergence from what validation saw is refused. The loop
+  // bound is the validated length from `validateRegistry`, never a fresh
+  // `registry.length` read through the Proxy (a divergent length could bypass
+  // the 500-entry bound and a throwing `get` trap would escape unguarded);
+  // the bounded re-read keeps lookup `O(n)`, `n <= MAX_DEPRECATIONS`.
   const list = registry as unknown[];
+  const validatedLength = registryResult.length;
   let match: {
     readonly routeKey: string;
     readonly deprecatedAtIso: string;
     readonly sunsetAtIso: string | null;
     readonly successorPath: string | null;
   } | undefined;
-  for (let index = 0; index < list.length; index += 1) {
+  for (let index = 0; index < validatedLength; index += 1) {
     let routeKeyValue: unknown;
     let deprecatedValue: unknown;
     let sunsetValue: unknown;

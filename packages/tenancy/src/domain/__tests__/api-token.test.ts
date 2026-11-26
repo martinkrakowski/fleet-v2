@@ -513,6 +513,35 @@ describe("hostile inputs", () => {
     }
   });
 
+  it("refuses a transparent Proxy of a valid input when the supplied detector detects nothing", () => {
+    const forged: IsProxy = (): boolean => false;
+    const alwaysTrue: IsProxy = (): boolean => true;
+    const proxiedRecord = new Proxy(validRecord(), {});
+    const proxiedUse = new Proxy(useInput(), {});
+    const proxiedRotation = new Proxy(rotationInput(), {});
+    for (const detector of [forged, alwaysTrue]) {
+      expect(parseApiTokenRecord(proxiedRecord, detector)).toEqual({
+        outcome: "refused",
+        reason: "invalid-record",
+      });
+      expect(decideApiTokenUse(proxiedUse, detector)).toEqual({
+        outcome: "refused",
+        reason: "invalid-input",
+      });
+      expect(decideApiTokenRotation(proxiedRotation, detector)).toEqual({
+        outcome: "refused",
+        reason: "invalid-input",
+      });
+      // Even a plain valid input is refused: the forged detector itself is untrusted.
+      expect(parseApiTokenRecord(validRecord(), detector).outcome).toBe("refused");
+      expect(decideApiTokenUse(useInput(), detector).outcome).toBe("refused");
+      expect(decideApiTokenRotation(rotationInput(), detector).outcome).toBe("refused");
+    }
+    // The genuine detector still refuses the Proxy and still accepts a plain valid input.
+    expect(parseApiTokenRecord(proxiedRecord, types.isProxy).outcome).toBe("refused");
+    expect(parseApiTokenRecord(validRecord(), types.isProxy).outcome).toBe("parsed");
+  });
+
   it("requires a trusted proxy detector on every public entry point", () => {
     // The detector is a required parameter: no optional `isProxy?` and no
     // permissive default may exist, or a Proxy could be accepted silently.

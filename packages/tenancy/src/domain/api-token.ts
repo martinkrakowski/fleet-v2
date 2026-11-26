@@ -298,6 +298,26 @@ function buildRecord(snap: Record<string, unknown>): ApiTokenRecord | null {
 }
 
 /**
+ * Whether the supplied detector is a genuine Proxy detector rather than a
+ * caller-forged one. A detector that detects nothing (or everything) would
+ * let a Proxy whose traps consistently expose a valid record reach the
+ * snapshot, so before it is trusted it must report a locally built Proxy as
+ * a Proxy and plain values as plain. A non-function or a throwing detector
+ * is untrusted. Cost bound: O(1) - one Proxy construction and three calls.
+ */
+function isTrustedDetector(isProxy: unknown): isProxy is IsProxy {
+  if (typeof isProxy !== "function") {
+    return false;
+  }
+  try {
+    const detect = isProxy as IsProxy;
+    return detect(new Proxy({}, {})) === true && detect({}) === false && detect([]) === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Snapshot unknown input as a plain object (refusing every hostile shape)
  * and screen its own keys. Returns null on any refusal. Cost bound: O(1).
  */
@@ -321,13 +341,17 @@ function snapObject(
  * Parse one untrusted API token record. The record is read once through
  * `snapshotPlainData` (getters never run, Proxies refused via the required
  * detector — the caller passes a trusted detector such as `node:util`'s
- * `types.isProxy`; there is no default, because a missing detector would
- * silently accept a Proxy); every field is validated before a record is
+ * `types.isProxy`; there is no default, and a detector that does not report a
+ * locally built Proxy as a Proxy is refused, so a forged always-false detector
+ * cannot switch the Proxy refusal off); every field is validated before a record is
  * produced. Returns `{ outcome: "refused", reason: "invalid-record" }` on
  * every hostile or malformed shape, never a throw, and never echoes the
  * digest.
  */
 export function parseApiTokenRecord(raw: unknown, isProxy: IsProxy): ApiTokenParseResult {
+  if (!isTrustedDetector(isProxy)) {
+    return INVALID_RECORD;
+  }
   const snap = snapObject(raw, isProxy, RECORD_LIMITS);
   if (snap === null) {
     return INVALID_RECORD;
@@ -371,6 +395,9 @@ function digestsMatch(presented: string, stored: string): boolean {
  *    stored digest.
  */
 export function decideApiTokenUse(input: unknown, isProxy: IsProxy): ApiTokenUseResult {
+  if (!isTrustedDetector(isProxy)) {
+    return { outcome: "refused", reason: INVALID_INPUT };
+  }
   const wrapper = snapshotPlainData(input, isProxy, WRAPPER_LIMITS);
   if (!wrapper.ok) {
     return { outcome: "refused", reason: wrapperReason(wrapper.path) };
@@ -456,6 +483,9 @@ export function decideApiTokenUse(input: unknown, isProxy: IsProxy): ApiTokenUse
  * (`not-yet-valid`, `expired`).
  */
 export function decideApiTokenRotation(input: unknown, isProxy: IsProxy): ApiTokenRotationResult {
+  if (!isTrustedDetector(isProxy)) {
+    return { outcome: "refused", reason: INVALID_INPUT };
+  }
   const wrapper = snapshotPlainData(input, isProxy, WRAPPER_LIMITS);
   if (!wrapper.ok) {
     return { outcome: "refused", reason: wrapperReason(wrapper.path) };

@@ -13,12 +13,14 @@
  * `{ ok: false, reason }` result, never a throw and never a pass. A
  * rejected value is never echoed into a reason.
  *
- * The proxy detector is an OPTIONAL second positional parameter (never a
+ * The proxy detector is a REQUIRED second positional parameter (never a
  * field of an options object: the snapshot refuses function values, so an
- * options object carrying a function cannot be snapshotted). When omitted
- * it defaults to a detector that detects nothing; when supplied and not a
- * function the parse is refused (`proxy-detector-required`); a detector
- * that throws is refused (`detector-threw`).
+ * options object carrying a function cannot be snapshotted). Because only
+ * the caller can know what counts as a Proxy for the values it passes, an
+ * absent detector is never silently replaced by one that detects nothing:
+ * when the detector is omitted (undefined) or supplied but not a function
+ * the parse is refused (`proxy-detector-required`) without reading the
+ * input; a detector that throws is refused (`detector-threw`).
  *
  * The input is copied ONCE by `snapshotPlainData` through its own data
  * descriptors, so no getter and no Proxy `get` trap ever runs and no value
@@ -101,9 +103,6 @@ export type ForgeInstallationParseRefusalReason =
 export type ParseForgeInstallationRecordResult =
   | { readonly ok: true; readonly record: ForgeInstallationRecord }
   | { readonly ok: false; readonly reason: ForgeInstallationParseRefusalReason };
-
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
 
 /**
  * Map one snapshot refusal to this module's typed reason, using the refusal
@@ -245,11 +244,13 @@ export function parseForgeInstallationRecord(
   isProxy?: IsProxy,
 ): ParseForgeInstallationRecordResult {
   // The detector is validated before anything else touches the input.
-  const detector = isProxy === undefined ? NO_DETECTOR : isProxy;
-  if (typeof detector !== "function") {
+  // An absent detector is a refusal, not a no-op default: without a trusted
+  // detector a Proxy mirroring a valid record could run its reflection
+  // traps during parsing and be accepted.
+  if (isProxy === undefined || typeof isProxy !== "function") {
     return { ok: false, reason: "proxy-detector-required" };
   }
-  const snapshot = snapshotPlainData(raw, detector, {
+  const snapshot = snapshotPlainData(raw, isProxy, {
     maxDepth: 2,
     maxKeys: ALLOWED_KEYS.size + 1,
     maxArrayLength: MAX_FORGE_INSTALLATION_REPOSITORIES,

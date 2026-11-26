@@ -122,12 +122,15 @@ describe("parseForgeInstallationRecord: accepted records", () => {
     }
   });
 
-  it("does not run without a detector either: the two-argument contract with an absent detector defaults to no detection", () => {
-    const result = parseForgeInstallationRecord(record());
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.record.installationId).toBe("inst-01");
-    }
+  it("refuses a call without a detector with proxy-detector-required and never reads the input", () => {
+    const probe = hostileProxy();
+    const result = parseForgeInstallationRecord(probe);
+    expect(result).toEqual({ ok: false, reason: "proxy-detector-required" });
+  });
+
+  it("refuses an explicitly undefined detector with proxy-detector-required", () => {
+    const result = parseForgeInstallationRecord(record(), undefined);
+    expect(result).toEqual({ ok: false, reason: "proxy-detector-required" });
   });
 });
 

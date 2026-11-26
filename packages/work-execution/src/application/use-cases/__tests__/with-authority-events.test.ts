@@ -151,9 +151,8 @@ describe('withStopAuthorityEvents', () => {
     }
   });
 
-  it('emits no event for already-requested, not-found, refused, still-running, or unknown stop outcomes', async () => {
+  it('emits no event for not-found, refused, still-running, or unknown stop outcomes', async () => {
     const runStopResults: RequestLaneRunStopResult[] = [
-      { outcome: 'already-requested', runId: `run-${ulid(1)}`, mode: 'graceful' },
       { outcome: 'not-found', runId: `run-${ulid(1)}` },
       { outcome: 'refused', reason: 'stale-revision' },
     ];
@@ -182,6 +181,53 @@ describe('withStopAuthorityEvents', () => {
       expect(outcome.auditGap).toBe(false);
       expect(events).toEqual([]);
     }
+  });
+
+  it('forwards the same deterministic eventId for an already-requested retry of the same key', async () => {
+    // The stop was recorded while the sink was unavailable; the retry with
+    // the same request returns `already-requested`, and the wrapper still
+    // derives the recorded key's event id from the request so the idempotent
+    // sink can dedup — the audit event is not permanently lost.
+    const key = stopKey(1);
+    const alreadyRequested: RequestLaneRunStopResult = {
+      outcome: 'already-requested',
+      runId: `run-${ulid(1)}`,
+      mode: 'graceful',
+    };
+    const { sink, events } = recordingSink();
+    const audited = withStopAuthorityEvents(runStopUseCase(alreadyRequested), sink, CONTEXT);
+    const first = await audited.requestLaneRunStop(runStopRequest());
+    expect(first.result).toBe(alreadyRequested);
+    expect(first.auditGap).toBe(false);
+    expect(events.length).toBe(1);
+    expect(events[0].eventId).toBe(`stop:${key}`);
+    // A second retry forwards the identical event id again: no wrapper state.
+    const second = await audited.requestLaneRunStop(runStopRequest());
+    expect(second.auditGap).toBe(false);
+    expect(events.length).toBe(2);
+    expect(events[1].eventId).toBe(`stop:${key}`);
+  });
+
+  it('reports auditGap true for an already-requested outcome whose request cannot yield a stop key', async () => {
+    const alreadyRequested: RequestLaneRunStopResult = {
+      outcome: 'already-requested',
+      runId: `run-${ulid(1)}`,
+      mode: 'graceful',
+    };
+    // A request without a readable `via` cannot rebuild the key, so the
+    // wrapper cannot claim the event was recorded.
+    const keyless = {
+      runId: `run-${ulid(1)}`,
+      mode: 'graceful',
+      entryId: ulid(2),
+      nowIso: NOW_ISO,
+    } as unknown as RequestLaneRunStopRequest;
+    const { sink, events } = recordingSink();
+    const outcome = await withStopAuthorityEvents(runStopUseCase(alreadyRequested), sink, CONTEXT)
+      .requestLaneRunStop(keyless);
+    expect(outcome.result).toBe(alreadyRequested);
+    expect(outcome.auditGap).toBe(true);
+    expect(events).toEqual([]);
   });
 
   it('returns unchanged result with auditGap true when sink refuses, throws, lacks record, or nowIso is missing', async () => {

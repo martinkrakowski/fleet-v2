@@ -49,6 +49,8 @@ import {
   type ConductorHaltPort,
   type RequestLaneRunStopPort,
   type StopAttemptRequest,
+  AuthorityEventJournalAdapter,
+  type AuthorityEventSinkPort,
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
@@ -75,7 +77,9 @@ import {
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
   resolveImplementerSeat,
+  withStopAuthorityEvents,
   type ImplementerSeatResolution,
+  type StopAuthorityEventContext,
 } from "@fleet/work-execution/use-cases";
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
@@ -280,6 +284,48 @@ export interface WorkCrossContextDelegates {
 let current: WorkComposition | null = null;
 let configured: WorkComposition | null = null;
 
+/**
+ * FC12B fix round 2: wraps a stop use case with the authority event emission
+ * and flattens the audited outcome back to the plain port surface the routes
+ * and the run-owned guard consume (the guard's entries call `execute`, which
+ * here reaches the audited wrapper's `stopAttempt`, so both entrypoints audit
+ * exactly once). The audited `auditGap` flag is not representable on that
+ * surface: the stop's own record stays authoritative, and a same-key retry
+ * re-emits the identical event id to the idempotent sink.
+ */
+function auditedStopAttemptUseCase(
+  useCase: StopAttemptUseCase,
+  sink: AuthorityEventSinkPort | null | undefined,
+  context: StopAuthorityEventContext,
+): Pick<StopAttemptUseCase, "execute" | "stopAttempt"> {
+  const audited = withStopAuthorityEvents(useCase, sink, context);
+  return {
+    execute: async (input?: unknown) =>
+      (await audited.stopAttempt(input as StopAttemptRequest)).result,
+    stopAttempt: async (request: StopAttemptRequest) =>
+      (await audited.stopAttempt(request)).result,
+  };
+}
+
+/** The run-stop twin of {@link auditedStopAttemptUseCase}. */
+function auditedRequestLaneRunStopUseCase(
+  useCase: RequestLaneRunStopUseCase,
+  sink: AuthorityEventSinkPort | null | undefined,
+  context: StopAuthorityEventContext,
+): RequestLaneRunStopPort {
+  const audited = withStopAuthorityEvents(useCase, sink, context);
+  return {
+    requestLaneRunStop: async (request) =>
+      (await audited.requestLaneRunStop(request)).result,
+  };
+}
+
+/** The actor the API's stop boundary records in the authority trail. */
+const API_STOP_AUTHORITY_CONTEXT: StopAuthorityEventContext = {
+  actor: "web-api",
+  organizationId: null,
+};
+
 function unconfiguredWorkComposition(): WorkComposition {
   return {
     registerWorkOrder: new RegisterWorkOrderUseCase(),
@@ -300,7 +346,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
     dispatchAttempt: new DispatchAttemptUseCase(),
     reconcileAttempt: new ReconcileAttemptUseCase(),
-    stopAttempt: new StopAttemptUseCase(),
+    stopAttempt: auditedStopAttemptUseCase(new StopAttemptUseCase(), null, API_STOP_AUTHORITY_CONTEXT),
     // Unconfigured, the halt write throws Not implemented (501) and the stop
     // use case refuses every request with invalid-request: an API without a
     // runtime never reports a durable write.
@@ -643,12 +689,20 @@ export function createConfiguredWorkComposition(
       runnerForAttempt,
     }),
     stopAttempt: withRunOwnedStopRefusal(
-      new StopAttemptUseCase({
-        attemptRepo,
-        journal,
-        runner,
-        runnerForAttempt,
-      }),
+      auditedStopAttemptUseCase(
+        new StopAttemptUseCase({
+          attemptRepo,
+          journal,
+          runner,
+          runnerForAttempt,
+        }),
+        // The durable state directory backs the audit journal; a disposable
+        // API keeps an in-memory journal for its process lifetime.
+        new AuthorityEventJournalAdapter(
+          hasDurableStateDir ? { stateDir: stateDir as string } : {},
+        ),
+        API_STOP_AUTHORITY_CONTEXT,
+      ),
       laneRunRepo,
     ),
     // A-C: the run-control writes go through the same durable state directory
@@ -658,10 +712,14 @@ export function createConfiguredWorkComposition(
     ...(hasDurableStateDir
       ? {
           setConductorHalt: new ConductorHaltAdapter({ stateDir: stateDir as string }),
-          requestLaneRunStop: new RequestLaneRunStopUseCase({
-            runRepo: laneRunRepo,
-            runJournal: new LaneRunJournalAdapter({ stateDir: stateDir as string }),
-          }),
+          requestLaneRunStop: auditedRequestLaneRunStopUseCase(
+            new RequestLaneRunStopUseCase({
+              runRepo: laneRunRepo,
+              runJournal: new LaneRunJournalAdapter({ stateDir: stateDir as string }),
+            }),
+            new AuthorityEventJournalAdapter({ stateDir: stateDir as string }),
+            API_STOP_AUTHORITY_CONTEXT,
+          ),
         }
       : {
           setConductorHalt: {
@@ -669,7 +727,11 @@ export function createConfiguredWorkComposition(
               return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
             },
           },
-          requestLaneRunStop: new RequestLaneRunStopUseCase(),
+          requestLaneRunStop: auditedRequestLaneRunStopUseCase(
+            new RequestLaneRunStopUseCase(),
+            null,
+            API_STOP_AUTHORITY_CONTEXT,
+          ),
         }),
     runControlLimiter: new ProbeLimiter(4),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({

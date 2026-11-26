@@ -5,10 +5,13 @@
  * derived stop event to the injected sink.
  *
  * Emission is stop-only and success-only: `stop-recorded` for the lane-run
- * stop, `terminated` or `cancelled` for the attempt stop. Every other
- * outcome (`already-requested`, `not-found`, `refused`, `still-running`,
- * `unknown`) emits nothing and reports no audit gap — the record already
- * says what happened, or nothing was stopped.
+ * stop, `terminated` or `cancelled` for the attempt stop, and — because the
+ * sink is idempotent on `eventId` — `already-requested` for the lane-run
+ * stop too: a stop recorded while the sink was unavailable is retried with
+ * the same key, the retry derives the same event id from the request, and
+ * the idempotent sink dedups, so the audit event is never permanently lost.
+ * Every other outcome (`not-found`, `refused`, `still-running`, `unknown`)
+ * emits nothing and reports no audit gap — nothing was stopped.
  *
  * The wrapper holds no state: no deduplication set or map lives here. The
  * `eventId` is derived deterministically from the result's own key or attempt
@@ -38,6 +41,7 @@ import type { AuthorityEventSinkPort } from '../ports/out/AuthorityEventSinkPort
 import {
   authorityEventForStop,
 } from '../../domain/authority-event-mapping.js';
+import { laneRunStopForceKey, laneRunStopKey } from '../../domain/lane-run-keys.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 
 /** Who the audit trail names as the stop's actor, frozen at composition. */
@@ -112,12 +116,18 @@ function wrapRequestLaneRunStop(
       request: RequestLaneRunStopRequest,
     ): Promise<AuditedStopOutcome<RequestLaneRunStopResult>> => {
       const result = await useCase.requestLaneRunStop(request);
-      if (result.outcome !== 'stop-recorded') {
+      if (result.outcome !== 'stop-recorded' && result.outcome !== 'already-requested') {
         return { result, auditGap: false };
       }
       // Deterministic from the recorded stop key: a retry of the same
-      // recorded stop derives the same event id with no wrapper state.
-      const key = readOwnText(result, 'key');
+      // recorded stop derives the same event id with no wrapper state. On
+      // `already-requested` the result carries no key, so the key is rebuilt
+      // from the request's own runId, mode and via — the same derivation the
+      // use case used — and the idempotent sink dedups the repeat.
+      const key =
+        result.outcome === 'stop-recorded'
+          ? readOwnText(result, 'key')
+          : stopKeyForRequest(request);
       const auditGap =
         key === null
           ? true
@@ -153,6 +163,30 @@ function wrapStopAttempt(
       return { result, auditGap };
     },
   };
+}
+
+/**
+ * Rebuilds the stop journal key from the request itself — the same
+ * derivation `RequestLaneRunStopUseCase` performs — so an `already-requested`
+ * retry forwards the identical deterministic event id. Any missing,
+ * non-string or out-of-domain field, and any builder refusal, reads as
+ * `null`: the caller reports an audit gap instead of guessing a key. The
+ * read is a descriptor snapshot, so no getter ever runs; the cost is O(1)
+ * (three bounded field reads plus two constant-work builder checks).
+ */
+function stopKeyForRequest(request: unknown): string | null {
+  const runId = readOwnText(request, 'runId');
+  const mode = readOwnText(request, 'mode');
+  const via = readOwnText(request, 'via');
+  if (runId === null || (mode !== 'graceful' && mode !== 'force') || (via !== 'web' && via !== 'cli')) {
+    return null;
+  }
+  try {
+    const built = mode === 'force' ? laneRunStopForceKey(runId, via) : laneRunStopKey(runId, via);
+    return built.ok ? built.key : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

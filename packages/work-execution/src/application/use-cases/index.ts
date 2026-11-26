@@ -13,6 +13,7 @@ export * from "./cancel-prepared-run-active.js";
 export * from "./CancelPreparedAttemptUseCase.use-case.js";
 export * from "./chain-pass-halt.js";
 export * from "./CloseWorkOrderUseCase.use-case.js";
+export * from "./cloud-provider-registry.js";
 export * from "./CollectAttemptArtifactsUseCase.use-case.js";
 export * from "./CommitEditOnlyAttemptUseCase.use-case.js";
 export * from "./CompareScorecardUseCase.use-case.js";

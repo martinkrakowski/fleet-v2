@@ -1296,6 +1296,101 @@ describe('parseInstallation v2', () => {
       });
     }
   });
+
+  // IH1a: the optional `runner.optional` field; absent means required.
+  const withOptional = (optional: unknown) => ({
+    ...validV2,
+    hosts: {
+      ...validV2.hosts,
+      'lane-host': {
+        ...validV2.hosts['lane-host'],
+        runner: { ...validV2.hosts['lane-host'].runner, optional },
+      },
+    },
+  });
+
+  it('accepts runner.optional true and false on either runner kind', () => {
+    for (const optional of [true, false]) {
+      for (const kind of ['opencode', 'agy'] as const) {
+        const runner =
+          kind === 'agy'
+            ? { kind, port: 46000, agyMode: 'edit-only', optional }
+            : { kind, port: 46000, optional };
+        expect(
+          parseInstallation({
+            ...validV2,
+            hosts: {
+              ...validV2.hosts,
+              'lane-host': { ...validV2.hosts['lane-host'], runner },
+            },
+          }),
+        ).toEqual({
+          ok: true,
+          installation: {
+            ...validV2,
+            hosts: {
+              ...validV2.hosts,
+              'lane-host': { ...validV2.hosts['lane-host'], runner },
+            },
+          },
+        });
+      }
+    }
+  });
+
+  it('leaves runner.optional undefined when absent', () => {
+    const parsed = parseInstallation(validV2);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(
+        parsed.installation.hosts?.['lane-host']?.runner?.optional,
+      ).toBeUndefined();
+    }
+  });
+
+  it('refuses a non-boolean runner.optional', () => {
+    for (const optional of ['true', 1, null, {}, []]) {
+      expect(parseInstallation(withOptional(optional))).toEqual({
+        ok: false,
+        errors: ['hosts.lane-host.runner.optional: must be a boolean'],
+      });
+    }
+  });
+
+  it('refuses an accessor getter on runner.optional without invoking it', () => {
+    let read = false;
+    const runner = {
+      ...validV2.hosts['lane-host'].runner,
+      get optional(): boolean {
+        read = true;
+        return true;
+      },
+    };
+    const result = parseInstallation({
+      ...validV2,
+      hosts: {
+        ...validV2.hosts,
+        'lane-host': { ...validV2.hosts['lane-host'], runner },
+      },
+    });
+    expect(read).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.optional: must be a plain data property'],
+    });
+  });
+
+  it('carries runner.optional onto the derived model runners when present and omits it when absent', () => {
+    for (const optional of [true, false, undefined] as const) {
+      const parsed = parseInstallation(withOptional(optional));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      const { model } = deriveInstallationModel(parsed.installation);
+      expect(model.hosts['lane-host']?.runner?.optional).toBe(optional);
+    }
+  });
 });
 
 describe('parseInstallation v2 daemon', () => {

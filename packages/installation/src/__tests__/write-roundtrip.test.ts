@@ -109,6 +109,7 @@ const fullV2File = {
         },
         maxLanes: 2,
         gateSlot: { path: '/usr/local/bin/gate-slot', slots: 2 },
+        optional: false,
       },
     },
     agyfull: {
@@ -129,6 +130,7 @@ const fullV2File = {
         },
         maxLanes: 2,
         gateSlot: { path: '/usr/local/bin/gate-slot', slots: 2 },
+        optional: true,
         agyMode: 'full',
         agyAcknowledgement: {
           textVersion: AGY_SECURITY_TEXT_VERSION,

@@ -165,6 +165,8 @@ export interface OpencodeHostRunnerDraft {
   readonly capabilities?: RunnerCapabilityDeclaration;
   /** The host-wide gate-slot throttle the host already declares (KF-30b). */
   readonly gateSlot?: GateSlotSection;
+  /** Whether the runner may sit idle; absent means `false` (required). */
+  readonly optional?: boolean;
 }
 
 /** An agy runner as the operator described it; `full` needs its mode typed. */
@@ -181,6 +183,8 @@ export interface AgyHostRunnerDraft {
   readonly capabilities?: RunnerCapabilityDeclaration;
   /** The host-wide gate-slot throttle the host already declares (KF-30b). */
   readonly gateSlot?: GateSlotSection;
+  /** Whether the runner may sit idle; absent means `false` (required). */
+  readonly optional?: boolean;
 }
 
 /** One drafted runner, discriminated by the kind that selects its fields. */
@@ -316,6 +320,10 @@ function buildHostRunner(
           `${path}.capabilities`,
           errors,
         );
+  const optional = fields.optional;
+  if (optional !== undefined && typeof optional !== 'boolean') {
+    errors.push(`${path}.optional: must be a boolean`);
+  }
   const common = {
     port: port as number,
     ...(tunnelOffset !== undefined ? { tunnelOffset: tunnelOffset as number } : {}),
@@ -327,6 +335,7 @@ function buildHostRunner(
     ...(fields.gateSlot !== undefined
       ? { gateSlot: fields.gateSlot as GateSlotSection }
       : {}),
+    ...(optional !== undefined ? { optional: optional as boolean } : {}),
   };
   if (fields.kind === 'agy') {
     return {
@@ -701,6 +710,8 @@ function mergeDraftedHost(
     guardedRunner === undefined
       ? undefined
       : ownDataValue(guardedRunner, 'tunnelOffset');
+  const guardedOptional =
+    guardedRunner === undefined ? undefined : ownDataValue(guardedRunner, 'optional');
   const guardedAliases =
     guardedExisting === undefined
       ? undefined
@@ -717,9 +728,21 @@ function mergeDraftedHost(
     guardedDraftedRunner === undefined
       ? undefined
       : ownDataValue(guardedDraftedRunner, 'tunnelOffset');
+  const draftedOptional =
+    guardedDraftedRunner === undefined
+      ? undefined
+      : ownDataValue(guardedDraftedRunner, 'optional');
 
   const container = drafted.container ?? readGuardedString(guardedContainer);
   const tunnelOffset = draftedTunnelOffset ?? readGuardedNumber(guardedTunnelOffset);
+  // An edit draft that omits `optional` keeps the existing declaration;
+  // only a boolean is ever carried.
+  const optional =
+    typeof draftedOptional === 'boolean'
+      ? draftedOptional
+      : typeof guardedOptional === 'boolean'
+        ? guardedOptional
+        : undefined;
 
   let roleAliases: Partial<Record<HostRole, string>> | undefined;
   if (drafted.roleAliases !== undefined) {
@@ -749,15 +772,20 @@ function mergeDraftedHost(
     }
   }
 
+  const runnerOverrides = {
+    ...(tunnelOffset !== undefined ? { tunnelOffset } : {}),
+    ...(optional !== undefined ? { optional } : {}),
+  };
   return {
     ...drafted,
     ...(container !== undefined ? { container } : {}),
     ...(roleAliases !== undefined ? { roleAliases } : {}),
-    ...(drafted.runner !== undefined && tunnelOffset !== undefined
+    ...(drafted.runner !== undefined &&
+    (tunnelOffset !== undefined || optional !== undefined)
       ? {
           runner: {
             ...(guardedDraftedRunner ?? {}),
-            tunnelOffset,
+            ...runnerOverrides,
           } as HostSection['runner'],
         }
       : {}),

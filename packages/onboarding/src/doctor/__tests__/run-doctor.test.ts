@@ -458,6 +458,51 @@ describe('runDoctor', () => {
     expect(lines.filter((line) => line.check === 'gate-slot')).toEqual([]);
   });
 
+  it('reports a runner-optional line for optional true, false and absent', async () => {
+    const withOptional = (optional?: boolean) =>
+      sampleModel({
+        host: {
+          runner: {
+            kind: 'opencode',
+            port: 4096,
+            capabilities: {
+              source: 'declared',
+              filesystemScope: 'scoped-worktree',
+              networkEgressRestricted: true,
+              cpuAndMemoryLimited: true,
+              processTreeTermination: true,
+            },
+            ...(optional !== undefined ? { optional } : {}),
+          },
+        },
+      });
+    const { probes } = fakeProbes();
+    const detail = (model: FleetInstallationModel) => {
+      const found = collect(loadedResult(model), probes).then((lines) =>
+        lines.find((line) => line.check === 'runner-optional'),
+      );
+      return found;
+    };
+    expect((await detail(withOptional(true)))?.detail).toBe(
+      'optional (runner.optional true)',
+    );
+    expect((await detail(withOptional(false)))?.detail).toBe(
+      'required (runner.optional false)',
+    );
+    expect((await detail(withOptional()))?.detail).toBe(
+      'required (runner.optional absent; absent means required)',
+    );
+    for (const optional of [true, false, undefined]) {
+      const line = await detail(withOptional(optional));
+      expect(line).toMatchObject({
+        scope: 'host',
+        subject: 'main',
+        check: 'runner-optional',
+        status: 'PASS',
+      });
+    }
+  });
+
   it('reports UNKNOWN with the source in detail for a legacy-asserted runner', async () => {
     const legacy: FleetInstallationModel = {
       ...sampleModel(),
@@ -692,7 +737,8 @@ describe('runDoctor', () => {
         line.check !== 'runner-capabilities' &&
         line.check !== 'free-tier' &&
         line.check !== 'auto-merge' &&
-        line.check !== 'gate-slot',
+        line.check !== 'gate-slot' &&
+        line.check !== 'runner-optional',
     );
     const unknownLines = lines.filter((line) => line.status === 'UNKNOWN');
     expect(unknownLines).toHaveLength(expectedUnknown.length);
@@ -2002,6 +2048,7 @@ describe('runDoctor login-shell canary (SHP1)', () => {
       'worktree-root-writable:UNKNOWN',
       'runner-capabilities:PASS',
       'gate-slot:PASS',
+      'runner-optional:PASS',
       'ci-runner-slot-1:UNKNOWN',
       'disk-quota:UNKNOWN',
       // The runner host's opencode server answer is not gated by the canary

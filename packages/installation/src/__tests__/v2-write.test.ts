@@ -92,6 +92,30 @@ describe('writeInstallationV2', () => {
     });
   });
 
+  it('round-trips runner.optional true and false', () => {
+    for (const optional of [true, false]) {
+      const installation = parseV2Fixture({
+        ...validV2,
+        hosts: {
+          ...validV2.hosts,
+          'lane-host': {
+            ...validV2.hosts['lane-host'],
+            runner: {
+              ...validV2.hosts['lane-host'].runner,
+              optional,
+            },
+          },
+        },
+      });
+      expect(installation.hosts['lane-host']?.runner?.optional).toBe(optional);
+      const written = writeInstallationV2(installation);
+      expect(parseInstallation(JSON.parse(written))).toEqual({
+        ok: true,
+        installation,
+      });
+    }
+  });
+
   it('round-trips a jev decisions block', () => {
     const installation = parseV2Fixture({
       ...validV2,

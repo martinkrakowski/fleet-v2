@@ -1371,7 +1371,14 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
             kind: "opencode",
             port: 4166,
             authFile: path.join(dir, "auth.json"),
+            optional: true,
           },
+        },
+        verifier: {
+          transport: "ssh",
+          sshAlias: "v",
+          worktreeRoot: path.join(dir, "verifier"),
+          roles: ["verifier"],
         },
       },
     });
@@ -1388,6 +1395,7 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
       "TUNNEL_OFFSET",
       "DIAL_PORT",
       "AUTH",
+      "OPTIONAL",
     ]) {
       expect(all.stdout).toContain(column);
     }
@@ -1397,6 +1405,20 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     expect(all.stdout).toContain("4167");
     expect(all.stdout).toContain("configured");
     expect(all.stdout).not.toContain("auth.json");
+    // OPTIONAL: true for lanehost, false for mac's required runner, - for the
+    // runner-less verifier.
+    const optionalColumn = all.stdout.indexOf("OPTIONAL");
+    expect(optionalColumn).toBeGreaterThan(-1);
+    const lanehostRow = all.stdout
+      .split("\n")
+      .find((line) => line.startsWith("lanehost"));
+    expect(lanehostRow).toContain(" true");
+    const macRow = all.stdout.split("\n").find((line) => line.startsWith("mac"));
+    expect(macRow).toContain(" false");
+    const verifierRow = all.stdout
+      .split("\n")
+      .find((line) => line.startsWith("verifier"));
+    expect(verifierRow).toContain(" -");
     const one = await runHosts(["show", "lanehost"], file);
     expect(one.code).toBe(0);
     expect(one.stdout).toContain("4167");
@@ -1463,6 +1485,30 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     expect(refused.code).toBe(1);
     expect(refused.stderr).toContain("tunnelOffset");
     expect(readFileSync(file, "utf8")).toBe(reloaded);
+  });
+
+  it("hosts edit preserves runner.optional: true when the edit changes another field", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const base = v2Installation(path.join(dir, "worktrees")) as Record<
+      string,
+      unknown
+    >;
+    const hosts = base.hosts as Record<
+      string,
+      { runner?: { optional?: boolean } }
+    >;
+    hosts.lanehost.runner = { ...hosts.lanehost.runner, optional: true };
+    writeJsonFile(file, base);
+    const edited = await runHosts(
+      ["edit", "lanehost", "--port", "4266", "--yes"],
+      file,
+    );
+    expect(edited.code).toBe(0);
+    const reloaded = JSON.parse(readFileSync(file, "utf8")) as {
+      hosts: Record<string, { runner?: { optional?: boolean } }>;
+    };
+    expect(reloaded.hosts.lanehost?.runner?.optional).toBe(true);
   });
 
   it("hostsCommand never throws on malformed runtime argv/options, sparse arrays, unknown role enums or throwing getters", async () => {

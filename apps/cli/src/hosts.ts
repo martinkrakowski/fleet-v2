@@ -702,6 +702,7 @@ function runnerDraftFor(
       : {}),
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
     ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
+    ...(runner.optional !== undefined ? { optional: runner.optional } : {}),
   };
   if (runner.kind === "agy") {
     return {
@@ -1735,6 +1736,7 @@ function printHostTable(
         runner === undefined ? "-" : String(runner.tunnelOffset ?? 1),
       dialPort,
       auth: runner?.authFile !== undefined ? "configured" : "-",
+      optional: runner === undefined ? "-" : String(runner.optional ?? false),
     };
   });
   const widths = {
@@ -1748,6 +1750,7 @@ function printHostTable(
     tunnelOffset: Math.max("TUNNEL_OFFSET".length, ...rows.map((r) => r.tunnelOffset.length)),
     dialPort: Math.max("DIAL_PORT".length, ...rows.map((r) => r.dialPort.length)),
     auth: Math.max("AUTH".length, ...rows.map((r) => r.auth.length)),
+    optional: Math.max("OPTIONAL".length, ...rows.map((r) => r.optional.length)),
   };
   const header = [
     "HOST".padEnd(widths.name),
@@ -1760,6 +1763,7 @@ function printHostTable(
     "TUNNEL_OFFSET".padEnd(widths.tunnelOffset),
     "DIAL_PORT".padEnd(widths.dialPort),
     "AUTH".padEnd(widths.auth),
+    "OPTIONAL".padEnd(widths.optional),
   ].join("  ");
   out.stdout(`${header}\n`);
   for (const row of rows) {
@@ -1775,6 +1779,7 @@ function printHostTable(
         row.tunnelOffset.padEnd(widths.tunnelOffset),
         row.dialPort.padEnd(widths.dialPort),
         row.auth.padEnd(widths.auth),
+        row.optional.padEnd(widths.optional),
       ].join("  ") + "\n",
     );
   }

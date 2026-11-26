@@ -271,6 +271,40 @@ describe('draftHost', () => {
     }
   });
 
+  it('carries the drafted optional flag on either runner kind and refuses non-boolean values', () => {
+    for (const optional of [true, false] as const) {
+      const opencode = draftHost(
+        sshInput({ runner: { kind: 'opencode', port: 4166, optional } }),
+      );
+      expect(opencode.ok).toBe(true);
+      if (opencode.ok) {
+        expect(opencode.draft.host.runner).toMatchObject({ optional });
+      }
+
+      const agy = draftHost(
+        sshInput({
+          runner: { kind: 'agy', agyMode: 'edit-only', port: 4166, optional },
+        }),
+      );
+      expect(agy.ok).toBe(true);
+      if (agy.ok) {
+        expect(agy.draft.host.runner).toMatchObject({ optional });
+      }
+    }
+
+    for (const optional of ['true', 1, null]) {
+      const result = draftHost(
+        sshInput({ runner: { kind: 'opencode', port: 4166, optional: optional as never } }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.errors).toEqual([
+          'hosts.lanehost.runner.optional: must be a boolean',
+        ]);
+      }
+    }
+  });
+
   it('carries the agy fields on an agy runner and never on an opencode one', () => {
     const agy = draftHost(
       sshInput({
@@ -597,6 +631,60 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
         worktreeRoot: '/srv/worktrees',
         roles: ['lane-runner'],
         runner: { kind: 'opencode', port: 46000, tunnelOffset: 1 },
+      });
+    }
+  });
+
+  it('preserves an existing runner.optional: true when the edit draft omits optional', () => {
+    const existing = {
+      transport: 'ssh',
+      sshAlias: 'here',
+      worktreeRoot: '/srv/worktrees',
+      roles: ['orchestrator'],
+      runner: { kind: 'opencode', port: 46000, optional: true },
+    };
+    const result = applyHostDraft(
+      hereFile(existing),
+      {
+        name: 'here',
+        host: {
+          transport: 'ssh',
+          sshAlias: 'here',
+          worktreeRoot: '/srv/worktrees',
+          roles: ['orchestrator'],
+          runner: { kind: 'opencode', port: 46001 },
+        },
+      },
+      'edit',
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.candidate.hosts.here.runner).toMatchObject({
+        kind: 'opencode',
+        port: 46001,
+        optional: true,
+      });
+    }
+
+    // A draft that declares optional wins as supplied.
+    const overridden = applyHostDraft(
+      hereFile(existing),
+      {
+        name: 'here',
+        host: {
+          transport: 'ssh',
+          sshAlias: 'here',
+          worktreeRoot: '/srv/worktrees',
+          roles: ['orchestrator'],
+          runner: { kind: 'opencode', port: 46001, optional: false },
+        },
+      },
+      'edit',
+    );
+    expect(overridden.ok).toBe(true);
+    if (overridden.ok) {
+      expect(overridden.candidate.hosts.here.runner).toMatchObject({
+        optional: false,
       });
     }
   });

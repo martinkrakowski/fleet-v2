@@ -194,3 +194,42 @@ describe('OrganizationRepositoryAdapter (file mode)', () => {
     );
   });
 });
+
+describe('OrganizationRepositoryAdapter reads hostile create/save inputs once', () => {
+  it('refuses a record carrying a caller-supplied revision key instead of silently dropping it', async () => {
+    const adapter = new OrganizationRepositoryAdapter();
+    const withRevision = { ...makeOrg(), revision: 7 } as unknown as OrganizationRecord;
+    await expect(adapter.createOrganization(withRevision)).resolves.toEqual({
+      status: 'refused',
+      reason: 'invalid-record',
+    });
+    expect(await adapter.findOrganization('org-1')).toBeNull();
+    await adapter.createOrganization(makeOrg());
+    await expect(adapter.saveOrganization(withRevision, 0)).resolves.toEqual({
+      status: 'refused',
+      reason: 'invalid-record',
+    });
+    expect((await adapter.findOrganization('org-1'))?.revision).toBe(0);
+  });
+
+  it('never runs a Proxy get trap and refuses a Proxy-wrapped record on create and save', async () => {
+    let getRan = 0;
+    const hostile = new Proxy(makeOrg(), {
+      get() {
+        getRan += 1;
+        throw new Error('get trap ran');
+      },
+    }) as unknown as OrganizationRecord;
+    const adapter = new OrganizationRepositoryAdapter();
+    await expect(adapter.createOrganization(hostile)).resolves.toEqual({
+      status: 'refused',
+      reason: 'invalid-record',
+    });
+    await adapter.createOrganization(makeOrg());
+    await expect(adapter.saveOrganization(hostile, 0)).resolves.toEqual({
+      status: 'refused',
+      reason: 'invalid-record',
+    });
+    expect(getRan).toBe(0);
+  });
+});

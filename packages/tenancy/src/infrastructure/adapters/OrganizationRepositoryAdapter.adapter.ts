@@ -48,29 +48,6 @@ export interface OrganizationRepositoryAdapterOptions {
 
 const ORGANIZATION_STORE_NAME = 'organizations.json';
 
-/**
- * The only own keys a persisted organization envelope may carry: the record's
- * own keys plus the storage keys. Cost bound: O(1) — a fixed set.
- */
-const ORGANIZATION_STORE_ALLOWED_KEYS: ReadonlySet<string> = new Set([
-  'schemaVersion',
-  'revision',
-  'organizationId',
-  'displayName',
-  'status',
-  'createdAtIso',
-  'retiredAtIso',
-]);
-
-/** The record fields read back from a persisted envelope after stripping. */
-const ORGANIZATION_RECORD_FIELDS: readonly string[] = [
-  'organizationId',
-  'displayName',
-  'status',
-  'createdAtIso',
-  'retiredAtIso',
-];
-
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return (
     typeof value === 'number' &&
@@ -86,56 +63,17 @@ function isProxy(value: unknown): boolean {
 }
 
 /**
- * Snapshot an untrusted create/save input into a plain record without ever
- * invoking a getter: every own property is read through its descriptor and
- * accessor properties are refused before any read. Refuses null, undefined,
- * non-objects, arrays (and with them array holes, array-likes and
- * non-iterables, which are all refused by the same plain-object check),
- * Proxies (via `types.isProxy`, which observes no trap), accessor
- * properties, symbol keys, unknown keys (which covers the
- * prototype-polluting keys `__proto__`, `constructor` and `prototype`) and
- * oversized strings (via `validateOrganizationRecord`).
- *
- * Cost bound: O(1) — one own-key pass over at most the 7 allowed keys plus
- * one bounded validation pass (depth 1, strings capped at 4096 characters).
+ * Validate an untrusted create/save input. `validateOrganizationRecord`
+ * snapshots it once through the shared `record-guards` reader, so no getter
+ * and no Proxy trap ever runs, an extra key (including `revision`, which the
+ * caller never supplies, and the prototype-polluting keys) is refused, and
+ * the accepted record is a frozen copy. Cost bound: O(1) — one bounded
+ * snapshot pass over at most the allowed keys.
  */
 function snapshotOrganizationInput(
   input: unknown,
 ): { ok: true; record: OrganizationRecord } | { ok: false } {
-  if (typeof input !== 'object' || input === null || Array.isArray(input) || isProxy(input)) {
-    return { ok: false };
-  }
-  const proto = Object.getPrototypeOf(input);
-  if (proto !== Object.prototype && proto !== null) {
-    return { ok: false };
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(input);
-  const ownKeys = Reflect.ownKeys(input);
-  // Refuse before iterating when the shape is already wrong.
-  if (ownKeys.length > ORGANIZATION_STORE_ALLOWED_KEYS.size) {
-    return { ok: false };
-  }
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || !ORGANIZATION_STORE_ALLOWED_KEYS.has(key)) {
-      // Any key outside the allow-list is refused, including `__proto__`,
-      // `constructor` and `prototype`; the offending key text is never echoed.
-      return { ok: false };
-    }
-    const descriptor = descriptors[key];
-    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
-      // An accessor (or non-enumerable) property is refused unread.
-      return { ok: false };
-    }
-  }
-  const plain: Record<string, unknown> = {};
-  for (const field of ORGANIZATION_RECORD_FIELDS) {
-    plain[field] = descriptors[field]?.value;
-  }
-  const schemaVersionDescriptor = descriptors['schemaVersion'];
-  if (schemaVersionDescriptor !== undefined) {
-    plain['schemaVersion'] = schemaVersionDescriptor.value;
-  }
-  const validated = validateOrganizationRecord(plain, isProxy);
+  const validated = validateOrganizationRecord(input, isProxy);
   return validated.ok ? { ok: true, record: validated.value } : { ok: false };
 }
 
@@ -145,8 +83,8 @@ function snapshotOrganizationInput(
  * and never throws. The returned record carries no `schemaVersion` key — it
  * was stripped before validation. An absent `revision` reads as 0.
  *
- * Cost bound: O(1) per record — one own-key pass over at most the 7 allowed
- * keys, one bounded validation pass, and one version check.
+ * Cost bound: O(k) per record over its own keys (a persisted element is a
+ * bounded JSON object), one bounded validation pass and one version check.
  */
 export function parseVersionedOrganizationStateRecord(
   raw: unknown,
@@ -156,28 +94,30 @@ export function parseVersionedOrganizationStateRecord(
     if (versionCheck.status !== 'ok') {
       return versionCheck;
     }
+    // `raw` is a JSON-parsed element. Copy every own data property except
+    // the two storage keys; validateOrganizationRecord then refuses any
+    // extra key, accessor or hostile shape in its own single snapshot.
     const descriptors = Object.getOwnPropertyDescriptors(raw as object);
-    const ownKeys = Reflect.ownKeys(raw as object);
-    if (ownKeys.length > ORGANIZATION_STORE_ALLOWED_KEYS.size) {
-      return { status: 'invalid' };
-    }
-    for (const key of ownKeys) {
-      if (typeof key !== 'string' || !ORGANIZATION_STORE_ALLOWED_KEYS.has(key)) {
+    const plain: Record<string, unknown> = {};
+    let revision: unknown = 0;
+    for (const key of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[key as string];
+      if (typeof key !== 'string' || descriptor === undefined || !('value' in descriptor)) {
         return { status: 'invalid' };
       }
-      const descriptor = descriptors[key];
-      if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
-        return { status: 'invalid' };
+      if (key === 'revision') {
+        revision = descriptor.value;
+      } else if (key !== 'schemaVersion') {
+        Object.defineProperty(plain, key, {
+          value: descriptor.value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
     }
-    const revisionDescriptor = descriptors['revision'];
-    const revision = revisionDescriptor === undefined ? 0 : (revisionDescriptor.value as unknown);
     if (!isNonNegativeSafeInteger(revision)) {
       return { status: 'invalid' };
-    }
-    const plain: Record<string, unknown> = {};
-    for (const field of ORGANIZATION_RECORD_FIELDS) {
-      plain[field] = descriptors[field]?.value;
     }
     const validated = validateOrganizationRecord(plain);
     if (!validated.ok) {

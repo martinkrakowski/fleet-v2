@@ -1192,9 +1192,9 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: []
+          out: [OrganizationRepositoryPort]
       infrastructure:
-        adapters: []
+        adapters: [OrganizationRepositoryAdapter]
 
   - name: billing
     type: supporting
@@ -1213,9 +1213,9 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: [OrganizationRepositoryPort]
+          out: []
       infrastructure:
-        adapters: [OrganizationRepositoryAdapter]
+        adapters: []
 
 context_mappings:
   - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; AcceptanceReceiptReadAdapter (telemetry, OT2b) reads receipts through its own read-only InspectAcceptanceEvidenceUseCase instance; dependency is declared on work-execution." }

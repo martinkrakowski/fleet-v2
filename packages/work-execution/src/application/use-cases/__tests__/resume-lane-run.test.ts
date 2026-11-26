@@ -10,18 +10,19 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { LaneRun } from '../../../domain/entities/LaneRun.js';
+import { LaneRun, readLaneRunRecord } from '../../../domain/entities/LaneRun.js';
 import { laneRunConductEntry, laneRunGateFact, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
-import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
-import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
+import { LANE_RUN_ONE_WAY_STEPS, reviewTransportRetryCountOf } from '../../../domain/lane-run-records.js';
+import type { LaneRunParkRecord, LaneRunRecord, LaneRunReviewRetryRecord } from '../../../domain/lane-run-records.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { performPark } from '../advance-lane-run/step-context.js';
 import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -1150,5 +1151,221 @@ describe('ResumeLaneRunUseCase GU2 bounded gate retry', () => {
       await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
     ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
     expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
+  });
+});
+
+describe('LaneRun reviewTransportRetry (AB-TP4A)', () => {
+  const RETRY: LaneRunReviewRetryRecord = {
+    step: 'code-review',
+    head12: 'a'.repeat(12),
+    count: 2,
+    nextRetryAtIso: '2026-10-27T10:20:00.000Z',
+  };
+
+  it('the retry survives LaneRun.create, toRecord, readLaneRunRecord, a JSON round-trip and the adapter store', async () => {
+    const created = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: RETRY });
+    expect(created.success).toBe(true);
+    if (!created.success) {
+      return;
+    }
+    expect(created.value.toRecord().reviewTransportRetry).toEqual(RETRY);
+    expect(reviewTransportRetryCountOf(created.value.toRecord())).toBe(2);
+
+    const reparsed = LaneRun.create(JSON.parse(JSON.stringify(created.value.toRecord())));
+    expect(reparsed.success).toBe(true);
+    if (!reparsed.success) {
+      return;
+    }
+    expect(reparsed.value.toRecord().reviewTransportRetry).toEqual(RETRY);
+
+    const read = readLaneRunRecord(created.value.toRecord());
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.record.reviewTransportRetry).toEqual(RETRY);
+
+    const repo = new LaneRunRepositoryAdapter();
+    const record = created.value.toRecord();
+    expect(await repo.create(record)).toEqual({ outcome: 'saved', record });
+    expect(
+      await repo.acquireLease(RUN_ID, {
+        holderId: HOLDER,
+        observedFence: 0,
+        leaseUntilIso: LEASE_UNTIL,
+        nowIso: NOW,
+      }),
+    ).toMatchObject({ outcome: 'saved' });
+    const fetched = await repo.get(RUN_ID);
+    expect(fetched?.reviewTransportRetry).toEqual(RETRY);
+
+    // identityChanged does not compare the counter, so a new count saves freely.
+    const stored = await repo.get(RUN_ID);
+    expect(
+      await repo.save(
+        { ...stored, reviewTransportRetry: { ...RETRY, count: 3 }, revision: (stored?.revision ?? 0) + 1 } as LaneRunRecord,
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+    expect((await repo.get(RUN_ID))?.reviewTransportRetry).toEqual({ ...RETRY, count: 3 });
+  });
+
+  it('reviewTransportRetry: null is valid and reads as a count of 0', () => {
+    const created = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: null });
+    expect(created.success).toBe(true);
+    if (!created.success) {
+      return;
+    }
+    expect(created.value.toRecord().reviewTransportRetry).toBeNull();
+    expect(reviewTransportRetryCountOf(created.value.toRecord())).toBe(0);
+  });
+
+  it('reviewTransportRetryCountOf returns 0 on absent, null, non-matching step or head12, and a throwing getter', () => {
+    expect(reviewTransportRetryCountOf(undefined)).toBe(0);
+    expect(reviewTransportRetryCountOf(null)).toBe(0);
+    expect(reviewTransportRetryCountOf({})).toBe(0);
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: null })).toBe(0);
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: RETRY })).toBe(2);
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: RETRY }, 'brief-check')).toBe(0);
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: RETRY }, 'code-review', '0'.repeat(12))).toBe(0);
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: RETRY }, 'code-review', RETRY.head12)).toBe(2);
+    expect(
+      reviewTransportRetryCountOf({
+        get reviewTransportRetry(): LaneRunReviewRetryRecord {
+          throw new Error('no');
+        },
+      }),
+    ).toBe(0);
+  });
+
+  it.each([
+    'extra keys',
+    'missing keys',
+    'bad step',
+    'bad head12',
+    'negative count',
+    'non-integer count',
+    'count over 100',
+    'invalid nextRetryAtIso',
+    'throwing getter',
+  ])('LaneRun.create and the adapter refuse a malformed reviewTransportRetry (%s)', async (malformation) => {
+    const bad: Record<string, unknown> = { ...RETRY };
+    if (malformation === 'extra keys') {
+      bad.extra = 1;
+    } else if (malformation === 'missing keys') {
+      delete (bad as { count?: unknown }).count;
+    } else if (malformation === 'bad step') {
+      bad.step = 'gate';
+    } else if (malformation === 'bad head12') {
+      bad.head12 = 'xyz';
+    } else if (malformation === 'negative count') {
+      bad.count = -1;
+    } else if (malformation === 'non-integer count') {
+      bad.count = 1.5;
+    } else if (malformation === 'count over 100') {
+      bad.count = 101;
+    } else if (malformation === 'invalid nextRetryAtIso') {
+      bad.nextRetryAtIso = '2026-02-31T10:00:00.000Z';
+    } else {
+      Object.defineProperty(bad, 'count', { enumerable: true, get() { throw new Error('no'); } });
+    }
+
+    const result = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: bad });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toBe('LaneRun reviewTransportRetry is invalid');
+      expect(result.code).toBe('invalid');
+    }
+
+    const malformedRecord = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: bad });
+    expect(malformedRecord.success).toBe(false);
+    const read = readLaneRunRecord({ ...BASE_RECORD, reviewTransportRetry: bad });
+    expect(read.ok).toBe(false);
+    if (!read.ok) {
+      expect(read.reason).toBe('malformed');
+    }
+    const repo = new LaneRunRepositoryAdapter();
+    expect(await repo.create({ ...BASE_RECORD, reviewTransportRetry: bad } as unknown as LaneRunRecord)).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-record',
+    });
+  });
+
+  it('performPark clears reviewTransportRetry to null', async () => {
+    const fx = await seededParked();
+    const record = await fx.repo.get(RUN_ID);
+    // Seed the counter on the parked run through the store's own save path.
+    expect(
+      await fx.repo.save(
+        { ...record, reviewTransportRetry: RETRY, revision: (record?.revision ?? 0) + 1 } as LaneRunRecord,
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+    const withRetry = await fx.repo.get(RUN_ID);    expect(withRetry?.reviewTransportRetry).toEqual(RETRY);
+
+    const result = await performPark(
+      { deps: advanceDeps(fx.repo, fx.journal) },
+      withRetry as LaneRunRecord,
+      'halted',
+      null,
+      'brief-check',
+      { runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER },
+    );
+    expect(result).toEqual({ outcome: 'parked', reason: 'halted', qualifier: null });
+    const parked = await fx.repo.get(RUN_ID);
+    expect(parked?.parked).not.toBeNull();
+    expect(parked?.reviewTransportRetry).toBeNull();
+    expect(reviewTransportRetryCountOf(parked)).toBe(0);
+  });
+
+  it('a resume clears reviewTransportRetry to null on both the normal and the crash-repair exit', async () => {
+    const normal = await seededParked();
+    const seededRecord = await normal.repo.get(RUN_ID);
+    expect(
+      await normal.repo.save(
+        { ...seededRecord, reviewTransportRetry: RETRY, revision: (seededRecord?.revision ?? 0) + 1 } as LaneRunRecord,
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+    await normal.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await normal.resume.applyPendingResume({
+        runId: RUN_ID,
+        lease: { holderId: HOLDER, fence: 1 },
+        nowIso: NOW,
+      }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const resumed = await normal.repo.get(RUN_ID);
+    expect(resumed?.parked).toBeNull();
+    expect(resumed?.reviewTransportRetry).toBeNull();
+
+    // The crash-repair exit: the first apply is refused on the save, then a second
+    // apply finishes it through finishConductedResumeExit.
+    const fx = await seededParked();
+    const parkedRecord = await fx.repo.get(RUN_ID);
+    expect(
+      await fx.repo.save(
+        { ...parkedRecord, reviewTransportRetry: RETRY, revision: (parkedRecord?.revision ?? 0) + 1 } as LaneRunRecord,
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await fx.resume.applyPendingResume({
+        runId: RUN_ID,
+        lease: { holderId: 'driver-example-2', fence: 99 },
+        nowIso: NOW,
+      }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'save-refused' });
+    expect(
+      await fx.resume.applyPendingResume({
+        runId: RUN_ID,
+        lease: { holderId: HOLDER, fence: 1 },
+        nowIso: LATER,
+      }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const repaired = await fx.repo.get(RUN_ID);
+    expect(repaired?.parked).toBeNull();
+    expect(repaired?.reviewTransportRetry).toBeNull();
   });
 });

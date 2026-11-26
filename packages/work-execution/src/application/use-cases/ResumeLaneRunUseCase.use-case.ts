@@ -737,7 +737,13 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
     }
     const finished = await this.deps.runRepo.save(
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        // AB-TP4A: the resume clears any in-flight review transport retry.
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+        revision: record.revision + 1,
+      },
       { holderId, fence, nowIso },
     );
     if (finished.outcome !== 'saved') {
@@ -841,7 +847,13 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
 
     const saved = await this.deps.runRepo.save(
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        // AB-TP4A: the resume clears any in-flight review transport retry.
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+        revision: record.revision + 1,
+      },
       {
         holderId,
         fence,

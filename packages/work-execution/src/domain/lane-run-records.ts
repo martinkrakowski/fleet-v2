@@ -236,4 +236,66 @@ export interface LaneRunRecord {
   readonly provenance?: LaneRunProvenance;
   /** Record schema version on disk (Q5a, D6); absent reads as 1. */
   readonly schemaVersion?: number;
+  /**
+   * The in-flight review transport retry counter (AB-TP4A): the review step,
+   * the head the retry was counted at, how many transport failures happened
+   * and when the next retry is allowed. `null` once cleared (a park or a
+   * resume), absent on records written before AB-TP4A. Cap and backoff
+   * semantics live with the review transport (AB-TP4B); the record only
+   * carries the count.
+   */
+  readonly reviewTransportRetry?: LaneRunReviewRetryRecord | null;
+}
+
+/** The review steps whose transport failures a run's retry counter may carry (AB-TP4A). */
+export const LANE_RUN_REVIEW_RETRY_STEPS = ['brief-check', 'code-review', 'pre-merge'] as const;
+export type LaneRunReviewRetryStep = (typeof LANE_RUN_REVIEW_RETRY_STEPS)[number];
+
+/** The in-flight review transport retry counter, carried on the record between attempts (AB-TP4A). */
+export interface LaneRunReviewRetryRecord {
+  readonly step: LaneRunReviewRetryStep;
+  /** The commit head the count was taken at; a new head resets it (read only). */
+  readonly head12: string;
+  readonly count: number;
+  readonly nextRetryAtIso: string;
+}
+
+/** The count a record carries, `0` when absent, `null`, cleared or out of shape. Pure, never throws. */
+export function reviewTransportRetryCountOf(
+  record: unknown,
+  step?: LaneRunReviewRetryStep,
+  head12?: string,
+): number {
+  try {
+    if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+      return 0;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'reviewTransportRetry');
+    if (descriptor === undefined) {
+      return 0;
+    }
+    const retry: unknown = descriptor.value;
+    if (retry === undefined || retry === null) {
+      return 0;
+    }
+    if (typeof retry !== 'object' || Array.isArray(retry)) {
+      return 0;
+    }
+    const countDescriptor = Object.getOwnPropertyDescriptor(retry, 'count');
+    const count: unknown = countDescriptor?.value;
+    if (countDescriptor === undefined || typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0 || count > 100) {
+      return 0;
+    }
+    const stepValue: unknown = Object.getOwnPropertyDescriptor(retry, 'step')?.value;
+    const headValue: unknown = Object.getOwnPropertyDescriptor(retry, 'head12')?.value;
+    if (step !== undefined && stepValue !== step) {
+      return 0;
+    }
+    if (head12 !== undefined && headValue !== head12) {
+      return 0;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
 }

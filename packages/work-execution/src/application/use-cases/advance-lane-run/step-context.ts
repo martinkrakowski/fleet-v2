@@ -91,7 +91,13 @@ export async function performEnter(ctx: AdvanceStepContext,
   }
   if (record.parked !== null) {
     const saved = await saveOrRefuse(ctx,
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        // AB-TP4A: a park exit leaves no in-flight review transport retry behind.
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+        revision: record.revision + 1,
+      },
       request,
     );
     if (!saved.ok) {
@@ -440,6 +446,8 @@ export async function performPark(ctx: AdvanceStepContext,
   });
   const parkedRecord: LaneRunRecord = {
     ...record,
+    // AB-TP4A: the park clears any in-flight review transport retry.
+    ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
     parked: {
       reason,
       qualifier,
@@ -704,6 +712,8 @@ export async function tryEscalatePark(
   const saved = await saveOrRefuse(ctx, {
     ...record,
     parked: null,
+    // AB-TP4A: a park exit leaves no in-flight review transport retry behind.
+    ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
     revision: record.revision + 1,
   }, request);
   if (!saved.ok) {

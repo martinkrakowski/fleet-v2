@@ -28,6 +28,7 @@ import {
   LANE_RUN_PARK_QUALIFIER,
   LANE_RUN_PARK_REASONS,
   LANE_RUN_RECORD_VERSION,
+  LANE_RUN_REVIEW_RETRY_STEPS,
   LANE_RUN_SCHEMA_VERSION,
   LANE_RUN_TIERS,
   RUN_STOP_REFUSAL_KINDS,
@@ -40,6 +41,8 @@ import type {
   LaneRunParkRecord,
   LaneRunProvenance,
   LaneRunRecord,
+  LaneRunReviewRetryRecord,
+  LaneRunReviewRetryStep,
   LaneRunTier,
   RunStopRefusalKind,
 } from '../lane-run-records.js';
@@ -80,14 +83,18 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
 
 /**
  * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1), `provenance`
- * (CO28, D-R8) and `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
- * readable without a version bump; anything else is an unknown key.
+ * (CO28, D-R8), `schemaVersion` (Q5a, D6) and `reviewTransportRetry` (AB-TP4A). One
+ * optional-key read keeps every stored record readable without a version bump; anything
+ * else is an unknown key.
  */
-const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion'];
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion', 'reviewTransportRetry'];
 
 const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings', 'class'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
+const REVIEW_RETRY_KEYS: readonly string[] = ['step', 'head12', 'count', 'nextRetryAtIso'];
+/** A `@<head12>` commit head: twelve lowercase hex digits. */
+const REVIEW_RETRY_HEAD_PATTERN = /^[0-9a-f]{12}$/;
 
 export class LaneRun {
   private constructor(private readonly record: LaneRunRecord) {
@@ -145,8 +152,7 @@ export class LaneRun {
     if (!branchFields.ok) {
       return invalid(branchFields.error);
     }
-    const record: LaneRunRecord = {
-      version: LANE_RUN_RECORD_VERSION,
+    const record: LaneRunRecord = {      version: LANE_RUN_RECORD_VERSION,
       runId: recordInput.runId as string,
       workOrderId: recordInput.workOrderId as string,
       tier: recordInput.tier as LaneRunTier,
@@ -169,6 +175,9 @@ export class LaneRun {
       ...(branchFields.branchName === undefined ? {} : { branchName: branchFields.branchName }),
       ...(branchFields.baseBranch === undefined ? {} : { baseBranch: branchFields.baseBranch }),
       ...(branchFields.provenance === undefined ? {} : { provenance: branchFields.provenance }),
+      ...(branchFields.reviewTransportRetry === undefined
+        ? {}
+        : { reviewTransportRetry: branchFields.reviewTransportRetry }),
       ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
@@ -221,6 +230,12 @@ export class LaneRun {
       ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
       ...(this.record.provenance === undefined ? {} : { provenance: this.record.provenance }),
       ...(this.record.schemaVersion === undefined ? {} : { schemaVersion: this.record.schemaVersion }),
+      ...(this.record.reviewTransportRetry === undefined
+        ? {}
+        : {
+            reviewTransportRetry:
+              this.record.reviewTransportRetry === null ? null : { ...this.record.reviewTransportRetry },
+          }),
     };
   }
 
@@ -470,16 +485,18 @@ function readOptionalProvenance(recordInput: Record<string, unknown>): {
 }
 
 /**
- * runPolicyRevision, branchName (KF-5a), baseBranch (CB1) and provenance (CO28): the last field
- * checks of the body, moved here (fix round 1) so createUnchecked stays under
- * the file's complexity cap of 12. Returns the first refusal, with the same
- * messages as the inline checks it replaced.
+ * runPolicyRevision, branchName (KF-5a), baseBranch (CB1), provenance (CO28) and
+ * reviewTransportRetry (AB-TP4A): the last field checks of the body, moved here
+ * (fix round 1) so createUnchecked stays under the file's complexity cap of 12.
+ * Returns the first refusal, with the same messages as the inline checks it
+ * replaced.
  */
 function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   ok: true;
   branchName: string | undefined;
   baseBranch: BaseBranchValue | undefined;
   provenance: LaneRunProvenance | undefined;
+  reviewTransportRetry: LaneRunReviewRetryRecord | null | undefined;
 } | { ok: false; error: string } {
   const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
   if (runPolicyRevisionError !== null) {
@@ -497,11 +514,62 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   if (!provenance.ok) {
     return { ok: false, error: provenance.error };
   }
+  const reviewTransportRetry = readOptionalReviewTransportRetry(recordInput);
+  if (!reviewTransportRetry.ok) {
+    return { ok: false, error: reviewTransportRetry.error };
+  }
   return {
     ok: true,
     branchName: branchName.branchName,
     baseBranch: baseBranch.baseBranch,
     provenance: provenance.provenance,
+    reviewTransportRetry: reviewTransportRetry.reviewTransportRetry,
+  };
+}
+
+/**
+ * The in-flight review transport retry counter (AB-TP4A): absent or `null` on most
+ * records, otherwise a frozen snapshot of the exact plain record with the four keys.
+ * Reads through its own property descriptors so no getter ever runs; any malformation
+ * is the fixed refusal, never a throw.
+ */
+function readOptionalReviewTransportRetry(recordInput: Record<string, unknown>): {
+  ok: true;
+  reviewTransportRetry: LaneRunReviewRetryRecord | null | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'reviewTransportRetry')) {
+    return { ok: true, reviewTransportRetry: undefined };
+  }
+  if (recordInput.reviewTransportRetry === null) {
+    return { ok: true, reviewTransportRetry: null };
+  }
+  const snapshot = readExactPlainRecord(recordInput.reviewTransportRetry, REVIEW_RETRY_KEYS);
+  if (snapshot === null) {
+    return { ok: false, error: 'LaneRun reviewTransportRetry is invalid' };
+  }
+  if (
+    !LANE_RUN_REVIEW_RETRY_STEPS.includes(snapshot.step as LaneRunReviewRetryStep) ||
+    typeof snapshot.head12 !== 'string' ||
+    !REVIEW_RETRY_HEAD_PATTERN.test(snapshot.head12) ||
+    typeof snapshot.count !== 'number' ||
+    !Number.isSafeInteger(snapshot.count) ||
+    snapshot.count < 0 ||
+    snapshot.count > 100 ||
+    typeof snapshot.nextRetryAtIso !== 'string' ||
+    !LEASE_ISO_PATTERN.test(snapshot.nextRetryAtIso) ||
+    !isCalendarDateTime(snapshot.nextRetryAtIso) ||
+    Number.isNaN(Date.parse(snapshot.nextRetryAtIso))
+  ) {
+    return { ok: false, error: 'LaneRun reviewTransportRetry is invalid' };
+  }
+  return {
+    ok: true,
+    reviewTransportRetry: Object.freeze({
+      step: snapshot.step as LaneRunReviewRetryStep,
+      head12: snapshot.head12,
+      count: snapshot.count,
+      nextRetryAtIso: new Date(snapshot.nextRetryAtIso).toISOString(),
+    }),
   };
 }
 

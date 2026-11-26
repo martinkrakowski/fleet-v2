@@ -33,4 +33,3 @@ export interface RunnerForAttemptPort {
   /** Return the runner that addresses the attempt's recorded host. */
   runnerForAttempt(request: RunnerForAttemptRequest): RunnerForAttemptResult;
 }
-

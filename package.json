@@ -14,7 +14,6 @@
     "lint": "turbo lint",
     "typecheck": "turbo typecheck",
     "test": "turbo test",
-    "vitest": "node_modules/.bin/vitest",
     "test:bin": "sh scripts/test-bin.sh",
     "clean": "turbo clean",
     "sync": "hexagen sync",

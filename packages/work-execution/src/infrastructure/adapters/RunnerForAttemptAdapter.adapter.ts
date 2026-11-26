@@ -76,6 +76,9 @@ function readOwnDataProp(
   return { ok: false };
 }
 
+/** Roles arrays longer than this are refused in O(1) without scanning. */
+const MAX_ROLES_ENTRIES = 64;
+
 /**
  * A bounded, non-coercing label for an invalid host name in a refusal: an
  * over-long string is truncated to 128 characters and a non-string is
@@ -83,9 +86,6 @@ function readOwnDataProp(
  * coercion (`toString`, `Symbol.toPrimitive`) ever runs and no unbounded
  * string is ever interpolated.
  */
-/** Roles arrays longer than this are refused in O(1) without scanning. */
-const MAX_ROLES_ENTRIES = 64;
-
 function boundedHostLabel(value: unknown): string {
   if (typeof value !== "string") return typeof value;
   return value.length > 128 ? `${value.slice(0, 128)}…` : `'${value}'`;

@@ -1290,6 +1290,152 @@ describe('applyHostDraft validates the host it files (Luna pre-merge round)', ()
   });
 });
 
+/**
+ * IH1a fix round 1: the final validation reads a copied view that omits
+ * accessors, so a getter on `runner.optional` read as absent and the raw
+ * runner was filed with the getter still attached.
+ */
+describe('applyHostDraft refuses a hostile runner.optional (IH1a fix round 1)', () => {
+  const base = { schemaVersion: 2, hosts: {} };
+  const goodHost = {
+    transport: 'ssh',
+    sshAlias: 'lanehost',
+    worktreeRoot: '/srv/fleet-v2/worktrees',
+    roles: ['lane-runner'],
+  };
+
+  it('refuses a hand-built add draft whose runner.optional is an accessor, without running the getter', () => {
+    let getterRan = false;
+    const runner: Record<string, unknown> = { kind: 'opencode', port: 4166 };
+    Object.defineProperty(runner, 'optional', {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return 'true';
+      },
+    });
+    const result = applyHostDraft(
+      base,
+      { name: 'lanehost', host: { ...goodHost, runner } as never },
+      'add',
+    );
+    expect(getterRan).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('invalid');
+      expect(result.errors).toEqual([
+        'hosts.lanehost.runner.optional: must be a plain data property',
+      ]);
+    }
+  });
+
+  it('refuses the same accessor in edit mode when the merge keeps the drafted runner', () => {
+    let getterRan = false;
+    const runner: Record<string, unknown> = { kind: 'opencode', port: 4167 };
+    Object.defineProperty(runner, 'optional', {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return true;
+      },
+    });
+    const existing = {
+      transport: 'ssh',
+      sshAlias: 'lanehost',
+      worktreeRoot: '/srv/fleet-v2/worktrees',
+      roles: ['lane-runner'],
+      runner: { kind: 'opencode', port: 4166 },
+    };
+    const result = applyHostDraft(
+      { schemaVersion: 2, hosts: { lanehost: existing } },
+      { name: 'lanehost', host: { ...goodHost, runner } as never },
+      'edit',
+    );
+    expect(getterRan).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toEqual([
+        'hosts.lanehost.runner.optional: must be a plain data property',
+      ]);
+    }
+  });
+
+  it('still files a boolean optional and preserves an existing one on an edit whose draft carries the flag behind a merge', () => {
+    const added = applyHostDraft(
+      base,
+      {
+        name: 'lanehost',
+        host: {
+          ...goodHost,
+          runner: { kind: 'opencode', port: 4166, optional: true },
+        } as never,
+      },
+      'add',
+    );
+    expect(added.ok).toBe(true);
+    if (added.ok) {
+      expect(added.candidate.hosts.lanehost.runner).toMatchObject({
+        optional: true,
+      });
+    }
+
+    const existing = {
+      transport: 'ssh',
+      sshAlias: 'lanehost',
+      worktreeRoot: '/srv/fleet-v2/worktrees',
+      roles: ['lane-runner'],
+      runner: { kind: 'opencode', port: 4166, optional: true },
+    };
+    let getterRan = false;
+    const runner: Record<string, unknown> = { kind: 'opencode', port: 4167 };
+    Object.defineProperty(runner, 'optional', {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return false;
+      },
+    });
+    const edited = applyHostDraft(
+      { schemaVersion: 2, hosts: { lanehost: existing } },
+      { name: 'lanehost', host: { ...goodHost, runner } as never },
+      'edit',
+    );
+    expect(getterRan).toBe(false);
+    expect(edited.ok).toBe(true);
+    if (edited.ok) {
+      // The merge rebuilds the runner from own data, so the filed runner is
+      // plain data carrying the preserved flag, never the getter.
+      expect(edited.candidate.hosts.lanehost.runner).toEqual({
+        kind: 'opencode',
+        port: 4167,
+        optional: true,
+      });
+    }
+  });
+
+  it('refuses a non-boolean optional data property with the boolean refusal', () => {
+    for (const optional of ['true', 1, null]) {
+      const result = applyHostDraft(
+        base,
+        {
+          name: 'lanehost',
+          host: {
+            ...goodHost,
+            runner: { kind: 'opencode', port: 4166, optional },
+          } as never,
+        },
+        'add',
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.errors).toEqual([
+          'hosts.lanehost.runner.optional: must be a boolean',
+        ]);
+      }
+    }
+  });
+});
+
 describe('screenHostName (Fable re-check round)', () => {
   it('echoes a short, plain, valid name and screens everything else, including sanitizeToken shapes', async () => {
     const { screenHostName, sanitizeToken } = await import('../draft.js');

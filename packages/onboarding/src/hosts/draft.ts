@@ -805,6 +805,40 @@ function readGuardedNumber(value: unknown): number | undefined {
 }
 
 /**
+ * The refusal for a candidate host whose filed `runner.optional` is not plain
+ * data. The copied view the field validation reads omits accessors, so a
+ * getter on `runner.optional` would read as absent there and the raw runner
+ * would be filed with the getter still attached. The candidate's own
+ * descriptor is checked instead: an accessor is refused, never run (IH1a fix
+ * round 1). A host or runner that is not plain data is left to the field
+ * validation, which refuses it on its missing fields.
+ */
+function refusedRunnerOptionalAccessor(
+  merged: unknown,
+  name: string,
+): string | undefined {
+  if (!isPlainRecord(merged)) {
+    return undefined;
+  }
+  const runner = ownDataValue(merged, 'runner');
+  if (!isPlainRecord(runner)) {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(runner, 'optional');
+    if (
+      descriptor !== undefined &&
+      (descriptor.get !== undefined || descriptor.set !== undefined)
+    ) {
+      return `${hostPath(name)}.runner.optional: must be a plain data property`;
+    }
+  } catch {
+    return `${hostPath(name)}.runner.optional: must be a plain data property`;
+  }
+  return undefined;
+}
+
+/**
  * Apply one draft to a copy of the current installation value and return the
  * candidate file. The current value is never mutated: the candidate is a new
  * object whose `hosts` record is the current one plus the drafted entry. In
@@ -874,6 +908,13 @@ export function applyHostDraft(
       : (host as unknown as HostSection);
   // The same field validation `draftHost` runs, on the host as it will be
   // filed: `roles: ["wizard"]` or `roleAliases: null` never reaches `ok: true`.
+  // An accessor on `runner.optional` reads as absent through the copied view
+  // that validation runs on, so the candidate's own descriptor is refused
+  // first: a hand-built draft can never file a getter (IH1a fix round 1).
+  const optionalAccessor = refusedRunnerOptionalAccessor(merged, name);
+  if (optionalAccessor !== undefined) {
+    return { ok: false, reason: 'invalid', errors: [optionalAccessor] };
+  }
   const checked = validateHostFields(copyOwnData(merged) ?? {}, name);
   if (!checked.ok) {
     return { ok: false, reason: 'invalid', errors: checked.errors };

@@ -29,8 +29,8 @@ import type {
   RunnerForAttemptPort,
   RunnerForAttemptRequest,
   RunnerForAttemptResult,
-  RunnerForHostNamePort,
 } from "../../application/ports/out/RunnerForAttemptPort.out-port.js";
+import type { RunnerForHostNamePort } from "../../application/ports/out/RunnerForHostNamePort.out-port.js";
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
   AttemptRecord,
@@ -75,6 +75,9 @@ function readOwnDataProp(
   }
   return { ok: false };
 }
+
+/** Roles arrays longer than this are refused in O(1) without scanning. */
+const MAX_ROLES_ENTRIES = 64;
 
 /**
  * A bounded, non-coercing label for an invalid host name in a refusal: an
@@ -318,17 +321,27 @@ export class RunnerForAttemptAdapter
     let denseRoles = false;
     let hasLaneRunner = false;
     if (typeof roles === "object" && roles !== null && !types.isProxy(roles) && Array.isArray(roles)) {
-      denseRoles = true;
-      const rolesObj = roles as object;
-      for (let i = 0; i < roles.length; i += 1) {
-        const entry = readOwnDataProp(rolesObj, String(i));
-        if (!entry.ok || entry.value === undefined) {
-          // An accessor is refused without invoking it; `undefined` is a
-          // sparse hole (no own data property at that index).
-          denseRoles = false;
-          break;
+      // An enormous array is refused in O(1) before any scan: the length is
+      // bounded, so no untrusted length ever drives a full scan.
+      if (roles.length <= MAX_ROLES_ENTRIES) {
+        denseRoles = true;
+        const rolesObj = roles as object;
+        for (let i = 0; i < roles.length; i += 1) {
+          const entry = readOwnDataProp(rolesObj, String(i));
+          if (!entry.ok || entry.value === undefined) {
+            // An accessor is refused without invoking it; `undefined` is a
+            // sparse hole (no own data property at that index).
+            denseRoles = false;
+            break;
+          }
+          // Every entry must be a plain string: a wrong primitive (number,
+          // boolean, object, ...) is malformed roles, refused like a hole.
+          if (typeof entry.value !== "string") {
+            denseRoles = false;
+            break;
+          }
+          if (entry.value === "lane-runner") hasLaneRunner = true;
         }
-        if (entry.value === "lane-runner") hasLaneRunner = true;
       }
     }
     if (!denseRoles || !hasLaneRunner) {
@@ -491,7 +504,8 @@ export class RunnerForAttemptAdapter
     }
 
     const sourceRead = readOwnDataProp(capsObj, "source");
-    const source = sourceRead.ok ? sourceRead.value : undefined;
+    if (!sourceRead.ok) return null;
+    const source = sourceRead.value;
     if (source !== undefined && source !== "declared") return null;
 
     return {

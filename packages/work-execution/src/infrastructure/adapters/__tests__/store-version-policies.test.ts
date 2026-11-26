@@ -797,13 +797,10 @@ describe('validateSchemaVersionPolicyValue', () => {
       acceptedVersions: proxyFakeSlice,
     });
     expect(proxyResult.ok).toBe(true);
-    if (proxyResult.ok) {
-      expect(proxyResult.policy.acceptedVersions).toEqual([1]);
+    if (!proxyResult.ok) {
+      throw new Error(`expected ok, got ${proxyResult.error}`);
     }
-    // And the copy is validated: a fabricated [999] for writer 1 would have
-    // been an invalid accepted policy (future/invalid version), so a constant
-    // or identity copy path fails this assertion.
-    expect([999].some((version) => version > 1)).toBe(true);
+    expect(proxyResult.policy.acceptedVersions).toEqual([1]);
   });
 
   it('refuses a Proxy over [1, 999] whose get trap reports length 1 while its own length descriptor says 2', () => {

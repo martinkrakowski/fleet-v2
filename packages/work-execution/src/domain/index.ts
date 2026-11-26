@@ -67,6 +67,7 @@ export * from "./run-telemetry-dispositions.js";
 export * from "./run-telemetry-ids.js";
 export * from "./run-telemetry-redaction.js";
 export * from "./run-telemetry-spans.js";
+export * from "./runner-image-window.js";
 export * from "./seat-selection.js";
 export * from "./shadow-attestations.js";
 export * from "./shadow-comparators.js";

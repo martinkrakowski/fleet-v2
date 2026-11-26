@@ -166,7 +166,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: yarn
+          # No yarn cache: this job installs nothing, so the cache path never exists and
+          # setup-node's post-step save fails the job (2026-11-26).
       - name: corepack enable
         run: corepack enable
       - name: yarn npm audit (high and above, report-only)

@@ -53,6 +53,26 @@ export function attemptStateLabel(value: unknown): AttemptStateValue | 'unknown'
   return 'unknown';
 }
 
+/**
+ * A rejected value as a refusal may print it: a fixed category derived from
+ * `typeof` and the array slot only. It never coerces, reads a property or
+ * triggers a Proxy trap, and never echoes the value. O(1) time and space; a
+ * revoked Proxy (where `Array.isArray` throws) is reported as `<object>`.
+ */
+export function describeRejectedValue(value: unknown): string {
+  if (value === null) {
+    return '<null>';
+  }
+  try {
+    if (Array.isArray(value)) {
+      return '<array>';
+    }
+  } catch {
+    return '<object>';
+  }
+  return '<' + typeof value + '>';
+}
+
 export class AttemptState {
   private constructor(private readonly value: AttemptStateValue) {
     // Value is immutable after construction.
@@ -60,7 +80,7 @@ export class AttemptState {
 
   static create(value: unknown): { success: boolean; value?: AttemptState; error?: Error } {
     if (typeof value !== 'string' || !ATTEMPT_STATE_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid attempt state: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid attempt state: ' + describeRejectedValue(value)) };
     }
     return { success: true, value: new AttemptState(value as AttemptStateValue) };
   }

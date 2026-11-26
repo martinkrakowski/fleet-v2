@@ -5,6 +5,8 @@
  * produced, not that it ran.
  */
 
+import { describeRejectedValue } from './AttemptState.vo.js';
+
 export const ATTEMPT_OUTCOMES = ['done', 'partial', 'stopped', 'no-commit'] as const;
 
 export type AttemptOutcomeValue = (typeof ATTEMPT_OUTCOMES)[number];
@@ -18,7 +20,7 @@ export class AttemptOutcome {
 
   static create(value: unknown): { success: boolean; value?: AttemptOutcome; error?: Error } {
     if (typeof value !== 'string' || !ATTEMPT_OUTCOME_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid attempt outcome: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid attempt outcome: ' + describeRejectedValue(value)) };
     }
     return { success: true, value: new AttemptOutcome(value as AttemptOutcomeValue) };
   }

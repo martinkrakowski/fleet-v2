@@ -7,6 +7,7 @@
 
 import { readJournalPullRequestRef } from '../execution-records.js';
 import type { ActionJournalEntryRecord } from '../execution-records.js';
+import { describeRejectedValue } from '../value-objects/AttemptState.vo.js';
 
 const ACTIONS: readonly unknown[] = ['dispatch', 'reconcile', 'stop', 'collect', 'forge', 'accept'];
 const STATUSES: readonly unknown[] = ['intent-recorded', 'completed', 'ambiguous', 'refused'];
@@ -33,10 +34,10 @@ export class ActionJournalEntry {
       throw new Error('ActionJournalEntry requires a non-empty recordedAtIso');
     }
     if (!ACTIONS.includes(record.action)) {
-      throw new Error(`ActionJournalEntry has an invalid action: ${String(record.action)}`);
+      throw new Error('ActionJournalEntry has an invalid action: ' + describeRejectedValue(record.action));
     }
     if (!STATUSES.includes(record.status)) {
-      throw new Error(`ActionJournalEntry has an invalid status: ${String(record.status)}`);
+      throw new Error('ActionJournalEntry has an invalid status: ' + describeRejectedValue(record.status));
     }
     // The typed pull-request reference (WB5b) is permitted only on `forge`
     // entries and must carry a valid (repository, number) pair.

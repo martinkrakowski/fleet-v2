@@ -5,6 +5,8 @@
  * accept no further dispatch.
  */
 
+import { describeRejectedValue } from './AttemptState.vo.js';
+
 export const WORK_ORDER_STATES = [
   'approved',
   'prepared',
@@ -28,7 +30,7 @@ export class WorkOrderState {
 
   static create(value: unknown): { success: boolean; value?: WorkOrderState; error?: Error } {
     if (typeof value !== 'string' || !WORK_ORDER_STATE_VALUES.includes(value)) {
-      return { success: false, error: new Error(`Invalid work order state: ${String(value)}`) };
+      return { success: false, error: new Error('Invalid work order state: ' + describeRejectedValue(value)) };
     }
     return { success: true, value: new WorkOrderState(value as WorkOrderStateValue) };
   }

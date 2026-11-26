@@ -326,6 +326,12 @@ export class MembershipRepositoryAdapter implements MembershipRepositoryPort {
         actualRevision: current.revision,
       };
     }
+    if (expectedRevision === Number.MAX_SAFE_INTEGER) {
+      // Overflow guard: the next revision would leave the safe-integer range
+      // and be persisted but rejected on read. Refused only on a matching
+      // revision, so a mismatch still reports stale-revision. Cost bound: O(1).
+      return invalidRecord('revision-overflow');
+    }
     const decision = decideMembershipChange(current.members, change, nowIso);
     if (!decision.ok) {
       return { outcome: 'refused', reason: decision.reason };
@@ -364,6 +370,11 @@ export class MembershipRepositoryAdapter implements MembershipRepositoryPort {
             expectedRevision,
             actualRevision: current.revision,
           };
+          return;
+        }
+        if (expectedRevision === Number.MAX_SAFE_INTEGER) {
+          // Overflow guard: see writeInMemory; refused before touching disk.
+          outcome = invalidRecord('revision-overflow');
           return;
         }
         const decision = decideMembershipChange(current.members, change, nowIso);

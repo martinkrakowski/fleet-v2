@@ -127,6 +127,37 @@ describe('MembershipRepositoryAdapter (file mode)', () => {
     expect(MEMBERSHIP_STORE_VERSION_POLICY.acceptedVersions).toEqual([1]);
   });
 
+  it('refuses applyChange at the safe-integer revision ceiling with invalid-record, leaving the file bytes unchanged, and still reports stale-revision on a mismatch', async () => {
+    const storePath = path.join(stateDir, 'membership.json');
+    const envelope = {
+      schemaVersion: 1,
+      organizationId: 'org-a',
+      revision: Number.MAX_SAFE_INTEGER,
+      members: [member('org-a', 'owner-1', 'owner')],
+    };
+    const bytes = JSON.stringify([envelope]);
+    await fs.writeFile(storePath, bytes);
+    const adapter = new MembershipRepositoryAdapter({ stateDir });
+    const change = {
+      kind: 'add' as const,
+      organizationId: 'org-a',
+      actingActor: 'owner-1',
+      actor: 'member-1',
+      role: 'viewer' as Role,
+    };
+    expect(await adapter.applyChange('org-a', change, Number.MAX_SAFE_INTEGER, NOW)).toEqual({
+      outcome: 'invalid-record',
+      reason: 'revision-overflow',
+    });
+    expect(await fs.readFile(storePath, 'utf8')).toBe(bytes);
+    expect(await adapter.applyChange('org-a', change, 3, NOW)).toEqual({
+      outcome: 'stale-revision',
+      expectedRevision: 3,
+      actualRevision: Number.MAX_SAFE_INTEGER,
+    });
+    expect(await adapter.listMembers('org-a')).toHaveLength(1);
+  });
+
   it('throws StateFileUnknownVersionError on unknown schemaVersion without quarantining, touching bytes or echoing stored values', async () => {
     const target = path.join(stateDir, 'membership.json');
     await fs.writeFile(

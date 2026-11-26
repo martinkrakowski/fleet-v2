@@ -15,8 +15,8 @@ service.
 ## Dependency direction
 
 ```text
-apps/cli → all four contexts
-apps/api → all four contexts
+apps/cli → all of the business contexts declared in bounded_contexts
+apps/api → all of the business contexts declared in bounded_contexts
 apps/web → @fleet/ui (presentation primitives) + HTTP API boundary
 work-execution → evidence-and-acceptance
 work-execution → brief-knowledge
@@ -116,7 +116,8 @@ broken, so the suite is a condition of adding an adapter, not a follow-up.
 6. Pilot checked lessons and scoped lexical retrieval before adding richer indexes.
 7. Implement authorised forge actions and prove stale-head rejection before merge.
 
-Each station is implemented across the four bounded contexts and is reachable
+Each station is implemented across the business contexts declared in
+bounded_contexts and is reachable
 from both composition roots: `@fleet/cli` through `node apps/cli/dist/bin.js`, and
 `@fleet/api` through its Nitro `/v1/*` routes. `@fleet/ui` carries the shared
 presentation primitives; `@fleet/web` is the presentation boundary that renders

@@ -781,6 +781,52 @@ function nowIsoOf(options: ConductorCliOptions): string {
   return options.now !== undefined ? options.now() : new Date().toISOString();
 }
 
+/** The most reservations one scan reads; a longer list is treated as unreadable (fail closed). */
+const RESERVATION_SCAN_LIMIT = 10_000;
+
+type HeldReservationLookup =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'held'; readonly slotIndex: number | null }
+  | { readonly kind: 'unreadable' };
+
+/** An own data property's value; a getter, an accessor or a missing key reads as absent, and no getter is ever run. */
+function ownDataValue(source: object, key: string): { readonly present: boolean; readonly value?: unknown } {
+  const descriptor = Object.getOwnPropertyDescriptor(source, key);
+  if (descriptor === undefined || !('value' in descriptor)) {
+    return { present: false };
+  }
+  return { present: true, value: descriptor.value };
+}
+
+/**
+ * Looks for a held reservation of `attemptId` in an untrusted list. `none` only
+ * after a complete read of a plain array in which every entry was a plain
+ * object read by data property; anything else is `unreadable`, which the
+ * caller treats as "may be held" (fail closed).
+ */
+function findHeldReservation(reservations: unknown, attemptId: string): HeldReservationLookup {
+  if (!Array.isArray(reservations) || reservations.length > RESERVATION_SCAN_LIMIT) {
+    return { kind: 'unreadable' };
+  }
+  for (let index = 0; index < reservations.length; index += 1) {
+    const entryProperty = ownDataValue(reservations, String(index));
+    const entry = entryProperty.value;
+    if (!entryProperty.present || typeof entry !== 'object' || entry === null) {
+      return { kind: 'unreadable' };
+    }
+    const entryAttempt = ownDataValue(entry, 'attemptId');
+    const entryHeld = ownDataValue(entry, 'held');
+    if (!entryAttempt.present || !entryHeld.present) {
+      return { kind: 'unreadable' };
+    }
+    if (entryAttempt.value === attemptId && entryHeld.value === true) {
+      const slot = ownDataValue(entry, 'slotIndex');
+      return { kind: 'held', slotIndex: slot.present && typeof slot.value === 'number' ? slot.value : null };
+    }
+  }
+  return { kind: 'none' };
+}
+
 /**
  * AD-2 fallback: when the start use case returned `incomplete` without a
  * recorded ledger fact, raise a `crashed-start` attention item immediately
@@ -811,12 +857,15 @@ async function raiseStartIncompleteAttention(
   }
   let slotIndex: number | null = null;
   try {
-    const reservations = await runtime.execution.executionJournal.listActiveReservations();
-    const held = reservations.find(
-      (reservation) => reservation.attemptId === result.attemptId && reservation.held,
-    );
-    if (held !== undefined) {
-      slotIndex = held.slotIndex ?? null;
+    const reservations: unknown = await runtime.execution.executionJournal.listActiveReservations();
+    const found = findHeldReservation(reservations, result.attemptId);
+    if (found.kind === 'none') {
+      // A successful, fully readable list with no held reservation for this
+      // attempt: no slot is held, so "left a slot held" would mislead.
+      return;
+    }
+    if (found.kind === 'held') {
+      slotIndex = found.slotIndex;
     }
   } catch {
     slotIndex = null;

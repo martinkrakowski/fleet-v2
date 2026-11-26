@@ -22,6 +22,7 @@ import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './g
 import { sshRemoteArgv } from './ssh-remote.js';
 import type {
   CiRunnerSlotState,
+  DiskQuotaUsage,
   DoctorProbes,
   LoginShellState,
   PinnedBuildProbeResult,
@@ -567,6 +568,47 @@ function loginShellState(raw: DoctorCommandRunResult): LoginShellState {
   return result.exitCode === 0 && result.stdout === LOGIN_SHELL_CANARY ? 'intact' : 'mangled';
 }
 
+/**
+ * The fixed host-side file that declares the disk quota usage, one whole
+ * line `<usedBytes> <totalBytes>`. The path is a code constant, never a
+ * configuration key; the argv that reads it is fixed too.
+ */
+export const DISK_QUOTA_FILE = '/etc/fleet/disk-quota-bytes';
+
+/** At most this many characters of the usage file's answer are parsed. */
+export const DISK_QUOTA_MAX_CHARS = 256;
+
+/** The one whole-line shape the usage file may take. */
+const DISK_QUOTA_LINE = /^\s*(\d+)\s+(\d+)\s*$/;
+
+/**
+ * Map the usage file's answer to its two numbers. `O(1)`: the length is
+ * checked before any regex, and at most `DISK_QUOTA_MAX_CHARS` characters
+ * are matched. Anything else — malformed, oversized, out of range — is
+ * `undefined`; the raw text is never returned.
+ */
+export function parseDiskQuotaUsage(stdout: string): DiskQuotaUsage | undefined {
+  if (typeof stdout !== 'string' || stdout.length > DISK_QUOTA_MAX_CHARS) {
+    return undefined;
+  }
+  const match = DISK_QUOTA_LINE.exec(stdout.slice(0, DISK_QUOTA_MAX_CHARS));
+  if (match === null) {
+    return undefined;
+  }
+  const usedBytes = Number(match[1]);
+  const totalBytes = Number(match[2]);
+  if (
+    !Number.isSafeInteger(usedBytes) ||
+    !Number.isSafeInteger(totalBytes) ||
+    totalBytes <= 0 ||
+    usedBytes < 0 ||
+    usedBytes > totalBytes
+  ) {
+    return undefined;
+  }
+  return { usedBytes, totalBytes };
+}
+
 /** Run one argv on the host's transport; a spawn failure reports as a failed run. */
 async function runOnHost(
   deps: Required<
@@ -898,6 +940,26 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
         );
       } catch {
         return 'unknown';
+      }
+    },
+
+    async diskQuotaUsage(host): Promise<DiskQuotaUsage | undefined> {
+      try {
+        if (host === 'local' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return undefined;
+        }
+        const result = await runOnHost(executors, host, ['cat', DISK_QUOTA_FILE]);
+        if (
+          result.error !== undefined ||
+          result.signal !== null ||
+          result.exitCode !== 0 ||
+          typeof result.stdout !== 'string'
+        ) {
+          return undefined;
+        }
+        return parseDiskQuotaUsage(result.stdout);
+      } catch {
+        return undefined;
       }
     },
 

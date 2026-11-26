@@ -1,11 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type {
   OwnerQuestionAnswerRecord,
+  OwnerQuestionAudience,
   OwnerQuestionOptionRecord,
   OwnerQuestionRecordInput,
 } from '../owner-question-records.js';
-import { OwnerQuestion, canTransitionOwnerQuestion } from '../entities/OwnerQuestion.js';
+import { OWNER_QUESTION_RECORD_VERSION } from '../owner-question-records.js';
+import {
+  OwnerQuestion,
+  OWNER_QUESTION_ACTOR_PATTERN,
+  canTransitionOwnerQuestion,
+  validateAnswerActor,
+} from '../entities/OwnerQuestion.js';
 
 /**
  * Secret-shaped fakes are assembled at runtime from inert pieces so this file
@@ -520,7 +527,7 @@ describe('OwnerQuestion validation', () => {
   });
 });
 
-function answeredAnswer(): OwnerQuestionAnswerRecord {
+function answeredAnswer(overrides: Partial<OwnerQuestionAnswerRecord> = {}): OwnerQuestionAnswerRecord {
   return {
     shape: 'accept',
     optionId: 'a',
@@ -530,5 +537,569 @@ function answeredAnswer(): OwnerQuestionAnswerRecord {
     answeredVia: 'web',
     answeredAt: '2026-10-16T11:00:00.000Z',
     sessionId: null,
+    ...overrides,
   };
 }
+
+describe('OwnerQuestion record version, audience and answer actor', () => {
+  describe('schemaVersion', () => {
+    it('normalises an omitted or v1 record to schemaVersion 2 and marks it legacy', () => {
+      for (const schemaVersion of [undefined, 1]) {
+        const record = questionRecord({
+          state: 'open',
+          answer: null,
+          schemaVersion,
+        } as unknown as Partial<OwnerQuestionRecordInput>);
+        const stored = OwnerQuestion.fromRecord(record).toRecord();
+        expect(stored.schemaVersion).toBe(2);
+        expect(stored.schemaVersion).toBe(OWNER_QUESTION_RECORD_VERSION);
+        expect(stored.audience).toBe('owner-only');
+      }
+    });
+
+    it('accepts schemaVersion 2 and keeps a seeded audience of any', () => {
+      const stored = OwnerQuestion.fromRecord(
+        questionRecord({ state: 'open', answer: null, schemaVersion: 2, audience: 'any' }),
+      ).toRecord();
+      expect(stored.schemaVersion).toBe(2);
+      expect(stored.audience).toBe('any');
+    });
+
+    it('refuses unknown or malformed schemaVersion values', () => {
+      const bad: unknown[] = [0, 3, -1, 1.5, '2', null, Number.NaN, Number.POSITIVE_INFINITY, {}];
+      for (const schemaVersion of bad) {
+        let message = '';
+        try {
+          OwnerQuestion.fromRecord(
+            questionRecord({
+              state: 'open',
+              answer: null,
+              schemaVersion,
+            } as unknown as Partial<OwnerQuestionRecordInput>),
+          );
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, `schemaVersion ${String(schemaVersion)}`).toBe(
+          'OwnerQuestion unsupported schemaVersion',
+        );
+      }
+    });
+  });
+
+  describe('audience', () => {
+    it('reads an omitted or unknown audience on a v2 record as owner-only and preserves any', () => {
+      expect(
+        OwnerQuestion.fromRecord(
+          questionRecord({ state: 'open', answer: null, schemaVersion: 2, audience: undefined }),
+        ).toRecord().audience,
+      ).toBe('owner-only');
+      for (const unknownAudience of ['public', null]) {
+        expect(
+          OwnerQuestion.fromRecord(
+            questionRecord({
+              state: 'open',
+              answer: null,
+              schemaVersion: 2,
+              audience: unknownAudience as unknown as OwnerQuestionAudience,
+            }),
+          ).toRecord().audience,
+        ).toBe('owner-only');
+      }
+      expect(
+        OwnerQuestion.fromRecord(
+          questionRecord({ state: 'open', answer: null, schemaVersion: 2, audience: 'any' }),
+        ).toRecord().audience,
+      ).toBe('any');
+    });
+
+    it('reads every legacy v1 record as owner-only even when any is stored', () => {
+      const stored = OwnerQuestion.fromRecord(
+        questionRecord({
+          state: 'open',
+          answer: null,
+          schemaVersion: 1,
+          audience: 'any',
+        } as Partial<OwnerQuestionRecordInput>),
+      ).toRecord();
+      expect(stored.audience).toBe('owner-only');
+    });
+  });
+
+  describe('answer actor', () => {
+    it('keeps an owner or agent actor on an any-audience web or cli answer', () => {
+      for (const via of ['web', 'cli'] as const) {
+        const agent = OwnerQuestion.fromRecord(
+          answeredRecord({
+            schemaVersion: 2,
+            audience: 'any',
+            answer: answeredAnswer({ answeredVia: via, actor: 'agent:tok-1' }),
+          }),
+        ).toRecord();
+        expect(agent.answer?.actor).toBe('agent:tok-1');
+        const owner = OwnerQuestion.fromRecord(
+          answeredRecord({
+            schemaVersion: 2,
+            audience: 'any',
+            answer: answeredAnswer({ answeredVia: via, actor: 'owner' }),
+          }),
+        ).toRecord();
+        expect(owner.answer?.actor).toBe('owner');
+      }
+    });
+
+    it('reads a missing actor as owner on a legacy record and on a v2 record alike', () => {
+      const legacy = OwnerQuestion.fromRecord(answeredRecord()).toRecord();
+      expect(legacy.answer?.actor).toBe('owner');
+      const v2 = OwnerQuestion.fromRecord(
+        answeredRecord({ schemaVersion: 2, audience: 'any', answer: answeredAnswer() }),
+      ).toRecord();
+      expect(v2.answer?.actor).toBe('owner');
+    });
+
+    it('refuses malformed or secret-shaped actor values without echoing them', () => {
+      const secret = `tok_${'sec'}_${'X'.repeat(24)}`;
+      const bad: unknown[] = [
+        '',
+        'has space',
+        'owner ',
+        'agent:',
+        `agent:${'a'.repeat(129)}`,
+        `agent:bad/slash${'a'.repeat(4)}`,
+        42,
+        secret,
+      ];
+      for (const actor of bad) {
+        let message = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({
+              schemaVersion: 2,
+              audience: 'any',
+              answer: answeredAnswer({ actor } as unknown as Partial<OwnerQuestionAnswerRecord>),
+            }),
+          );
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, `actor ${typeof actor === 'string' && actor === secret ? '<secret>' : String(actor)}`).toBe(
+          'OwnerQuestion answer actor must be owner or agent:<id>',
+        );
+        expect(message).not.toContain(secret);
+      }
+      expect(OWNER_QUESTION_ACTOR_PATTERN.test('agent:tok-1')).toBe(true);
+      expect(OWNER_QUESTION_ACTOR_PATTERN.test('owner')).toBe(false);
+    });
+
+    it('refuses agent or non-owner actor on signed-decision answers', () => {
+      for (const actor of ['agent:tok-1', 'someone-else', 42]) {
+        let message = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({
+              answer: answeredAnswer({
+                answeredVia: 'signed-decision',
+                actor,
+              } as unknown as Partial<OwnerQuestionAnswerRecord>),
+            }),
+          );
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toBe('OwnerQuestion signed-decision answer requires actor owner');
+      }
+      // An absent or explicit owner actor is accepted on a signed decision.
+      const signed = OwnerQuestion.fromRecord(
+        answeredRecord({ answer: answeredAnswer({ answeredVia: 'signed-decision' }) }),
+      ).toRecord();
+      expect(signed.answer?.actor).toBe('owner');
+    });
+
+    it('refuses agent actor when audience is owner-only or omitted', () => {
+      for (const audience of ['owner-only', undefined, 'public', null] as const) {
+        let message = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({
+              schemaVersion: 2,
+              audience: audience as unknown as OwnerQuestionAudience,
+              answer: answeredAnswer({ actor: 'agent:tok-1' }),
+            }),
+          );
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, `audience ${String(audience)}`).toBe(
+          'OwnerQuestion refuses agent answer when audience is not any or answeredVia is signed-decision',
+        );
+      }
+    });
+
+    it('keeps the agent actor out of error messages, the stored record and console.error', () => {
+      const secret = `tok_${'sec'}_${'X'.repeat(24)}`;
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const stored = OwnerQuestion.fromRecord(
+          answeredRecord({
+            schemaVersion: 2,
+            audience: 'any',
+            answer: answeredAnswer({ actor: 'agent:tok-1' }),
+          }),
+        ).toRecord();
+        expect(stored.answer?.actor).toBe('agent:tok-1');
+        expect(JSON.stringify(stored)).not.toContain(secret);
+        let message = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({
+              schemaVersion: 2,
+              audience: 'any',
+              answer: answeredAnswer({ actor: secret } as unknown as Partial<OwnerQuestionAnswerRecord>),
+            }),
+          );
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).not.toContain(secret);
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('validateAnswerActor', () => {
+    it('maps signed-decision answers to owner and refuses every other actor', () => {
+      expect(validateAnswerActor(undefined, 'signed-decision', false)).toBe('owner');
+      expect(validateAnswerActor('owner', 'signed-decision', true)).toBe('owner');
+      expect(() => validateAnswerActor('agent:tok-1', 'signed-decision', false)).toThrow(
+        'OwnerQuestion signed-decision answer requires actor owner',
+      );
+    });
+
+    it('reads a missing actor as owner at every version and validates agent shapes otherwise', () => {
+      expect(validateAnswerActor(undefined, 'web', true)).toBe('owner');
+      expect(validateAnswerActor(undefined, 'web', false)).toBe('owner');
+      expect(validateAnswerActor('owner', 'cli', false)).toBe('owner');
+      expect(validateAnswerActor('agent:tok-1', 'cli', false)).toBe('agent:tok-1');
+      expect(() => validateAnswerActor('agent:tok 1', 'web', false)).toThrow(
+        'OwnerQuestion answer actor must be owner or agent:<id>',
+      );
+      expect(() => validateAnswerActor(42, 'web', false)).toThrow(
+        'OwnerQuestion answer actor must be owner or agent:<id>',
+      );
+      expect(() => validateAnswerActor(null, 'web', false)).toThrow(
+        'OwnerQuestion answer actor must be owner or agent:<id>',
+      );
+    });
+  });
+
+  describe('hostile record and answer input', () => {
+    it('refuses null, undefined, primitives, array-likes, and non-plain objects on record and answer', () => {
+      const nonObjects: unknown[] = [
+        null,
+        undefined,
+        42,
+        'record',
+        true,
+        [],
+        ['a', 'b'],
+        new Date(0),
+        () => 'x',
+        Symbol('x'),
+      ];
+      for (const bad of nonObjects) {
+        let recordMessage = '';
+        try {
+          OwnerQuestion.fromRecord(bad as OwnerQuestionRecordInput);
+        } catch (error) {
+          recordMessage = error instanceof Error ? error.message : String(error);
+        }
+        expect(recordMessage).toBe('OwnerQuestion requires a record');
+      }
+      // An array-like plain object (indices as own keys) carries no allowed key.
+      const arrayLike = Object.assign({}, { 0: 'a', 1: 'b', length: 2 });
+      expect(() => OwnerQuestion.fromRecord(arrayLike as unknown as OwnerQuestionRecordInput)).toThrow(
+        'OwnerQuestion requires a record',
+      );
+      // null and undefined answers on an answered record refuse as missing.
+      for (const missing of [null, undefined]) {
+        let missingMessage = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({ answer: missing as unknown as OwnerQuestionAnswerRecord }),
+          );
+        } catch (error) {
+          missingMessage = error instanceof Error ? error.message : String(error);
+        }
+        expect(missingMessage).toBe('OwnerQuestion in state answered requires an answer');
+      }
+      for (const badAnswer of [42, 'answer', [], ['x'], () => 'x']) {
+        let answerMessage = '';
+        try {
+          OwnerQuestion.fromRecord(
+            answeredRecord({ answer: badAnswer as unknown as OwnerQuestionAnswerRecord }),
+          );
+        } catch (error) {
+          answerMessage = error instanceof Error ? error.message : String(error);
+        }
+        expect(answerMessage).toBe('OwnerQuestion answer must be an object');
+      }
+    });
+
+    it('refuses getters without invoking them, revoked proxies, and prototype-polluting keys', () => {
+      let getterRuns = 0;
+      const getterRecord: Record<string, unknown> = { ...questionRecord() };
+      Object.defineProperty(getterRecord, 'title', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return 'stolen';
+        },
+      });
+      expect(() => OwnerQuestion.fromRecord(getterRecord as unknown as OwnerQuestionRecordInput)).toThrow(
+        'OwnerQuestion requires a record',
+      );
+      expect(getterRuns).toBe(0);
+
+      let answerGetterRuns = 0;
+      const getterAnswer: Record<string, unknown> = { ...answeredAnswer() };
+      Object.defineProperty(getterAnswer, 'text', {
+        enumerable: true,
+        get() {
+          answerGetterRuns += 1;
+          return 'stolen';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord(
+          answeredRecord({ answer: getterAnswer as unknown as OwnerQuestionAnswerRecord }),
+        ),
+      ).toThrow('OwnerQuestion answer must be an object');
+      expect(answerGetterRuns).toBe(0);
+
+      // A spy getter on the record's `answer` slot itself is never run either.
+      let answerSlotRuns = 0;
+      const spiedRecord: Record<string, unknown> = { ...questionRecord() };
+      Object.defineProperty(spiedRecord, 'answer', {
+        enumerable: true,
+        get() {
+          answerSlotRuns += 1;
+          return answeredAnswer();
+        },
+      });
+      expect(() => OwnerQuestion.fromRecord(spiedRecord as unknown as OwnerQuestionRecordInput)).toThrow(
+        'OwnerQuestion requires a record',
+      );
+      expect(answerSlotRuns).toBe(0);
+
+      const { proxy, revoke } = Proxy.revocable({ ...questionRecord() }, {});
+      revoke();
+      expect(() => OwnerQuestion.fromRecord(proxy as unknown as OwnerQuestionRecordInput)).toThrow(
+        'OwnerQuestion requires a record',
+      );
+
+      for (const pollutingKey of ['__proto__', 'constructor', 'prototype']) {
+        const polluted: Record<string, unknown> = { ...questionRecord() };
+        Object.defineProperty(polluted, pollutingKey, {
+          enumerable: true,
+          value: { evil: true },
+          writable: true,
+          configurable: true,
+        });
+        expect(() =>
+          OwnerQuestion.fromRecord(polluted as unknown as OwnerQuestionRecordInput),
+        ).toThrow('OwnerQuestion requires a record');
+      }
+      const pollutedAnswer: Record<string, unknown> = { ...answeredAnswer() };
+      Object.defineProperty(pollutedAnswer, '__proto__', {
+        enumerable: true,
+        value: { evil: true },
+        writable: true,
+        configurable: true,
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord(
+          answeredRecord({ answer: pollutedAnswer as unknown as OwnerQuestionAnswerRecord }),
+        ),
+      ).toThrow('OwnerQuestion answer must be an object');
+    });
+
+    it('refuses unknown extra keys on the record and the answer', () => {
+      const extraKey = { ...questionRecord(), extraField: 'x' } as unknown as OwnerQuestionRecordInput;
+      expect(() => OwnerQuestion.fromRecord(extraKey)).toThrow('OwnerQuestion requires a record');
+      const extraAnswer = {
+        ...answeredAnswer(),
+        extraField: 'x',
+      } as unknown as OwnerQuestionAnswerRecord;
+      expect(() =>
+        OwnerQuestion.fromRecord(answeredRecord({ answer: extraAnswer })),
+      ).toThrow('OwnerQuestion answer must be an object');
+    });
+
+    it('refuses array holes and non-arrays in options and blocks', () => {
+      const holedOptions = questionRecord();
+      const optionsArray = [holedOptions.options[0], holedOptions.options[1]] as OwnerQuestionOptionRecord[];
+      delete (optionsArray as unknown as Record<string, unknown>)[1];
+      expect(() => OwnerQuestion.fromRecord({ ...holedOptions, options: optionsArray })).toThrow(
+        /options must be objects/,
+      );
+      expect(() =>
+        OwnerQuestion.fromRecord(questionRecord({ options: 'not-an-array' as unknown as OwnerQuestionOptionRecord[] })),
+      ).toThrow(/array of options/);
+      expect(() =>
+        OwnerQuestion.fromRecord(questionRecord({ blocks: 'not-an-array' as unknown as OwnerQuestionRecordInput['blocks'] })),
+      ).toThrow(/blocks must be an array/);
+      const holed = answeredRecord({ blocks: [{ kind: 'lane', ref: 'lane-7' }] });
+      const blocksArray = [{ kind: 'lane', ref: 'lane-7' }] as unknown as OwnerQuestionRecordInput['blocks'];
+      delete (blocksArray as unknown as Record<string, unknown>)[0];
+      expect(() => OwnerQuestion.fromRecord({ ...holed, blocks: blocksArray })).toThrow(
+        /blocks must be objects/,
+      );
+    });
+
+    it('refuses an enormous actor beyond the pattern length bound', () => {
+      let message = '';
+      try {
+        OwnerQuestion.fromRecord(
+          answeredRecord({
+            schemaVersion: 2,
+            audience: 'any',
+            answer: answeredAnswer({ actor: `agent:${'a'.repeat(128)}x` }),
+          }),
+        );
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toBe('OwnerQuestion answer actor must be owner or agent:<id>');
+    });
+  });
+
+  describe('hostile-input cost bounds and nested descriptor reads', () => {
+    it('refuses an options array beyond the record JSON budget before touching any element', () => {
+      let getterRuns = 0;
+      const hostileOption: Record<string, unknown> = {};
+      Object.defineProperty(hostileOption, 'id', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return 'a';
+        },
+      });
+      // Far beyond any count a record within 32768 JSON characters could hold;
+      // every element carries a getter, so traversal would run it.
+      const huge = Array.from({ length: 5000 }, () => hostileOption);
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          options: huge as unknown as OwnerQuestionOptionRecord[],
+        }),
+      ).toThrow(/at most \d+ entries/);
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses a blocks array beyond the record JSON budget before touching any element', () => {
+      let getterRuns = 0;
+      const hostileBlock: Record<string, unknown> = {};
+      Object.defineProperty(hostileBlock, 'kind', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return 'lane';
+        },
+      });
+      const huge = Array.from({ length: 5000 }, () => hostileBlock);
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          blocks: huge as unknown as OwnerQuestionRecordInput['blocks'],
+        }),
+      ).toThrow(/at most \d+ entries/);
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses getters on nested option, recommendation, block and acknowledgement fields without invoking them', () => {
+      // A getter on an option field is refused and never runs.
+      let optionRuns = 0;
+      const option: Record<string, unknown> = { label: 'L', consequence: 'C' };
+      Object.defineProperty(option, 'id', {
+        enumerable: true,
+        get() {
+          optionRuns += 1;
+          return 'a';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          options: [option, option] as unknown as OwnerQuestionOptionRecord[],
+        }),
+      ).toThrow('OwnerQuestion options must be objects');
+      expect(optionRuns).toBe(0);
+
+      // A getter on the recommendation's optionId is refused and never runs.
+      let recommendationRuns = 0;
+      const recommendation: Record<string, unknown> = { because: 'Reversibility beats speed here.' };
+      Object.defineProperty(recommendation, 'optionId', {
+        enumerable: true,
+        get() {
+          recommendationRuns += 1;
+          return 'a';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          recommendation: recommendation as unknown as OwnerQuestionRecordInput['recommendation'],
+        }),
+      ).toThrow('OwnerQuestion requires a recommendation');
+      expect(recommendationRuns).toBe(0);
+
+      // A getter on a block's ref is refused and never runs.
+      let blockRuns = 0;
+      const block: Record<string, unknown> = { kind: 'lane' };
+      Object.defineProperty(block, 'ref', {
+        enumerable: true,
+        get() {
+          blockRuns += 1;
+          return 'lane-7';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord(),
+          blocks: [block] as unknown as OwnerQuestionRecordInput['blocks'],
+        }),
+      ).toThrow('OwnerQuestion blocks must be objects');
+      expect(blockRuns).toBe(0);
+
+      // A getter on the acknowledgement's by is refused and never runs.
+      let acknowledgementRuns = 0;
+      const acknowledgement: Record<string, unknown> = { at: '2026-10-16T12:00:00.000Z' };
+      Object.defineProperty(acknowledgement, 'by', {
+        enumerable: true,
+        get() {
+          acknowledgementRuns += 1;
+          return 'orchestrator';
+        },
+      });
+      expect(() =>
+        OwnerQuestion.fromRecord({
+          ...questionRecord({ state: 'acknowledged' }),
+          answer: {
+            shape: 'accept',
+            optionId: 'a',
+            text: null,
+            reason: null,
+            questionRevision: 1,
+            answeredVia: 'web',
+            answeredAt: '2026-10-16T11:00:00.000Z',
+            sessionId: null,
+          },
+          acknowledgement: acknowledgement as unknown as OwnerQuestionRecordInput['acknowledgement'],
+        }),
+      ).toThrow('OwnerQuestion acknowledgement must be an object');
+      expect(acknowledgementRuns).toBe(0);
+    });
+  });
+});

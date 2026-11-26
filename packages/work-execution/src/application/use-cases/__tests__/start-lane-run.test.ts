@@ -103,6 +103,10 @@ function briefFixture(overrides: Partial<PrepareBriefPackageRequest> = {}): Prep
     ownedPaths: ['packages/example/src'],
     permissions: [],
     acceptanceChecks: [],
+    // RB4: the static pre-reserve brief check replays prepare's request-only
+    // refusals, so the fixture carries a valid prefix list the way a real
+    // conducted request does.
+    allowedPathPrefixes: ['packages/example/src'],
     acceptanceSpec: {
       commitRequired: true,
       diffCheck: true,
@@ -1157,11 +1161,96 @@ describe('StartLaneRunUseCase', () => {
     expect(reason.length).toBeLessThanOrEqual('brief-rejected'.length + 2 + 200);
   });
 
+  it('test 4j: duplicate acceptanceChecks names are refused with the brief refusal reason before the reserve, with zero capacity calls, no worktree or brief call and no start-incomplete fact', async () => {
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({
+        brief: briefFixture({ acceptanceChecks: ['check-a', 'check-b', 'check-a'] }),
+      }),
+    );
+    // The refusal shape and the reason string are exactly what the brief step
+    // would have produced for the same request.
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected: acceptanceChecks must be distinct names',
+    });
+    // Nothing was reserved, prepared or authored for a request the brief
+    // refuses on its face.
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+    expect(await harness.executionJournal.listStartIncompleteForAttempt(ATTEMPT_ID)).toEqual({
+      outcome: 'listed',
+      facts: [],
+    });
+  });
+
+  it('test 4k: an acceptance-spec-shell refusal from the static brief check keeps the brief-acceptance-spec-shell class and reserves nothing', async () => {
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({
+        brief: briefFixture({
+          acceptanceSpec: {
+            commitRequired: true,
+            diffCheck: true,
+            commands: [{ argv: ['bash', '-c', 'echo hi'] }],
+          },
+        }),
+      }),
+    );
+    expect(result).toMatchObject({ outcome: 'incomplete', step: 'brief' });
+    expect((result as { reason: string }).reason.startsWith('brief-acceptance-spec-shell')).toBe(
+      true,
+    );
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
+  it('test 4l: a worktree-dependent brief refusal still holds the reservation with one capacity call', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'example brief rejection' }]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toMatchObject({ outcome: 'incomplete', step: 'brief' });
+    expect(harness.capacityCalls).toHaveLength(1);
+    expect(harness.briefCalls).toHaveLength(1);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
   it('test 4g: a rejection with no reason string keeps the bare class', async () => {
     const harness = makeHarness();
     harness.setBriefAnswers([{ outcome: 'rejected', reason: '   ' }]);
     const result = await harness.useCase.startLaneRun(requestFixture());
     expect(result).toMatchObject({ step: 'brief', reason: 'brief-rejected' });
+  });
+
+  it('test 4m: a rejected brief whose reason is a number or an object with a throwing toString yields the bare class, never a throw', async () => {
+    for (const hostile of [42, { toString: () => { throw new Error('must not run'); } }]) {
+      const harness = makeHarness();
+      harness.setBriefAnswers([{ outcome: 'rejected', reason: hostile as never }]);
+      const result = await harness.useCase.startLaneRun(requestFixture());
+      expect(result).toEqual({
+        outcome: 'incomplete',
+        runId: RUN_ID,
+        attemptId: ATTEMPT_ID,
+        step: 'brief',
+        reason: 'brief-rejected',
+      });
+      expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+    }
+  });
+
+  it('test 4n: an empty baseCommit passes the pre-reserve static check and the start reaches started', async () => {
+    const harness = makeHarness();
+    const result = await harness.useCase.startLaneRun(
+      requestFixture({ brief: briefFixture({ baseCommit: '' }) }),
+    );
+    expect(result).toMatchObject({ outcome: 'started' });
+    expect(harness.capacityCalls).toHaveLength(1);
   });
 
   it('test 5: a retry after completion returns started and calls no fake again', async () => {

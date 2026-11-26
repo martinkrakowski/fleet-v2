@@ -220,7 +220,13 @@ export type ReleaseRootRead =
  * else (wrong type, empty, oversized, accessor, hostile) is invalid and must
  * fail closed, never be treated as absent.
  */
-export function readReleaseRoot(record: object): ReleaseRootRead {
+export function readReleaseRoot(record: unknown): ReleaseRootRead {
+  // A non-object (primitive, function, null, undefined) is never a record: it
+  // is invalid, not absent. Checked before any property lookup, so no
+  // primitive is boxed. Cost: O(1).
+  if (typeof record !== 'object' || record === null) {
+    return { state: 'invalid' };
+  }
   try {
     const descriptor = Object.getOwnPropertyDescriptor(record, 'releaseRoot');
     if (descriptor === undefined) {
@@ -242,10 +248,11 @@ export function readReleaseRoot(record: object): ReleaseRootRead {
 
 /** True when the two reads may authorize one another: both absent, or both valid and equal. */
 export function releaseRootsAgree(a: ReleaseRootRead, b: ReleaseRootRead): boolean {
-  if (a.state === 'invalid' || b.state === 'invalid') {
-    return false;
+  if (a.state === 'absent') {
+    return b.state === 'absent';
   }
-  return a.state === 'absent' ? b.state === 'absent' : b.state === 'valid' && a.value === b.value;
+  // Only a valid pair can agree; an invalid or unknown state on either side never does.
+  return a.state === 'valid' && b.state === 'valid' && a.value === b.value;
 }
 
 /**

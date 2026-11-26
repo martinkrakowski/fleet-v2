@@ -210,3 +210,157 @@ export function laneRunReviewFact(
 
   return Object.freeze({ verdict, seatIndex: latest.seatIndex, retries });
 }
+
+/** The longest journal the seat-usage reader accepts; a longer one reads as no usage (O(1) refusal). */
+export const LANE_RUN_REVIEW_SEAT_USAGE_MAX_ENTRIES = 100_000;
+
+/** Unparseable (`review-unknown`) verdicts one seat may give at one head before the next seat is tried (RM2). */
+export const LANE_RUN_REVIEW_UNPARSEABLE_SEAT_LIMIT = 2;
+
+/** What the journal says about review-seat use at one head for one kind (RM2). */
+export interface LaneRunReviewSeatUsage {
+  /** Counted intents (`matching`) on the latest counted intent's seat; 0 when none. */
+  readonly latestSeatIntents: number;
+  /** Seats with at least two counted intents whose final reason is `review-unknown`, ascending. */
+  readonly exhaustedSeatIndexes: readonly number[];
+}
+
+const NO_SEAT_USAGE: LaneRunReviewSeatUsage = Object.freeze({
+  latestSeatIntents: 0,
+  exhaustedSeatIndexes: Object.freeze([]) as readonly number[],
+});
+
+const SEAT_USAGE_ENTRY_FIELDS = ['kind', 'runId', 'key', 'outcome', 'reasonCode', 'detail', 'recordedAtIso'] as const;
+
+/**
+ * Copies the fields the seat-usage reader needs out of an untrusted journal
+ * array through own data descriptors only: a getter is never run, a hole, a
+ * non-array, an array-like, a non-object entry or an own `__proto__` key
+ * refuses the whole read (null). Cost O(entries x fields), entries bounded by
+ * `LANE_RUN_REVIEW_SEAT_USAGE_MAX_ENTRIES`; a non-array or oversized input
+ * is refused in O(1).
+ */
+function snapshotJournalForSeatUsage(entries: unknown): readonly LaneRunJournalEntryRecord[] | null {
+  if (!Array.isArray(entries)) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(entries, 'length');
+  const length: unknown = lengthDescriptor === undefined ? undefined : lengthDescriptor.value;
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > LANE_RUN_REVIEW_SEAT_USAGE_MAX_ENTRIES) {
+    return null;
+  }
+  const snapshot: LaneRunJournalEntryRecord[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const slot = Object.getOwnPropertyDescriptor(entries, String(index));
+    if (slot === undefined || !('value' in slot)) {
+      return null;
+    }
+    const entry: unknown = slot.value;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return null;
+    }
+    if (Object.getOwnPropertyDescriptor(entry, '__proto__') !== undefined) {
+      return null;
+    }
+    const copy: Record<string, unknown> = {};
+    for (const field of SEAT_USAGE_ENTRY_FIELDS) {
+      const descriptor = Object.getOwnPropertyDescriptor(entry, field);
+      if (descriptor === undefined) {
+        copy[field] = null;
+      } else if ('value' in descriptor) {
+        copy[field] = descriptor.value;
+      } else {
+        return null;
+      }
+    }
+    const isText = (value: unknown): boolean => value === null || typeof value === 'string';
+    if (
+      !isText(copy.key) ||
+      !isText(copy.runId) ||
+      !isText(copy.reasonCode) ||
+      !isText(copy.outcome) ||
+      typeof copy.kind !== 'string' ||
+      typeof copy.recordedAtIso !== 'string'
+    ) {
+      return null;
+    }
+    snapshot.push(copy as unknown as LaneRunJournalEntryRecord);
+  }
+  return snapshot;
+}
+
+/**
+ * RM2: how many of the review's counted intents each seat has used at `head12`.
+ * Counts exactly the intents `laneRunReviewFact` counts (`matching`): this
+ * run's step intents of `kind` at `head12`, after the latest `review-retry`
+ * boundary, excluding `seat-busy` and `review-superseded` ones, so a resume
+ * starts a clean count. Read-only over a snapshot of the journal; never
+ * throws; a hostile or malformed input, a bad run id, a null head or a kind
+ * other than `brief-check` / `code-review` reads as no usage.
+ */
+export function laneRunReviewSeatUsage(
+  entries: unknown,
+  runId: string,
+  kind: LaneRunReviewKind,
+  head12: string | null,
+): LaneRunReviewSeatUsage {
+  if (
+    typeof runId !== 'string' ||
+    !LANE_RUN_ID_PATTERN.test(runId) ||
+    head12 === null ||
+    (kind !== 'brief-check' && kind !== 'code-review')
+  ) {
+    return NO_SEAT_USAGE;
+  }
+  const journal = snapshotJournalForSeatUsage(entries);
+  if (journal === null) {
+    return NO_SEAT_USAGE;
+  }
+  const latestBoundaryIso = latestReviewRetryBoundaryIsoOf(journal, runId);
+  const matching: Array<{ readonly key: string; readonly seatIndex: number }> = [];
+  for (const entry of journal) {
+    if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
+      continue;
+    }
+    if (parsed.step !== kind || parsed.head12 !== head12) {
+      continue;
+    }
+    if (latestBoundaryIso !== null && entry.recordedAtIso < latestBoundaryIso) {
+      continue;
+    }
+    const finalReason = finalReasonCodeOf(journal, entry.key);
+    if (finalReason !== undefined && finalReason !== null && SKIPPED_REVIEW_FINAL_REASONS.has(finalReason)) {
+      continue;
+    }
+    if (finalReason === 'seat-busy') {
+      continue;
+    }
+    matching.push({ key: entry.key, seatIndex: parsed.seatIndex });
+  }
+  if (matching.length === 0) {
+    return NO_SEAT_USAGE;
+  }
+  const latestSeatIndex = matching[matching.length - 1]!.seatIndex;
+  let latestSeatIntents = 0;
+  const unknownBySeat = new Map<number, number>();
+  for (const intent of matching) {
+    if (intent.seatIndex === latestSeatIndex) {
+      latestSeatIntents += 1;
+    }
+    if (finalReasonCodeOf(journal, intent.key) === 'review-unknown') {
+      unknownBySeat.set(intent.seatIndex, (unknownBySeat.get(intent.seatIndex) ?? 0) + 1);
+    }
+  }
+  const exhausted: number[] = [];
+  for (const [seatIndex, count] of unknownBySeat) {
+    if (count >= LANE_RUN_REVIEW_UNPARSEABLE_SEAT_LIMIT) {
+      exhausted.push(seatIndex);
+    }
+  }
+  exhausted.sort((a, b) => a - b);
+  return Object.freeze({ latestSeatIntents, exhaustedSeatIndexes: Object.freeze(exhausted) });
+}

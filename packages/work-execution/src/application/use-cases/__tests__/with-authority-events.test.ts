@@ -273,6 +273,28 @@ describe('withStopAuthorityEvents', () => {
     expect(badNow.events).toEqual([]);
   });
 
+  it('marks a gap instead of emitting a default-organisation event when the context organizationId is missing or not a string', async () => {
+    const result = stopRecordedResult(stopKey(1));
+
+    const missingOrg = recordingSink();
+    const missingOrgOutcome = await withStopAuthorityEvents(runStopUseCase(result), missingOrg.sink, {
+      actor: 'op.cli',
+      organizationId: undefined,
+    } as never).requestLaneRunStop(runStopRequest());
+    expect(missingOrgOutcome.result).toBe(result);
+    expect(missingOrgOutcome.auditGap).toBe(true);
+    expect(missingOrg.events).toEqual([]);
+
+    const nonStringOrg = recordingSink();
+    const nonStringOrgOutcome = await withStopAuthorityEvents(runStopUseCase(result), nonStringOrg.sink, {
+      actor: 'op.cli',
+      organizationId: 7,
+    } as never).requestLaneRunStop(runStopRequest());
+    expect(nonStringOrgOutcome.result).toBe(result);
+    expect(nonStringOrgOutcome.auditGap).toBe(true);
+    expect(nonStringOrg.events).toEqual([]);
+  });
+
   it('propagates the wrapped use case without altering its non-emitting result objects', async () => {
     const refused: RequestLaneRunStopResult = { outcome: 'refused', reason: 'journal-refused' };
     const { sink, events } = recordingSink();

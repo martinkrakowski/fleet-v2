@@ -155,18 +155,29 @@ function wrapStopAttempt(
   };
 }
 
-/** The mapper input of one stop event: exactly the four keys the mapper accepts. */
+/**
+ * The mapper input of one stop event: exactly the four keys the mapper
+ * accepts. When the context is invalid — its `organizationId` is missing or
+ * not a string — the `organizationId` key is OMITTED, so the mapper's
+ * exact-key check refuses the input: an invalid context can never be
+ * misattributed to the default organisation (an explicit `null` is the only
+ * way to reach that default).
+ */
 function mapperInput(
   eventId: string,
   request: unknown,
   context: StopAuthorityEventContext,
 ): unknown {
-  return {
+  const organizationId = readOrganizationId(context);
+  const input: Record<string, unknown> = {
     eventId,
     actor: readOwnText(context, 'actor'),
-    organizationId: readOrganizationId(context),
     atIso: readOwnText(request, 'nowIso'),
   };
+  if (organizationId.ok) {
+    input['organizationId'] = organizationId.value;
+  }
+  return input;
 }
 
 /**
@@ -183,20 +194,28 @@ function readOwnText(value: unknown, key: string): string | null {
   }
 }
 
-/** Reads `organizationId` preserving `null` (the default organisation) from a descriptor snapshot. */
-function readOrganizationId(context: unknown): string | null {
+/**
+ * Reads `organizationId` from a descriptor snapshot, distinguishing an
+ * explicit `null` (the default organisation, passed through) from a missing
+ * or non-string value (an invalid context, reported as `{ ok: false }` so the
+ * mapper input omits the key and the mapper refuses — never converted to the
+ * default organisation).
+ */
+function readOrganizationId(
+  context: unknown,
+): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
   try {
     const snapshot = snapshotPlainDataRecord(context);
-    if (snapshot === null) {
-      return null;
+    if (snapshot === null || !Object.hasOwn(snapshot, 'organizationId')) {
+      return { ok: false };
     }
     const read = snapshot['organizationId'];
     if (read === null) {
-      return null;
+      return { ok: true, value: null };
     }
-    return typeof read === 'string' ? read : null;
+    return typeof read === 'string' ? { ok: true, value: read } : { ok: false };
   } catch {
-    return null;
+    return { ok: false };
   }
 }
 

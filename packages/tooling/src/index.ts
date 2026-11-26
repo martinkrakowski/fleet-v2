@@ -7,3 +7,4 @@ export * from './agy.js';
 export * from './descriptors.js';
 export * from './detect.js';
 export * from './recommend.js';
+export * from './availability-claim-guard.js';

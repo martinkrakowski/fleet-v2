@@ -1,0 +1,34 @@
+{
+  "day": "2026-03-01",
+  "repoDigest": "0f1e2d3c4b5a",
+  "excludeBatchMerges": true,
+  "shell": {
+    "unknownLines": 0,
+    "events": [
+      {
+        "line": 0,
+        "atIso": "2026-03-01T10:00:00Z",
+        "kind": "result",
+        "outcome": "merged",
+        "pullRequest": 421,
+        "headOid": "dddddddddddddddddddddddddddddddddddddddd",
+        "detailCode": "batch-member",
+        "fromHeadOid": null
+      },
+      {
+        "line": 1,
+        "atIso": "2026-03-01T11:00:00Z",
+        "kind": "result",
+        "outcome": "merged",
+        "pullRequest": 422,
+        "headOid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "detailCode": "none",
+        "fromHeadOid": null
+      }
+    ]
+  },
+  "fleet": {
+    "results": [],
+    "entries": []
+  }
+}

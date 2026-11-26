@@ -15,8 +15,14 @@ export default defineEventHandler(async (event) => {
   try {
     const composition = workComposition();
     const body = await readObjectBody(event);
+    // A boundary timestamp lets the stop's authority event carry a valid
+    // `atIso`; the route invents one only when the caller supplied none.
+    const payload: Record<string, unknown> = { ...body, attemptId };
+    if (!Object.hasOwn(payload, "nowIso")) {
+      payload["nowIso"] = new Date().toISOString();
+    }
     const stopped = await composition.attemptLimiter.run(attemptId, () =>
-      composition.stopAttempt.execute({ ...body, attemptId }),
+      composition.stopAttempt.execute(payload),
     );
     if (!stopped.ok) {
       if (stopped.reason === "busy-project") {

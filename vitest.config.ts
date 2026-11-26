@@ -10,17 +10,23 @@
 // run would exit 0 having collected nothing. The projects and coverage block
 // therefore apply only when vitest runs from the repository root; from any
 // other directory an empty config is exported so each workspace keeps its own
-// CLI flags and Vitest's defaults.
+// CLI flags and Vitest's defaults. In both branches `globalSetup` loads
+// `vitest.global-tmp.ts`, which creates one run-scoped temp root per vitest
+// run and removes it at teardown.
 import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { defineConfig } from 'vitest/config';
 
 const runsFromRepositoryRoot = () =>
   realpathSync(process.cwd()) === realpathSync(import.meta.dirname);
 
+const globalTmpSetup = resolve(import.meta.dirname, 'vitest.global-tmp.ts');
+
 export default defineConfig(
   runsFromRepositoryRoot()
     ? {
         test: {
+          globalSetup: [globalTmpSetup],
           passWithNoTests: true,
           projects: [
             { root: 'packages/brief-knowledge', test: { name: '@fleet/brief-knowledge', exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.output/**'] } },
@@ -46,5 +52,5 @@ export default defineConfig(
           },
         },
       }
-    : {},
+    : { test: { globalSetup: [globalTmpSetup] } },
 );

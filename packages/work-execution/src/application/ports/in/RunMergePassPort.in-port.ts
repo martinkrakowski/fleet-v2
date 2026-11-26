@@ -1,5 +1,6 @@
 // @generated inbound contract scaffold — refined for lane DT9a.
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
+import type { BaseBranchValue } from '../../../domain/base-branch.js';
 
 /** One bounded merge pass for one repository, in shadow mode (DT9a); entry records and notifications (DT9c). */
 export interface RunMergePassRequest {
@@ -8,6 +9,7 @@ export interface RunMergePassRequest {
   readonly projectId: string;    // the evidence project, for the procedure receipt
   readonly policy: MergeRepoPolicy;  // the repository policy, exactly the decider's input
   readonly deadlineIso: string;  // the pass budget deadline (D-DT9)
+  readonly baseBranch?: BaseBranchValue;  // the base partition to order and judge; omitted keeps the main-only read
 }
 
 export type MergePassEntryDecision = 'journalled' | 'recorded' | 'no-action' | 'live-deferred';

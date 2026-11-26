@@ -103,7 +103,9 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
       rt.execution.stopAttempt.stopAttempt({
         attemptId: str(p, 'attemptId'),
         gracePeriodSeconds: optNum(p, 'gracePeriodSeconds'),
-        nowIso: optStr(p, 'nowIso'),
+        // A boundary timestamp lets the stop's authority event carry a valid
+        // `atIso`; an absent one would report an audit gap without one.
+        nowIso: optStr(p, 'nowIso') ?? new Date().toISOString(),
       }),
     collect: async (p, rt) => {
       const attemptId = str(p, 'attemptId');

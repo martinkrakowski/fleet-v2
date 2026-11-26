@@ -1360,7 +1360,7 @@ describe('applyHostDraft refuses a hostile runner.optional (IH1a fix round 1)', 
     }
   });
 
-  it('still files a boolean optional and preserves an existing one on an edit whose draft carries the flag behind a merge', () => {
+  it('refuses a drafted runner.optional accessor on an edit whose existing flag would otherwise survive the merge', () => {
     const added = applyHostDraft(
       base,
       {
@@ -1401,15 +1401,15 @@ describe('applyHostDraft refuses a hostile runner.optional (IH1a fix round 1)', 
       'edit',
     );
     expect(getterRan).toBe(false);
-    expect(edited.ok).toBe(true);
-    if (edited.ok) {
-      // The merge rebuilds the runner from own data, so the filed runner is
-      // plain data carrying the preserved flag, never the getter.
-      expect(edited.candidate.hosts.lanehost.runner).toEqual({
-        kind: 'opencode',
-        port: 4167,
-        optional: true,
-      });
+    // An accessor on `runner.optional` is refused, never silently erased by
+    // the merge: the merge rebuilds the runner from own data, so a check on
+    // the merged host would never see the getter.
+    expect(edited.ok).toBe(false);
+    if (!edited.ok) {
+      expect(edited.reason).toBe('invalid');
+      expect(edited.errors).toEqual([
+        'hosts.lanehost.runner.optional: must be a plain data property',
+      ]);
     }
   });
 

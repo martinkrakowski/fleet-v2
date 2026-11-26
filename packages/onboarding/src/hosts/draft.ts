@@ -909,9 +909,16 @@ export function applyHostDraft(
   // The same field validation `draftHost` runs, on the host as it will be
   // filed: `roles: ["wizard"]` or `roleAliases: null` never reaches `ok: true`.
   // An accessor on `runner.optional` reads as absent through the copied view
-  // that validation runs on, so the candidate's own descriptor is refused
+  // that validation runs on, so the raw draft's own descriptor is refused
   // first: a hand-built draft can never file a getter (IH1a fix round 1).
-  const optionalAccessor = refusedRunnerOptionalAccessor(merged, name);
+  // The raw draft is checked, not the merged host: `mergeDraftedHost` and the
+  // `copyOwnData` copies rebuild the runner from own data, which erases an
+  // accessor before the check could see it (IH1a fix round 2).
+  const optionalAccessor =
+    refusedRunnerOptionalAccessor(
+      draftFields === undefined ? undefined : draftFields.host,
+      name,
+    ) ?? refusedRunnerOptionalAccessor(merged, name);
   if (optionalAccessor !== undefined) {
     return { ok: false, reason: 'invalid', errors: [optionalAccessor] };
   }

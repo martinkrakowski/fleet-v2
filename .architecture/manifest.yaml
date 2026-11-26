@@ -1186,7 +1186,7 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [Organization, Project]
+        entities: [Organization, Project, TenantDataKey]
         value_objects: []
       application:
         use_cases: []

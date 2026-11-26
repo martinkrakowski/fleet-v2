@@ -543,24 +543,14 @@ export function decideMembershipChange(
   // `schemaVersion: undefined` property: an explicit undefined own key
   // would fail validateMembershipRecord with `invalid-schema-version`
   // downstream, so the key is present only when the target carries it.
-  const changed: MembershipRecord = Object.freeze(
-    target.schemaVersion === 1
-      ? {
-          schemaVersion: 1 as const,
-          organizationId: target.organizationId,
-          actor: target.actor,
-          role: decided.role,
-          addedAtIso: target.addedAtIso,
-          addedBy: target.addedBy,
-        }
-      : {
-          organizationId: target.organizationId,
-          actor: target.actor,
-          role: decided.role,
-          addedAtIso: target.addedAtIso,
-          addedBy: target.addedBy,
-        },
-  );
+  const changed: MembershipRecord = Object.freeze({
+    ...(target.schemaVersion === 1 ? { schemaVersion: 1 as const } : {}),
+    organizationId: target.organizationId,
+    actor: target.actor,
+    role: decided.role,
+    addedAtIso: target.addedAtIso,
+    addedBy: target.addedBy,
+  });
   return {
     ok: true,
     members: Object.freeze(

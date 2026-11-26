@@ -460,21 +460,38 @@ export function decideScopedHalt(input: unknown, isProxy: IsProxy): ScopedHaltWi
   if (root === null) {
     return { ok: false, reason: 'invalid-input', dispatchHalted: true };
   }
+  // Actor, actor-organization and request refusals report the evaluated
+  // dispatch state whenever `halts` and `target` both read clean; they fall
+  // back to `true` only on a snapshot refusal or an invalid `halts`/`target`.
+  const evaluatedDispatch = (): boolean => {
+    if (!Object.hasOwn(root, 'halts') || !Object.hasOwn(root, 'target')) {
+      return true;
+    }
+    const haltsCheck = validateHalts(root.halts);
+    if (!haltsCheck.ok) {
+      return true;
+    }
+    const targetCheck = validateTarget(root.target);
+    if (!targetCheck.ok) {
+      return true;
+    }
+    return evaluateDispatchHalted(haltsCheck.entries, targetCheck.target);
+  };
   if (!Object.hasOwn(root, 'actorKind') || !isHaltActorKind(root.actorKind)) {
-    return { ok: false, reason: 'invalid-actor', dispatchHalted: true };
+    return { ok: false, reason: 'invalid-actor', dispatchHalted: evaluatedDispatch() };
   }
   const actorKind: HaltActorKind = root.actorKind;
   let actorOrganizationId: string | undefined;
   if (actorKind === 'org-admin') {
     if (!isNonEmptyTrimmedString(root.actorOrganizationId)) {
-      return { ok: false, reason: 'invalid-actor-organization', dispatchHalted: true };
+      return { ok: false, reason: 'invalid-actor-organization', dispatchHalted: evaluatedDispatch() };
     }
     actorOrganizationId = root.actorOrganizationId;
   } else if (Object.hasOwn(root, 'actorOrganizationId')) {
-    return { ok: false, reason: 'invalid-actor-organization', dispatchHalted: true };
+    return { ok: false, reason: 'invalid-actor-organization', dispatchHalted: evaluatedDispatch() };
   }
   if (!Object.hasOwn(root, 'requested')) {
-    return { ok: false, reason: 'invalid-request', dispatchHalted: true };
+    return { ok: false, reason: 'invalid-request', dispatchHalted: evaluatedDispatch() };
   }
   const requested = plainRecordWithOnlyKeys(root.requested, ['scope', 'halted', 'id', 'confirmGlobalLift']);
   if (
@@ -485,7 +502,7 @@ export function decideScopedHalt(input: unknown, isProxy: IsProxy): ScopedHaltWi
     (Object.hasOwn(requested, 'confirmGlobalLift') && typeof requested.confirmGlobalLift !== 'boolean') ||
     !validateScopeId(requested.scope, requested.id, Object.hasOwn(requested, 'id'))
   ) {
-    return { ok: false, reason: 'invalid-request', dispatchHalted: true };
+    return { ok: false, reason: 'invalid-request', dispatchHalted: evaluatedDispatch() };
   }
   if (!Object.hasOwn(root, 'halts')) {
     return { ok: false, reason: 'invalid-halts', dispatchHalted: true };

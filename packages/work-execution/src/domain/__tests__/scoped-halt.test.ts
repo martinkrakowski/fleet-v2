@@ -210,6 +210,23 @@ describe('decideHaltRequest', () => {
     // Bad actorKind value.
     const badActor = { ...noActor, actorKind: 'root' };
     expect(haltRequest(badActor)).toEqual({ ok: false, reason: 'invalid-actor' });
+    // An actor refusal after a clean snapshot reports the evaluated dispatch
+    // state: valid halts and target with no active halt means false.
+    const badActorEvaluated = {
+      actorKind: 'root',
+      requested: { scope: 'org', id: ORG_A, halted: true },
+      halts: [orgEntry(false)],
+      target: TARGET_A,
+    };
+    expect(scopedHalt(badActorEvaluated)).toEqual({ ok: false, reason: 'invalid-actor', dispatchHalted: false });
+    // An active halt still reports dispatchHalted true through the refusal.
+    expect(
+      scopedHalt({ ...badActorEvaluated, halts: [orgEntry(true)] }),
+    ).toEqual({ ok: false, reason: 'invalid-actor', dispatchHalted: true });
+    // An invalid target falls back to fail-closed true through the refusal.
+    expect(
+      scopedHalt({ ...badActorEvaluated, target: { organizationId: ORG_A } }),
+    ).toEqual({ ok: false, reason: 'invalid-actor', dispatchHalted: true });
     // Missing actorOrganizationId for org-admin.
     const noActorOrg = {
       actorKind: 'org-admin',

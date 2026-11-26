@@ -13,6 +13,7 @@
 import { snapshotPlainData, type IsProxy } from "@fleet/shared";
 import {
   accepted,
+  compareZonedIsoInstants,
   isZonedIsoDateTime,
   ORGANIZATION_ID_PATTERN,
   refused,
@@ -104,6 +105,7 @@ export function validateProjectRecord(
   }
   return validateProjectFields({
     schemaVersion: record.schemaVersion,
+    schemaVersionPresent: Object.hasOwn(record, "schemaVersion"),
     projectId: record.projectId,
     organizationId: record.organizationId,
     displayName: record.displayName,
@@ -138,6 +140,9 @@ function projectSnapshotRefusal(
     case "not-plain":
       return "project record must be a plain object";
     case "not-enumerable":
+      if (path !== null && allowedKeys.has(path)) {
+        return `project record ${path} is a non-enumerable property`;
+      }
       return "project record has a non-enumerable property";
     case "symbol-key":
       return "project record has a symbol own key";
@@ -148,6 +153,9 @@ function projectSnapshotRefusal(
     case "too-long":
       return "project record has an oversized string";
     case "unsupported-type":
+      if (path !== null && allowedKeys.has(path)) {
+        return `project record ${path} has an unsupported value type`;
+      }
       return "project record must be a plain object";
     case "hostile":
       return "project record is a hostile runtime value";
@@ -158,6 +166,7 @@ function projectSnapshotRefusal(
 
 interface ProjectFields {
   readonly schemaVersion: unknown;
+  readonly schemaVersionPresent: boolean;
   readonly projectId: unknown;
   readonly organizationId: unknown;
   readonly displayName: unknown;
@@ -168,7 +177,7 @@ interface ProjectFields {
 
 /** Field-level validation shared by the project validator and the transition function. */
 function validateProjectFields(fields: ProjectFields): ValidationResult<ProjectRecord> {
-  if (fields.schemaVersion !== undefined && fields.schemaVersion !== 1) {
+  if (fields.schemaVersionPresent && fields.schemaVersion !== 1) {
     return refused("project record schemaVersion must be 1 when present");
   }
   if (typeof fields.projectId !== "string" || !ORGANIZATION_ID_PATTERN.test(fields.projectId)) {
@@ -207,7 +216,7 @@ function validateProjectFields(fields: ProjectFields): ValidationResult<ProjectR
   if (fields.status === "active") {
     return refused("project record retiredAtIso must be null when status is active");
   }
-  if (Date.parse(fields.retiredAtIso) < Date.parse(fields.createdAtIso)) {
+  if (compareZonedIsoInstants(fields.retiredAtIso, fields.createdAtIso) < 0) {
     return refused("project record retiredAtIso must not precede createdAtIso");
   }
   return accepted(finishProjectRecord(fields, fields.retiredAtIso as string));
@@ -280,7 +289,7 @@ export function decideProjectTransition(
     if (to.value.retiredAtIso === null) {
       return refused("retiredAtIso must be set when status is retired");
     }
-    if (Date.parse(to.value.retiredAtIso) < Date.parse(to.value.createdAtIso)) {
+    if (compareZonedIsoInstants(to.value.retiredAtIso, to.value.createdAtIso) < 0) {
       return refused("retiredAtIso must not precede createdAtIso");
     }
   }

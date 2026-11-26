@@ -71,6 +71,32 @@ export function isZonedIsoDateTime(value: unknown): value is string {
 }
 
 /**
+ * Compare two zoned ISO-8601 timestamps that already passed
+ * isZonedIsoDateTime, to the full nine fractional digits the format allows.
+ * Date.parse keeps only millisecond precision, so two instants that differ
+ * below a millisecond would compare equal. Returns a negative number, zero
+ * or a positive number. Cost bound: O(1) — two Date.parse calls and one
+ * comparison of two fixed-width digit strings.
+ */
+export function compareZonedIsoInstants(a: string, b: string): number {
+  const millisA = Date.parse(a);
+  const millisB = Date.parse(b);
+  if (millisA !== millisB) {
+    return millisA < millisB ? -1 : 1;
+  }
+  const subMilli = (value: string): string => {
+    const match = /\.(\d{1,9})/.exec(value);
+    return (match === null ? "" : match[1]).padEnd(9, "0").slice(3);
+  };
+  const subA = subMilli(a);
+  const subB = subMilli(b);
+  if (subA === subB) {
+    return 0;
+  }
+  return subA < subB ? -1 : 1;
+}
+
+/**
  * `DEFAULT_ORGANIZATION_ID` is always a valid organisation id, and an absent
  * organisation id anywhere in a hosted record means the default organisation
  * (the reader that applies this fallback is a later unit; a stored default
@@ -122,6 +148,7 @@ interface SnapshotFields {
   readonly createdAtIso: unknown;
   readonly retiredAtIso: unknown;
   readonly schemaVersion: unknown;
+  readonly schemaVersionPresent: boolean;
 }
 
 /**
@@ -169,6 +196,7 @@ export function validateOrganizationRecord(
   }
   const fields: SnapshotFields = {
     schemaVersion: record.schemaVersion,
+    schemaVersionPresent: Object.hasOwn(record, "schemaVersion"),
     organizationId: record.organizationId,
     displayName: record.displayName,
     status: record.status,
@@ -203,6 +231,9 @@ function organizationSnapshotRefusal(
     case "not-plain":
       return "organization record must be a plain object";
     case "not-enumerable":
+      if (path !== null && allowedKeys.has(path)) {
+        return `organization record ${path} is a non-enumerable property`;
+      }
       return "organization record has a non-enumerable property";
     case "symbol-key":
       return "organization record has a symbol own key";
@@ -213,6 +244,9 @@ function organizationSnapshotRefusal(
     case "too-long":
       return "organization record has an oversized string";
     case "unsupported-type":
+      if (path !== null && allowedKeys.has(path)) {
+        return `organization record ${path} has an unsupported value type`;
+      }
       return "organization record must be a plain object";
     case "hostile":
       return "organization record is a hostile runtime value";
@@ -223,7 +257,7 @@ function organizationSnapshotRefusal(
 
 /** Field-level validation shared by the organization validator and retire. */
 function validateOrganizationFields(fields: SnapshotFields): ValidationResult<OrganizationRecord> {
-  if (fields.schemaVersion !== undefined && fields.schemaVersion !== 1) {
+  if (fields.schemaVersionPresent && fields.schemaVersion !== 1) {
     return refused("organization record schemaVersion must be 1 when present");
   }
   if (typeof fields.organizationId !== "string" || !ORGANIZATION_ID_PATTERN.test(fields.organizationId)) {
@@ -256,7 +290,7 @@ function validateOrganizationFields(fields: SnapshotFields): ValidationResult<Or
   if (fields.status === "active") {
     return refused("organization record retiredAtIso must be null when status is active");
   }
-  if (Date.parse(fields.retiredAtIso) < Date.parse(fields.createdAtIso)) {
+  if (compareZonedIsoInstants(fields.retiredAtIso, fields.createdAtIso) < 0) {
     return refused("organization record retiredAtIso must not precede createdAtIso");
   }
   return accepted(finishOrganizationRecord(fields, fields.retiredAtIso as string));
@@ -315,7 +349,7 @@ export function retireOrganization(
   if (validated.value.status === "retired") {
     return { ok: false, reason: "organization record status is already retired" };
   }
-  if (Date.parse(nowIso) < Date.parse(validated.value.createdAtIso)) {
+  if (compareZonedIsoInstants(nowIso, validated.value.createdAtIso) < 0) {
     return { ok: false, reason: "nowIso must not precede createdAtIso" };
   }
   const retired: OrganizationRecord = Object.freeze({

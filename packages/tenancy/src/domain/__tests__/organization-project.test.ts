@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   acceptsNewWork,
+  compareZonedIsoInstants,
   DEFAULT_ORGANIZATION_ID,
   decideProjectTransition,
   isZonedIsoDateTime,
@@ -597,5 +598,217 @@ describe("decideProjectTransition", () => {
     if (!badNext.ok) {
       expect(badNext.reason).toContain("next");
     }
+  });
+});
+
+describe("FC3A review fixes: schemaVersion presence, sub-millisecond ordering, non-enumerable field names", () => {
+  it("refuses an own schemaVersion key whose value is undefined for organization and project, while an absent key is accepted", () => {
+    const org = validateOrganizationRecord(validOrganization({ schemaVersion: undefined }));
+    expect(org.ok).toBe(false);
+    if (!org.ok) {
+      expect(org.reason).toContain("schemaVersion");
+    }
+    const project = validateProjectRecord(validProject({ schemaVersion: undefined }));
+    expect(project.ok).toBe(false);
+    if (!project.ok) {
+      expect(project.reason).toContain("schemaVersion");
+    }
+    expect(validateOrganizationRecord(validOrganization()).ok).toBe(true);
+    expect(validateProjectRecord(validProject()).ok).toBe(true);
+    expect(validateOrganizationRecord(validOrganization({ schemaVersion: 1 })).ok).toBe(true);
+  });
+
+  it("compareZonedIsoInstants orders instants that differ only below one millisecond and reports equal instants as zero", () => {
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.0000001Z", "2026-01-01T00:00:00.0000009Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.0000009Z", "2026-01-01T00:00:00.0000001Z"),
+    ).toBeGreaterThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.5Z", "2026-01-01T00:00:00.500000000Z"),
+    ).toBe(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.999Z", "2026-01-01T00:00:01Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T02:00:00+02:00", "2026-01-01T00:00:00Z"),
+    ).toBe(0);
+  });
+
+  it("refuses a retired organization and project whose retiredAtIso precedes createdAtIso by less than a millisecond, and accepts equal and later sub-millisecond values", () => {
+    const createdAtIso = "2026-01-01T00:00:00.0000009Z";
+    const early = "2026-01-01T00:00:00.0000001Z";
+    const later = "2026-01-01T00:00:00.0000010Z";
+    const org = validateOrganizationRecord(
+      validOrganization({ createdAtIso, status: "retired", retiredAtIso: early }),
+    );
+    expect(org.ok).toBe(false);
+    if (!org.ok) {
+      expect(org.reason).toContain("retiredAtIso");
+    }
+    const project = validateProjectRecord(
+      validProject({ createdAtIso, status: "retired", retiredAtIso: early }),
+    );
+    expect(project.ok).toBe(false);
+    expect(
+      validateOrganizationRecord(
+        validOrganization({ createdAtIso, status: "retired", retiredAtIso: createdAtIso }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      validateProjectRecord(
+        validProject({ createdAtIso, status: "retired", retiredAtIso: later }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it("retireOrganization refuses a nowIso that precedes createdAtIso by less than a millisecond", () => {
+    const active = validateOrganizationRecord(
+      validOrganization({ createdAtIso: "2026-01-01T00:00:00.0000009Z" }),
+    );
+    expect(active.ok).toBe(true);
+    if (!active.ok) {
+      return;
+    }
+    const early = retireOrganization(active.value, "2026-01-01T00:00:00.0000001Z");
+    expect(early.ok).toBe(false);
+    expect(retireOrganization(active.value, "2026-01-01T00:00:00.0000009Z").ok).toBe(true);
+  });
+
+  it("names the field in the refusal when an allowed field is a non-enumerable property, for organization and project", () => {
+    const org = validOrganization();
+    Object.defineProperty(org, "displayName", { value: "Acme", enumerable: false });
+    const orgResult = validateOrganizationRecord(org);
+    expect(orgResult.ok).toBe(false);
+    if (!orgResult.ok) {
+      expect(orgResult.reason).toContain("displayName");
+      expect(orgResult.reason).toContain("non-enumerable");
+    }
+    const project = validProject();
+    Object.defineProperty(project, "displayName", { value: "Website", enumerable: false });
+    const projectResult = validateProjectRecord(project);
+    expect(projectResult.ok).toBe(false);
+    if (!projectResult.ok) {
+      expect(projectResult.reason).toContain("displayName");
+      expect(projectResult.reason).toContain("non-enumerable");
+    }
+  });
+
+  it("decideProjectTransition refuses a retired next record whose retiredAtIso precedes createdAtIso below a millisecond", () => {
+    const createdAtIso = "2026-01-01T00:00:00.0000009Z";
+    const current = validProject({ createdAtIso });
+    const next = validProject({
+      createdAtIso,
+      status: "retired",
+      retiredAtIso: "2026-01-01T00:00:00.0000001Z",
+    });
+    expect(decideProjectTransition(current, next).ok).toBe(false);
+  });
+});
+
+describe("FC3A review fixes: schemaVersion presence, sub-millisecond ordering, non-enumerable field names", () => {
+  it("refuses an own schemaVersion key whose value is undefined for organization and project, while an absent key is accepted", () => {
+    const org = validateOrganizationRecord(validOrganization({ schemaVersion: undefined }));
+    expect(org.ok).toBe(false);
+    if (!org.ok) {
+      expect(org.reason).toContain("schemaVersion");
+    }
+    const project = validateProjectRecord(validProject({ schemaVersion: undefined }));
+    expect(project.ok).toBe(false);
+    if (!project.ok) {
+      expect(project.reason).toContain("schemaVersion");
+    }
+    expect(validateOrganizationRecord(validOrganization()).ok).toBe(true);
+    expect(validateProjectRecord(validProject()).ok).toBe(true);
+    expect(validateOrganizationRecord(validOrganization({ schemaVersion: 1 })).ok).toBe(true);
+  });
+
+  it("compareZonedIsoInstants orders instants that differ only below one millisecond and reports equal instants as zero", () => {
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.0000001Z", "2026-01-01T00:00:00.0000009Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.0000009Z", "2026-01-01T00:00:00.0000001Z"),
+    ).toBeGreaterThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.5Z", "2026-01-01T00:00:00.500000000Z"),
+    ).toBe(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T00:00:00.999Z", "2026-01-01T00:00:01Z"),
+    ).toBeLessThan(0);
+    expect(
+      compareZonedIsoInstants("2026-01-01T02:00:00+02:00", "2026-01-01T00:00:00Z"),
+    ).toBe(0);
+  });
+
+  it("refuses a retired organization and project whose retiredAtIso precedes createdAtIso by less than a millisecond, and accepts equal and later sub-millisecond values", () => {
+    const createdAtIso = "2026-01-01T00:00:00.0000009Z";
+    const early = "2026-01-01T00:00:00.0000001Z";
+    const later = "2026-01-01T00:00:00.0000010Z";
+    const org = validateOrganizationRecord(
+      validOrganization({ createdAtIso, status: "retired", retiredAtIso: early }),
+    );
+    expect(org.ok).toBe(false);
+    if (!org.ok) {
+      expect(org.reason).toContain("retiredAtIso");
+    }
+    const project = validateProjectRecord(
+      validProject({ createdAtIso, status: "retired", retiredAtIso: early }),
+    );
+    expect(project.ok).toBe(false);
+    expect(
+      validateOrganizationRecord(
+        validOrganization({ createdAtIso, status: "retired", retiredAtIso: createdAtIso }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      validateProjectRecord(
+        validProject({ createdAtIso, status: "retired", retiredAtIso: later }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it("retireOrganization refuses a nowIso that precedes createdAtIso by less than a millisecond", () => {
+    const active = validateOrganizationRecord(
+      validOrganization({ createdAtIso: "2026-01-01T00:00:00.0000009Z" }),
+    );
+    expect(active.ok).toBe(true);
+    if (!active.ok) {
+      return;
+    }
+    const early = retireOrganization(active.value, "2026-01-01T00:00:00.0000001Z");
+    expect(early.ok).toBe(false);
+    expect(retireOrganization(active.value, "2026-01-01T00:00:00.0000009Z").ok).toBe(true);
+  });
+
+  it("names the field in the refusal when an allowed field is a non-enumerable property, for organization and project", () => {
+    const org = validOrganization();
+    Object.defineProperty(org, "displayName", { value: "Acme", enumerable: false });
+    const orgResult = validateOrganizationRecord(org);
+    expect(orgResult.ok).toBe(false);
+    if (!orgResult.ok) {
+      expect(orgResult.reason).toContain("displayName");
+      expect(orgResult.reason).toContain("non-enumerable");
+    }
+    const project = validProject();
+    Object.defineProperty(project, "displayName", { value: "Website", enumerable: false });
+    const projectResult = validateProjectRecord(project);
+    expect(projectResult.ok).toBe(false);
+    if (!projectResult.ok) {
+      expect(projectResult.reason).toContain("displayName");
+      expect(projectResult.reason).toContain("non-enumerable");
+    }
+  });
+
+  it("decideProjectTransition refuses a retired next record whose retiredAtIso precedes createdAtIso below a millisecond", () => {
+    const createdAtIso = "2026-01-01T00:00:00.0000009Z";
+    const current = validProject({ createdAtIso });
+    const next = validProject({
+      createdAtIso,
+      status: "retired",
+      retiredAtIso: "2026-01-01T00:00:00.0000001Z",
+    });
+    expect(decideProjectTransition(current, next).ok).toBe(false);
   });
 });

@@ -356,6 +356,22 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
           throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} is not a RunnerTunnelAdapter`);
         }
       }
+      // Copy from the validated descriptors, never by index read (a Proxy's
+      // `get` trap stays uninvoked and cannot substitute an unchecked member).
+      const copy: RunnerTunnelAdapter[] = [];
+      for (let i = 0; i < members.length; i += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(members, i);
+        if (
+          descriptor === undefined ||
+          descriptor.get !== undefined ||
+          descriptor.set !== undefined ||
+          !(descriptor.value instanceof RunnerTunnelAdapter)
+        ) {
+          throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} changed during validation`);
+        }
+        copy.push(descriptor.value);
+      }
+      this.members = copy;
     } catch (error: unknown) {
       if (error instanceof TypeError) {
         throw error;
@@ -364,12 +380,6 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
       // threw: refuse the input as a TypeError instead of letting it escape.
       throw new TypeError('RunnerTunnelSetAdapter: hostile members input');
     }
-    // Copy by validated index, never by spread (a Proxy's traps stay uninvoked).
-    const copy: RunnerTunnelAdapter[] = [];
-    for (let i = 0; i < members.length; i += 1) {
-      copy.push(members[i] as RunnerTunnelAdapter);
-    }
-    this.members = copy;
   }
 
   /** Whether any member currently holds an owned child. */

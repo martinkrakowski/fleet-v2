@@ -1081,8 +1081,6 @@ describe('conductor run tunnel wiring (G2)', () => {
 describe('hostile Proxy, subclass and accessor input (fix round 1)', () => {
   const asMembers = (value: unknown): readonly RunnerTunnelAdapter[] =>
     value as readonly RunnerTunnelAdapter[];
-  const asInstallation = (value: unknown): FleetInstallation | undefined =>
-    value as FleetInstallation | undefined;
 
   it('RunnerTunnelSetAdapter refuses Proxy-wrapped and custom-prototype members arrays instead of touching their traps', () => {
     const adapter = new RunnerTunnelAdapter({});
@@ -1106,6 +1104,111 @@ describe('hostile Proxy, subclass and accessor input (fix round 1)', () => {
     // A plain, real array of real adapters is still accepted.
     expect(() => new RunnerTunnelSetAdapter([adapter])).not.toThrow();
   });
+
+});
+
+describe('hostile prototype fall-through and lying Proxies (fix round 2)', () => {
+  const asMembers = (value: unknown): readonly RunnerTunnelAdapter[] =>
+    value as readonly RunnerTunnelAdapter[];
+  const asInstallation = (value: unknown): FleetInstallation | undefined =>
+    value as FleetInstallation | undefined;
+
+  it('resolveRunnerTunnelTargets never reads an absent field through a polluted Object.prototype', () => {
+    // A polluted `Object.prototype` getter for a missing field must never run:
+    // the function refuses any field that is not an own data property.
+    const polluted = new Error('the polluted Object.prototype getter must never run');
+    const saved = Object.getOwnPropertyDescriptor(Object.prototype, 'schemaVersion');
+    Object.defineProperty(Object.prototype, 'schemaVersion', {
+      enumerable: false,
+      configurable: true,
+      get: () => {
+        throw polluted;
+      },
+    });
+    try {
+      // The installation has no own `schemaVersion`, so the read would fall
+      // through to the inherited getter: refused as [] without invoking it.
+      expect(
+        resolveRunnerTunnelTargets(asInstallation({ hosts: { 'runner-a': sshHostFixture('alias-a', 4166) } })),
+      ).toEqual([]);
+    } finally {
+      if (saved === undefined) {
+        delete (Object.prototype as Record<string, unknown>).schemaVersion;
+      } else {
+        Object.defineProperty(Object.prototype, 'schemaVersion', saved);
+      }
+    }
+    // A valid v2 installation still resolves its target.
+    expect(
+      resolveRunnerTunnelTargets(installationWithHosts({ 'runner-a': sshHostFixture('alias-a', 4166) })),
+    ).toEqual([{ hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 }]);
+  });
+
+  it('resolveRunnerTunnelTargets refuses Proxies that report Object.prototype when a descriptor trap throws', () => {
+    // The Proxy passes the plain-object check (getPrototypeOf reports
+    // Object.prototype) but its getOwnPropertyDescriptor trap throws during
+    // the accessor checks: the answer is [] instead of an escaped error.
+    const hostile = new Proxy(
+      { schemaVersion: 2, hosts: { 'runner-a': sshHostFixture('alias-a', 4166) } } as Record<string, unknown>,
+      {
+        getOwnPropertyDescriptor(): never {
+          throw new Error('the installation getOwnPropertyDescriptor trap must not escape');
+        },
+      },
+    );
+    expect(resolveRunnerTunnelTargets(asInstallation(hostile))).toEqual([]);
+  });
+
+  it('RunnerTunnelSetAdapter builds from descriptors without ever invoking a Proxy get trap', () => {
+    const adapter = new RunnerTunnelAdapter({});
+    // The Proxy reports Array.prototype (so it passes the prototype check) and
+    // honest descriptors, but its `get` trap throws whenever an element is
+    // read by index. Validation and the copy read only descriptors, so the
+    // trap is never touched (the old index-based copy would have escaped it).
+    const lyingGet = new Proxy([adapter] as unknown as readonly RunnerTunnelAdapter[], {
+      getPrototypeOf: () => Array.prototype,
+      get(target, key) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) {
+          throw new Error('the members get trap must never run');
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    let built: RunnerTunnelSetAdapter | undefined;
+    expect(() => {
+      built = new RunnerTunnelSetAdapter(asMembers(lyingGet));
+    }).not.toThrow();
+    expect(built).toBeInstanceOf(RunnerTunnelSetAdapter);
+    // A Proxy whose descriptor traps throw during the copy is refused as a
+    // TypeError instead of letting the trap escape.
+    const throwingDescriptor = new Proxy([adapter] as unknown as readonly RunnerTunnelAdapter[], {
+      getPrototypeOf: () => Array.prototype,
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') {
+          return { value: 1, writable: true, enumerable: true, configurable: true };
+        }
+        if (key === '0') {
+          return { value: adapter, writable: true, enumerable: true, configurable: true };
+        }
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+      ownKeys: () => ['0', 'length'],
+    });
+    const sabotaged = new Proxy(throwingDescriptor, {
+      getOwnPropertyDescriptor(_target, key) {
+        if (key === '0') {
+          throw new Error('the members getOwnPropertyDescriptor trap must not escape');
+        }
+        return Reflect.getOwnPropertyDescriptor(throwingDescriptor, key);
+      },
+    });
+    expect(() => new RunnerTunnelSetAdapter(asMembers(sabotaged))).toThrow(TypeError);
+  });
+});
+
+describe('hostile class, Proxy and accessor input (fix round 1, continued)', () => {
+  const asInstallation = (value: unknown): FleetInstallation | undefined =>
+    value as FleetInstallation | undefined;
 
   it('resolveRunnerTunnelTargets refuses class instances, Proxy traps, and schemaVersion and runner accessors without invoking them', () => {
     // A class instance (custom prototype) is refused even with a valid shape.

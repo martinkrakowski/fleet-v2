@@ -505,10 +505,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   }
 }
 
-/** True when the own property is an accessor: its getter is never invoked. */
+/**
+ * True unless the key is an own data property: an accessor is refused unread,
+ * a missing own property is refused too (reading it would fall through to the
+ * prototype chain, where a polluted `Object.prototype` getter could run), and
+ * a throwing descriptor trap refuses the record instead of escaping.
+ */
 function isAccessor(record: Record<string, unknown>, key: string): boolean {
-  const descriptor = Object.getOwnPropertyDescriptor(record, key);
-  return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    return (
+      descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined
+    );
+  } catch {
+    // A hostile `getOwnPropertyDescriptor` trap: refuse without escaping.
+    return true;
+  }
 }
 
 /** Array membership without ever calling a method or a getter on the array. */
@@ -556,7 +568,13 @@ export function resolveRunnerTunnelTargets(installation?: FleetInstallation): re
   if (isAccessor(installation, 'hosts')) {
     return [];
   }
-  const hosts = installation.hosts;
+  let hosts: unknown;
+  try {
+    hosts = installation.hosts;
+  } catch {
+    // A hostile `get` trap on the wrapped record: refuse the installation.
+    return [];
+  }
   if (!isPlainObject(hosts)) {
     return [];
   }

@@ -127,15 +127,21 @@ describe("aggregateDailyMeter", () => {
     for (let i = 0; i < DAILY_METER_MAX_ROWS + 1; i += 1) {
       huge[i] = row({ attemptId: `att-${i}` });
     }
-    // The snapshot caps the array length in O(1) before walking elements,
-    // so a hostile getter on the first element must never run.
-    let elementReads = 0;
+    // The snapshot caps the array length in O(1) before walking elements.
+    // It reads elements through property descriptors, so touching an element
+    // raises `getOwnPropertyDescriptor`/`ownKeys` traps, not a `get` trap:
+    // count those to prove the element was never even visited.
+    let elementVisits = 0;
     const watched = new Proxy(
       { ...row(), extra: 0 },
       {
-        get() {
-          elementReads += 1;
-          return 1;
+        getOwnPropertyDescriptor() {
+          elementVisits += 1;
+          return undefined;
+        },
+        ownKeys() {
+          elementVisits += 1;
+          return Reflect.ownKeys(row());
         },
       },
     );
@@ -144,15 +150,20 @@ describe("aggregateDailyMeter", () => {
       ok: false,
       reason: "invalid-input",
     });
-    expect(elementReads).toBe(0);
+    expect(elementVisits).toBe(0);
   });
 
   it("refuses getters on input, rows, and row elements without invoking them", () => {
+    // The refusal alone would pass even if a getter ran, threw, and was
+    // swallowed by the snapshot; the invocation counter proves the getter
+    // body never executed at all.
+    let getterInvocations = 0;
     const makeGetter = () => {
       const watched: Record<string, unknown> = {};
       Object.defineProperty(watched, "secret", {
         enumerable: true,
         get() {
+          getterInvocations += 1;
           throw new Error("getter ran");
         },
       });
@@ -162,6 +173,7 @@ describe("aggregateDailyMeter", () => {
     Object.defineProperty(outer, "secret", {
       enumerable: true,
       get() {
+        getterInvocations += 1;
         throw new Error("getter ran");
       },
     });
@@ -183,6 +195,7 @@ describe("aggregateDailyMeter", () => {
     Object.defineProperty(getterRow, "tokens", {
       enumerable: true,
       get() {
+        getterInvocations += 1;
         throw new Error("getter ran");
       },
     });
@@ -190,6 +203,7 @@ describe("aggregateDailyMeter", () => {
       ok: false,
       reason: "invalid-input",
     });
+    expect(getterInvocations).toBe(0);
   });
 
   it("refuses hostile Proxies and transparent Proxies when detector is supplied", () => {

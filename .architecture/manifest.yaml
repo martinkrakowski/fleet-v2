@@ -1181,8 +1181,9 @@ bounded_contexts:
     status: active
     description: >-
       Owns organisation, project and membership records for deployments serving
-      more than one organisation. Pure domain entities only; ports, adapters
-      and I/O belong to later stations.
+      more than one organisation. Domain entities, the organisation repository
+      port and its file-backed adapter; use cases and wiring belong to later
+      stations.
     depends_on: []
     layers:
       domain:
@@ -1192,9 +1193,9 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: []
+          out: [OrganizationRepositoryPort]
       infrastructure:
-        adapters: []
+        adapters: [OrganizationRepositoryAdapter]
 
   - name: billing
     type: supporting

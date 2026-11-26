@@ -11,14 +11,16 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { promisify, types } from 'node:util';
 
-import { isValidHostName } from '@fleet/shared';
+import { isValidHostName, snapshotPlainData, type IsProxy } from '@fleet/shared';
 
 import type {
   AbortWorktreeRunRequest,
   AbortWorktreeRunResult,
   ExecutionRunnerPort,
+  ListRunnerSessionsRef,
+  ListRunnerSessionsResult,
   RunnerIsolationCapabilities,
   RunnerSessionRef,
   RunnerSessionStatus,
@@ -399,6 +401,12 @@ function parseSessionId(stdout: string): string | null {
 }
 
 const STATUS_HEADER_PATTERN = /^ocm-run: running in .*:$/;
+
+/** Explicit loop cost bound on the lines scanned after a status header. */
+const MAX_STATUS_LINES = 1024;
+
+/** Explicit loop cost bound on the session ids collected from status text. */
+const MAX_LISTED_SESSIONS = 1024;
 const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 /**
@@ -411,7 +419,11 @@ function statusSessionIds(stdout: string): string[] {
   const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
   if (headerIndex === -1) return [];
   const ids = new Set<string>();
-  for (const rawLine of lines.slice(headerIndex + 1)) {
+  // Cost bound: at most MAX_STATUS_LINES lines scanned after the header and
+  // at most MAX_LISTED_SESSIONS ids collected, whatever the output holds.
+  const boundedLines = lines.slice(headerIndex + 1, headerIndex + 1 + MAX_STATUS_LINES);
+  for (const rawLine of boundedLines) {
+    if (ids.size >= MAX_LISTED_SESSIONS) break;
     const line = rawLine.trim();
     if (SESSION_ID_PATTERN.test(line)) ids.add(line);
   }
@@ -421,6 +433,66 @@ function statusSessionIds(stdout: string): string[] {
 /** A runner output line that reports the runner aborted a session. */
 function isAbortLine(line: string): boolean {
   return /aborted the session/.test(line) || /aborting it/.test(line);
+}
+
+/**
+ * Pure parse of an untrusted runner session-list payload into a typed
+ * `ListRunnerSessionsResult`. Every untrusted value is read only through
+ * `snapshotPlainData` with the infrastructure-injected `isProxy` detector —
+ * never a hand-rolled guard, never a constant or identity check — so a
+ * hostile getter or Proxy trap is refused before it can execute. The payload
+ * is either an array of session id strings or a plain record whose own
+ * `sessions` property holds such an array. `snapshotPlainData` enforces the
+ * resource bounds (`maxDepth: 16`, `maxKeys: 128`, `maxArrayLength: 1024`,
+ * `maxNodes: 4096`, `maxStringLength: 16_384`) before any loop; the loop here
+ * is bounded by `sessions.length <= 1024` and every id must be a non-empty
+ * `SESSION_ID_PATTERN` string of at most 128 characters.
+ */
+export function parseListSessionsPayload(
+  value: unknown,
+  isProxy: IsProxy,
+): ListRunnerSessionsResult {
+  const snapshot = snapshotPlainData(value, isProxy);
+  if (!snapshot.ok) {
+    return {
+      ok: false,
+      error: 'unreadable',
+      reason: `Unreadable runner session payload: ${snapshot.reason}`,
+    };
+  }
+  const data = snapshot.value;
+  let rawSessions: unknown;
+  if (Array.isArray(data)) {
+    rawSessions = data;
+  } else if (typeof data === 'object' && data !== null) {
+    const record = data as Record<string, unknown>;
+    // Prototype-polluting keys are refused, never interpreted: a payload key
+    // named `__proto__`, `constructor` or `prototype` is hostile input.
+    const keys = Object.keys(record);
+    if (keys.some((key) => key === '__proto__' || key === 'constructor' || key === 'prototype')) {
+      return { ok: false, error: 'unreadable', reason: 'Runner session payload holds a prototype-polluting key' };
+    }
+    if (!Object.prototype.hasOwnProperty.call(record, 'sessions')) {
+      return { ok: false, error: 'unreadable', reason: 'Runner session payload has no sessions property' };
+    }
+    rawSessions = record.sessions;
+  } else {
+    return { ok: false, error: 'unreadable', reason: 'Runner session payload is not a list or record' };
+  }
+  if (!Array.isArray(rawSessions)) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session payload sessions is not an array' };
+  }
+  if (rawSessions.length > 1024) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session payload lists too many sessions' };
+  }
+  const sessions: string[] = [];
+  for (const id of rawSessions) {
+    if (typeof id !== 'string' || id.length === 0 || id.length > 128 || !SESSION_ID_PATTERN.test(id)) {
+      return { ok: false, error: 'unreadable', reason: 'Runner session payload holds an invalid session id' };
+    }
+    sessions.push(id);
+  }
+  return { ok: true, sessions };
 }
 
 /**
@@ -1104,6 +1176,143 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
     return {
       outcome: 'still-running',
       reason: result.stderr || result.stdout || 'Abort did not confirm termination',
+    };
+  }
+
+  /**
+   * Read-only listing of the session ids a worktree directory's runner
+   * reports, with no collect step and no state change. The ref is validated
+   * through `snapshotPlainData` with the infrastructure-injected proxy
+   * detector, the worktree path is required, and the configured port/host
+   * must be safe and match the recorded runner when one is provided. The
+   * subprocess runs under a bounded status timeout; its result is re-read
+   * only through `snapshotPlainData`. Every failure or unknown path fails
+   * closed: `unreachable` when the runner cannot be reached, `unreadable`
+   * when its answer cannot be trusted.
+   */
+  async listSessions(ref?: ListRunnerSessionsRef): Promise<ListRunnerSessionsResult> {
+    if (ref !== undefined) {
+      const snapRef = snapshotPlainData(ref, types.isProxy);
+      if (!snapRef.ok) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: `Unreadable listSessions ref: ${snapRef.reason}`,
+        };
+      }
+    }
+    const worktreePath = ref?.worktreePath;
+    if (typeof worktreePath !== 'string' || worktreePath.trim() === '') {
+      return { ok: false, error: 'unreadable', reason: 'Missing or invalid worktreePath' };
+    }
+
+    const configuredPort = this.configuredRemotePort();
+    const configuredHost = this.configuredRemoteHost();
+
+    if (configuredPort === undefined) {
+      return { ok: false, error: 'unreadable', reason: 'No runner port configured' };
+    }
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return { ok: false, error: 'unreadable', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+
+    const recordedRunner = ref?.runner ?? null;
+    if (recordedRunner !== null) {
+      if (
+        recordedRunner.host !== null &&
+        recordedRunner.host !== undefined &&
+        !isSafeSshHost(recordedRunner.host)
+      ) {
+        return { ok: false, error: 'unreadable', reason: `Unsafe recorded runner host: ${recordedRunner.host}` };
+      }
+      if (
+        configuredPort !== recordedRunner.remotePort ||
+        (configuredHost ?? null) !== (recordedRunner.host ?? null)
+      ) {
+        return { ok: false, error: 'unreadable', reason: 'Configured runner port or host differs from recorded runner' };
+      }
+    }
+
+    let result: SubprocessResult;
+    try {
+      result = await this.run(
+        this.binPath(),
+        ['--status', '--dir', worktreePath],
+        this.remotePortEnv(configuredPort, recordedRunner?.host ?? undefined),
+        { timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS },
+      );
+    } catch (error) {
+      return { ok: false, error: 'unreachable', reason: `Status command failed: ${String(error)}` };
+    }
+
+    const snapResult = snapshotPlainData(result, types.isProxy);
+    if (!snapResult.ok) {
+      return {
+        ok: false,
+        error: 'unreadable',
+        reason: `Unreadable runner status result: ${snapResult.reason}`,
+      };
+    }
+    const inspected = snapResult.value as unknown;
+    if (
+      typeof inspected !== 'object' ||
+      inspected === null ||
+      !Number.isInteger((inspected as SubprocessResult).exitCode) ||
+      typeof (inspected as SubprocessResult).stdout !== 'string'
+    ) {
+      return { ok: false, error: 'unreadable', reason: 'Runner status result has an invalid shape' };
+    }
+    const exitCode = (inspected as SubprocessResult).exitCode;
+    const stdout = (inspected as SubprocessResult).stdout;
+
+    if (exitCode === 1) {
+      return {
+        ok: false,
+        error: 'unreachable',
+        reason: `status command exited 1: ${result.stderr || result.stdout || 'no output'}`,
+      };
+    }
+    if (exitCode === 2) {
+      return {
+        ok: false,
+        error: 'unreadable',
+        reason: `status command exited 2: ${result.stderr || result.stdout || 'no output'}`,
+      };
+    }
+    if (exitCode === 0) {
+      const trimmed = stdout.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          return parseListSessionsPayload(JSON.parse(trimmed), types.isProxy);
+        } catch {
+          return { ok: false, error: 'unreadable', reason: 'Malformed JSON in runner status output' };
+        }
+      }
+      return { ok: true, sessions: [] };
+    }
+    if (exitCode === 3) {
+      const trimmed = stdout.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          return parseListSessionsPayload(JSON.parse(trimmed), types.isProxy);
+        } catch {
+          return { ok: false, error: 'unreadable', reason: 'Malformed JSON in runner status output' };
+        }
+      }
+      const ids = statusSessionIds(stdout);
+      if (ids.length === 0) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: `status exit 3 listed no valid session ids`,
+        };
+      }
+      return { ok: true, sessions: ids };
+    }
+    return {
+      ok: false,
+      error: 'unreadable',
+      reason: `status command exited ${exitCode}: ${result.stderr || result.stdout || 'no output'}`,
     };
   }
 

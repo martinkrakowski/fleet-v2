@@ -6,10 +6,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   AttemptRepositoryAdapter,
+  AuthorityEventJournalAdapter,
   LaneRun,
   LaneRunRepositoryAdapter,
+  withStopAuthorityEvents,
   type AttemptRecord,
   type LaneRunRecord,
+  type StopAuthorityEventContext,
+  type StopAttemptPort,
 } from "@fleet/work-execution";
 
 import { createConfiguredWorkComposition } from "../work/composition";
@@ -52,14 +56,15 @@ async function makeOcmRunStub(): Promise<string> {
   return stub;
 }
 
-async function seedRunningAttempt(stateDir: string): Promise<void> {
-  const record: AttemptRecord = {
-    id: ATTEMPT_ID,
+/** One valid attempt record; `stateDir` only fills the worktree path field. */
+function makeAttemptRecord(id: string, worktreePath = "/tmp/fleet-fc12d-unused"): AttemptRecord {
+  return {
+    id,
     workOrderId: "wo-fc12d",
     kind: "initial",
     fixNumber: 0,
     priorAttemptId: null,
-    worktreePath: stateDir,
+    worktreePath,
     baseCommit: "a".repeat(40),
     state: "running",
     revision: 1,
@@ -80,7 +85,12 @@ async function seedRunningAttempt(stateDir: string): Promise<void> {
     createdAtIso: NOW_ISO,
     updatedAtIso: NOW_ISO,
   };
-  await new AttemptRepositoryAdapter({ stateDir }).saveAttempt(record);
+}
+
+async function seedRunningAttempt(stateDir: string): Promise<void> {
+  await new AttemptRepositoryAdapter({ stateDir }).saveAttempt(
+    makeAttemptRecord(ATTEMPT_ID, stateDir),
+  );
 }
 
 /** One active lane run that owns no attempt. */
@@ -165,7 +175,7 @@ describe("API stop authority event wiring (FC12D)", () => {
     });
   });
 
-  it("emits one authority event on requestLaneRunStop and keeps one line with the same eventId on idempotent retry", async () => {
+  it("emits one authority event on requestLaneRunStop, refuses an exact replay of the same request, and keeps one line with the same eventId on a fresh-entryId retry", async () => {
     const { stateDir, ocmRunBin } = await makeDurableComposition();
     const work = createConfiguredWorkComposition(compositionOptions(stateDir, ocmRunBin));
     const request = {
@@ -191,22 +201,25 @@ describe("API stop authority event wiring (FC12D)", () => {
       afterRevision: null,
     });
 
-    // A retried stop arrives as a fresh request: the web stop route mints a
-    // new entry id per HTTP call (`stop.post.ts`), so a second request for
-    // the same recorded stop key answers `already-requested` and appends no
-    // journal entry of its own.
+    // The brief's retry requirement: the exact same request, byte for byte.
+    // The run journal refuses a replayed entry id (`duplicate-entry-id`), so
+    // the use case answers `refused/journal-refused` — and appends nothing:
+    // the journal still holds exactly one line with the identical event id.
+    const replayed = await work.requestLaneRunStop.requestLaneRunStop(request);
+    expect(replayed).toEqual({ outcome: "refused", reason: "journal-refused" });
+    const afterReplay = await readJournal(stateDir);
+    expect(afterReplay).not.toBeNull();
+    expect(afterReplay).toHaveLength(1);
+    expect(afterReplay![0]!["eventId"]).toBe(`stop:${RUN_ID}/stop@web`);
+
+    // The wired retry the web stop route actually performs (`stop.post.ts`
+    // mints a fresh entry id per HTTP call): the same stop key answers
+    // `already-requested`, and the audited wrapper re-emits the identical
+    // event id to the idempotent sink — still exactly one journal line.
     const retryRequest = { ...request, entryId: RETRY_ENTRY_ID };
     const retried = await work.requestLaneRunStop.requestLaneRunStop(retryRequest);
     expect(retried).toEqual({ outcome: "already-requested", runId: RUN_ID, mode: "graceful" });
-
-    // The idempotent retry the brief requires: the exact same request, byte
-    // for byte, answered `already-requested` again. The first retry appended
-    // nothing, so the journal's entry-id uniqueness cannot refuse the replay,
-    // and the journal still holds exactly one line with the identical event id.
-    const exact = await work.requestLaneRunStop.requestLaneRunStop(retryRequest);
-    expect(exact).toEqual({ outcome: "already-requested", runId: RUN_ID, mode: "graceful" });
     const afterRetry = await readJournal(stateDir);
-    expect(afterRetry).not.toBeNull();
     expect(afterRetry).toHaveLength(1);
     expect(afterRetry![0]!["eventId"]).toBe(`stop:${RUN_ID}/stop@web`);
   });
@@ -248,8 +261,64 @@ describe("API stop authority event wiring (FC12D)", () => {
     });
     expect(refused.outcome).toBe("refused");
 
+    // The disposable composition wires the lane-run stop with a null sink
+    // behind a use case built without repositories: the use case's own
+    // not-implemented failure propagates unchanged and the null sink is
+    // never touched.
+    await expect(
+      work.requestLaneRunStop.requestLaneRunStop({
+        runId: RUN_ID,
+        mode: "graceful",
+        via: "web",
+        entryId: ENTRY_ID,
+        nowIso: NOW_ISO,
+      }),
+    ).rejects.toThrow("Not implemented: RequestLaneRunStopUseCase");
+
     await expect(
       readFile(path.join(unusedDir, "authority-events.jsonl"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("completes the stop event path without error through the in-memory and null sinks the disposable composition wires", async () => {
+    // The same wrapper `createConfiguredWorkComposition` applies, over a stub
+    // stop use case: the disposable composition wires an in-memory
+    // `AuthorityEventJournalAdapter` behind `stopAttempt` and `null` behind
+    // `requestLaneRunStop`, so both sink shapes must complete the event path
+    // without error.
+    const attempt = makeAttemptRecord("attempt-fc12d-sink");
+    const useCase: StopAttemptPort = {
+      stopAttempt: async () => ({
+        outcome: "terminated",
+        attempt,
+        receipt: {
+          attemptId: attempt.id,
+          sessionId: "sess-1",
+          endedAtIso: NOW_ISO,
+          authoritative: true,
+          exitStatus: null,
+          stoppedByRequest: true,
+        },
+        capacityReleased: true,
+      }),
+    };
+    const context: StopAuthorityEventContext = { actor: "web-api", organizationId: null };
+
+    const inMemory = withStopAuthorityEvents(
+      useCase,
+      new AuthorityEventJournalAdapter({}),
+      context,
+    );
+    const first = await inMemory.stopAttempt({ attemptId: attempt.id, nowIso: NOW_ISO });
+    expect(first.result.outcome).toBe("terminated");
+    expect(first.auditGap).toBe(false);
+    const repeat = await inMemory.stopAttempt({ attemptId: attempt.id, nowIso: NOW_ISO });
+    expect(repeat.result.outcome).toBe("terminated");
+    expect(repeat.auditGap).toBe(false);
+
+    const nullSink = withStopAuthorityEvents(useCase, null, context);
+    const gapped = await nullSink.stopAttempt({ attemptId: attempt.id, nowIso: NOW_ISO });
+    expect(gapped.result.outcome).toBe("terminated");
+    expect(gapped.auditGap).toBe(true);
   });
 });

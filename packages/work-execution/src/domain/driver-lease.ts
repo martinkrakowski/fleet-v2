@@ -11,7 +11,7 @@
  */
 
 import { isCalendarDateTime } from './plain-record-reads.js';
-import { LANE_RUN_LEASE_MAX_MS } from './lane-run-lease.js';
+import { CONDUCTOR_DRIVER_LEASE_RECORD_VERSION, LANE_RUN_LEASE_MAX_MS } from './lane-run-lease.js';
 import type { LaneRunLeaseRecord } from './lane-run-records.js';
 import { containsSecretShape, snapshotPlainData } from '@fleet/shared';
 import type { IsProxy, PlainDataLimits, PlainDataRefusalReason } from '@fleet/shared';
@@ -33,9 +33,18 @@ export type DriverLeaseRefusalReason =
   | 'lease-held'
   | 'lost-tiebreak';
 
+/**
+ * The lease record this decider produces: a run lease stamped with the
+ * driver-lease schema version, so the persisted record is exactly what
+ * `readConductorDriverLease` accepts.
+ */
+export type DriverLeaseRecord = LaneRunLeaseRecord & {
+  readonly version: typeof CONDUCTOR_DRIVER_LEASE_RECORD_VERSION;
+};
+
 export type DriverLeaseDecision =
-  | { readonly outcome: 'acquired'; readonly lease: LaneRunLeaseRecord }
-  | { readonly outcome: 'renewed'; readonly lease: LaneRunLeaseRecord }
+  | { readonly outcome: 'acquired'; readonly lease: DriverLeaseRecord }
+  | { readonly outcome: 'renewed'; readonly lease: DriverLeaseRecord }
   | { readonly outcome: 'refused'; readonly reason: DriverLeaseRefusalReason };
 
 const ID_MAX_BYTES = 256;
@@ -146,24 +155,26 @@ function isValidLeaseFields(lease: Record<string, unknown>): boolean {
   if (
     !isValidCandidateId(lease.holderId) ||
     !isZonedIso(lease.leaseUntilIso) ||
-    !(Number.isSafeInteger(lease.fence) && (lease.fence as number) >= 1)
+    !(Number.isSafeInteger(lease.fence) && (lease.fence as number) >= 1) ||
+    lease.version !== CONDUCTOR_DRIVER_LEASE_RECORD_VERSION
   ) {
-    return false;
-  }
-  if (Object.hasOwn(lease, 'version') && lease.version !== 1) {
     return false;
   }
   return true;
 }
 
 /**
- * The pure takeover decider. The injected `isProxy` is a separate positional
- * parameter (never an options field): infrastructure passes
- * `types.isProxy` so this module never imports a runtime specifier.
+ * The pure takeover decider. The injected `isProxy` is a required separate
+ * positional parameter (never an options field, never defaulted): the domain
+ * layer may not import `node:util`, so infrastructure passes `types.isProxy`.
+ * Without a real detector a Proxy over a plain record would be reflected and
+ * its traps would run, so there is no "accept everything" fallback: a missing
+ * or non-function detector is a typed `'invalid-input'` refusal from
+ * `snapshotPlainData`, never a silent pass.
  */
 export function decideDriverLease(
   input: unknown,
-  isProxy: IsProxy = () => false,
+  isProxy: IsProxy,
 ): DriverLeaseDecision {
   // One hostile-input read; the snapshot runs the detector before any
   // reflection, reads descriptors without invoking getters, refuses
@@ -219,6 +230,7 @@ export function decideDriverLease(
       !Object.hasOwn(leaseRecord, 'holderId') ||
       !Object.hasOwn(leaseRecord, 'fence') ||
       !Object.hasOwn(leaseRecord, 'leaseUntilIso') ||
+      !Object.hasOwn(leaseRecord, 'version') ||
       !isValidLeaseFields(leaseRecord)
     ) {
       return refused('invalid-lease');
@@ -264,6 +276,7 @@ export function decideDriverLease(
       return {
         outcome: 'renewed',
         lease: Object.freeze({
+          version: CONDUCTOR_DRIVER_LEASE_RECORD_VERSION,
           holderId: leaseRecord?.holderId as string,
           fence: leaseRecord?.fence as number,
           leaseUntilIso: nextLeaseUntilIso,
@@ -285,6 +298,7 @@ export function decideDriverLease(
   return {
     outcome: 'acquired',
     lease: Object.freeze({
+      version: CONDUCTOR_DRIVER_LEASE_RECORD_VERSION,
       holderId: candidateId,
       fence: nextFence,
       leaseUntilIso: nextLeaseUntilIso,

@@ -4,9 +4,18 @@
  * and no rejected value is ever echoed.
  */
 
+import { types } from 'node:util';
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_DRIVER_LEASE_TTL_MS, decideDriverLease } from '../driver-lease.js';
+
+/**
+ * Every plain call goes through the real production detector, exactly like
+ * infrastructure: there is no accepting fallback for a Proxy.
+ */
+function decide(input: unknown): ReturnType<typeof decideDriverLease> {
+  return decideDriverLease(input, types.isProxy);
+}
 
 /** A revoked Proxy throws on every trap, including [[GetPrototypeOf]]. */
 function revokedProxy(): unknown {
@@ -15,18 +24,19 @@ function revokedProxy(): unknown {
   return proxy;
 }
 
-/** A getter-bearing record whose getters record any invocation. */
-function getterOn(key: string, value: unknown, target: Record<string, unknown>): unknown {
-  const probe: Record<string, unknown> = { ...target, [key]: value };
-  return new Proxy(probe, {
-    getOwnPropertyDescriptor(t, prop) {
-      const descriptor = Reflect.getOwnPropertyDescriptor(t, prop);
-      if (prop === key && descriptor !== undefined) {
-        return { ...descriptor, get: () => (invokedGetters.push(key), descriptor.value) };
-      }
-      return descriptor;
-    },
+/**
+ * A plain record carrying one accessor on `key` whose getter records any
+ * invocation: no Proxy is involved, so the real detector sees plain data and
+ * the descriptor read must refuse without ever running the getter.
+ */
+function accessorOn(key: string, value: unknown, target: Record<string, unknown>): unknown {
+  const probe: Record<string, unknown> = { ...target };
+  delete probe[key];
+  Object.defineProperty(probe, key, {
+    enumerable: true,
+    get: () => (invokedGetters.push(key), value),
   });
+  return probe;
 }
 const invokedGetters: string[] = [];
 
@@ -54,13 +64,12 @@ function liveLease(holderId: string, fence: number, leaseUntilIso: string): Reco
 }
 
 describe('decideDriverLease', () => {
-  it('acquires from a null lease with fence 1 and a frozen lease record using the default ttl', () => {
-    const decision = decideDriverLease(
-      baseRequest({ lease: null }),
-    );
+  it('acquires from a null lease with fence 1 and a frozen version-stamped lease record using the default ttl', () => {
+    const decision = decide(baseRequest({ lease: null }));
     expect(decision).toEqual({
       outcome: 'acquired',
       lease: {
+        version: 1,
         holderId: 'driver-b',
         fence: 1,
         leaseUntilIso: '2026-01-01T00:01:00.000Z',
@@ -71,7 +80,7 @@ describe('decideDriverLease', () => {
   });
 
   it('refuses a takeover before expiry (1ms before leaseUntilIso) with lease-held', () => {
-    const decision = decideDriverLease(
+    const decision = decide(
       baseRequest({
         lease: liveLease('driver-a', 3, '2026-01-01T00:01:00.000Z'),
       }),
@@ -80,7 +89,7 @@ describe('decideDriverLease', () => {
   });
 
   it('acquires a takeover at the exact expiry instant and after it, incrementing fence by 1', () => {
-    const atExpiry = decideDriverLease(
+    const atExpiry = decide(
       baseRequest({
         nowIso: '2026-01-01T01:00:00.000Z',
         lease: liveLease('driver-a', 3, '2026-01-01T01:00:00.000Z'),
@@ -88,9 +97,14 @@ describe('decideDriverLease', () => {
     );
     expect(atExpiry).toEqual({
       outcome: 'acquired',
-      lease: { holderId: 'driver-b', fence: 4, leaseUntilIso: '2026-01-01T01:01:00.000Z' },
+      lease: {
+        version: 1,
+        holderId: 'driver-b',
+        fence: 4,
+        leaseUntilIso: '2026-01-01T01:01:00.000Z',
+      },
     });
-    const afterExpiry = decideDriverLease(
+    const afterExpiry = decide(
       baseRequest({
         nowIso: '2026-01-01T02:00:00.000Z',
         lease: liveLease('driver-a', 7, '2026-01-01T01:00:00.000Z'),
@@ -98,12 +112,17 @@ describe('decideDriverLease', () => {
     );
     expect(afterExpiry).toEqual({
       outcome: 'acquired',
-      lease: { holderId: 'driver-b', fence: 8, leaseUntilIso: '2026-01-01T02:01:00.000Z' },
+      lease: {
+        version: 1,
+        holderId: 'driver-b',
+        fence: 8,
+        leaseUntilIso: '2026-01-01T02:01:00.000Z',
+      },
     });
   });
 
   it('renews for the holder before expiry (1ms before leaseUntilIso), keeping the fence and advancing leaseUntilIso', () => {
-    const decision = decideDriverLease(
+    const decision = decide(
       baseRequest({
         candidateId: 'driver-a',
         nowIso: '2026-01-01T00:00:59.999Z',
@@ -113,6 +132,7 @@ describe('decideDriverLease', () => {
     expect(decision).toEqual({
       outcome: 'renewed',
       lease: {
+        version: 1,
         holderId: 'driver-a',
         fence: 3,
         leaseUntilIso: '2026-01-01T00:01:59.999Z',
@@ -121,7 +141,7 @@ describe('decideDriverLease', () => {
   });
 
   it('reacquires as the holder at or after expiry (nowIso === leaseUntilIso), incrementing fence by 1', () => {
-    const decision = decideDriverLease(
+    const decision = decide(
       baseRequest({
         candidateId: 'driver-a',
         nowIso: '2026-01-01T01:00:00.000Z',
@@ -130,7 +150,12 @@ describe('decideDriverLease', () => {
     );
     expect(decision).toEqual({
       outcome: 'acquired',
-      lease: { holderId: 'driver-a', fence: 4, leaseUntilIso: '2026-01-01T01:01:00.000Z' },
+      lease: {
+        version: 1,
+        holderId: 'driver-a',
+        fence: 4,
+        leaseUntilIso: '2026-01-01T01:01:00.000Z',
+      },
     });
   });
 
@@ -139,11 +164,16 @@ describe('decideDriverLease', () => {
       nowIso: '2026-01-01T01:00:00.000Z',
       lease: liveLease('driver-a', 3, '2026-01-01T01:00:00.000Z'),
     });
-    expect(decideDriverLease({ ...request, candidateId: 'driver-a', competingCandidateIds: ['driver-b'] })).toEqual({
+    expect(decide({ ...request, candidateId: 'driver-a', competingCandidateIds: ['driver-b'] })).toEqual({
       outcome: 'acquired',
-      lease: { holderId: 'driver-a', fence: 4, leaseUntilIso: '2026-01-01T01:01:00.000Z' },
+      lease: {
+        version: 1,
+        holderId: 'driver-a',
+        fence: 4,
+        leaseUntilIso: '2026-01-01T01:01:00.000Z',
+      },
     });
-    expect(decideDriverLease({ ...request, candidateId: 'driver-b', competingCandidateIds: ['driver-a'] })).toEqual({
+    expect(decide({ ...request, candidateId: 'driver-b', competingCandidateIds: ['driver-a'] })).toEqual({
       outcome: 'refused',
       reason: 'lost-tiebreak',
     });
@@ -154,7 +184,7 @@ describe('decideDriverLease', () => {
       baseRequest({ lease: liveLease('driver-a', 1, '2020-01-01T00:00:00.000Z') }),
     );
     const before = JSON.stringify(request);
-    decideDriverLease(request);
+    decide(request);
     expect(JSON.stringify(request)).toBe(before);
   });
 
@@ -170,10 +200,10 @@ describe('decideDriverLease', () => {
       JSON.parse('{"__proto__":1}'),
       { ...baseRequest({}), extra: 1 },
     ]) {
-      expect(decideDriverLease(input)).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+      expect(decide(input)).toEqual({ outcome: 'refused', reason: 'invalid-input' });
     }
-    const getterInput = getterOn('unknownKey', 1, { ...baseRequest({}), unknownKey: 1 });
-    expect(decideDriverLease(getterInput)).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+    const getterInput = accessorOn('unknownKey', 1, { ...baseRequest({}), unknownKey: 1 });
+    expect(decide(getterInput)).toEqual({ outcome: 'refused', reason: 'invalid-input' });
     expect(invokedGetters).toEqual([]);
   });
 
@@ -193,8 +223,24 @@ describe('decideDriverLease', () => {
     expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-input' });
     expect(reflected).toBe(false);
     expect(detectorInvocations.length).toBeGreaterThan(0);
-    // A throwing or revoked-Proxy-shaped input via the default detector path.
-    expect(decideDriverLease(revokedProxy())).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+    // A revoked Proxy is refused through the same required-detector path.
+    expect(decide(revokedProxy())).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+  });
+
+  it('refuses a missing or non-function detector with invalid-input instead of silently accepting a Proxy', () => {
+    let reflected = false;
+    const proxied = new Proxy(baseRequest({}), {
+      ownKeys() {
+        reflected = true;
+        throw new Error('ownKeys must never be reached');
+      },
+    });
+    for (const missing of [undefined, null]) {
+      expect(
+        decideDriverLease(proxied, missing as never),
+      ).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+    }
+    expect(reflected).toBe(false);
   });
 
   it('refuses missing, empty, untrimmed, overlong, non-string, getter-bearing, and secret-shaped candidateId with invalid-candidate-id', () => {
@@ -209,17 +255,17 @@ describe('decideDriverLease', () => {
       'x'.repeat(257),
       secretShaped,
     ]) {
-      expect(decideDriverLease(baseRequest({ candidateId }))).toEqual({
+      expect(decide(baseRequest({ candidateId }))).toEqual({
         outcome: 'refused',
         reason: 'invalid-candidate-id',
       });
     }
-    expect(decideDriverLease({ nowIso: '2026-01-01T00:00:00.000Z', lease: null })).toEqual({
+    expect(decide({ nowIso: '2026-01-01T00:00:00.000Z', lease: null })).toEqual({
       outcome: 'refused',
       reason: 'invalid-candidate-id',
     });
-    const getterInput = getterOn('candidateId', 'driver-b', baseRequest({}));
-    expect(decideDriverLease(getterInput)).toEqual({
+    const getterInput = accessorOn('candidateId', 'driver-b', baseRequest({}));
+    expect(decide(getterInput)).toEqual({
       outcome: 'refused',
       reason: 'invalid-candidate-id',
     });
@@ -236,49 +282,50 @@ describe('decideDriverLease', () => {
       '2026-01-01T00:00:00Z ',
       '2026-02-31T00:00:00.000Z',
     ]) {
-      expect(decideDriverLease(baseRequest({ nowIso }))).toEqual({
+      expect(decide(baseRequest({ nowIso }))).toEqual({
         outcome: 'refused',
         reason: 'invalid-now-iso',
       });
     }
-    expect(decideDriverLease({ candidateId: 'driver-b', lease: null })).toEqual({
+    expect(decide({ candidateId: 'driver-b', lease: null })).toEqual({
       outcome: 'refused',
       reason: 'invalid-now-iso',
     });
-    const getterInput = getterOn('nowIso', '2026-01-01T00:00:00.000Z', baseRequest({}));
-    expect(decideDriverLease(getterInput)).toEqual({
+    const getterInput = accessorOn('nowIso', '2026-01-01T00:00:00.000Z', baseRequest({}));
+    expect(decide(getterInput)).toEqual({
       outcome: 'refused',
       reason: 'invalid-now-iso',
     });
     expect(invokedGetters).toEqual([]);
   });
 
-  it('refuses missing, malformed, getter-bearing, proxied, non-v1, and fence-overflow lease records with invalid-lease', () => {
+  it('refuses missing, malformed, getter-bearing, proxied, non-v1, missing-version, and fence-overflow lease records with invalid-lease', () => {
     const atExpiry = '2026-01-01T01:00:00.000Z';
     for (const lease of [
       undefined,
       42,
       'lease',
       ['lease'],
+      { holderId: 'driver-a', fence: 1, leaseUntilIso: atExpiry },
       liveLease('driver-a', 0, atExpiry),
       liveLease('driver-a', 1.5, atExpiry),
       liveLease('driver-a', Number.MAX_SAFE_INTEGER, atExpiry),
       { ...liveLease('driver-a', 1, atExpiry), version: 2 },
-      { ...liveLease('driver-a', 1, atExpiry), version: 1, __proto__: null, extra: 1 },
       { holderId: '', fence: 1, leaseUntilIso: atExpiry, version: 1 },
       { holderId: 'driver-a', fence: 1, leaseUntilIso: '2026-01-01T00:00:00', version: 1 },
       revokedProxy(),
     ]) {
-      expect(
-        decideDriverLease(baseRequest({ nowIso: atExpiry, lease })),
-      ).toEqual({ outcome: 'refused', reason: 'invalid-lease' });
+      expect(decide(baseRequest({ nowIso: atExpiry, lease }))).toEqual({
+        outcome: 'refused',
+        reason: 'invalid-lease',
+      });
     }
-    expect(decideDriverLease({ candidateId: 'driver-b', nowIso: atExpiry })).toEqual({
+    expect(decide({ candidateId: 'driver-b', nowIso: atExpiry })).toEqual({
       outcome: 'refused',
       reason: 'invalid-lease',
     });
-    const getterInput = getterOn('lease', liveLease('driver-a', 1, atExpiry), baseRequest({ nowIso: atExpiry }));
-    expect(decideDriverLease(getterInput)).toEqual({ outcome: 'refused', reason: 'invalid-lease' });
+    const getterInput = accessorOn('lease', liveLease('driver-a', 1, atExpiry), baseRequest({ nowIso: atExpiry }));
+    expect(decide(getterInput)).toEqual({ outcome: 'refused', reason: 'invalid-lease' });
     expect(invokedGetters).toEqual([]);
   });
 
@@ -298,41 +345,47 @@ describe('decideDriverLease', () => {
       ['driver-a', 'x'.repeat(257)],
       ['driver-a', ['driver-b']],
     ]) {
-      expect(decideDriverLease(baseRequest({ competingCandidateIds }))).toEqual({
+      expect(decide(baseRequest({ competingCandidateIds }))).toEqual({
         outcome: 'refused',
         reason: 'invalid-competing-candidates',
       });
     }
-    const getterInput = getterOn('competingCandidateIds', ['driver-a'], baseRequest({}));
-    expect(decideDriverLease(getterInput)).toEqual({
+    const getterInput = accessorOn('competingCandidateIds', ['driver-a'], baseRequest({}));
+    expect(decide(getterInput)).toEqual({
       outcome: 'refused',
       reason: 'invalid-competing-candidates',
     });
     expect(invokedGetters).toEqual([]);
   });
 
-  it('refuses competingCandidateIds exceeding 64 entries in O(1) before ownKeys', () => {
-    let ownKeysReached = false;
+  it('refuses competingCandidateIds exceeding 64 entries in O(1), and a Proxy candidate list before any reflection', () => {
+    // A Proxy is refused by the required detector before any length or
+    // own-keys read could observe a trap.
+    let reflected = false;
     const proxied = new Proxy([['driver-a']], {
-      getOwnPropertyDescriptor(t, prop) {
-        const descriptor = Reflect.getOwnPropertyDescriptor(t, prop);
-        if (prop === 'length' && descriptor !== undefined) {
-          return { ...descriptor, value: 2 ** 32 - 1 };
-        }
-        return descriptor;
+      getOwnPropertyDescriptor() {
+        reflected = true;
+        throw new Error('descriptor traps must never be reached');
       },
       ownKeys() {
-        ownKeysReached = true;
-        throw new Error('ownKeys must never be reached past the O(1) pre-gate');
+        reflected = true;
+        throw new Error('ownKeys must never be reached');
       },
     });
-    expect(decideDriverLease(baseRequest({ competingCandidateIds: proxied }))).toEqual({
+    expect(decide(baseRequest({ competingCandidateIds: proxied }))).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-competing-candidates',
+    });
+    expect(reflected).toBe(false);
+    // A plain array over the cap is refused by the O(1) length pre-gate.
+    const tooLong = new Array(65).fill('driver-a');
+    expect(decide(baseRequest({ competingCandidateIds: tooLong }))).toEqual({
       outcome: 'refused',
       reason: 'too-many-competing-candidates',
     });
-    expect(ownKeysReached).toBe(false);
-    const tooLong = new Array(65).fill('driver-a');
-    expect(decideDriverLease(baseRequest({ competingCandidateIds: tooLong }))).toEqual({
+    // An enormous plain length (2**32 - 1) is refused without reading keys.
+    const enormous: unknown = new Array(2 ** 32 - 1);
+    expect(decide(baseRequest({ competingCandidateIds: enormous }))).toEqual({
       outcome: 'refused',
       reason: 'too-many-competing-candidates',
     });
@@ -349,13 +402,13 @@ describe('decideDriverLease', () => {
       '60000',
       10 * 60 * 1000 + 1,
     ]) {
-      expect(decideDriverLease(baseRequest({ leaseDurationMs }))).toEqual({
+      expect(decide(baseRequest({ leaseDurationMs }))).toEqual({
         outcome: 'refused',
         reason: 'invalid-lease-duration',
       });
     }
-    const getterInput = getterOn('leaseDurationMs', 60_000, baseRequest({}));
-    expect(decideDriverLease(getterInput)).toEqual({
+    const getterInput = accessorOn('leaseDurationMs', 60_000, baseRequest({}));
+    expect(decide(getterInput)).toEqual({
       outcome: 'refused',
       reason: 'invalid-lease-duration',
     });
@@ -363,7 +416,7 @@ describe('decideDriverLease', () => {
   });
 
   it('refuses a second driver while the lease is live 1ms before expiry with lease-held', () => {
-    const decision = decideDriverLease(
+    const decision = decide(
       baseRequest({
         nowIso: '2026-01-01T00:00:59.999Z',
         lease: liveLease('driver-a', 1, '2026-01-01T00:01:00.000Z'),
@@ -373,7 +426,7 @@ describe('decideDriverLease', () => {
   });
 
   it('refuses the lexicographically larger candidate with lost-tiebreak when two candidates contend at the same instant', () => {
-    const decision = decideDriverLease(
+    const decision = decide(
       baseRequest({
         nowIso: '2026-01-01T01:00:00.000Z',
         lease: liveLease('driver-a', 1, '2026-01-01T01:00:00.000Z'),

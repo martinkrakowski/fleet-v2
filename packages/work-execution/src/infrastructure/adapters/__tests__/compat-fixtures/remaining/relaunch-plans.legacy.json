@@ -1,0 +1,12 @@
+[
+  {
+    "planDigest": "1d2031bff9ace407efe3c3b052aead4b06959007030025c6d6e93efe341f55fd",
+    "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "createdAtIso": "2026-01-01T00:00:00.000Z",
+    "hostFilter": null,
+    "maxActiveRuns": 1,
+    "dispatchStaggerMs": 0,
+    "conductor": { "halted": false, "driverLease": "absent", "runCount": 0 },
+    "lanes": []
+  }
+]

@@ -15,6 +15,8 @@ import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-po
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
+import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 
 const OWNER = 'fleet';
@@ -141,6 +143,52 @@ interface Harness {
   readonly appends: () => number;
 }
 
+/** One v2 merge-queue entry as the real queue adapter would store it. */
+function makeQueueEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEntryRecord {
+  return {
+    version: 2,
+    entryId: ulid(),
+    repository: { owner: OWNER, repo: REPO },
+    repoDigest: DIGEST,
+    pullRequest: 1,
+    headOid: HEAD,
+    state: 'queued',
+    reason: null,
+    attempt: 0,
+    notBeforeIso: null,
+    enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+    enqueuedBy: 'conductor',
+    supersedes: null,
+    runId: null,
+    attemptId: null,
+    workOrderId: null,
+    tier: 0,
+    verifiedHeadOid: null,
+    verifiedBy: null,
+    policyRevision: null,
+    premergeReceiptHeadOid: null,
+    veto: null,
+    mergeCommitOid: null,
+    mergedAtIso: null,
+    revision: 1,
+    baseBranch: 'main',
+    ...overrides,
+  };
+}
+
+function queueFake(
+  entries: unknown,
+): Pick<MergeQueueRepositoryPort, 'listMergeEntries'> {
+  return {
+    async listMergeEntries() {
+      if (typeof entries === 'object' && entries !== null && (entries as { throws?: unknown }).throws === true) {
+        throw new Error('queue read failed');
+      }
+      return entries as readonly MergeQueueEntryRecord[];
+    },
+  };
+}
+
 function makeHarness(input: {
   readonly forgeResult?: ReadForgeMergeResult;
   readonly policy?: Record<string, unknown>;
@@ -149,6 +197,7 @@ function makeHarness(input: {
   readonly clockJumpsAfterIntent?: boolean;
   readonly forge?: ForgeMergeReadPort & { calls: number };
   readonly requestOverrides?: Record<string, unknown>;
+  readonly queueEntries?: unknown;
 } = {}): Harness {
   const journal = new LaneRunJournalAdapter();
   const forge = input.forge ?? forgeReadFake(input.forgeResult ?? greenForge());
@@ -174,6 +223,7 @@ function makeHarness(input: {
     verification: verificationFake,
     journal: wrapped,
     halt: haltFake,
+    queue: queueFake(input.queueEntries ?? []),
     newUlid: ulid,
     nowIso: () => clock,
   });
@@ -192,6 +242,7 @@ function makeHarness(input: {
       policy: makePolicy(input.policy),
       pullRequest: 1,
       headOid: HEAD,
+      baseBranch: 'main',
       deadlineIso: input.deadlineIso ?? DEADLINE,
       ...input.requestOverrides,
     },
@@ -389,5 +440,106 @@ describe('DecideShadowMergeUseCase', () => {
     expect(badPr).toEqual({ outcome: 'refused', reasonCode: 'invalid-request', journalKey: null });
     expect(badPrHarness.forge.calls).toBe(0);
     expect(badPrHarness.appends()).toBe(0);
+  });
+
+  it('a chain base is judged against its own base: a green head whose forge base is chain/example journals would-merge on the merge-pr key, never base-mismatch', async () => {
+    const harness = makeHarness({
+      forgeResult: { ...greenForge(), baseRef: 'chain/example' },
+      requestOverrides: { baseBranch: 'chain/example' },
+    });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({
+      outcome: 'journalled',
+      reasonCode: 'would-merge',
+      journalKey: MERGE_KEY,
+    });
+    const rows = await rowsFor(harness.journal, MERGE_KEY);
+    expect(rows.map((row) => row.kind)).toEqual(['intent', 'result']);
+    expect(rows[1].reasonCode).toBe('would-merge');
+  });
+
+  it('an earlier live entry on the same base holds the queue head: the decision is the not-queue-head wait with zero forge reads and zero journal appends', async () => {
+    const harness = makeHarness({
+      queueEntries: [
+        makeQueueEntry({
+          pullRequest: 7,
+          headOid: 'a'.repeat(40),
+          enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+          baseBranch: 'main',
+        }),
+      ],
+    });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'not-ready', reasonCode: 'not-queue-head', journalKey: null });
+    expect(harness.forge.calls).toBe(0);
+    expect(harness.appends()).toBe(0);
+    expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(0);
+  });
+
+  it('an earlier live entry on a different base does not block the decision', async () => {
+    const harness = makeHarness({
+      forgeResult: { ...greenForge(), baseRef: 'chain/example' },
+      requestOverrides: { baseBranch: 'chain/example' },
+      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), baseBranch: 'main' })],
+    });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+  });
+
+  it('a parked earlier entry on the same base does not block the decision, because the head skips parked entries', async () => {
+    const harness = makeHarness({
+      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), state: 'parked', reason: 'checks' })],
+    });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+  });
+
+  it('the pair already queued as its base head is still decided for its own key', async () => {
+    const harness = makeHarness({
+      queueEntries: [makeQueueEntry()],
+    });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+  });
+
+  it('a throwing, a non-array and an oversized queue peek each return refused decide-failed with zero forge reads and zero journal appends', async () => {
+    const throwingHarness = makeHarness({ queueEntries: { throws: true } });
+    const throwing = await throwingHarness.useCase.decideShadowMerge(throwingHarness.request);
+    expect(throwing).toEqual({ outcome: 'refused', reasonCode: 'decide-failed', journalKey: null });
+    expect(throwingHarness.forge.calls).toBe(0);
+    expect(throwingHarness.appends()).toBe(0);
+
+    const nonArrayHarness = makeHarness({ queueEntries: { not: 'an-array' } });
+    const nonArray = await nonArrayHarness.useCase.decideShadowMerge(nonArrayHarness.request);
+    expect(nonArray).toEqual({ outcome: 'refused', reasonCode: 'decide-failed', journalKey: null });
+    expect(nonArrayHarness.forge.calls).toBe(0);
+
+    const oversizeHarness = makeHarness({
+      queueEntries: Array.from({ length: 5001 }, () => makeQueueEntry()),
+    });
+    const oversize = await oversizeHarness.useCase.decideShadowMerge(oversizeHarness.request);
+    expect(oversize).toEqual({ outcome: 'refused', reasonCode: 'decide-failed', journalKey: null });
+    expect(oversizeHarness.forge.calls).toBe(0);
+    expect(oversizeHarness.appends()).toBe(0);
+  });
+
+  it('a malformed baseBranch is invalid-request with zero journal appends and zero forge reads', async () => {
+    const harness = makeHarness({ requestOverrides: { baseBranch: 'release' } });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'invalid-request', journalKey: null });
+    expect(harness.forge.calls).toBe(0);
+    expect(harness.appends()).toBe(0);
   });
 });

@@ -4,7 +4,10 @@
  * DecideShadowMergeUseCase implements DecideShadowMergePort: for ONE
  * `(pullRequest, headOid)` pair it journals the shadow merge decision
  * `RunMergePassUseCase` would reach, by running the real pass over a
- * single-entry in-memory queue. No queue writes, no CLI, no live action.
+ * single-entry in-memory queue. The entry is a v2 record carrying the pair's
+ * own base branch, and the real queue is peeked read-only first so the pair
+ * is only decided when it would be that base partition's queue head. No
+ * queue writes, no CLI, no live action.
  */
 
 import type {
@@ -18,10 +21,16 @@ import type {
 import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { parseBaseBranch } from '../../domain/base-branch.js';
 import {
-  MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
+  MERGE_QUEUE_ORDER_CAP,
+  findMergeQueueHead,
+  orderMergeQueue,
+  sameMergeQueueIdentity,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
 import {
@@ -47,6 +56,8 @@ export interface DecideShadowMergeDependencies {
   readonly verification: MergeVerificationPort;
   readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey' | 'listForKeyPrefix'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** Read-only peek at the real merge queue, for the base partition's head. */
+  readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
   readonly newUlid: () => string;
   readonly nowIso: () => string;
 }
@@ -98,6 +109,9 @@ function isValidRequest(request: unknown): request is DecideShadowMergeRequest {
     return false;
   }
   if (typeof request.headOid !== 'string' || !HEAD_OID_PATTERN.test(request.headOid)) {
+    return false;
+  }
+  if (typeof request.baseBranch !== 'string' || parseBaseBranch(request.baseBranch) === undefined) {
     return false;
   }
   if (typeof request.deadlineIso !== 'string' || !isZonedIsoDateTime(request.deadlineIso)) {
@@ -176,8 +190,21 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     }
     const expectedKey = built.key;
 
+    // The synthetic queue holds only this pair, so the inner pass would
+    // always treat it as the queue head. The real pass orders and judges a
+    // head per (repository, base branch): when an earlier live entry holds
+    // that head, the real pass waits with `not-queue-head`, so the decision
+    // here is that wait, reached with zero forge reads and zero appends.
+    const headState = await this.queueHeadState(request);
+    if (headState === 'unreadable') {
+      return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+    }
+    if (headState === 'blocked') {
+      return { outcome: 'not-ready', reasonCode: 'not-queue-head', journalKey: null };
+    }
+
     const entry: MergeQueueEntryRecord = {
-      version: MERGE_QUEUE_ENTRY_VERSION,
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
       entryId: this.deps.newUlid(),
       repository: request.repository,
       repoDigest: request.repoDigest,
@@ -202,6 +229,9 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
       mergeCommitOid: null,
       mergedAtIso: null,
       revision: 1,
+      // v2: the pair is judged against the base it was queued for, never
+      // silently against main (a chain/foo PR is not a base-mismatch).
+      baseBranch: request.baseBranch,
     };
 
     const innerDeadlineIso = new Date(Date.parse(request.deadlineIso) - INNER_PASS_HEADROOM_MS).toISOString();
@@ -224,6 +254,7 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
       projectId: request.projectId,
       policy: request.policy,
       deadlineIso: innerDeadlineIso,
+      baseBranch: request.baseBranch,
     });
 
     // S9: the inner pass ran out of budget. Close an open intent on merge-pr
@@ -272,6 +303,46 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
       reasonCode: report.reasonCode ?? 'not-ready',
       journalKey: null,
     };
+  }
+
+  /**
+   * The real queue's head for this request's base partition, as the inner
+   * pass would see it once the synthetic entry is appended: `clear` when the
+   * pair itself would be the head, `blocked` when an earlier live entry
+   * holds it, `unreadable` when the peek fails or is malformed (fail closed:
+   * a refusal, never a would-merge). A parked head is skipped exactly as
+   * `findMergeQueueHead` skips it, so a parked predecessor never blocks.
+   */
+  private async queueHeadState(
+    request: DecideShadowMergeRequest,
+  ): Promise<'clear' | 'blocked' | 'unreadable'> {
+    let records: unknown;
+    try {
+      records = await this.deps.queue.listMergeEntries({
+        repository: request.repository,
+        deadlineIso: request.deadlineIso,
+      });
+    } catch {
+      return 'unreadable';
+    }
+    if (!Array.isArray(records) || records.length > MERGE_QUEUE_ORDER_CAP) {
+      return 'unreadable';
+    }
+    const ordered = orderMergeQueue(
+      records as readonly MergeQueueEntryRecord[],
+      request.repoDigest,
+      request.baseBranch,
+    );
+    const head = findMergeQueueHead(ordered, request.repoDigest, request.baseBranch);
+    if (head === null) {
+      return 'clear';
+    }
+    const synthetic = {
+      repository: request.repository,
+      pullRequest: request.pullRequest,
+      headOid: request.headOid,
+    };
+    return sameMergeQueueIdentity(head, synthetic) ? 'clear' : 'blocked';
   }
 
   /** S9: close an open intent on `expectedKey` with the closing result; already closed is fine. */

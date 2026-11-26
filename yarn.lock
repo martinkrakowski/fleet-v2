@@ -412,6 +412,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/billing@workspace:packages/billing":
+  version: 0.0.0-use.local
+  resolution: "@fleet/billing@workspace:packages/billing"
+  dependencies:
+    "@eslint/js": "npm:^9.0.0"
+    "@fleet/shared": "workspace:*"
+    eslint: "npm:^9.0.0"
+    typescript: "npm:^5.5.4"
+    typescript-eslint: "npm:^8.0.0"
+    vitest: "npm:^4.1.9"
+  languageName: unknown
+  linkType: soft
+
 "@fleet/brief-knowledge@workspace:*, @fleet/brief-knowledge@workspace:packages/brief-knowledge":
   version: 0.0.0-use.local
   resolution: "@fleet/brief-knowledge@workspace:packages/brief-knowledge"

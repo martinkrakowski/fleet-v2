@@ -7,10 +7,9 @@
  * pre-inspection host and runner refusals) and never falls back to the
  * composed runner; every test title states what it asserts.
  *
- * Mutation proof (see the brief): after these tests passed, the
- * implementation was broken one named production line at a time and each
- * named test was watched to fail, then the code was restored. Each line
- * below names the single production line whose change makes the test fail
+ * Mutation note (see the brief): production code is never broken or edited
+ * to prove these tests. Each line below instead names the single production
+ * line whose change would make the named test fail
  * (all in `DispatchAttemptUseCase.use-case.ts`):
  * - "refuses reservation on runner-b with existing reason and no journal
  *   write when runnerForHost is absent" — the guarded-branch return
@@ -53,6 +52,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
+  CapacityReservationRecord,
   AttemptRunnerRecord,
   WorkOrderRecord,
 } from '../src/domain/execution-records.js';

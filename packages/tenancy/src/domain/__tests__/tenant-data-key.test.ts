@@ -446,7 +446,7 @@ describe("decideKeyUse reads hostile records once and honours the injected Proxy
     expect(trapRan).toBe(false);
   });
 
-  it("never runs a Proxy get trap: a throwing get trap is a typed refusal and a flip-flopping status is never read through get", () => {
+  it("without a detector a Proxy is read through its own data descriptors only: a throwing get trap never runs, so the decision is exactly allowed and the status is not flipped", () => {
     let getRan = 0;
     const throwing = new Proxy(validKey(), {
       get() {
@@ -454,8 +454,14 @@ describe("decideKeyUse reads hostile records once and honours the injected Proxy
         throw new Error("get trap ran");
       },
     });
-    expect(() => parseTenantDataKeyRecord(throwing)).not.toThrow();
-    expect(() => decideKeyUse(throwing, "healthy", "acme", "wrap")).not.toThrow();
+    const parsedThrowing = parseTenantDataKeyRecord(throwing);
+    expect(parsedThrowing.ok).toBe(true);
+    expect(decideKeyUse(throwing, "healthy", "acme", "wrap")).toEqual({ allowed: true });
+    // With the detector supplied the same Proxy is refused.
+    expect(decideKeyUse(throwing, "healthy", "acme", "wrap", isProxy)).toEqual({
+      allowed: false,
+      reason: "invalid-request",
+    });
     const flipFlop = new Proxy(validKey(), {
       get(target, key) {
         getRan += 1;
@@ -463,9 +469,48 @@ describe("decideKeyUse reads hostile records once and honours the injected Proxy
       },
     });
     const parsed = parseTenantDataKeyRecord(flipFlop);
+    expect(parsed.ok).toBe(true);
     if (parsed.ok) {
       expect(parsed.record.status).toBe("active");
     }
     expect(getRan).toBe(0);
+  });
+
+  it("refuses a retired record whose retiredAtIso precedes createdAtIso, including below a millisecond, and accepts an equal one", () => {
+    const early = parseTenantDataKeyRecord(
+      validKey({
+        status: "rotated",
+        createdAtIso: "2026-01-01T00:00:00.0000009Z",
+        retiredAtIso: "2026-01-01T00:00:00.0000001Z",
+      }),
+    );
+    expect(early.ok).toBe(false);
+    if (!early.ok) {
+      expect(early.reason).toBe("tenant data key record retiredAtIso must not precede createdAtIso");
+    }
+    expect(
+      parseTenantDataKeyRecord(
+        validKey({ status: "rotated", createdAtIso: CREATED, retiredAtIso: CREATED }),
+      ).ok,
+    ).toBe(true);
+  });
+
+  it("an unavailable KMS takes precedence over a destroyed or rotated key: unavailable, never key-not-active", () => {
+    const destroyed = validKey({ status: "destroyed", retiredAtIso: RETIRED_AT });
+    const rotated = validKey({ status: "rotated", retiredAtIso: RETIRED_AT });
+    for (const health of ["degraded", "down", undefined, "unknown"]) {
+      expect(decideKeyUse(destroyed, health, "acme", "wrap")).toEqual({
+        allowed: false,
+        reason: "unavailable",
+      });
+      expect(decideKeyUse(rotated, health, "acme", "wrap")).toEqual({
+        allowed: false,
+        reason: "unavailable",
+      });
+    }
+    expect(decideKeyUse(destroyed, "healthy", "acme", "wrap")).toEqual({
+      allowed: false,
+      reason: "key-not-active",
+    });
   });
 });

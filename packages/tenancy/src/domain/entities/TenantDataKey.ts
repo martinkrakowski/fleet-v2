@@ -15,6 +15,7 @@
 import type { IsProxy } from "@fleet/shared";
 
 import {
+  compareZonedIsoInstants,
   hasControlCharacter,
   isZonedIsoDateTime,
   ORGANIZATION_ID_PATTERN,
@@ -88,11 +89,13 @@ export type ParseTenantDataKeyRecordResult =
  * `DEFAULT_ORGANIZATION_ID`: an absent, null, undefined, empty or invalid
  * organisation id is a refusal.
  *
- * The input is read ONCE, by `readRecord` (the shared bounded snapshot): no
+ * The input is read ONCE, by `snapshotRecord` (the shared bounded snapshot): no
  * getter and no Proxy `get` trap ever runs and no value can change between
  * check and use; every check below runs on the frozen snapshot. Extra,
  * symbol-keyed and prototype-polluting own keys are refused with a reason
- * that never echoes a value (an unknown key's name is not echoed either). Cost bound: the snapshot's own-key enumeration is the
+ * that never echoes a value (an unknown key's name is not echoed either).
+ *
+ * Cost bound: the snapshot's own-key enumeration is the
  * minimum any correct extra-key refusal must do (O(own keys)); apart from
  * it the parse is O(1) — every per-field check runs over a length-capped
  * string.
@@ -155,6 +158,9 @@ export function parseTenantDataKeyRecord(
     if (status === "active") {
       return keyRefused("tenant data key record retiredAtIso must be null when status is active");
     }
+    if (compareZonedIsoInstants(retiredAtIso, createdAtIso) < 0) {
+      return keyRefused("tenant data key record retiredAtIso must not precede createdAtIso");
+    }
   }
   const parsed: {
     schemaVersion?: 1;
@@ -212,8 +218,12 @@ export function decideKeyUse(
   isProxy?: IsProxy,
 ): KeyUseDecision {
   // The optional detector is passed through so infrastructure can refuse a
-  // Proxy-wrapped record outright; without it the record is still read once
-  // through its own data descriptors.
+  // Proxy-wrapped record outright (the domain cannot import the runtime's
+  // detector itself). Without it a Proxy is read once through its own data
+  // descriptors, never through [[Get]]: a Proxy that lies consistently in
+  // every trap is the accepted residual. No production caller exists yet
+  // (this package is domain-only: no port, use case or adapter reads a
+  // record), so the future KMS port adapter MUST pass `types.isProxy`.
   const parsed = parseTenantDataKeyRecord(record, isProxy);
   if (!parsed.ok) {
     return { allowed: false, reason: "invalid-request" };

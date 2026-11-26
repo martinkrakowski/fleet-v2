@@ -33,7 +33,7 @@ export class Attempt {
       throw new Error('Attempt requires a non-empty baseCommit');
     }
     if (record.kind !== 'initial' && record.kind !== 'fix') {
-      throw new Error(`Attempt has an invalid kind: ${String(record.kind)}`);
+      throw new Error('Attempt has an invalid kind: ' + describeRejectedValue(record.kind));
     }
     if (Number.isInteger(record.fixNumber) === false || record.fixNumber < 0) {
       throw new Error('Attempt requires a non-negative integer fixNumber');

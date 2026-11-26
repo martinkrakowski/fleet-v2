@@ -190,21 +190,28 @@ function snapshotRecord(raw: unknown): RecordSnapshot {
       return { kind: 'invalid' };
     }
     const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.keys(raw as Record<string, unknown>)) {
+    // `Reflect.ownKeys` (not `Object.keys`) so a hidden non-enumerable or
+    // symbol own property is still enumerated and refused instead of being
+    // silently skipped; a throwing trap reads as hostile.
+    for (const key of Reflect.ownKeys(raw as object)) {
+      if (typeof key !== 'string') {
+        // A symbol own property is an unexpected extra key.
+        return { kind: 'invalid' };
+      }
       const value = ownValue(raw, key, true);
       if (value === HOSTILE) {
         return { kind: 'hostile' };
       }
       if (value === UNREADABLE) {
-        // `Object.keys` enumerated it, so a missing descriptor is a lying
+        // `Reflect.ownKeys` enumerated it, so a missing descriptor is a lying
         // Proxy: treated as hostile rather than silently skipped.
         return { kind: 'hostile' };
       }
       if (POLLUTING_KEYS.has(key)) {
-        // Held as a value in a null-prototype record: never written onto
-        // `Object.prototype` and never treated as an expected key.
-        out[`polluting:${key}`] = value;
-        continue;
+        // Refused, never renamed and carried into the snapshot: a record with
+        // an own `__proto__`, `constructor` or `prototype` key is invalid
+        // input, whatever its value.
+        return { kind: 'invalid' };
       }
       out[key] = value;
     }
@@ -245,7 +252,9 @@ function snapshotList(raw: unknown): ListSnapshot {
     }
     const items: Readonly<Record<string, unknown>>[] = [];
     for (let index = 0; index < length; index += 1) {
-      const item = ownValue(raw, index);
+      // `requireEnumerable` so a hidden non-enumerable element is refused
+      // rather than silently accepted.
+      const item = ownValue(raw, index, true);
       if (item === HOSTILE) {
         return { kind: 'hostile' };
       }

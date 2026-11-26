@@ -270,6 +270,39 @@ describe('assembleEvidenceBundle', () => {
     )).toEqual({ ok: false, reason: 'invalid-input' });
   });
 
+  it('refuses a hidden non-enumerable extra key and a non-enumerable list element', () => {
+    const hidden = validInput() as unknown as Record<string, unknown>;
+    Object.defineProperty(hidden, 'sneaky', { value: 1, enumerable: false });
+    expect(assembleEvidenceBundle(hidden)).toEqual({ ok: false, reason: 'hostile-input' });
+
+    const hiddenNested = validInput({
+      receipts: [{ ...receipt(), hidden: 1 } as unknown as EvidenceBundleReceipt],
+    }) as unknown as { receipts: Record<string, unknown>[] };
+    Object.defineProperty(hiddenNested.receipts[0]!, 'sneaky', { value: 1, enumerable: false });
+    expect(assembleEvidenceBundle(hiddenNested as unknown)).toEqual({
+      ok: false,
+      reason: 'hostile-input',
+    });
+
+    const hiddenElement = validInput() as unknown as { receipts: unknown[] };
+    Object.defineProperty(hiddenElement.receipts, 0, { value: receipt(), enumerable: false });
+    expect(assembleEvidenceBundle(hiddenElement as unknown)).toEqual({
+      ok: false,
+      reason: 'hostile-input',
+    });
+
+    const symbolKey = validInput() as unknown as Record<string, unknown>;
+    Object.defineProperty(symbolKey, Symbol('extra'), { value: 1, enumerable: true });
+    expect(assembleEvidenceBundle(symbolKey)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses a JSONL line carrying an own prototype-polluting key', () => {
+    const result = assembleEvidenceBundle(deepFreeze(validInput({
+      authorityEventsJsonl: '{"organizationId":"org-1","__proto__":{"x":1}}\n',
+    })));
+    expect(result).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
   it('refuses prototype-polluting keys without polluting Object.prototype', () => {
     const before = JSON.stringify({ ...Object.prototype });
     const extra = validInput() as unknown as Record<string, unknown>;

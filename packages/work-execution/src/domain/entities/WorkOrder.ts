@@ -12,6 +12,7 @@ import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.j
 import { parsePullRequestTitle } from '../held-work-order.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
 import { WorkOrderState } from '../value-objects/WorkOrderState.vo.js';
+import { describeRejectedValue } from '../value-objects/AttemptState.vo.js';
 
 export class WorkOrder {
   private constructor(private record: WorkOrderRecord) {
@@ -40,7 +41,7 @@ export class WorkOrder {
     }
     const state = WorkOrderState.create(record.state);
     if (!state.success || state.value === undefined) {
-      throw new Error(`WorkOrder has an invalid state: ${String(record.state)}`);
+      throw new Error('WorkOrder has an invalid state: ' + describeRejectedValue(record.state));
     }
     if (record.planRef !== undefined) {
       const planRefErrorMessage = planRefError(record.planRef, record.projectId);

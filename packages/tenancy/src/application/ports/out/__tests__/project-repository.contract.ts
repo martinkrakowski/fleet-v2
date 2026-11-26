@@ -212,6 +212,45 @@ export function describeProjectRepositoryContract(
       expect(await port.listProjects('org-a')).toEqual([]);
     });
 
+    it('fails closed on a hostile projectId lookup (wrong primitives, enormous string, pattern-failing ids) while a stored project stays readable', async () => {
+      const port = createPort();
+      await port.createProject(makeProject());
+      const enormous = 'a'.repeat(100_000);
+      for (const bad of ['', 'Proj 1', 'proj_1', enormous, null, undefined, 7, {}, []]) {
+        expect(await port.findProject('org-a', bad as string)).toBeNull();
+        expect(await port.findProject(bad as string, bad as string)).toBeNull();
+      }
+      expect(await port.listProjects(enormous)).toEqual([]);
+      expect((await port.findProject('org-a', 'proj-1'))?.record.projectId).toBe('proj-1');
+    });
+
+    it('refuses an array-like record and an enormous displayName with invalid-record and stores nothing', async () => {
+      const port = createPort();
+      const arrayLike = { length: 1, 0: makeProject() };
+      expect(await port.createProject(arrayLike as unknown as ProjectRecord)).toEqual({
+        status: 'refused',
+        reason: 'invalid-record',
+      });
+      expect(await port.createProject(makeProject({ displayName: 'x'.repeat(100_000) }))).toEqual({
+        status: 'refused',
+        reason: 'invalid-record',
+      });
+      expect(await port.listProjects('org-a')).toEqual([]);
+    });
+
+    it('keeps names that shadow Object.prototype members as ordinary ids: no pollution and no cross-organisation leak', async () => {
+      const port = createPort();
+      const created = await port.createProject(
+        makeProject({ organizationId: 'constructor', projectId: 'prototype' }),
+      );
+      expect(created.status).toBe('saved');
+      expect((await port.findProject('constructor', 'prototype'))?.record.displayName).toBe('Project 1');
+      expect(await port.findProject('prototype', 'constructor')).toBeNull();
+      expect(await port.findProject('org-a', 'constructor')).toBeNull();
+      expect(await port.listProjects('org-a')).toEqual([]);
+      expect(({} as Record<string, unknown>).displayName).toBeUndefined();
+    });
+
     it('refuses a caller-supplied revision key with invalid-record', async () => {
       const port = createPort();
       const withRevision = makeProject() as unknown as Record<string, unknown>;

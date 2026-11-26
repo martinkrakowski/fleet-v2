@@ -1249,3 +1249,57 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
     expect(entry.reason).toBeNull();
   });
 });
+
+describe('RunMergePassUseCase live queue head after the shadow skip (S1U6)', () => {
+  // The head is observable through the macOS wait: a non-head entry waits
+  // with `not-queue-head`, the head with `macos-unknown`.
+  const macosPolicy = { policy: { macosProcedure: 'macos-procedure' } };
+
+  async function seedAlreadyMerged(journal: LaneRunJournalAdapter, pullRequest: number, head12: string): Promise<void> {
+    const key = `merge/${DIGEST}/${pullRequest}/${head12}/would-already-merged`;
+    for (const kind of ['intent', 'result'] as const) {
+      const appended = await journal.append({
+        version: 1,
+        entryId: `01JE${String(pullRequest * 2 + (kind === 'intent' ? 0 : 1)).padStart(22, '0')}`,
+        kind,
+        key,
+        runId: null,
+        recordedAtIso: NOW,
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: kind === 'result' ? 'dry-run' : null,
+        reasonCode: kind === 'result' ? 'would-already-merged' : null,
+        detail: null,
+        grantId: null,
+        state: null,
+      } as LaneRunJournalEntryRecord);
+      expect(appended.outcome).toBe('appended');
+    }
+  }
+
+  it('when an earlier queued entry is journaled would-already-merged, the next entry becomes the filtered head (isQueueHead true)', async () => {
+    const first = makeEntry({ pullRequest: 1, enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const second = makeEntry({ pullRequest: 2, enqueuedAtIso: '2026-11-01T10:01:00.000Z' });
+    const f = shadowFixture([first, second], greenForge, macosPolicy);
+    await seedAlreadyMerged(f.deps.journal, 1, HEAD12);
+
+    const result = await f.useCase.runMergePass(f.request);
+
+    expect(result.entries.map((row) => row.entryId)).toEqual([second.entryId]);
+    expect(result.entries[0].reasonCode).toBe('macos-unknown');
+  });
+
+  it('a stale queued entry that is not journaled would-already-merged still holds the head and blocks the entry behind it (isQueueHead false)', async () => {
+    const first = makeEntry({ pullRequest: 1, enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const second = makeEntry({ pullRequest: 2, enqueuedAtIso: '2026-11-01T10:01:00.000Z' });
+    const f = shadowFixture([first, second], greenForge, macosPolicy);
+
+    const result = await f.useCase.runMergePass(f.request);
+
+    const byId = new Map(result.entries.map((row) => [row.entryId, row.reasonCode]));
+    expect(byId.get(first.entryId)).toBe('macos-unknown');
+    expect(byId.get(second.entryId)).toBe('not-queue-head');
+    expect(await f.deps.journal.listForKey(`merge/${DIGEST}/2/${HEAD12}/merge-pr`)).toHaveLength(0);
+  });
+});

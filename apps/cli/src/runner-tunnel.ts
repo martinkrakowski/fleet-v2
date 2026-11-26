@@ -359,6 +359,9 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
         if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined)) {
           throw new TypeError(`RunnerTunnelSetAdapter: accessor at index ${i}`);
         }
+        if (types.isProxy(descriptor?.value)) {
+          throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} must not be a Proxy`);
+        }
         if (!(descriptor?.value instanceof RunnerTunnelAdapter)) {
           throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} is not a RunnerTunnelAdapter`);
         }
@@ -372,6 +375,7 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
           descriptor === undefined ||
           descriptor.get !== undefined ||
           descriptor.set !== undefined ||
+          types.isProxy(descriptor.value) ||
           !(descriptor.value instanceof RunnerTunnelAdapter)
         ) {
           throw new TypeError(`RunnerTunnelSetAdapter: member at index ${i} changed during validation`);
@@ -404,7 +408,14 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
     // the same dial port would fight over one bind, so the set refuses first.
     const seenPorts = new Set<number>();
     for (const member of this.members) {
-      const dial = member.resolvedDialPort();
+      // A broken member must refuse the whole start before anything spawns:
+      // its throw is caught and the set answers `failed` immediately.
+      let dial: number | null;
+      try {
+        dial = member.resolvedDialPort();
+      } catch {
+        return 'failed';
+      }
       if (dial === null) {
         continue;
       }

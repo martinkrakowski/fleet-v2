@@ -505,9 +505,11 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
       },
     });
     const result = validateMembershipRecordImpl(flipFlop);
-    if (result.ok) {
-      expect(result.record.role).toBe("viewer");
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(`expected ok, got ${JSON.stringify(result)}`);
     }
+    expect(result.record.role).toBe("viewer");
     expect(reads).toBe(0);
     const flipChange = new Proxy(change("add", { role: "viewer" }), {
       get(target, key) {
@@ -516,13 +518,21 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
       },
     });
     const parsed = validateMembershipChangeImpl(flipChange);
-    if (parsed.ok && parsed.change.kind !== "remove") {
-      expect(parsed.change.role).toBe("viewer");
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error(`expected ok, got ${JSON.stringify(parsed)}`);
     }
+    if (parsed.change.kind === "remove") {
+      throw new Error("expected add");
+    }
+    expect(parsed.change.kind).toBe("add");
+    expect(parsed.change.role).toBe("viewer");
     const decided = decideMembershipChangeImpl(members(OWNER()), flipChange, NOW);
-    if (decided.ok) {
-      expect(decided.members.every((entry) => isValidRole(entry.role))).toBe(true);
+    expect(decided.ok).toBe(true);
+    if (!decided.ok) {
+      throw new Error(`expected ok, got ${JSON.stringify(decided)}`);
     }
+    expect(decided.members.every((entry) => isValidRole(entry.role))).toBe(true);
     expect(reads).toBe(0);
   });
 

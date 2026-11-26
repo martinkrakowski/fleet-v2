@@ -490,6 +490,7 @@ bounded_contexts:
             - ExecutionObservationPort
             - RunnerSelectorPort
             - RunnerForAttemptPort
+            - RunnerForHostNamePort
             - LaneDiffCheckPort
             - AllowedSeatPort
             - UsagePort
@@ -594,6 +595,7 @@ bounded_contexts:
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
       AllowedSeatPort: "Given the installation's seat catalogue and policy.useFreeSeats, decide whether a dispatch seat (tool, model, variant) or a reviewer model may be used; with the flag false only seats that are all not free are allowed, and an unknown or mixed match is refused."
       RunnerForAttemptPort: "Given the attempt's recorded runner block, return the runner that addresses the recorded host; a host that changed, was renamed or was removed is refused naming the recorded host, and a legacy attempt keeps the single legacy runner."
+      RunnerForHostNamePort: "Given the current installation's host by name alone, resolve the runner from that host's own declared port, auth file and capabilities; an unknown, invalid or accessor-carrying host is refused naming the cause, never a fallback to another host, port, auth file or capability profile."
       LaneDiffCheckPort: "Before any edit-only commit, collect a worktree's tracked and untracked changes against the base and run the pure lane diff check: allowed path prefixes from the frozen brief, fixed and policy protected paths, and secret patterns on added lines; findings carry path, line and rule name only, never a matched value."
       GatePredicatePort: "Evaluate a frozen acceptance spec on an attempt's worktree host: the commit since the base at the candidate head with a clean tree and the lane diff check first, then the fixed argv commands with their declared coverage, independent ones run concurrently within the gate slot budget; the verdict is the first predicate in declared order that does not pass, and results after it are discarded; results carry no command output."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
@@ -737,6 +739,7 @@ bounded_contexts:
       - { adapter: RunnerSelectorAdapter, implements: RunnerSelectorPort, integration: installation-host-structural-selection }
       - { adapter: AllowedSeatAdapter, implements: AllowedSeatPort, integration: installation-seat-catalogue-structural-check }
       - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
+      - { adapter: RunnerForAttemptAdapter, implements: RunnerForHostNamePort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
       - { adapter: GatePredicateAdapter, implements: GatePredicatePort, integration: injected-command-executor-gate-predicates }
       - { adapter: OpencodeApiUsageAdapter, implements: UsagePort, integration: ocm-run-usage-read-over-the-dispatch-route }

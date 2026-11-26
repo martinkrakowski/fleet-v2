@@ -229,6 +229,23 @@ describe('merge decide', () => {
     expect(results[0]?.outcome).toBe('dry-run');
   });
 
+  it('answers not-ready not-queue-head (exit 1) and journals nothing when an earlier live queue entry of the same repository holds the head', async () => {
+    const forge = greenForgeFake();
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
+    await seedQueueEntry(runtime, 3);
+    const before = await queueSnapshot(runtime);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(1);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('not-ready');
+    expect(printed['reasonCode']).toBe('not-queue-head');
+    expect(forge.calls).toHaveLength(0);
+    expect(await journalRowsFor(stateDir, null)).toHaveLength(0);
+    expect(await queueSnapshot(runtime)).toEqual(before);
+  });
+
   it('survives twenty concurrent journal writers: every decide row and every appended conduct row is present, none lost or torn', async () => {
     const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, greenForgeFake().run);
     await seedQueueEntry(runtime);

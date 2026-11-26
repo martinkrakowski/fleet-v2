@@ -281,9 +281,11 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     newUlid: () => newUlid(),
     nowIso: now,
   });
-  // S1U2: the same collaborators as the pass, minus the queue writes and the
-  // notifier; the decider owns no queue writer and never performs a live action.
+  // S1U2: the same collaborators as the pass, minus the queue writer and the
+  // notifier. The queue is passed read-only (the decider's `Pick` type admits
+  // only `listMergeEntries`) so the decision honours the real queue head.
   const decideShadowMerge = new DecideShadowMergeUseCase({
+    queue: input.mergeQueueRepository,
     forgeRead: input.mergeForgeRead,
     verification,
     journal: input.conductor.laneRunJournal,

@@ -56,12 +56,8 @@ export interface DecideShadowMergeDependencies {
   readonly verification: MergeVerificationPort;
   readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey' | 'listForKeyPrefix'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
-  /**
-   * Optional read-only peek at the real merge queue, for the base partition's
-   * head. When absent (the CLI wiring) the decide path reads no queue state at
-   * all and proceeds straight to the synthetic single-entry pass.
-   */
-  readonly queue?: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
+  /** Read-only peek at the real merge queue, for the base partition's head. */
+  readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
   readonly newUlid: () => string;
   readonly nowIso: () => string;
 }
@@ -199,16 +195,12 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     // head per (repository, base branch): when an earlier live entry holds
     // that head, the real pass waits with `not-queue-head`, so the decision
     // here is that wait, reached with zero forge reads and zero appends.
-    // The peek is optional: without a queue the decide path reads no queue
-    // state at all and goes straight to the pass.
-    if (this.deps.queue !== undefined) {
-      const headState = await this.queueHeadState(request);
-      if (headState === 'unreadable') {
-        return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
-      }
-      if (headState === 'blocked') {
-        return { outcome: 'not-ready', reasonCode: 'not-queue-head', journalKey: null };
-      }
+    const headState = await this.queueHeadState(request);
+    if (headState === 'unreadable') {
+      return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+    }
+    if (headState === 'blocked') {
+      return { outcome: 'not-ready', reasonCode: 'not-queue-head', journalKey: null };
     }
 
     const entry: MergeQueueEntryRecord = {
@@ -325,12 +317,8 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
     request: DecideShadowMergeRequest,
   ): Promise<'clear' | 'blocked' | 'unreadable'> {
     let records: unknown;
-    const queue = this.deps.queue;
-    if (queue === undefined) {
-      return 'clear';
-    }
     try {
-      records = await queue.listMergeEntries({
+      records = await this.deps.queue.listMergeEntries({
         repository: request.repository,
         deadlineIso: request.deadlineIso,
       });

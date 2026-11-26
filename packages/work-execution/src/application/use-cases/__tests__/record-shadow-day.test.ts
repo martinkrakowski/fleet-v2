@@ -298,7 +298,7 @@ function cleanFixture(day: string): Fixture {
       key,
       outcome: 'dry-run',
       reasonCode: 'would-merge',
-      recordedAtIso: `${day}T10:00:30Z`,
+      recordedAtIso: `${day}T09:59:30Z`,
     }),
   ];
   const queueEntries = [
@@ -938,7 +938,7 @@ function conformingFixture(): Fixture {
         key,
         outcome: 'dry-run',
         reasonCode: 'would-merge',
-        recordedAtIso: new Date(Date.parse(atIso) + 30_000).toISOString(),
+        recordedAtIso: new Date(Date.parse(atIso) - 30_000).toISOString(),
       }),
     );
     // S1 resolves a journaled would-merge's head against the LIVE queue

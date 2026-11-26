@@ -830,6 +830,99 @@ describe('parseInstallation v2', () => {
     });
   });
 
+  // MR1D: a second lane-runner host loads beside the first when its derived
+  // dial port differs, and is refused when it does not. Cost: O(hosts) map
+  // inserts and lookups over the parsed hosts.
+  const isolationFloor = {
+    networkEgressRestricted: true,
+    cpuAndMemoryLimited: true,
+    processTreeTermination: true,
+    filesystemScope: 'scoped-worktree',
+  } as const;
+  function twoSshRunners(a: number, b: number): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        orch: { transport: 'local', worktreeRoot: '/srv/fleet/o', roles: ['orchestrator'] },
+        'runner-a': {
+          transport: 'ssh',
+          sshAlias: 'runner-a.example',
+          worktreeRoot: '/srv/fleet/a',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: a, capabilities: isolationFloor },
+        },
+        'runner-b': {
+          transport: 'ssh',
+          sshAlias: 'runner-b.example',
+          worktreeRoot: '/srv/fleet/b',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: b, capabilities: isolationFloor },
+        },
+      },
+    };
+  }
+
+  it('loads two ssh lane-runner hosts on distinct runner ports', () => {
+    const result = parseInstallation(twoSshRunners(4166, 4266));
+    expect(result.ok).toBe(true);
+  });
+
+  it('two ssh lane-runner hosts on 4166 are refused with derived dial port must be unique', () => {
+    expect(parseInstallation(twoSshRunners(4166, 4166))).toEqual({
+      ok: false,
+      errors: ['hosts.runner-b.runner.port: derived dial port must be unique across hosts'],
+    });
+  });
+
+  it('ssh host on 4166 and local host on 4167 are refused with derived dial port must be unique', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        orch: { transport: 'local', worktreeRoot: '/srv/fleet/o', roles: ['orchestrator'] },
+        'runner-a': {
+          transport: 'ssh',
+          sshAlias: 'runner-a.example',
+          worktreeRoot: '/srv/fleet/a',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 4166, capabilities: isolationFloor },
+        },
+        'runner-b': {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/b',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 4167, capabilities: isolationFloor },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.runner-b.runner.port: derived dial port must be unique across hosts'],
+    });
+  });
+
+  it('lane-runner host without runner.port is refused', () => {
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        orch: { transport: 'local', worktreeRoot: '/srv/fleet/o', roles: ['orchestrator'] },
+        'runner-a': {
+          transport: 'ssh',
+          sshAlias: 'runner-a.example',
+          worktreeRoot: '/srv/fleet/a',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', capabilities: isolationFloor },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.runner-a.runner.port: required'],
+    });
+  });
+
   it('refuses an ssh runner on 65535: its forward port 65536 cannot be bound', () => {
     expect(twoRunners({ transport: 'ssh', port: 65535 }, { transport: 'ssh', port: 46000 })).toEqual({
       ok: false,

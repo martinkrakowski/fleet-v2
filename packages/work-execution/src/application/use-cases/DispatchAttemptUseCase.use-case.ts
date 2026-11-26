@@ -64,6 +64,14 @@ export interface DispatchAttemptDependencies {
    * reservation is refused as runner-not-available before any journal entry or save.
    */
   readonly agyRunner?: ExecutionRunnerPort;
+  /**
+   * G1: resolve the runner of a reservation held on a second lane-runner
+   * host. When wired and the reservation names a host other than the one the
+   * composed runner describes, the resolved runner dispatches; without it
+   * (or for a legacy null-host runner, or an agy seat) the mismatch refuses
+   * with the existing H9a/H9b/H10 reason, before any journal write.
+   */
+  readonly runnerForHost?: (hostName: string) => ExecutionRunnerPort | null;
   readonly observation?: ExecutionObservationPort;
   readonly artifactPort?: AttemptArtifactPort;
   /**
@@ -361,8 +369,8 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     // AG-3: the reservation's seat tool names the runner; a legacy reservation (null) is opencode.
     const reservedTool = heldReservation.seatTool ?? 'opencode';
-    const runner = reservedTool === 'agy' ? this.deps.agyRunner : this.deps.runner;
-    if (runner === undefined) {
+    const composedRunner = reservedTool === 'agy' ? this.deps.agyRunner : this.deps.runner;
+    if (composedRunner === undefined) {
       return { outcome: 'refused', reason: 'runner-not-available' };
     }
 
@@ -371,13 +379,46 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // (v2); it is null for v1 or absent installations, so legacy and pre-H9a
     // records with a null hostName pass through untouched. This refuses
     // before any start call and before any journal write.
-    const runnerHostName = runner.describeRunner?.()?.hostName ?? null;
+    // G1: when the reservation names a second lane-runner host, a wired
+    // `runnerForHost` resolves that host's own runner and it dispatches;
+    // never a fallback to the composed runner. The lookup is one O(1)
+    // callback call, reached only when the reservation host differs from the
+    // composed runner's, and every refusal below fires before any journal
+    // write or `inspectWorktree` call.
+    const runnerHostName = composedRunner.describeRunner?.()?.hostName ?? null;
     const reservationHostName = heldReservation.hostName ?? null;
+    let runner = composedRunner;
     if (reservationHostName !== null && reservationHostName !== runnerHostName) {
-      return {
-        outcome: 'refused',
-        reason: `Reservation host ${reservationHostName} is not the configured runner host ${runnerHostName}; several lane-runner hosts need H9b/H10`,
-      };
+      const mismatchReason = `Reservation host ${reservationHostName} is not the configured runner host ${runnerHostName}; several lane-runner hosts need H9b/H10`;
+      if (
+        // A legacy (v1) composed runner describes no host: it is never
+        // routed through `runnerForHost`.
+        runnerHostName === null ||
+        // An agy seat never routes through `runnerForHost`.
+        reservedTool === 'agy' ||
+        // Without a resolver the single-host refusal stands unchanged.
+        this.deps.runnerForHost === undefined
+      ) {
+        return { outcome: 'refused', reason: mismatchReason };
+      }
+      // The callback and the resolved runner's own description are read
+      // together: either throwing is the refusal, never a partial dispatch.
+      let resolvedRunner: ExecutionRunnerPort | null | undefined;
+      let resolvedHostName: string | null = null;
+      try {
+        resolvedRunner = this.deps.runnerForHost(reservationHostName);
+        resolvedHostName = resolvedRunner?.describeRunner?.()?.hostName ?? null;
+      } catch {
+        return { outcome: 'refused', reason: mismatchReason };
+      }
+      if (
+        resolvedRunner === null ||
+        resolvedRunner === undefined ||
+        resolvedHostName !== reservationHostName
+      ) {
+        return { outcome: 'refused', reason: mismatchReason };
+      }
+      runner = resolvedRunner;
     }
     // The reservation's allocated worktree is the only one this attempt may
     // dispatch into (review of #125): a v2 reserve allocates the path under

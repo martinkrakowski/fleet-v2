@@ -13,7 +13,7 @@ import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { promisify, types } from 'node:util';
 
 import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
@@ -204,6 +204,202 @@ function firstField(text: string): string | undefined {
   return field === '' ? undefined : field;
 }
 
+/** Own keys an untrusted answer may never carry: they would pollute or masquerade. */
+const POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype', 'length'];
+
+/** An untrusted answer with more own keys than this is refused unread. */
+const MAX_OWN_KEYS = 64;
+
+/** The answer a probe reports for an executor answer it refuses to read. */
+const UNTRUSTED_RUN_RESULT: DoctorCommandRunResult = Object.freeze({
+  exitCode: null,
+  signal: null,
+  stdout: '',
+  stderr: '',
+  error: 'untrusted probe result',
+});
+
+/**
+ * True for a plain data object: not a Proxy, prototype exactly
+ * `Object.prototype` or `null`, no polluting own key, at most `MAX_OWN_KEYS`
+ * own keys. Cost: O(1) type, proxy and prototype checks, four descriptor
+ * lookups and one own-key count bounded by `MAX_OWN_KEYS` + 1. Never runs a
+ * getter; a throwing trap is caught.
+ */
+function isPlainUntrustedObject(value: unknown): value is object {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || types.isProxy(value)) {
+    return false;
+  }
+  try {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== null && prototype !== Object.prototype) {
+      return false;
+    }
+    for (const key of POLLUTING_KEYS) {
+      if (Object.getOwnPropertyDescriptor(value, key) !== undefined) {
+        return false;
+      }
+    }
+    return Object.getOwnPropertyNames(value).length <= MAX_OWN_KEYS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One own data property of a plain object: `{ ok: true, value }` (value is
+ * `undefined` when the key is absent) or `{ ok: false }` for an accessor.
+ * Cost: one `Object.getOwnPropertyDescriptor` call; a getter is never invoked.
+ */
+function readOwnDataProperty(
+  object: object,
+  key: string,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  const descriptor = Object.getOwnPropertyDescriptor(object, key);
+  if (descriptor === undefined) {
+    return { ok: true, value: undefined };
+  }
+  return 'value' in descriptor ? { ok: true, value: descriptor.value } : { ok: false };
+}
+
+/** The data values of the named own properties, or `undefined` when any is an accessor. */
+function readOwnDataProperties(object: object, keys: readonly string[]): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    const read = readOwnDataProperty(object, key);
+    if (!read.ok) {
+      return undefined;
+    }
+    out[key] = read.value;
+  }
+  return out;
+}
+
+/**
+ * A fresh, plain `DoctorCommandRunResult` copied from an executor answer, or
+ * `undefined` when the answer is not a plain object with only data
+ * properties of the right types. Cost: O(1), five fixed fields.
+ */
+function readUntrustedRunResult(raw: unknown): DoctorCommandRunResult | undefined {
+  try {
+    if (!isPlainUntrustedObject(raw)) {
+      return undefined;
+    }
+    const fields = readOwnDataProperties(raw, ['exitCode', 'signal', 'stdout', 'stderr', 'error']);
+    if (fields === undefined) {
+      return undefined;
+    }
+    const { exitCode, signal, stdout, stderr, error } = fields;
+    if (exitCode !== null && !(typeof exitCode === 'number' && Number.isInteger(exitCode))) {
+      return undefined;
+    }
+    if (typeof stdout !== 'string') {
+      return undefined;
+    }
+    if (signal !== undefined && signal !== null && typeof signal !== 'string') {
+      return undefined;
+    }
+    if (stderr !== undefined && typeof stderr !== 'string') {
+      return undefined;
+    }
+    if (error !== undefined && typeof error !== 'string') {
+      return undefined;
+    }
+    return {
+      exitCode,
+      signal: signal ?? null,
+      stdout,
+      stderr: stderr ?? '',
+      ...(error === undefined ? {} : { error }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Run one argv and return a trusted copy of the answer; a throw or a refused answer is a failed run. */
+async function runTrusted(
+  executor: DoctorCommandExecutor,
+  argv: readonly string[],
+  options?: DoctorCommandRunOptions,
+): Promise<DoctorCommandRunResult> {
+  try {
+    return readUntrustedRunResult(await executor.run(argv, options)) ?? UNTRUSTED_RUN_RESULT;
+  } catch {
+    return UNTRUSTED_RUN_RESULT;
+  }
+}
+
+/**
+ * A fresh `PinnedBuildProbeResult` from an injected reader's answer, or
+ * `undefined` for a non-plain object, an accessor or a wrong field type.
+ * Cost: O(1), four fixed fields.
+ */
+function readUntrustedPinnedBuild(raw: unknown): PinnedBuildProbeResult | undefined {
+  try {
+    if (!isPlainUntrustedObject(raw)) {
+      return undefined;
+    }
+    const fields = readOwnDataProperties(raw, [
+      'pinnedCommit',
+      'baseTipCommit',
+      'behindCount',
+      'installRootName',
+    ]);
+    if (fields === undefined) {
+      return undefined;
+    }
+    const { pinnedCommit, baseTipCommit, behindCount, installRootName } = fields;
+    if (
+      (pinnedCommit !== undefined && typeof pinnedCommit !== 'string') ||
+      (baseTipCommit !== undefined && typeof baseTipCommit !== 'string') ||
+      (behindCount !== undefined && !(typeof behindCount === 'number' && Number.isSafeInteger(behindCount))) ||
+      (installRootName !== undefined && typeof installRootName !== 'string')
+    ) {
+      return undefined;
+    }
+    return {
+      pinnedCommit,
+      baseTipCommit,
+      behindCount,
+      ...(installRootName === undefined ? {} : { installRootName }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A fresh array of strings from an untrusted array, or `undefined` for a
+ * non-array, a Proxy, a foreign prototype, a hole, an accessor element, a
+ * non-string element or a length above `maxLen`. Cost: O(min(length, maxLen)).
+ */
+function readUntrustedStringArray(raw: unknown, maxLen: number): string[] | undefined {
+  try {
+    if (!Array.isArray(raw) || types.isProxy(raw) || Object.getPrototypeOf(raw) !== Array.prototype) {
+      return undefined;
+    }
+    const lengthRead = readOwnDataProperty(raw, 'length');
+    if (!lengthRead.ok || typeof lengthRead.value !== 'number' || lengthRead.value > maxLen) {
+      return undefined;
+    }
+    const out: string[] = [];
+    for (let index = 0; index < lengthRead.value; index += 1) {
+      const element = readOwnDataProperty(raw, String(index));
+      if (!element.ok || typeof element.value !== 'string' || Object.getOwnPropertyDescriptor(raw, String(index)) === undefined) {
+        return undefined;
+      }
+      out.push(element.value);
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The probe-argv cap: a template or candidate list longer than this is refused. */
+const MAX_ARGV_LENGTH = 64;
+
 /** True when the run completed with exit code 0. */
 function succeeded(
   result: DoctorCommandRunResult,
@@ -249,7 +445,7 @@ async function readPinnedBuildWithGit(
   let baseTipCommit: string | undefined;
   let behindCount: number | undefined;
 
-  const head = await executor.run(['git', 'rev-parse', 'HEAD'], {
+  const head = await runTrusted(executor, ['git', 'rev-parse', 'HEAD'], {
     cwd: repoRoot,
     timeoutMs,
   });
@@ -257,7 +453,7 @@ async function readPinnedBuildWithGit(
     pinnedCommit = revParseCommit(head.stdout);
   }
 
-  const base = await executor.run(['git', 'rev-parse', baseBranch], {
+  const base = await runTrusted(executor, ['git', 'rev-parse', baseBranch], {
     cwd: repoRoot,
     timeoutMs,
   });
@@ -269,7 +465,8 @@ async function readPinnedBuildWithGit(
     if (pinnedCommit === baseTipCommit) {
       behindCount = 0;
     } else {
-      const count = await executor.run(
+      const count = await runTrusted(
+        executor,
         ['git', 'rev-list', '--count', `${pinnedCommit}..${baseTipCommit}`],
         { cwd: repoRoot, timeoutMs },
       );
@@ -306,7 +503,11 @@ const NOT_ACTIVE_STATES: ReadonlySet<string> = new Set([
  * exit code and one whole-output state word are read; the output itself is
  * never returned.
  */
-function ciRunnerSlotState(result: DoctorCommandRunResult): CiRunnerSlotState {
+function ciRunnerSlotState(raw: DoctorCommandRunResult): CiRunnerSlotState {
+  const result = readUntrustedRunResult(raw);
+  if (result === undefined) {
+    return 'unknown';
+  }
   if (
     result.error !== undefined ||
     result.signal !== null ||
@@ -350,7 +551,11 @@ export const LOGIN_SHELL_CANARY = [
  * compared, never returned. Exit code 255 is ssh's own failure, so it says
  * nothing about the login shell.
  */
-function loginShellState(result: DoctorCommandRunResult): LoginShellState {
+function loginShellState(raw: DoctorCommandRunResult): LoginShellState {
+  const result = readUntrustedRunResult(raw);
+  if (result === undefined) {
+    return 'unknown';
+  }
   if (
     result.error !== undefined ||
     result.signal !== null ||
@@ -415,7 +620,7 @@ async function runOnHost(
 ): Promise<DoctorCommandRunResult> {
   const budget = { timeoutMs: timeoutMs ?? deps.timeoutMs };
   if (host === 'local') {
-    return deps.localExecutor.run(argv, budget);
+    return runTrusted(deps.localExecutor, argv, budget);
   }
   const remote = sshRemoteArgv(host, argv, SSH_CONNECT_TIMEOUT_S);
   if (!remote.ok) {
@@ -423,7 +628,7 @@ async function runOnHost(
     // `error` as a failed run.
     return { exitCode: null, signal: null, stdout: '', stderr: '', error: remote.reason };
   }
-  return deps.sshExecutor.run(remote.argv, budget);
+  return runTrusted(deps.sshExecutor, remote.argv, budget);
 }
 
 /** The tool descriptor's version argv (`detect`), or undefined for an unknown id. */
@@ -439,25 +644,36 @@ function versionArgvOf(toolId: ToolId): readonly string[] | undefined {
  * token degrades to the bare model.
  */
 export function seatProbeArgv(seat: SeatModel, template: readonly string[]): string[] {
+  // Untrusted input: the seat is read through descriptors (a getter never
+  // runs) and the template through a bounded array read; anything else gives
+  // no argv at all. Cost: O(1) seat reads + O(min(length, 64)) template read.
+  const tokens = readUntrustedStringArray(template, MAX_ARGV_LENGTH);
+  const seatFields = isPlainUntrustedObject(seat) ? readOwnDataProperties(seat, ['model', 'variant']) : undefined;
+  if (tokens === undefined || seatFields === undefined) {
+    return [];
+  }
+  const model = seatFields.model;
+  const variant = seatFields.variant;
+  if (typeof model !== 'string' || (variant !== undefined && typeof variant !== 'string')) {
+    return [];
+  }
   const argv: string[] = [];
-  for (let index = 0; index < template.length; index += 1) {
-    const token = template[index];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
     if (token === '{model}#{variant}') {
-      argv.push(
-        seat.variant === undefined ? seat.model : `${seat.model}#${seat.variant}`,
-      );
+      argv.push(variant === undefined ? model : `${model}#${variant}`);
       continue;
     }
     if (token === '{variant}') {
-      if (seat.variant !== undefined) {
-        argv.push(seat.variant);
+      if (variant !== undefined) {
+        argv.push(variant);
       } else if (argv.length > 0 && argv[argv.length - 1].startsWith('-')) {
         argv.pop();
       }
       continue;
     }
     if (token === '{model}') {
-      argv.push(seat.model);
+      argv.push(model);
     } else if (token === '{prompt}') {
       argv.push(SEAT_PROBE_PROMPT);
     } else {
@@ -473,6 +689,9 @@ export function seatProbeArgv(seat: SeatModel, template: readonly string[]): str
  * a readable model list.
  */
 export function serverModelIds(stdout: string): readonly string[] | undefined {
+  if (typeof stdout !== 'string') {
+    return undefined;
+  }
   const opencode = BUILT_IN_TOOLS.find((tool) => tool.id === 'opencode');
   if (opencode?.models === undefined) {
     return undefined;
@@ -588,11 +807,11 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       }
       // GNU coreutils `sha256sum` first; when it is missing (macOS/BSD ships
       // `shasum` instead) the same file is hashed with `shasum -a 256`.
-      let result = await localExecutor.run(['sha256sum', path], {
+      let result = await runTrusted(localExecutor, ['sha256sum', path], {
         timeoutMs,
       });
       if (!succeeded(result)) {
-        result = await localExecutor.run(['shasum', '-a', '256', path], {
+        result = await runTrusted(localExecutor, ['shasum', '-a', '256', path], {
           timeoutMs,
         });
       }
@@ -621,7 +840,13 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
     },
 
     async ghBinary() {
-      const candidates = deps.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
+      const candidates = readUntrustedStringArray(
+        deps.ghBinaryCandidates ?? GH_BINARY_CANDIDATES,
+        MAX_ARGV_LENGTH,
+      );
+      if (candidates === undefined) {
+        return undefined;
+      }
       try {
         for (const candidate of candidates) {
           if (existsSync(candidate)) {
@@ -655,7 +880,7 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
           authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
         };
       }
-      const result = await localExecutor.run([binaryPath, 'auth', 'status'], {
+      const result = await runTrusted(localExecutor, [binaryPath, 'auth', 'status'], {
         timeoutMs: ghAuthTimeoutMs,
       });
       if (result.error !== undefined || result.signal !== null || result.exitCode === null) {
@@ -675,7 +900,11 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
 
     async pinnedBuild(): Promise<PinnedBuildProbeResult | undefined> {
       if (deps.readPinnedBuild !== undefined) {
-        return await deps.readPinnedBuild();
+        try {
+          return readUntrustedPinnedBuild(await deps.readPinnedBuild());
+        } catch {
+          return undefined;
+        }
       }
       if (repoRoot === undefined) {
         return { pinnedCommit: undefined, baseTipCommit: undefined, behindCount: undefined };
@@ -798,17 +1027,23 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
     },
 
     async seatProbe(seat: SeatModel): Promise<SeatProbeResult> {
-      const descriptor = BUILT_IN_TOOLS.find((tool) => tool.id === seat.tool);
+      const toolRead = isPlainUntrustedObject(seat) ? readOwnDataProperty(seat, 'tool') : undefined;
+      if (toolRead === undefined || !toolRead.ok || typeof toolRead.value !== 'string') {
+        return { outcome: 'unknown', reason: 'seat probe received untrusted input' };
+      }
+      const toolId = toolRead.value;
+      const descriptor = BUILT_IN_TOOLS.find((tool) => tool.id === toolId);
       if (descriptor === undefined) {
         return {
           outcome: 'unknown',
-          reason: `seat tool ${seat.tool} has no probe descriptor`,
+          reason: `seat tool ${toolId} has no probe descriptor`,
         };
       }
-      const result = await localExecutor.run(
-        seatProbeArgv(seat, descriptor.invocation.argvTemplate),
-        { timeoutMs: seatTimeoutMs },
-      );
+      const argv = seatProbeArgv(seat, descriptor.invocation.argvTemplate);
+      if (argv.length === 0) {
+        return { outcome: 'unknown', reason: 'seat probe received untrusted input' };
+      }
+      const result = await runTrusted(localExecutor, argv, { timeoutMs: seatTimeoutMs });
       if (result.error !== undefined) {
         return { outcome: 'unknown', reason: `seat probe failed to run (${result.error})` };
       }

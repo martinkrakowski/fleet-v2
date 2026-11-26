@@ -13,6 +13,7 @@ export * from "./CloseWorkOrderPort.in-port.js";
 export * from "./CollectAttemptArtifactsPort.in-port.js";
 export * from "./CommitEditOnlyAttemptPort.in-port.js";
 export * from "./CompareScorecardPort.in-port.js";
+export * from "./DecideShadowMergePort.in-port.js";
 export * from "./DeclareLaneActivityPort.in-port.js";
 export * from "./DispatchAttemptPort.in-port.js";
 export * from "./EnqueueMergePort.in-port.js";

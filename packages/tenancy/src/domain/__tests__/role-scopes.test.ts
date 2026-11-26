@@ -213,6 +213,13 @@ describe("extractScopeList", () => {
       'export const FROZEN_SCOPES = ["read",, "tail"];',
       // A bare-word element after a valid first element.
       'export const FROZEN_SCOPES = ["read", tail];',
+      // Trailing text after the closing bracket that is not a declaration end.
+      'export const FROZEN_SCOPES = ["read"] garbage; ',
+      'export const FROZEN_SCOPES = ["read"]\nconst OTHER = 1;',
+      // A duplicate element.
+      'export const FROZEN_SCOPES = ["read", "read"];',
+      // A declaration that sits inside a line comment, not at a line start.
+      '// export const FROZEN_SCOPES = ["read"];',
     ]) {
       const result = extractScopeList(text, "FROZEN_SCOPES");
       expect(result.ok).toBe(false);
@@ -324,9 +331,9 @@ describe("drift guard", () => {
     try {
       return readFileSync(join(repoRoot, relativePath), "utf8");
     } catch (error) {
-      throw new Error(
-        `drift guard could not read ${relativePath}: ${String(error)}`,
-      );
+      throw new Error(`drift guard could not read ${relativePath}`, {
+        cause: error,
+      });
     }
   };
 
@@ -348,5 +355,19 @@ describe("drift guard", () => {
     expect(
       sameScopes(HOSTED_SCOPES, [...mintable.scopes, "orchestrate"]),
     ).toBe(true);
+  });
+
+  it("every scope granted to any role is mintable for a session", () => {
+    const mintable = extractScopeList(
+      readSource("apps/api/server/wiring/session-exchange.ts"),
+      "MINTABLE_SESSION_SCOPES",
+    );
+    expect(mintable.ok).toBe(true);
+    if (!mintable.ok) return;
+    for (const role of ROLES) {
+      for (const scope of scopesForRole(role)) {
+        expect(mintable.scopes).toContain(scope);
+      }
+    }
   });
 });

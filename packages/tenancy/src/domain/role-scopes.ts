@@ -82,6 +82,12 @@ const SCOPE_LIST_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SCOPE_LIST_NAME_MAX_LENGTH = 128;
 const SOURCE_TEXT_MAX_LENGTH = 1_000_000;
 
+/** True when `text` continues at `from` with `[ as const];` and nothing else on the statement. */
+function isDeclarationEnd(text: string, from: number): boolean {
+  const tail = text.slice(from, text.indexOf("\n", from) === -1 ? undefined : text.indexOf("\n", from));
+  return tail === ";" || tail === " as const;";
+}
+
 /**
  * Extracts the string elements of an `export const ${name} = [ ... ];`
  * declaration from source text. Returns a typed refusal for every invalid
@@ -110,12 +116,13 @@ export function extractScopeList(
   }
   const declaration = `export const ${name} = [`;
   const start = text.indexOf(declaration);
-  if (start === -1) {
+  // The declaration must begin a line, so a commented-out copy never matches.
+  if (start === -1 || (start > 0 && text[start - 1] !== "\n")) {
     return { ok: false, reason: "could not parse scope list" };
   }
   const elementsStart = start + declaration.length;
   const end = text.indexOf("]", elementsStart);
-  if (end === -1 || text.indexOf(";", end) === -1) {
+  if (end === -1 || !isDeclarationEnd(text, end + 1)) {
     return { ok: false, reason: "could not parse scope list" };
   }
   const body = text.slice(elementsStart, end);
@@ -146,7 +153,12 @@ export function extractScopeList(
       if (closing === -1) {
         return { ok: false, reason: "could not parse scope list" };
       }
-      scopes.push(body.slice(index + 1, closing));
+      const element = body.slice(index + 1, closing);
+      if (scopes.includes(element)) {
+        // A duplicate grant is drift, not a list.
+        return { ok: false, reason: "could not parse scope list" };
+      }
+      scopes.push(element);
       index = closing + 1;
       afterElement = true;
       continue;

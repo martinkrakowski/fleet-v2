@@ -86,6 +86,90 @@ describe('CoordinationRequest.fromRecord', () => {
     );
   });
 
+  it('refuses an accessor property on kind with a named error and never runs the getter', () => {
+    const record = baseRecord() as Record<string, unknown>;
+    let getterRuns = 0;
+    Object.defineProperty(record, 'kind', {
+      get() {
+        getterRuns += 1;
+        throw new Error('getter must never run');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(record as unknown as CoordinationRequestRecord);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(getterRuns).toBe(0);
+    expect(message).toBe('CoordinationRequest kind cannot be an accessor property.');
+  });
+
+  it('refuses an accessor property on state with a named error and never runs the getter', () => {
+    const record = baseRecord() as Record<string, unknown>;
+    let getterRuns = 0;
+    Object.defineProperty(record, 'state', {
+      get() {
+        getterRuns += 1;
+        throw new Error('getter must never run');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(record as unknown as CoordinationRequestRecord);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(getterRuns).toBe(0);
+    expect(message).toBe('CoordinationRequest state cannot be an accessor property.');
+  });
+
+  it('refuses an accessor property on deliveryStatus with a named error and never runs the getter', () => {
+    const record = baseRecord() as Record<string, unknown>;
+    let getterRuns = 0;
+    Object.defineProperty(record, 'deliveryStatus', {
+      get() {
+        getterRuns += 1;
+        throw new Error('getter must never run');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(record as unknown as CoordinationRequestRecord);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(getterRuns).toBe(0);
+    expect(message).toBe('CoordinationRequest deliveryStatus cannot be an accessor property.');
+  });
+
+  it('refuses a record Proxy whose getOwnPropertyDescriptor trap throws on kind with a named trap refusal', () => {
+    // Only the descriptor trap throws: the plain get reads succeed through the
+    // earlier field loops, then the descriptor snapshot itself is refused by
+    // name instead of letting the trap escape.
+    const target = baseRecord() as object;
+    const hostile = new Proxy(target, {
+      getOwnPropertyDescriptor() {
+        throw new Error('trap');
+      },
+    });
+    let message = '';
+    try {
+      CoordinationRequest.fromRecord(hostile as unknown as CoordinationRequestRecord);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe(
+      'CoordinationRequest kind validation failed due to a prohibited Proxy trap execution.',
+    );
+  });
+
   it('refuses a throwing-toString object on kind with a message ending in <object>', () => {
     expect(() => CoordinationRequest.fromRecord(recordWith({ kind: throwingToStringObject() }))).toThrow(
       'CoordinationRequest has an invalid kind: <object>',

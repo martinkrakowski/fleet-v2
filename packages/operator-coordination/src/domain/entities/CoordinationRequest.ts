@@ -134,13 +134,19 @@ export class CoordinationRequest {
         throw new Error(`CoordinationRequest ${field} must be a non-empty string or null`);
       }
     }
-    const kind = CoordinationKind.create(record.kind);
+    // kind, state and deliveryStatus are read through their own property
+    // descriptors and validated from that snapshot: a getter never runs, a
+    // revoked or hostile Proxy trap becomes a named refusal, and no later
+    // read can disagree with the validated value.
+    const kindValue = readOwnDataValue(record, 'kind');
+    const kind = CoordinationKind.create(kindValue);
     if (!kind.success || kind.value === undefined) {
-      throw new Error('CoordinationRequest has an invalid kind: ' + describeRejectedValue(record.kind));
+      throw new Error('CoordinationRequest has an invalid kind: ' + describeRejectedValue(kindValue));
     }
-    const state = CoordinationState.create(record.state);
+    const stateValue = readOwnDataValue(record, 'state');
+    const state = CoordinationState.create(stateValue);
     if (!state.success || state.value === undefined) {
-      throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(record.state));
+      throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(stateValue));
     }
     const policyGrant = CoordinationRequest.readPolicyGrant(record);
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
@@ -153,7 +159,7 @@ export class CoordinationRequest {
       if (shadowImportGrant === undefined) {
         throw new Error('CoordinationRequest merge:import-shadow requires a shadowImportGrant');
       }
-      if (record.kind !== 'action-decision') {
+      if (kindValue !== 'action-decision') {
         throw new Error('CoordinationRequest merge:import-shadow grant must be an action-decision');
       }
       if (record.expectedHeadSha !== null) {
@@ -165,10 +171,17 @@ export class CoordinationRequest {
       );
     }
     const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
-    if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
-      throw new Error('CoordinationRequest has an invalid delivery status: ' + describeRejectedValue(record.deliveryStatus));
+    const deliveryStatusValue = readOwnDataValue(record, 'deliveryStatus');
+    if (
+      typeof deliveryStatusValue !== 'string' ||
+      !DELIVERY_STATUSES.includes(deliveryStatusValue)
+    ) {
+      throw new Error(
+        'CoordinationRequest has an invalid delivery status: ' +
+          describeRejectedValue(deliveryStatusValue),
+      );
     }
-    if (record.deliveryStatus === 'delivery-gap') {
+    if (deliveryStatusValue === 'delivery-gap') {
       if (typeof record.deliveryGapReason !== 'string' || record.deliveryGapReason.length === 0) {
         throw new Error('CoordinationRequest requires a delivery gap reason for a delivery gap');
       }

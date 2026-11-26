@@ -9,5 +9,6 @@ export * from "./LaneRunState.vo.js";
 export * from "./ModelAssignment.vo.js";
 export * from "./RunnerObservation.vo.js";
 export * from "./SeatPlan.vo.js";
+export * from "./SpendCap.vo.js";
 export * from "./StopReason.vo.js";
 export * from "./WorkOrderState.vo.js";

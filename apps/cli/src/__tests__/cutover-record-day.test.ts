@@ -1443,7 +1443,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         kind: 'result',
         key: builtKey.key,
         runId: null,
-        recordedAtIso: `${day}T10:00:30Z`,
+        recordedAtIso: `${day}T09:59:30Z`,
         mode: null,
         expectedRevision: null,
         mintedId: null,
@@ -1477,6 +1477,46 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         throw new Error('expected the recorded day in the ledger');
       }
       expect(dayRecord.mergesCompared).toBe(1);
+      expect(dayRecord.verdicts.S1?.verdict).toBe('pass');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The CLI wiring pins `excludeBatchMerges: true` (owner decision
+  // 2026-11-25): an unmatched shell merge carrying the `batch #9` detail —
+  // a batch-member merge with NO fleet row — is excluded from S1's merge
+  // set through the REAL wired `record-day`, so the day passes instead of
+  // reporting `missing-in-fleet`.
+  it('excludes a batch-member shell merge with no fleet row from S1 through the wired record-day (excludeBatchMerges true)', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const day = '2026-06-14';
+    await fs.writeFile(
+      path.join(fixtureDir, 'events.jsonl'),
+      `${JSON.stringify({ at: `${day}T10:00:00Z`, kind: 'result', outcome: 'merged', pr: 9, headOid: '0123456789abcdef0123456789abcdef01234567', detail: 'batch #9' })}\n`,
+    );
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const runtime = wiredRuntime(stateDir);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as { outcome: string; recorded: Record<string, string> };
+      expect(body.outcome).toBe('recorded');
+      // The batch-member merge was excluded, not judged a divergence: S1 passes.
+      expect(body.recorded.S1).toBe('pass');
+      const ledger = JSON.parse(await fs.readFile(path.join(stateDir, 'cutover-shadow.json'), 'utf8')) as {
+        days?: ReadonlyArray<{ day: string; mergesCompared: number | null; verdicts: Record<string, { verdict: string }> }>;
+        ledger?: { days?: ReadonlyArray<{ day: string; mergesCompared: number | null; verdicts: Record<string, { verdict: string }> }> };
+      };
+      const days = ledger.days ?? ledger.ledger?.days ?? [];
+      const dayRecord = days.find((entry) => entry.day === day);
+      if (dayRecord === undefined) {
+        throw new Error('expected the recorded day in the ledger');
+      }
+      // The excluded merge never counted toward the 20-merge floor.
+      expect(dayRecord.mergesCompared).toBe(0);
       expect(dayRecord.verdicts.S1?.verdict).toBe('pass');
     } finally {
       vi.useRealTimers();

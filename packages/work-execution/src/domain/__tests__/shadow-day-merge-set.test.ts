@@ -42,7 +42,7 @@ function fleetResult(overrides: Record<string, unknown> = {}): Record<string, un
     key: mergeKey(DIGEST, 7, HEAD_A.slice(0, 12)),
     outcome: 'dry-run',
     reasonCode: 'would-merge',
-    recordedAtIso: inDayIso(600, 10),
+    recordedAtIso: inDayIso(599, 50),
     ...overrides,
   };
 }
@@ -69,7 +69,7 @@ describe('evaluateShadowMergeSet (S1)', () => {
     const input = dayInput({
       shell: { events: [shellEvent(), shellEvent({ line: 2, atIso: inDayIso(700), pullRequest: 8, headOid: HEAD_C })], unknownLines: 0 },
       fleet: {
-        results: [fleetResult(), fleetResult({ key: mergeKey(DIGEST, 8, HEAD_C.slice(0, 12)), recordedAtIso: inDayIso(700, 10) })],
+        results: [fleetResult(), fleetResult({ key: mergeKey(DIGEST, 8, HEAD_C.slice(0, 12)), recordedAtIso: inDayIso(699, 50) })],
         entries: [fleetEntry(), fleetEntry({ pullRequest: 8, headOid: HEAD_C })],
       },
     });
@@ -126,12 +126,15 @@ describe('evaluateShadowMergeSet (S1)', () => {
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
   });
 
-  it('passes a shell merge at 23:59:55 UTC matched against a fleet would-merge recorded at 00:00:05 the next day', () => {
+  it('passes a boundary-crossing pair: a fleet would-merge at 23:59:55 UTC on day D and its shell merge at 00:00:05 the next day', () => {
     const input = dayInput({
-      shell: { events: [shellEvent({ atIso: `${DAY}T23:59:55Z` })], unknownLines: 0 },
-      fleet: { results: [fleetResult({ recordedAtIso: '2026-11-11T00:00:05.000Z' })], entries: [fleetEntry()] },
+      shell: { events: [shellEvent({ atIso: '2026-11-11T00:00:05Z' })], unknownLines: 0 },
+      fleet: { results: [fleetResult({ recordedAtIso: `${DAY}T23:59:55Z` })], entries: [fleetEntry()] },
     });
-    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+    // The shell merge's own time falls on the NEXT day, so it does not count
+    // toward `mergesCompared` — but the pair still compares, and the fleet
+    // row (earlier) precedes the shell merge (later), so the day passes.
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, mergesCompared: 0 });
   });
 
   it('passes when a divergence falls ONLY inside the grace margin, not within the day itself', () => {
@@ -284,6 +287,118 @@ describe('evaluateShadowMergeSet (S1)', () => {
     const events = [...graceEvents, shellEvent({ line: 99, pullRequest: 2, headOid: HEAD_C })];
     const input = dayInput({ shell: { events, unknownLines: 0 }, fleet: { results: [], entries: [] } });
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'unknown', reason: 'merge-set-comparison-truncated', mergesCompared: 1 });
+  });
+
+  it('fails with merge-set-divergence and divergences 1 when the fleet would-merge is recorded 1 s AFTER the shell merge of the same PR and head', () => {
+    const input = dayInput({ fleet: { results: [fleetResult({ recordedAtIso: inDayIso(600, 1) })], entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('passes with merge-set-equal when the same pair has the fleet row recorded 1 s BEFORE the shell merge', () => {
+    const input = dayInput({ fleet: { results: [fleetResult({ recordedAtIso: inDayIso(599, 59) })], entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('passes when the fleet row and the shell merge carry EQUAL whole-second instants', () => {
+    const input = dayInput({ fleet: { results: [fleetResult({ recordedAtIso: inDayIso(600) })], entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('counts the EARLIEST of two fleet rows for one pair, so one before and one after the shell merge still passes', () => {
+    const input = dayInput({
+      fleet: {
+        results: [
+          fleetResult({ recordedAtIso: inDayIso(600, 5) }),
+          fleetResult({ recordedAtIso: inDayIso(599, 30) }),
+        ],
+        entries: [fleetEntry()],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'pass', reason: 'merge-set-equal', divergences: 0 });
+  });
+
+  it('fails with merge-set-divergence when the only fleet rows are would-already-merged for the shell-merged heads', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ reasonCode: 'would-already-merged' })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('a batch-member merge with no fleet row passes with excludedBatchMerges 1 under excludeBatchMerges true, while a non-batch merge with no fleet row still fails', () => {
+    const excluded = dayInput({
+      excludeBatchMerges: true,
+      shell: { events: [shellEvent(), shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C, detailCode: 'batch-member' })], unknownLines: 0 },
+    });
+    expect(evaluateShadowMergeSet(excluded)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+    const notExcluded = dayInput({
+      shell: { events: [shellEvent(), shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C })], unknownLines: 0 },
+    });
+    expect(evaluateShadowMergeSet(notExcluded)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
+  });
+
+  it("a batch PR's own merge with no fleet row passes under excludeBatchMerges true when its batch/opened event exists, counting in excludedBatchMerges, and fails without the opened event", () => {
+    const opened = shellEvent({ line: 1, kind: 'batch', outcome: 'opened', pullRequest: 9, headOid: HEAD_C, detailCode: 'none' });
+    const ownMerge = shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C });
+    const withOpened = dayInput({ excludeBatchMerges: true, shell: { events: [shellEvent(), opened, ownMerge], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(withOpened)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+    const withoutOpened = dayInput({ excludeBatchMerges: true, shell: { events: [shellEvent(), ownMerge], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(withoutOpened)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
+  });
+
+  it("a batch PR's own merge whose merged headOid differs from the opened event's headOid is still excluded, matched on PR number alone", () => {
+    const openedHead = 'b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7';
+    const opened = shellEvent({ line: 1, kind: 'batch', outcome: 'opened', pullRequest: 9, headOid: openedHead, detailCode: 'none' });
+    const ownMerge = shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C });
+    const input = dayInput({ excludeBatchMerges: true, shell: { events: [shellEvent(), opened, ownMerge], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+  });
+
+  it('an excluded batch member that DOES have a fleet would-merge row passes, the row dropped on the fleet side too (no missing-in-shell)', () => {
+    const batchMerge = shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C, detailCode: 'batch-member' });
+    const input = dayInput({
+      excludeBatchMerges: true,
+      shell: { events: [shellEvent(), batchMerge], unknownLines: 0 },
+      fleet: {
+        results: [fleetResult(), fleetResult({ key: mergeKey(DIGEST, 9, HEAD_C.slice(0, 12)), recordedAtIso: inDayIso(599, 40) })],
+        entries: [fleetEntry(), fleetEntry({ pullRequest: 9, headOid: HEAD_C })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+  });
+
+  it('a fleet row at 00:00:00.900Z against a shell merge stamped 00:00:00Z passes (fleet instant floored to the second), and a row at 00:00:01.000Z fails', () => {
+    const shellAtMidnight = shellEvent({ atIso: `${DAY}T00:00:00Z` });
+    const run = (fleetAt: string) => evaluateShadowMergeSet(dayInput({
+      shell: { events: [shellAtMidnight], unknownLines: 0 },
+      fleet: { results: [fleetResult({ recordedAtIso: fleetAt })], entries: [fleetEntry()] },
+    }));
+    expect(run(`${DAY}T00:00:00.900Z`)).toEqual(PASS_DAY);
+    expect(run(`${DAY}T00:00:01.000Z`)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('compares offset-carried instants by instant, not by text: a +02:00 row equal in instant passes, and a -02:00 row textually earlier but instantially later fails', () => {
+    const passing = dayInput({
+      fleet: { results: [fleetResult({ recordedAtIso: `${DAY}T12:00:00.000+02:00` })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(passing)).toEqual(PASS_DAY);
+    const failing = dayInput({
+      fleet: { results: [fleetResult({ recordedAtIso: `${DAY}T09:00:00.000-02:00` })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(failing)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('an excluded batch PR with a fleet would-merge on a DIFFERENT head than its shell merge passes, the fleet row dropped by PR number (no missing-in-shell)', () => {
+    const otherHead = 'b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7';
+    const batchMerge = shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C, detailCode: 'batch-member' });
+    const input = dayInput({
+      excludeBatchMerges: true,
+      shell: { events: [shellEvent(), batchMerge], unknownLines: 0 },
+      fleet: {
+        results: [fleetResult(), fleetResult({ key: mergeKey(DIGEST, 9, otherHead.slice(0, 12)), recordedAtIso: inDayIso(599, 40) })],
+        entries: [fleetEntry(), fleetEntry({ pullRequest: 9, headOid: otherHead })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
   });
 });
 

@@ -29,7 +29,9 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'capacity-released', 'capacity-none-held', 'capacity-held', 'cancel-refused', 'cancel-changed',
   'stop-timeout', 'stop-force', 'stop-force-slot-held', 'stop-unconfirmed', 'stop-confirmed',
   'collected', 'collect-refused', 'edit-only-refused', 'edit-only-unknown', 'no-completion-receipt',
-  'edits-outside-owned-paths', // SN1: the commit refused because edits sit outside the owned paths; the worktree was normalized
+  'edits-outside-owned-paths', // SN1: the commit refused `outside-allowed-paths`; the worktree was normalized
+  'edit-only-diff-findings', // CB8: the commit refused `diff-findings` (secret/pattern findings); the worktree was normalized
+  'staged-content-findings', // CB8: the commit refused `staged-content-findings`; the worktree was normalized
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
   'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
   'assessment-unavailable', 'review-seat-unavailable',

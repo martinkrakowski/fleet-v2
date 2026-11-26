@@ -910,7 +910,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(harness.commitRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
   });
 
-  it('test 6b: a diff-findings commit refusal journals edits-outside-owned-paths and the next advance parks step-refused collect', async () => {
+  it('test 6b: a diff-findings commit refusal journals edit-only-diff-findings and the next advance parks step-refused collect', async () => {
     const findings: readonly LaneDiffFinding[] = [
       { path: 'packages/example/secret.txt', line: 3, rule: 'secret-shape' },
     ];
@@ -924,7 +924,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       step: 'collect',
       key: collectKey(),
       result: 'refused',
-      reasonCode: 'edits-outside-owned-paths',
+      reasonCode: 'edit-only-diff-findings',
     });
     expect(harness.collectRequests).toHaveLength(0);
     const parked = await advance(harness);

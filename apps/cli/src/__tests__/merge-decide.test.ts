@@ -372,4 +372,23 @@ describe('merge decide', () => {
     expect(fake.calls).toHaveLength(0);
     expect(await journalRowsFor(stateDir, null)).toHaveLength(0);
   });
+
+  it.each([
+    ['an array', [] as unknown],
+    ['an object without an outcome', { reasonCode: 'would-merge', journalKey: null } as unknown],
+  ])('refuses decide-failed (exit 1) when the use case returns %s instead of a typed result', async (_label, bogus) => {
+    const fake = greenForgeFake();
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, fake.run);
+    (runtime.daemon as unknown as { decideShadowMerge: unknown }).decideShadowMerge = {
+      decideShadowMerge: async () => bogus,
+    };
+
+    const result = await runDecide(runtime, decideArgv());
+
+    expect(result.code).toBe(1);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed).toEqual({ outcome: 'refused', reasonCode: 'decide-failed', journalKey: null });
+    expect(fake.calls).toHaveLength(0);
+    expect(await journalRowsFor(stateDir, null)).toHaveLength(0);
+  });
 });

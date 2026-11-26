@@ -66,6 +66,15 @@ function requiredEntryId(p: Payload, subcommand: string): string {
 const DEFAULT_READINESS_TIMEOUT_MS = 30 * 1000;
 /** S1U2: the default and the cap for one `merge decide` shadow decision. */
 const DEFAULT_DECIDE_TIMEOUT_MS = 20_000;
+
+/** The outcomes a decide result may carry; anything else is a malformed result. */
+const DECIDE_OUTCOMES: ReadonlySet<string> = new Set([
+  'journalled',
+  'already-journalled',
+  'not-ready',
+  'refused',
+  'budget-exhausted',
+]);
 const MAX_DECIDE_TIMEOUT_MS = 120_000;
 
 /** S1U2: the base the pair was queued for; `main` unless `--base` says otherwise. */
@@ -401,7 +410,10 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue
         return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
       }
       const result: unknown = await (method as (...args: unknown[]) => Promise<unknown>).call(port, request);
-      if (result === null || typeof result !== 'object') {
+      if (
+        result === null || typeof result !== 'object' || Array.isArray(result) ||
+        !DECIDE_OUTCOMES.has((result as { outcome?: unknown }).outcome as string)
+      ) {
         return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
       }
       return result as DecideShadowMergeResult;

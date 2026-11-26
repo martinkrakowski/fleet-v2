@@ -527,7 +527,6 @@ describe('DecideShadowMergeUseCase', () => {
     ['a parked entry', [makeQueueEntry({ state: 'parked', reason: 'checks' })]],
     ['a dropped entry', [makeQueueEntry({ state: 'dropped', reason: 'closed' })]],
     ['no entry at all', []],
-    ['only an older head queued while the newer head is asked', [makeQueueEntry({ headOid: MOVED_HEAD })]],
   ])('%s is refused not-queued with zero forge reads and no would-merge row', async (_label, queueEntries) => {
     const harness = makeHarness({ queueEntries });
 
@@ -537,6 +536,43 @@ describe('DecideShadowMergeUseCase', () => {
     expect(harness.forge.calls).toBe(0);
     expect(harness.appends()).toBe(0);
     expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(0);
+  });
+
+  it.each([
+    ['a queued entry at an older head', makeQueueEntry({ headOid: MOVED_HEAD })],
+    ['a parked update-refused entry at an older head', makeQueueEntry({ headOid: MOVED_HEAD, state: 'parked', reason: 'update-refused' })],
+    ['a ready entry at an older head', makeQueueEntry({ headOid: MOVED_HEAD, state: 'ready' })],
+    ['a ready entry at the same head', makeQueueEntry({ state: 'ready' })],
+  ])('%s is decided would-merge for the requested head', async (_label, entry) => {
+    const harness = makeHarness({ queueEntries: [entry] });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+    expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(1);
+  });
+
+  it.each([
+    ['a parked entry for another reason at an older head', () => [makeQueueEntry({ headOid: MOVED_HEAD, state: 'parked', reason: 'checks' })]],
+    ['a parked update-refused entry at the same head', () => [makeQueueEntry({ state: 'parked', reason: 'update-refused' })]],
+    ['a dropped entry at an older head', () => [makeQueueEntry({ headOid: MOVED_HEAD, state: 'dropped', reason: 'closed' })]],
+    ['a merged entry at an older head', () => [makeQueueEntry({ headOid: MOVED_HEAD, state: 'merged' })]],
+    ['an unknown state at an older head', () => [makeQueueEntry({ headOid: MOVED_HEAD, state: 'unknown-state' as never })]],
+    ['an older head under another repoDigest', () => [makeQueueEntry({ headOid: MOVED_HEAD, repoDigest: 'ffffffffffff' })]],
+    ['a null element', () => [null as never]],
+    ['an entry with a throwing getter', () => {
+      const bad = makeQueueEntry({ headOid: MOVED_HEAD });
+      Object.defineProperty(bad, 'state', { get() { throw new Error('boom'); } });
+      return [bad];
+    }],
+  ])('%s is refused not-queued with zero forge reads and zero journal appends', async (_label, build) => {
+    const harness = makeHarness({ queueEntries: build() });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'not-queued', journalKey: null });
+    expect(harness.forge.calls).toBe(0);
+    expect(harness.appends()).toBe(0);
   });
 
   it('an earlier live entry on a different base does not block the decision', async () => {

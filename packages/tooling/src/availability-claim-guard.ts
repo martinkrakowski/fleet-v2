@@ -114,6 +114,14 @@ const AVAILABILITY_CONTEXT_PATTERN = /\b(?:availability|uptime|downtime|sla)\b/i
 const AVAILABILITY_CONTEXT_WINDOW = 64;
 
 /**
+ * Hard cap on collected findings. Unbounded input (`maxArrayLength: 1024`
+ * documents of up to 262,144 characters each) could otherwise allocate tens
+ * of millions of finding objects and exhaust memory; past this cap the guard
+ * stops collecting and reports what it found.
+ */
+const MAX_FINDINGS = 1024;
+
+/**
  * Decide whether one percentage match is an availability figure: either it
  * carries fractional precision (`99.9%`) or it appears within
  * {@link AVAILABILITY_CONTEXT_WINDOW} characters of availability wording.
@@ -241,6 +249,9 @@ export function findUnbackedAvailabilityClaims(
 
   const findings: AvailabilityClaimFinding[] = [];
   for (const doc of validatedDocs) {
+    if (findings.length >= MAX_FINDINGS) {
+      break;
+    }
     const tokens = new Set<string>();
     for (const match of doc.text.matchAll(TOKEN_PATTERN)) {
       tokens.add(match[0]);
@@ -250,6 +261,9 @@ export function findUnbackedAvailabilityClaims(
       continue;
     }
     for (const match of doc.text.matchAll(PERCENTAGE_PATTERN)) {
+      if (findings.length >= MAX_FINDINGS) {
+        break;
+      }
       if (
         isAvailabilityFigure(
           doc.text,

@@ -282,6 +282,23 @@ describe('findUnbackedAvailabilityClaims', () => {
     });
   });
 
+  it('caps collected findings at 1024 for input dense with unbacked figures', () => {
+    // 2_000 decimal figures in one document (~12k characters, within the
+    // 262,144-character limit) would allocate 2,000 findings unbounded.
+    const text = Array.from({ length: 2_000 }, () => '99.9%').join(' ');
+    const result = findUnbackedAvailabilityClaims(
+      [{ id: 'doc-1', text }],
+      [],
+      isProxy,
+    );
+    expect(result.status).toBe('flagged');
+    if (result.status !== 'flagged') {
+      throw new Error('expected flagged');
+    }
+    expect(result.findings.length).toBe(1024);
+    expect(result.findings[0]).toEqual({ docId: 'doc-1', figure: '99.9%' });
+  });
+
   it('refuses missing or throwing isProxy detector', () => {
     expect(
       findUnbackedAvailabilityClaims([DOC], [DRILL], undefined as never),

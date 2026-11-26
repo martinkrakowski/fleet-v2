@@ -159,6 +159,10 @@ const AUTHORITY_EVENT_KEYS = [
   'afterRevision',
 ] as const;
 
+const AUTHORITY_EVENT_KEYS_WITHOUT_ORGANIZATION = AUTHORITY_EVENT_KEYS.filter(
+  (key) => key !== 'organizationId',
+);
+
 const AUTHORITY_EVENT_KINDS: ReadonlySet<string> = new Set([
   'dispatch',
   'stop',
@@ -345,13 +349,18 @@ function isBoundedOptionalAuthorityText(value: unknown, maxLength: number): bool
 
 /**
  * One parsed JSONL line, already snapshotted to own enumerable data
- * properties, is a complete `AuthorityEvent`: exactly the seven keys, every
+ * properties, is a complete `AuthorityEvent`: exactly the seven keys (the organisation key may be absent), every
  * field present, well-formed and within its bound. O(1) per line beyond the
  * bounded field scans. Invalid shape reads as `invalid-input`, never a pass —
  * a bare `{"organizationId":"org-1"}` line carries no evidence.
  */
 function isAuthorityEventLine(record: Readonly<Record<string, unknown>>): boolean {
-  if (!hasExactKeys(record, AUTHORITY_EVENT_KEYS)) {
+  // `organizationId` may be absent (the brief accepts a line without one when
+  // the bundle has no organisation); every other key is required, no extras.
+  if (
+    !hasExactKeys(record, AUTHORITY_EVENT_KEYS)
+    && !hasExactKeys(record, AUTHORITY_EVENT_KEYS_WITHOUT_ORGANIZATION)
+  ) {
     return false;
   }
   if (!isBoundedAuthorityText(record.eventId, MAX_ID_LENGTH)) {
@@ -363,7 +372,7 @@ function isAuthorityEventLine(record: Readonly<Record<string, unknown>>): boolea
   if (typeof record.actor !== 'string' || !AUTHORITY_ACTOR_PATTERN.test(record.actor)) {
     return false;
   }
-  if (!isBoundedOptionalAuthorityText(record.organizationId, MAX_ID_LENGTH)) {
+  if (record.organizationId !== undefined && !isBoundedOptionalAuthorityText(record.organizationId, MAX_ID_LENGTH)) {
     return false;
   }
   const atIso = record.atIso;

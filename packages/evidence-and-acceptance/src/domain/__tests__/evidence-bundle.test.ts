@@ -132,13 +132,15 @@ describe('assembleEvidenceBundle', () => {
     );
     expect(withoutLineOrg.ok).toBe(true);
 
-    const withNullLineOrg = assembleEvidenceBundle(
+    const withoutOrgKey = JSON.parse(authorityLine(null)) as Record<string, unknown>;
+    delete withoutOrgKey.organizationId;
+    const withNoLineOrgKey = assembleEvidenceBundle(
       deepFreeze(validInput({
         organizationId: null,
-        authorityEventsJsonl: `${authorityLine(null)}\n`,
+        authorityEventsJsonl: `${JSON.stringify(withoutOrgKey)}\n`,
       })),
     );
-    expect(withNullLineOrg.ok).toBe(true);
+    expect(withNoLineOrgKey.ok).toBe(true);
   });
 
   it('refuses a JSONL line that is not a complete AuthorityEvent despite a matching organizationId', () => {
@@ -289,7 +291,11 @@ describe('assembleEvidenceBundle', () => {
   });
 
   it('refuses JSONL lines with duplicate keys before parsing them', () => {
-    const line = '{"organizationId":"other","organizationId":"org-1"}';
+    const base = authorityLine('org-1');
+    const line = base.replace('"organizationId":"org-1"', '"organizationId":"other","organizationId":"org-1"');
+    expect(line).not.toBe(base);
+    // Valid with the duplicate collapsed to its last value; only the duplicate-key guard refuses it.
+    expect(assembleEvidenceBundle(deepFreeze(validInput({ authorityEventsJsonl: `${base}\n` }))).ok).toBe(true);
     const result = assembleEvidenceBundle(deepFreeze(validInput({ authorityEventsJsonl: `${line}\n` })));
     // The duplicate-key refusal wins over the cross-organization check: the
     // last-write-wins value must never smuggle the line past the guard.

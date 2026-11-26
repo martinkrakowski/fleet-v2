@@ -18,8 +18,11 @@ import {
   dispositionCounts,
   encodeOtlpTraces,
   redactionChecks,
+  telemetryHashInput,
   TELEMETRY_HASH_PREFIX,
+  TELEMETRY_PLAN_SEAT_TOOLS,
   TELEMETRY_SCHEMA_VERSION,
+  TELEMETRY_SEAT_CALL_OUTCOMES,
   type ExportRunTelemetryResult,
 } from '@fleet/work-execution';
 
@@ -33,6 +36,7 @@ export interface TelemetryCliOptions {
 
 export const TELEMETRY_HELP = `Usage: fleet-v2 telemetry export --run <runId>|--work-order <id>|--since <ISO> [--until <ISO>] [--deadline <seconds>] [--retry-rejected] [--dry-run [--canary]] [--json]
        fleet-v2 telemetry status
+       fleet-v2 telemetry record-seat-call --tool <agy|grok|claude> --outcome <ok|empty|error|timeout> --wall-seconds <seconds> [--label <string>] [--deadline <seconds>] [--dry-run [--canary]] [--json]
 
 Export selects conducted runs and hand-run attempts — one run, one work order,
 or a time window — maps them to telemetry spans and sends them through the
@@ -55,6 +59,15 @@ status prints whether telemetry is configured (never the endpoint, token or
 salt), the salt fingerprint and the one recorded in the disposition store, the
 schema version and id hash prefix, the route, the last export time,
 per-disposition span counts and the export counters.
+
+record-seat-call records one plan-billed seat call (agy, grok or claude) as a
+metadata-only OpenInference span: it always carries the plan billing class and
+never a token, cost, model id, prompt, output, path, branch name or session id.
+The optional --label is an opaque seat/lane label that is hashed before it
+reaches the span and is never sent raw. In send mode it needs the configured
+endpoint and token file; --dry-run prints the span exactly as it would be sent
+and writes nothing, with --canary running the redaction checks on the encoded
+payload. The output is always JSON; --json is accepted and has no effect.
 
 Exit codes: 0 completed (nothing selected, or every selected span exported),
 1 refused, not configured, or any span pending or rejected, 2 usage error.`;
@@ -223,6 +236,174 @@ function parseExportFlags(argv: readonly string[], io: CliIo): ExportFlags | nul
   return { run, workOrder, since, until, deadline, retryRejected, dryRun, canary };
 }
 
+interface RecordSeatCallFlags {
+  readonly tool: string;
+  readonly outcome: string;
+  readonly wallSeconds: number;
+  readonly label: string | null;
+  readonly deadline: number;
+  readonly dryRun: boolean;
+  readonly canary: boolean;
+}
+
+/** A seat-call wall duration: a finite number ≥ 0. */
+function isNonNegativeSeconds(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** A seat-call label the domain accepts: non-empty, bounded, no lone surrogates. */
+function isAcceptableLabel(value: string): boolean {
+  return telemetryHashInput(value) !== null;
+}
+
+/**
+ * `telemetry record-seat-call`'s private flag reader: `--tool` (one of the
+ * plan seats), `--outcome` (one of the seat-call outcomes), `--wall-seconds`
+ * (finite ≥ 0), the optional `--label`, `--deadline` (integer 1..600,
+ * default 120), `--dry-run`, `--canary` (only with `--dry-run`), and the
+ * accepted no-op `--json`. A missing or repeated value, an unknown flag, a
+ * value outside its closed set or range, an empty or oversized label, or a
+ * bare positional is a usage error; each prints one fixed stderr line naming
+ * the problem and never the rejected value.
+ */
+function parseRecordSeatCallFlags(argv: readonly string[], io: CliIo): RecordSeatCallFlags | null {
+  let tool: string | undefined;
+  let outcome: string | undefined;
+  let wallSeconds: number | undefined;
+  let label: string | undefined;
+  let deadline = 120;
+  let dryRun = false;
+  let canary = false;
+  const seen = new Set<string>();
+  const readValue = (token: string, index: number): string | null => {
+    if (token.includes('=')) {
+      const equals = token.slice(token.indexOf('=') + 1);
+      if (equals === '') {
+        io.stderr(`${token} requires a value\n`);
+        return null;
+      }
+      return equals;
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value === '' || value.startsWith('--')) {
+      io.stderr(`${token} requires a value\n`);
+      return null;
+    }
+    return value;
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]!;
+    if (token === '--dry-run') {
+      if (dryRun) {
+        io.stderr(`Repeated flag: ${token}\n`);
+        return null;
+      }
+      dryRun = true;
+      continue;
+    }
+    if (token === '--canary') {
+      if (canary) {
+        io.stderr(`Repeated flag: ${token}\n`);
+        return null;
+      }
+      canary = true;
+      continue;
+    }
+    if (token === '--json') {
+      if (seen.has('json')) {
+        io.stderr(`Repeated flag: --json\n`);
+        return null;
+      }
+      seen.add('json');
+      continue;
+    }
+    const flag =
+      token === '--tool' || token.startsWith('--tool=')
+        ? 'tool'
+        : token === '--outcome' || token.startsWith('--outcome=')
+          ? 'outcome'
+          : token === '--wall-seconds' || token.startsWith('--wall-seconds=')
+            ? 'wall-seconds'
+            : token === '--label' || token.startsWith('--label=')
+              ? 'label'
+              : token === '--deadline' || token.startsWith('--deadline=')
+                ? 'deadline'
+                : null;
+    if (flag === null) {
+      io.stderr(`Unknown telemetry record-seat-call option\n`);
+      return null;
+    }
+    if (seen.has(flag)) {
+      io.stderr(`Repeated flag: --${flag}\n`);
+      return null;
+    }
+    const value = readValue(token, index);
+    if (value === null) {
+      return null;
+    }
+    if (!token.includes('=')) {
+      index += 1;
+    }
+    seen.add(flag);
+    if (flag === 'tool') {
+      if (!(TELEMETRY_PLAN_SEAT_TOOLS as readonly string[]).includes(value)) {
+        io.stderr(`--tool must be one of the plan seats (agy, grok, claude)\n`);
+        return null;
+      }
+      tool = value;
+      continue;
+    }
+    if (flag === 'outcome') {
+      if (!(TELEMETRY_SEAT_CALL_OUTCOMES as readonly string[]).includes(value)) {
+        io.stderr(`--outcome must be one of ok, empty, error, timeout\n`);
+        return null;
+      }
+      outcome = value;
+      continue;
+    }
+    if (flag === 'wall-seconds') {
+      const parsed = Number(value);
+      if (!isNonNegativeSeconds(parsed)) {
+        io.stderr(`--wall-seconds requires a finite number of seconds (0 or more)\n`);
+        return null;
+      }
+      wallSeconds = parsed;
+      continue;
+    }
+    if (flag === 'label') {
+      if (!isAcceptableLabel(value)) {
+        io.stderr(`--label requires a non-empty label of at most 1024 characters\n`);
+        return null;
+      }
+      label = value;
+      continue;
+    }
+    const parsedDeadline = Number(value);
+    if (!Number.isSafeInteger(parsedDeadline) || parsedDeadline < 1 || parsedDeadline > 600) {
+      io.stderr(`--deadline requires an integer from 1 to 600\n`);
+      return null;
+    }
+    deadline = parsedDeadline;
+  }
+  if (tool === undefined) {
+    io.stderr(`telemetry record-seat-call requires --tool (agy, grok or claude)\n`);
+    return null;
+  }
+  if (outcome === undefined) {
+    io.stderr(`telemetry record-seat-call requires --outcome (ok, empty, error or timeout)\n`);
+    return null;
+  }
+  if (wallSeconds === undefined) {
+    io.stderr(`telemetry record-seat-call requires --wall-seconds\n`);
+    return null;
+  }
+  if (canary && !dryRun) {
+    io.stderr(`--canary requires --dry-run\n`);
+    return null;
+  }
+  return { tool, outcome, wallSeconds, label: label ?? null, deadline, dryRun, canary };
+}
+
 /** Send exit code (plan §3.8): 0 when nothing was selected or every selected span exported. */
 function sendExitCode(result: ExportRunTelemetryResult): number {
   if (result.outcome === 'nothing-selected') {
@@ -374,6 +555,66 @@ async function dryRunReport(
 }
 
 /**
+ * `telemetry record-seat-call` (plan §3.2 "Seat calls"): build the typed
+ * request from the flags, run it, and print the result as one JSON line.
+ * Without a valid salt (`recordSeatCall === null`) or a send attempted before
+ * telemetry is fully configured, it prints
+ * `{"outcome":"not-configured","configured":…}` and exits 1 without calling
+ * the use case. Send mode prints the use-case result and maps its outcome to
+ * the exit code; a refused or failed result never echoes an input value.
+ */
+async function recordSeatCallCommand(
+  argv: readonly string[],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  options: TelemetryCliOptions,
+): Promise<number> {
+  const flags = parseRecordSeatCallFlags(argv, io);
+  if (flags === null) {
+    return 2;
+  }
+  if (runtime.telemetry.recordSeatCall === null) {
+    io.stdout(`${JSON.stringify({ outcome: 'not-configured', configured: runtime.telemetry.configured })}\n`);
+    return 1;
+  }
+  if (!flags.dryRun && runtime.telemetry.configured !== 'configured') {
+    io.stdout(`${JSON.stringify({ outcome: 'not-configured', configured: runtime.telemetry.configured })}\n`);
+    return 1;
+  }
+  const now = options.now !== undefined ? options.now() : new Date();
+  const result = await runtime.telemetry.recordSeatCall.execute({
+    tool: flags.tool,
+    outcome: flags.outcome,
+    wallSeconds: flags.wallSeconds,
+    label: flags.label,
+    mode: flags.dryRun ? ('dry-run' as const) : ('send' as const),
+    deadline: flags.dryRun ? null : { atMs: now.getTime() + flags.deadline * 1000 },
+    nowIso: now.toISOString(),
+  });
+  if (result.outcome !== 'dry-run') {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return result.outcome === 'exported' ? 0 : 1;
+  }
+  // Dry-run mode: encode the span exactly as it would be sent and, with
+  // --canary, run the redaction checks on the encoded payload.
+  const encoded = encodeOtlpTraces([result.span], runtime.telemetry.resource);
+  const encodeRefused = encoded === null ? 1 : 1 - encoded.encodedSpanIds.length;
+  const printed: Record<string, unknown> = { ...result, encodeRefused };
+  if (flags.canary) {
+    const block = await canaryBlock(encoded?.payload ?? null, runtime);
+    if (block === null) {
+      io.stdout(`${JSON.stringify({ outcome: 'canary-unreadable' })}\n`);
+      return 1;
+    }
+    printed.canary = block;
+  }
+  io.stdout(`${JSON.stringify(printed)}\n`);
+  const canaryPass =
+    printed.canary === undefined ? true : (printed.canary as { readonly pass: boolean }).pass;
+  return encodeRefused > 0 || !canaryPass ? 1 : 0;
+}
+
+/**
  * `telemetry status` (OT4b): one JSON object with the configuration code, the
  * salt fingerprints, the schema version and hash prefix, the route, the last
  * export time, per-disposition span counts and the export counters. Never
@@ -438,6 +679,9 @@ export async function telemetryCommand(
   }
   if (subcommand === 'export') {
     return await exportCommand(argv.slice(1), io, runtime, options);
+  }
+  if (subcommand === 'record-seat-call') {
+    return await recordSeatCallCommand(argv.slice(1), io, runtime, options);
   }
   if (subcommand === 'status') {
     return await statusCommand(argv.slice(1), io, runtime);

@@ -2,7 +2,7 @@
 // the export wiring — no-ops unless policy, salt, endpoint and token file
 // configure it (plan §3.3, §3.5, §3.9). The reads are its own instances, never
 // the evidence context's; the export writes only its own disposition store.
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 
 import {
@@ -17,6 +17,7 @@ import {
   LaneRunRepositoryAdapter,
   NoopRunTelemetryAdapter,
   NoopRunTelemetryMarkAdapter,
+  RecordSeatCallUseCase,
   TelemetryDispositionAdapter,
   WorkOrderRepositoryAdapter,
   createOtlpHttpRunTelemetryAdapter,
@@ -239,6 +240,20 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
         });
 
   /**
+   * `telemetry record-seat-call` (plan §3.2 "Seat calls"): one plan-billed
+   * seat call as a metadata-only span. Only a valid salt builds it; the span
+   * never carries a raw label, token, cost, model id or session id.
+   */
+  const recordSeatCall =
+    hmac === null
+      ? null
+      : new RecordSeatCallUseCase({
+          telemetry: telemetryPort,
+          hmac,
+          mintCallId: () => randomUUID(),
+        });
+
+  /**
    * The OTLP resource input for dry-run encoding (plan §3.2): the CLI package
    * version and the policy's project name, frozen.
    */
@@ -293,6 +308,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       acceptanceReceiptRead,
       dispositions,
       exportTelemetry,
+      recordSeatCall,
       configured,
       saltFingerprint: saltFingerprint,
       policy: policyView(policy),

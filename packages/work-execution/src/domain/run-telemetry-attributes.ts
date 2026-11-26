@@ -1,6 +1,6 @@
 /**
  * The attribute allow-list of run telemetry (plan §3.2): the span kinds, the
- * `RUN_TELEMETRY_ATTRIBUTES` table (55 keys, each with a type and a
+ * `RUN_TELEMETRY_ATTRIBUTES` table (56 keys, each with a type and a
  * validator), the never-sent keys and prefixes, and the resource attributes.
  * This is what reaches Phoenix (Tier 2), so every key is named here before it
  * can be sent, and a value that fails its rule drops the attribute, never the
@@ -52,7 +52,11 @@ export interface TelemetryAttributeRule {
 }
 
 export const TELEMETRY_TAGS = ['conducted', 'hand-run', 'dry-run', 'shadow', 'tier-1', 'tier-2'] as const;
-export const TELEMETRY_SEAT_TOOLS = ['opencode', 'agy', 'review-cli'] as const;
+export const TELEMETRY_SEAT_TOOLS = ['opencode', 'agy', 'review-cli', 'grok', 'claude'] as const;
+/** The plan-billed seat tools `record-seat-call` accepts; anything else (metered, OpenRouter-routed) is refused. */
+export const TELEMETRY_PLAN_SEAT_TOOLS = ['agy', 'grok', 'claude'] as const;
+/** The outcomes a seat-call span records. */
+export const TELEMETRY_SEAT_CALL_OUTCOMES = ['ok', 'empty', 'error', 'timeout'] as const;
 export const TELEMETRY_SEAT_BILLINGS = ['metered', 'plan', 'unknown'] as const;
 export const TELEMETRY_COST_BASES = ['metered', 'plan-estimate', 'unknown'] as const;
 export const TELEMETRY_USAGE_SOURCES = ['opencode-db', 'opencode-api', 'unavailable'] as const;
@@ -66,6 +70,10 @@ export const TELEMETRY_OUTCOMES: readonly string[] = Object.freeze([
   ...ATTEMPT_OUTCOMES,
   'accepted',
   'rejected',
+  'ok',
+  'empty',
+  'error',
+  'timeout',
 ]);
 
 /** True when `value` is a member of `allowed`. The one enum check every enum key reuses. */
@@ -273,6 +281,7 @@ export const RUN_TELEMETRY_ATTRIBUTES: Readonly<Record<string, TelemetryAttribut
   'agent.name': { type: 'string', check: oneOf(SEAT_PLAN_ROLES) },
   'fleet.seat.tool': { type: 'string', check: oneOf(TELEMETRY_SEAT_TOOLS) },
   'fleet.seat.billing': { type: 'string', check: oneOf(TELEMETRY_SEAT_BILLINGS) },
+  'fleet.seat.label_digest': digest,
   'llm.invocation_parameters': { type: 'string', check: (v, c) => c.spanKind === 'LLM' && isTelemetryInvocationParameters(v) },
   'llm.model_name': meteredModel,
   'llm.provider': meteredModel,

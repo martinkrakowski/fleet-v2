@@ -171,6 +171,7 @@ import {
   type ListStalledRunsUseCase,
   type StallAttentionAdapter,
   type ExportRunTelemetryUseCase,
+  type RecordSeatCallUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
   type RunTelemetryMarkPort,
@@ -1191,6 +1192,12 @@ export interface FleetCliRuntime {
     readonly dispositions: TelemetryDispositionAdapter;
     /** The export use case; null without an installation salt (dry runs need no endpoint). */
     readonly exportTelemetry: ExportRunTelemetryUseCase | null;
+    /**
+     * `telemetry record-seat-call`'s use case (plan §3.2 "Seat calls"): one
+     * plan-billed seat call as a metadata-only span; null without an
+     * installation salt.
+     */
+    readonly recordSeatCall: RecordSeatCallUseCase | null;
     /** Whether telemetry is configured; a fixed code, never the endpoint/token/salt. */
     readonly configured: TelemetryConfiguredState;
     /** Fingerprint of the installation salt (first 8 hex), or null without one. */

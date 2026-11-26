@@ -28,6 +28,8 @@ import {
   roundIdentity,
   runRootIdentity,
   runTraceRoot,
+  seatCallRootIdentity,
+  seatCallTraceRoot,
   telemetryDigest,
   telemetryHashInput,
   telemetrySpanId,
@@ -42,7 +44,12 @@ import {
 } from './run-telemetry-ids.js';
 import { TELEMETRY_MAX_EVENTS, TelemetrySpan } from './run-telemetry.js';
 import type { TelemetrySpanEvent, TelemetrySpanName, TelemetrySpanStatus } from './run-telemetry.js';
-import type { TelemetrySpanKind } from './run-telemetry-attributes.js';
+import {
+  TELEMETRY_PLAN_SEAT_TOOLS,
+  TELEMETRY_SEAT_CALL_OUTCOMES,
+  type TelemetrySpanKind,
+} from './run-telemetry-attributes.js';
+import { isCalendarDateTime } from './plain-record-reads.js';
 
 /** The plain input facts of the run mapper (plan §3.3): no raw id leaves it. */
 export interface LaneRunTelemetryFacts {
@@ -1047,5 +1054,122 @@ export function attemptTraceSpans(hmac: TelemetryHmac, facts: AttemptTraceTeleme
     return { spans: builder.spans, rejectedInvalid: builder.rejected.count };
   } catch {
     return { spans: [], rejectedInvalid: 1 };
+  }
+}
+
+/** A zoned ISO-8601 string naming a real calendar instant (the same rule `TelemetrySpan.build` applies). */
+const ZONED_ISO_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+function isZonedIsoInstant(value: unknown): boolean {
+  if (typeof value !== 'string' || !ZONED_ISO_INSTANT_PATTERN.test(value)) {
+    return false;
+  }
+  return isCalendarDateTime(value) && Number.isFinite(Date.parse(value));
+}
+
+/** One field of `facts` as an own data property: no getter ever runs; a throw reads as absent. */
+function seatCallField(value: Record<string, unknown>, field: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false };
+    }
+    return { ok: true, value: descriptor.value };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * The metadata-only span of one plan-billed seat call (`agy`, `grok` or
+ * `claude`), a root `seat-call` AGENT span in its own trace. It carries
+ * `fleet.seat.billing = 'plan'`, the tool, the outcome, the wall seconds and,
+ * when a label was given, its `seat-label` digest — never a raw label, token,
+ * cost, model id or any other identifier. `facts` is read through own data
+ * descriptors only; null on any invalid input or failed digest/id build,
+ * never a throw.
+ */
+export function seatCallSpan(hmac: TelemetryHmac, facts: unknown): TelemetrySpan | null {
+  try {
+    if (typeof facts !== 'object' || facts === null || Array.isArray(facts)) {
+      return null;
+    }
+    const prototype = Object.getPrototypeOf(facts);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return null;
+    }
+    const record = facts as Record<string, unknown>;
+    const callIdField = seatCallField(record, 'callId');
+    const toolField = seatCallField(record, 'tool');
+    const outcomeField = seatCallField(record, 'outcome');
+    const wallSecondsField = seatCallField(record, 'wallSeconds');
+    const nowIsoField = seatCallField(record, 'nowIso');
+    const labelField = seatCallField(record, 'label');
+    if (!callIdField.ok || !toolField.ok || !outcomeField.ok || !wallSecondsField.ok || !nowIsoField.ok || !labelField.ok) {
+      return null;
+    }
+    const callIdInput = telemetryHashInput(callIdField.value);
+    if (callIdInput === null) {
+      return null;
+    }
+    const tool = toolField.value;
+    if (typeof tool !== 'string' || !(TELEMETRY_PLAN_SEAT_TOOLS as readonly string[]).includes(tool)) {
+      return null;
+    }
+    const outcome = outcomeField.value;
+    if (typeof outcome !== 'string' || !(TELEMETRY_SEAT_CALL_OUTCOMES as readonly string[]).includes(outcome)) {
+      return null;
+    }
+    const wallSeconds = wallSecondsField.value;
+    if (typeof wallSeconds !== 'number' || !Number.isFinite(wallSeconds) || wallSeconds < 0) {
+      return null;
+    }
+    if (!isZonedIsoInstant(nowIsoField.value)) {
+      return null;
+    }
+    const endMs = Date.parse(nowIsoField.value as string);
+    const label = labelField.value;
+    let labelDigest: string | null = null;
+    if (label !== null) {
+      const labelInput = telemetryHashInput(label);
+      if (labelInput === null) {
+        return null;
+      }
+      labelDigest = telemetryDigest(hmac, 'seat-label', labelInput);
+      if (labelDigest === null) {
+        return null;
+      }
+    }
+    const root = seatCallTraceRoot(callIdInput);
+    if (root === null) {
+      return null;
+    }
+    const traceId = telemetryTraceId(hmac, root);
+    if (traceId === null) {
+      return null;
+    }
+    const spanId = telemetrySpanId(hmac, root, seatCallRootIdentity());
+    if (spanId === null) {
+      return null;
+    }
+    return TelemetrySpan.build({
+      traceId,
+      spanId,
+      parentSpanId: null,
+      name: 'seat-call',
+      kind: 'AGENT',
+      startIso: new Date(Math.max(0, endMs - Math.round(wallSeconds * 1000))).toISOString(),
+      endIso: new Date(endMs).toISOString(),
+      status: { code: outcome === 'error' || outcome === 'timeout' ? 'error' : 'ok', reasonCode: null },
+      attributes: {
+        'fleet.seat.billing': 'plan',
+        'fleet.seat.tool': tool,
+        'fleet.outcome': outcome,
+        'fleet.usage.wall_seconds': wallSeconds,
+        ...(labelDigest === null ? {} : { 'fleet.seat.label_digest': labelDigest }),
+      },
+      events: [],
+    });
+  } catch {
+    return null;
   }
 }

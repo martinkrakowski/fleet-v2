@@ -53,6 +53,7 @@ export * from "./ReapOrphanSessionsPort.in-port.js";
 export * from "./ReapZombiesPort.in-port.js";
 export * from "./ReconcileAttemptPort.in-port.js";
 export * from "./RecordBriefReadPort.in-port.js";
+export * from "./RecordSeatCallPort.in-port.js";
 export * from "./RecordShadowDayPort.in-port.js";
 export * from "./RefreshChainsPort.in-port.js";
 export * from "./RegisterWorkOrderPort.in-port.js";

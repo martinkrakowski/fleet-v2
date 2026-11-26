@@ -760,7 +760,7 @@ Commands:
   state check|restore|compact
   conductor status|halt|stop|resume|start|run
   daemon tick|status|pause|resume
-  telemetry export|status
+  telemetry export|status|record-seat-call
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]

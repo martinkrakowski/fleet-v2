@@ -20,7 +20,7 @@ workspace:
     the existing Waves service supplies observation and decisions.
 planes:
   core: [work-execution, evidence-and-acceptance]
-  supporting: [brief-knowledge, operator-coordination, merge-coordination, tenancy]
+  supporting: [brief-knowledge, operator-coordination, merge-coordination, tenancy, billing]
 
 monorepo:
   packageManager: yarn@4.12.0
@@ -1188,6 +1188,27 @@ bounded_contexts:
       domain:
         entities: [Organization, Project, Membership, TenantDataKey]
         value_objects: [Role]
+      application:
+        use_cases: []
+        ports:
+          in: []
+          out: []
+      infrastructure:
+        adapters: []
+
+  - name: billing
+    type: supporting
+    plane: supporting
+    status: active
+    description: >-
+      Owns usage metering records and plan structure records for optional
+      organisation-aware deployments. Scaffold only; no runtime behaviour and
+      no core package imports it.
+    depends_on: []
+    layers:
+      domain:
+        entities: []
+        value_objects: []
       application:
         use_cases: []
         ports:

@@ -189,11 +189,7 @@ generator:
     layers:
       domain:
         folder: src/domain
-        # `value-objects` is intentionally absent: the stub generator creates
-        # the directory for any context that declares value objects, and a
-        # configured subfolder here would force an empty value-objects
-        # directory with a .gitkeep into every entity-only context.
-        subfolders: [entities]
+        subfolders: [entities, value-objects]
       application:
         folder: src/application
         subfolders: [ports/in, ports/out, use-cases]

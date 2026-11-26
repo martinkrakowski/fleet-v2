@@ -2398,16 +2398,23 @@ async function conductorStopExit(
   parsed: ControlOptions,
   stateDir: string | undefined,
 ): Promise<number> {
-  return await guardedRunControlExit('stop', io, runtime, nowIso, parsed, stateDir, async (runId) =>
-    conductor.requestLaneRunStop.requestLaneRunStop({
+  return await guardedRunControlExit('stop', io, runtime, nowIso, parsed, stateDir, async (runId) => {
+    const audited = await conductor.requestLaneRunStop.requestLaneRunStop({
       runId,
       mode: parsed.force ? 'force' : 'graceful',
       via: 'cli',
       entryId: conductor.newUlid(),
       nowIso,
       ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
-    }),
-  );
+    });
+    // FC12B: the stop is journaled either way; `auditGap` says only that the
+    // authority event did not reach the sink, which the operator can repair
+    // by retrying the same stop (the same key re-emits to the idempotent sink).
+    if (audited.auditGap) {
+      io.stderr('warning: the stop authority event was not recorded; retry the same stop to record it\n');
+    }
+    return audited.result;
+  });
 }
 
 /** `conductor resume`: records a resume request for a run, refusing while a live driver lease is held. */

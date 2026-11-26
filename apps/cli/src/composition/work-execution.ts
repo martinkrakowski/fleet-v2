@@ -714,6 +714,13 @@ export function composeExecution(input: ComposeExecutionInput) {
       runner,
       runnerSelector,
       ...(agyRunner !== undefined ? { agyRunner } : {}),
+      // G1: a reservation held on a second lane-runner host dispatches
+      // through that host's own runner when the installation names it;
+      // an unknown host resolves to null and the dispatch refuses.
+      runnerForHost: (hostName) => {
+        const resolved = runnerForAttempt.runnerForHostName(hostName);
+        return resolved.ok ? resolved.runner : null;
+      },
       observation: executionObservation,
       artifactPort: attemptArtifact,
       computeDigest: sha256HexDigest,

@@ -676,6 +676,13 @@ export function createConfiguredWorkComposition(
       artifactPort,
       computeDigest: sha256HexDigest,
       allowedSeats,
+      // G1: a reservation held on a second lane-runner host dispatches
+      // through that host's own runner when the installation names it;
+      // an unknown host resolves to null and the dispatch refuses.
+      runnerForHost: (hostName) => {
+        const resolved = runnerForAttempt.runnerForHostName(hostName);
+        return resolved.ok ? resolved.runner : null;
+      },
       // SN2: the lane diff check for a clean strict-descendant head adoption
       // runs on the dispatching runner's recorded host.
       laneDiffCheckFor: (recorded) => {

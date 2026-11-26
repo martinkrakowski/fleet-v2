@@ -9,25 +9,23 @@
  * figure, currency symbol or rate appears anywhere in this module.
  *
  * Hostile-input posture: `parseSpendCap`, `periodKeyOf` and `decideSpend`
- * treat their inputs as untrusted. Every object read goes through
- * own-property descriptors only (a bounded enumerable-key census, then
- * `Object.getOwnPropertyDescriptor` probed by each fixed expected key name),
- * so no getter or setter ever runs. Missing keys, accessors, non-enumerable
- * shadows of expected keys, prototype-polluting keys (`__proto__`,
- * `constructor`, `prototype`) and extra enumerable keys are refused. Own
- * keys outside the expected set that are hidden (non-enumerable or symbol)
- * are an accepted residual: the platform offers no lazy own-key enumeration
- * to count them in O(1), and only the fixed expected names are ever probed,
- * so such a key is never read and cannot influence any decision (see
- * `readExactRecord`). Non-plain objects (including arrays and class
- * instances) are refused. A hostile Proxy trap surfaces as a typed refusal,
+ * treat their inputs as untrusted. Every object is copied ONCE by the shared
+ * `snapshotPlainData` guard from `@fleet/shared`, which reads own properties
+ * through their descriptors only (no getter, setter or Proxy `get` trap ever
+ * runs, and no value can change between check and use) and refuses accessors,
+ * non-enumerable and symbol keys, sparse arrays, non-plain prototypes and
+ * detectable Proxies (when the caller passes the runtime's `isProxy`
+ * detector); `readExactRecord` then refuses missing, extra and
+ * prototype-polluting keys. A hostile Proxy trap surfaces as a typed refusal,
  * never a throw; a Proxy that lies consistently in every trap is an accepted
- * residual. Every refusal is the typed reason `invalid-input`; no input
- * value is ever echoed back. Every check is O(1): the key census never
- * enumerates hidden keys (see `readExactRecord`), string lengths are bounded
- * (63 for identifiers, 7 for a period key, 64 for an ISO timestamp) and the
- * arithmetic rests on single safe-integer comparisons.
+ * residual. Every refusal is the typed reason `invalid-input`; no input value
+ * is ever echoed back. Cost bound: the snapshot's own-key enumeration is the
+ * minimum any correct hidden-key refusal must do, O(own keys); beyond it
+ * every check is O(1) (string lengths bounded: 63 for identifiers, 7 for a
+ * period key, 64 for an ISO timestamp; safe-integer comparisons).
  */
+
+import { snapshotPlainData, type IsProxy } from "@fleet/shared";
 
 /** The scope a cap applies to. An organization cap carries no project. */
 export type SpendCapScope = "organization" | "project";
@@ -92,119 +90,50 @@ function isRealCalendarDay(year: number, month: number, day: number): boolean {
 /** Longest string this module will even look at as an ISO timestamp. */
 const MAX_ISO_LENGTH = 64;
 
-/** Prototype-polluting keys, refused wherever a key-shaped string is read. */
-const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
-  "__proto__",
-  "constructor",
-  "prototype",
-]);
-
 type ReadResult =
   | { readonly ok: true; readonly value: Readonly<Record<string, unknown>> }
   | { readonly ok: false };
 
+/** A detector that detects nothing, used when the caller supplies none. */
+const NO_DETECTOR: IsProxy = () => false;
+
 /**
  * Snapshot an unknown value into a frozen plain record with exactly the
- * expected keys, reading every own property through its descriptor.
+ * expected keys. `snapshotPlainData` copies the value once, reading every own
+ * property through its descriptor, and refuses hidden (non-enumerable or
+ * symbol) keys, accessors, non-plain prototypes and, with a detector,
+ * Proxies; this function then requires the key set to be exactly
+ * `expectedKeys` (which also refuses `__proto__`, `constructor` and
+ * `prototype`, none of which is expected). `maxDepth` is the nesting the
+ * caller expects (1 for a flat record, 2 for a record of records).
  *
- * Cost bound: O(1). No platform API enumerates own keys lazily:
- * `Reflect.ownKeys`, `Object.getOwnPropertyNames` and
- * `Object.getOwnPropertySymbols` all materialize the complete own-key list
- * before it can be counted, so an input carrying the expected enumerable
- * keys plus arbitrarily many hidden (non-enumerable or symbol) keys would
- * make any full own-key census cost O(hidden keys) even when the count check
- * runs first. The census therefore never enumerates hidden keys at all and
- * rests on two bounded phases:
- *
- * 1. A lazy `for...in` census of the enumerable own string keys (the
- *    prototype is already pinned to `Object.prototype` or `null`, so nothing
- *    is inherited) bails out the moment the count exceeds the expected one.
- *    Any excess or unexpected enumerable key — including a
- *    prototype-polluting key — is refused after at most
- *    `expectedKeys.length + 1` iterations, never after enumerating all of
- *    them.
- * 2. Each *expected* key is probed by its fixed name through
- *    `Object.getOwnPropertyDescriptor`, O(expectedKeys.length) probes with
- *    no own-key enumeration anywhere: every expected key must be an own
- *    enumerable data property, so a missing key, an accessor, or a
- *    non-enumerable shadow of an expected key is refused without any getter
- *    or setter running.
- *
- * Residual, same class as a Proxy that lies in every trap: own keys outside
- * the expected set that are hidden (non-enumerable or symbol) are neither
- * enumerated nor probed — refusing them would require materializing every
- * own key, the exact unbounded cost this guard exists to avoid, because the
- * platform offers no lazy own-key enumeration for hidden properties. Only
- * the fixed expected names are ever probed, so a hidden extra is never read
- * and cannot influence any decision; building such an input already costs
- * the attacker one write per hidden key while nothing of it is ever touched.
- *
- * Refused, never thrown: non-objects, arrays, non-plain prototypes,
- * descriptor-read failures (hostile Proxy traps), excess or unexpected
- * enumerable keys (bounded phase 1), key counts other than the exact
- * expected one, missing keys, accessors and non-enumerable properties. A
- * Proxy that lies consistently in every trap is an accepted residual.
+ * Cost bound: O(own keys) for the snapshot's single enumeration — the
+ * minimum any correct extra-key refusal needs — then O(expectedKeys.length).
+ * Never throws; every refusal is a bare `{ ok: false }`.
  */
 function readExactRecord(
   input: unknown,
   expectedKeys: readonly string[],
+  maxDepth: number,
+  isProxy: IsProxy | undefined,
 ): ReadResult {
-  try {
-    if (typeof input !== "object" || input === null || Array.isArray(input)) {
-      return { ok: false };
-    }
-    const prototype = Object.getPrototypeOf(input);
-    if (prototype !== Object.prototype && prototype !== null) {
-      return { ok: false };
-    }
-    // Phase 1: lazy census of the enumerable own string keys, bailing out as
-    // soon as the count exceeds the expected one, so excess keys are refused
-    // in O(expectedKeys.length + 1) without materializing them. Symbols and
-    // non-enumerable keys are invisible here; hidden extras are the accepted
-    // residual documented above, never probed and never read.
-    const expected: ReadonlySet<string> = new Set(expectedKeys);
-    let enumerableCount = 0;
-    for (const key in input) {
-      enumerableCount += 1;
-      if (
-        enumerableCount > expectedKeys.length ||
-        typeof key !== "string" ||
-        !expected.has(key) ||
-        FORBIDDEN_KEYS.has(key)
-      ) {
-        return { ok: false };
-      }
-    }
-    if (enumerableCount !== expectedKeys.length) {
-      return { ok: false };
-    }
-    // Phase 2: probe the fixed expected names through their own descriptors,
-    // O(expectedKeys.length) probes and no own-key enumeration anywhere, so
-    // no hidden extra is ever materialized. A missing expected key, an
-    // accessor, or a non-enumerable shadow of an expected key is refused
-    // here without running any getter or setter.
-    const snapshot: Record<string, unknown> = {};
-    for (const key of expectedKeys) {
-      const descriptor = Object.getOwnPropertyDescriptor(input, key);
-      if (
-        descriptor === undefined ||
-        descriptor.get !== undefined ||
-        descriptor.set !== undefined ||
-        !descriptor.enumerable
-      ) {
-        return { ok: false };
-      }
-      snapshot[key] = descriptor.value;
-    }
-    Object.freeze(snapshot);
-    return { ok: true, value: snapshot };
-  } catch {
-    // A hostile Proxy trap (getPrototypeOf, getOwnPropertyDescriptor, or the
-    // ownKeys trap behind `for...in`) surfaces here as a typed refusal. No
-    // property value is ever read through a `get` trap, so a getter — the
-    // input's own or a trap's — never runs.
+  const snapshot = snapshotPlainData(input, isProxy ?? NO_DETECTOR, {
+    maxDepth,
+    maxKeys: expectedKeys.length,
+    maxStringLength: 4096,
+  });
+  if (!snapshot.ok) {
     return { ok: false };
   }
+  const value = snapshot.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false };
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== expectedKeys.length || !keys.every((key) => expectedKeys.includes(key))) {
+    return { ok: false };
+  }
+  return { ok: true, value: value as Readonly<Record<string, unknown>> };
 }
 
 /**
@@ -246,8 +175,8 @@ const CAP_KEYS = ["scope", "organizationId", "projectId", "periodKey", "limitUni
  * `isIdentifier`, `isPeriodKey` and `isUnitCount`. Never throws, never
  * echoes input values: every refusal is `invalid-input`.
  */
-export function parseSpendCap(raw: unknown): SpendCapParse {
-  const read = readExactRecord(raw, CAP_KEYS);
+export function parseSpendCap(raw: unknown, isProxy?: IsProxy): SpendCapParse {
+  const read = readExactRecord(raw, CAP_KEYS, 1, isProxy);
   if (!read.ok) {
     return { ok: false, reason: "invalid-input" };
   }
@@ -325,8 +254,14 @@ export function periodKeyOf(iso: unknown): PeriodKeyParse {
     return { ok: false, reason: "invalid-input" };
   }
   const year = parsed.getUTCFullYear();
+  // An offset can push the UTC instant out of the four-digit year range
+  // (`9999-12-31T23:59:59-01:00` is UTC year 10000, `0000-01-01T00:00:00+01:00`
+  // is year -1): such a month has no `YYYY-MM` name, so it is refused.
+  if (year < 0 || year > 9999) {
+    return { ok: false, reason: "invalid-input" };
+  }
   const month = parsed.getUTCMonth() + 1;
-  const periodKey = `${year}-${String(month).padStart(2, "0")}`;
+  const periodKey = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`;
   return { ok: true, periodKey };
 }
 
@@ -358,20 +293,20 @@ const DECISION_KEYS = [
  * overflowing cap parks with `spend-cap` and its scope. Unknown state is
  * never allow.
  */
-export function decideSpend(input: unknown): SpendDecision {
-  const read = readExactRecord(input, DECISION_KEYS);
+export function decideSpend(input: unknown, isProxy?: IsProxy): SpendDecision {
+  const read = readExactRecord(input, DECISION_KEYS, 2, isProxy);
   if (!read.ok) {
     return { outcome: "refuse", reason: "invalid-input" };
   }
   const { orgCap, projectCap, orgSpentUnits, projectSpentUnits, requestedUnits, periodKey } =
     read.value;
-  const orgParsed = parseSpendCap(orgCap);
+  const orgParsed = parseSpendCap(orgCap, isProxy);
   if (!orgParsed.ok || orgParsed.cap.scope !== "organization") {
     return { outcome: "refuse", reason: "invalid-input" };
   }
   let project: SpendCap | null = null;
   if (projectCap !== null) {
-    const projectParsed = parseSpendCap(projectCap);
+    const projectParsed = parseSpendCap(projectCap, isProxy);
     if (!projectParsed.ok || projectParsed.cap.scope !== "project") {
       return { outcome: "refuse", reason: "invalid-input" };
     }

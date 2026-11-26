@@ -5,6 +5,8 @@
  * asserts and its body proves it; every refusal is the typed
  * `invalid-input`, never a throw and never an echoed input value.
  */
+import { types } from "node:util";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -211,13 +213,9 @@ describe("parseSpendCap", () => {
     expect(shadowReads).toBe(0);
   });
 
-  it("ignores hidden extra keys in O(1) without reading them", () => {
-    // Residual (see readExactRecord): the platform offers no lazy own-key
-    // enumeration, so own keys outside the expected set that are
-    // non-enumerable or symbol are neither probed nor read, whatever their
-    // number; the parse is computed from the expected keys only. Each hidden
-    // extra below is an accessor whose getter records any attempt to read
-    // it, so the zero count proves it was never read.
+  it("refuses hidden extra keys (non-enumerable accessor, symbol) without reading them, however many", () => {
+    // `snapshotPlainData` reads descriptors only and refuses a hidden key, so
+    // the accessor below is never invoked and the parse is refused.
     const watched: Record<string, unknown> = { ...orgCap() };
     let hiddenReads = 0;
     Object.defineProperty(watched, "hidden", {
@@ -226,13 +224,16 @@ describe("parseSpendCap", () => {
         return 1;
       },
     });
-    Reflect.set(watched, Symbol.for("billing-hidden"), 1);
-    expect(parseSpendCap(watched)).toEqual({ ok: true, cap: orgCap() });    expect(hiddenReads).toBe(0);
+    expect(parseSpendCap(watched)).toEqual({ ok: false, reason: "invalid-input" });
+    const symbolic: Record<string | symbol, unknown> = { ...orgCap() };
+    symbolic[Symbol.for("billing-hidden")] = 1;
+    expect(parseSpendCap(symbolic)).toEqual({ ok: false, reason: "invalid-input" });
     const enormous = { ...orgCap() };
     for (let i = 0; i < 100_000; i += 1) {
       Object.defineProperty(enormous, `hidden-${String(i).padStart(6, "0")}`, { value: i });
     }
-    expect(parseSpendCap(enormous)).toEqual({ ok: true, cap: orgCap() });
+    expect(parseSpendCap(enormous)).toEqual({ ok: false, reason: "invalid-input" });
+    expect(hiddenReads).toBe(0);
   });
 
   it("refuses malformed organizationId and projectId", () => {
@@ -319,6 +320,13 @@ describe("periodKeyOf", () => {
     ]) {
       expect(periodKeyOf(bad)).toEqual({ ok: false, reason: "invalid-input" });
     }
+  });
+
+  it("refuses an offset that moves the UTC instant outside four-digit years and keeps the four-digit boundary months", () => {
+    expect(periodKeyOf("9999-12-31T23:59:59-01:00")).toEqual({ ok: false, reason: "invalid-input" });
+    expect(periodKeyOf("0000-01-01T00:00:00+01:00")).toEqual({ ok: false, reason: "invalid-input" });
+    expect(periodKeyOf("9999-12-31T23:59:59Z")).toEqual({ ok: true, periodKey: "9999-12" });
+    expect(periodKeyOf("0000-01-01T00:00:00Z")).toEqual({ ok: true, periodKey: "0000-01" });
   });
 
   it("never reads the system clock: the same string always yields the same month", () => {
@@ -461,23 +469,45 @@ describe("decideSpend", () => {
     expect(decideSpend(missing)).toEqual({ outcome: "refuse", reason: "invalid-input" });
   });
 
-  it("decides from the expected keys only, never reading hidden extra keys", () => {
-    // Residual (see readExactRecord in ../spend-cap.ts): hidden (non-
-    // enumerable or symbol) own keys outside the expected set are neither
-    // probed nor read; the decision is computed from the expected keys only.
-    // The hidden extra below is an accessor whose getter records any attempt
-    // to read it, so the zero count proves it was never read.
-    const watched: Record<string, unknown> = decisionInput();
+  it("refuses hidden extra keys on the decision input and on a nested cap without reading them", () => {
     let hiddenReads = 0;
+    const watched: Record<string, unknown> = decisionInput();
     Object.defineProperty(watched, "hidden", {
       get() {
         hiddenReads += 1;
         return 1;
       },
     });
-    Reflect.set(watched, Symbol.for("billing-hidden"), 1);
-    expect(decideSpend(watched)).toEqual({ outcome: "allow" });
+    expect(decideSpend(watched)).toEqual({ outcome: "refuse", reason: "invalid-input" });
+    const nested: Record<string, unknown> = { ...orgCap() };
+    Reflect.set(nested, Symbol.for("billing-hidden"), 1);
+    expect(decideSpend({ ...decisionInput(), orgCap: nested })).toEqual({
+      outcome: "refuse",
+      reason: "invalid-input",
+    });
     expect(hiddenReads).toBe(0);
+  });
+
+  it("reads Proxies through descriptors only: a throwing get trap never runs, and a supplied detector refuses a transparent Proxy", () => {
+    let getRan = 0;
+    const throwingGet = new Proxy(decisionInput(), {
+      get() {
+        getRan += 1;
+        throw new Error("get trap ran");
+      },
+    });
+    expect(decideSpend(throwingGet)).toEqual({ outcome: "allow" });
+    expect(getRan).toBe(0);
+    const transparent = new Proxy(decisionInput(), {});
+    expect(decideSpend(transparent, (value) => types.isProxy(value))).toEqual({
+      outcome: "refuse",
+      reason: "invalid-input",
+    });
+    expect(parseSpendCap(new Proxy(orgCap(), {}), (value) => types.isProxy(value))).toEqual({
+      ok: false,
+      reason: "invalid-input",
+    });
+    expect(decideSpend(decisionInput(), (value) => types.isProxy(value))).toEqual({ outcome: "allow" });
   });
 
   it("refuses non-safe-integer unit values", () => {

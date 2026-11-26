@@ -47,11 +47,26 @@ describe('WorkOrder.fromRecord refuses an invalid state without echoing it', () 
     const proxy = new Proxy(
       {},
       {
-        get: () => (calls++, undefined),
-        has: () => (calls++, false),
-        ownKeys: () => (calls++, []),
-        getPrototypeOf: () => (calls++, null),
-        getOwnPropertyDescriptor: () => (calls++, undefined),
+        get: () => {
+          calls += 1;
+          throw new Error('get trap ran');
+        },
+        has: () => {
+          calls += 1;
+          throw new Error('has trap ran');
+        },
+        ownKeys: () => {
+          calls += 1;
+          throw new Error('ownKeys trap ran');
+        },
+        getPrototypeOf: () => {
+          calls += 1;
+          throw new Error('getPrototypeOf trap ran');
+        },
+        getOwnPropertyDescriptor: () => {
+          calls += 1;
+          throw new Error('getOwnPropertyDescriptor trap ran');
+        },
       },
     );
     expect(stateMessage(proxy)).toBe('WorkOrder has an invalid state: <object>');

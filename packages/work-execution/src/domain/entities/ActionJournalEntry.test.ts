@@ -68,11 +68,26 @@ describe('ActionJournalEntry.fromRecord refuses an invalid action without echoin
     const proxy = new Proxy(
       {},
       {
-        get: () => (calls++, undefined),
-        has: () => (calls++, false),
-        ownKeys: () => (calls++, []),
-        getPrototypeOf: () => (calls++, null),
-        getOwnPropertyDescriptor: () => (calls++, undefined),
+        get: () => {
+          calls += 1;
+          throw new Error('get trap ran');
+        },
+        has: () => {
+          calls += 1;
+          throw new Error('has trap ran');
+        },
+        ownKeys: () => {
+          calls += 1;
+          throw new Error('ownKeys trap ran');
+        },
+        getPrototypeOf: () => {
+          calls += 1;
+          throw new Error('getPrototypeOf trap ran');
+        },
+        getOwnPropertyDescriptor: () => {
+          calls += 1;
+          throw new Error('getOwnPropertyDescriptor trap ran');
+        },
       },
     );
     expect(actionMessage(proxy)).toBe('ActionJournalEntry has an invalid action: <object>');
@@ -108,11 +123,26 @@ describe('ActionJournalEntry.fromRecord refuses an invalid status without echoin
     const proxy = new Proxy(
       {},
       {
-        get: () => (calls++, undefined),
-        has: () => (calls++, false),
-        ownKeys: () => (calls++, []),
-        getPrototypeOf: () => (calls++, null),
-        getOwnPropertyDescriptor: () => (calls++, undefined),
+        get: () => {
+          calls += 1;
+          throw new Error('get trap ran');
+        },
+        has: () => {
+          calls += 1;
+          throw new Error('has trap ran');
+        },
+        ownKeys: () => {
+          calls += 1;
+          throw new Error('ownKeys trap ran');
+        },
+        getPrototypeOf: () => {
+          calls += 1;
+          throw new Error('getPrototypeOf trap ran');
+        },
+        getOwnPropertyDescriptor: () => {
+          calls += 1;
+          throw new Error('getOwnPropertyDescriptor trap ran');
+        },
       },
     );
     expect(statusMessage(proxy)).toBe('ActionJournalEntry has an invalid status: <object>');

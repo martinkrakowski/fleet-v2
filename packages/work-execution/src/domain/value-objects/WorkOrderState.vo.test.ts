@@ -33,11 +33,26 @@ describe('WorkOrderState.create refusals describe the value by type only', () =>
     const proxy = new Proxy(
       {},
       {
-        get: () => (calls++, undefined),
-        has: () => (calls++, false),
-        ownKeys: () => (calls++, []),
-        getPrototypeOf: () => (calls++, null),
-        getOwnPropertyDescriptor: () => (calls++, undefined),
+        get: () => {
+          calls += 1;
+          throw new Error('get trap ran');
+        },
+        has: () => {
+          calls += 1;
+          throw new Error('has trap ran');
+        },
+        ownKeys: () => {
+          calls += 1;
+          throw new Error('ownKeys trap ran');
+        },
+        getPrototypeOf: () => {
+          calls += 1;
+          throw new Error('getPrototypeOf trap ran');
+        },
+        getOwnPropertyDescriptor: () => {
+          calls += 1;
+          throw new Error('getOwnPropertyDescriptor trap ran');
+        },
       },
     );
     expect(refusal(proxy)).toBe('Invalid work order state: <object>');

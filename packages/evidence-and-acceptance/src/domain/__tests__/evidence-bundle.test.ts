@@ -280,6 +280,14 @@ describe('assembleEvidenceBundle', () => {
     )).toEqual({ ok: false, reason: 'invalid-input' });
   });
 
+  it('refuses whitespace-only JSONL lines as malformed instead of skipping them', () => {
+    for (const blank of [' ', '\t', '\r', ' \t ']) {
+      expect(assembleEvidenceBundle(
+        deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1')}\n${blank}\n` })),
+      )).toEqual({ ok: false, reason: 'invalid-input' });
+    }
+  });
+
   it('refuses JSONL lines with duplicate keys before parsing them', () => {
     const line = '{"organizationId":"other","organizationId":"org-1"}';
     const result = assembleEvidenceBundle(deepFreeze(validInput({ authorityEventsJsonl: `${line}\n` })));

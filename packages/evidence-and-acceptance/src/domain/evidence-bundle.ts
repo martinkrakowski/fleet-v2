@@ -544,7 +544,7 @@ export function assembleEvidenceBundle(input: unknown): EvidenceBundleResult {
     // `AuthorityEvent` object with unique keys, whose `organizationId`
     // matches the bundle's.
     for (const line of authorityEventsJsonl.split('\n')) {
-      if (line.trim() === '') {
+      if (line === '') {
         continue;
       }
       const duplicateKeyCheck = checkJsonDuplicateKeys(line, MAX_AUTHORITY_EVENTS_JSONL_LENGTH);

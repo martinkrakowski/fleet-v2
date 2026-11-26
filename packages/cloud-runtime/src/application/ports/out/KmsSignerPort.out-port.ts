@@ -129,6 +129,13 @@ export function validateSignInputs(
   payload: unknown,
   isProxy?: IsProxy,
 ): ValidateSignInputsResult {
+  // Fail closed when the detector is omitted: pure JavaScript has no
+  // side-effect-free Proxy detector, so a permissive default (e.g. an
+  // `alwaysFalse` predicate) would let a missed Proxy's reflection traps run
+  // during snapshotting. Callers must pass `types.isProxy` from `node:util`.
+  if (isProxy === undefined) {
+    return { ok: false, reason: 'invalid-request' };
+  }
   const health = readKeyHandleHealth(keyHandle, isProxy);
   if (health === null) {
     return { ok: false, reason: 'invalid-request' };
@@ -140,7 +147,7 @@ export function validateSignInputs(
   if (handle === null) {
     return { ok: false, reason: 'invalid-request' };
   }
-  const payloadSnapshot = snapshotPlainData(payload, isProxy ?? alwaysFalse, KMS_INPUT_LIMITS);
+  const payloadSnapshot = snapshotPlainData(payload, isProxy, KMS_INPUT_LIMITS);
   if (!payloadSnapshot.ok) {
     return { ok: false, reason: 'invalid-request' };
   }
@@ -182,7 +189,7 @@ export function validateSignInputs(
  * `health` is missing or not a string, and the string value otherwise — the
  * caller decides `'healthy'` from anything else. Cost bound: O(1).
  */
-function readKeyHandleHealth(keyHandle: unknown, isProxy?: IsProxy): string | null {
+function readKeyHandleHealth(keyHandle: unknown, isProxy: IsProxy): string | null {
   const record = snapshotRecordWithKeys(keyHandle, KEY_HANDLE_KEYS, isProxy);
   if (record === null) {
     return null;
@@ -192,7 +199,7 @@ function readKeyHandleHealth(keyHandle: unknown, isProxy?: IsProxy): string | nu
 }
 
 /** Read the full validated `KmsKeyHandle` off a snapshot copy, or `null`. Cost bound: O(1). */
-function readKeyHandle(keyHandle: unknown, isProxy?: IsProxy): KmsKeyHandle | null {
+function readKeyHandle(keyHandle: unknown, isProxy: IsProxy): KmsKeyHandle | null {
   const record = snapshotRecordWithKeys(keyHandle, KEY_HANDLE_KEYS, isProxy);
   if (record === null) {
     return null;
@@ -215,9 +222,9 @@ function readKeyHandle(keyHandle: unknown, isProxy?: IsProxy): KmsKeyHandle | nu
 function snapshotRecordWithKeys(
   value: unknown,
   keys: readonly string[],
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): Record<string, unknown> | null {
-  const snapshot = snapshotPlainData(value, isProxy ?? alwaysFalse, KMS_INPUT_LIMITS);
+  const snapshot = snapshotPlainData(value, isProxy, KMS_INPUT_LIMITS);
   if (!snapshot.ok) {
     return null;
   }
@@ -238,7 +245,6 @@ function snapshotRecordWithKeys(
   return record;
 }
 
-/** A side-effect-free detector that never flags anything; only a default when a caller omits `isProxy`. */
-function alwaysFalse(_value: unknown): boolean {
-  return false;
-}
+// No `alwaysFalse` default: when `isProxy` is omitted the validator refuses
+// outright, because pure JavaScript has no side-effect-free Proxy detector and
+// a permissive fallback would let a missed Proxy's reflection traps run.

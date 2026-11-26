@@ -102,7 +102,8 @@ const BROKER_REQUEST_LIMITS: PlainDataLimits = Object.freeze({
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 
 /** ISO-8601 calendar date-time with an explicit offset (`Z` or ±HH:MM). */
-const ISO_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_INSTANT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
 
 /** The only own keys a broker request may carry. */
 const REQUEST_KEYS: readonly string[] = [
@@ -188,7 +189,18 @@ export function isBoundedIsoInstant(value: unknown): value is string {
   const daysInMonth = [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][
     month - 1
   ];
-  return day <= daysInMonth;
+  if (day > daysInMonth) {
+    return false;
+  }
+  // The offset is validated numerically too: `+99:99` and other impossible
+  // offsets are refused, not just non-matching shapes. O(1) — two fixed
+  // two-digit comparisons on a length-capped string.
+  const offsetHour = Number(match[2]);
+  const offsetMinute = Number(match[3]);
+  if (offsetHour > 23 || offsetMinute > 59) {
+    return false;
+  }
+  return true;
 }
 
 function isLeapYear(year: number): boolean {
@@ -220,6 +232,12 @@ export type ValidateBrokerRequestResult =
  * keys (no polluting, extra, missing, symbol or non-enumerable key), and each
  * field is type-checked on the frozen copy.
  *
+ * When `isProxy` is omitted the request is refused outright (`invalid-request`):
+ * pure JavaScript has no side-effect-free Proxy detector, so a permissive
+ * default like `alwaysFalse` would let a missed Proxy's reflection traps run
+ * during snapshotting. Fail closed — callers (infrastructure, test runners)
+ * must pass `types.isProxy` from `node:util`.
+ *
  * Cost bound: O(1) — the snapshot is bounded by the fixed
  * `BROKER_REQUEST_LIMITS`, and every per-field check runs over a
  * length-capped string or a fixed key set.
@@ -228,7 +246,11 @@ export function validateBrokerRequest(
   input: unknown,
   isProxy?: IsProxy,
 ): ValidateBrokerRequestResult {
-  const snapshot = snapshotPlainData(input, isProxy ?? alwaysFalse, BROKER_REQUEST_LIMITS);
+  // Fail closed when the detector is omitted: see the docstring above.
+  if (isProxy === undefined) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const snapshot = snapshotPlainData(input, isProxy, BROKER_REQUEST_LIMITS);
   if (!snapshot.ok) {
     return { ok: false, reason: 'invalid-request' };
   }
@@ -340,7 +362,6 @@ export function isInstallationTokenExpired(expiresAtIso: unknown, nowIso: unknow
   return nowMs >= expiresAtMs;
 }
 
-/** A side-effect-free detector that never flags anything; only a default when a caller omits `isProxy`. */
-function alwaysFalse(_value: unknown): boolean {
-  return false;
-}
+// No `alwaysFalse` default: when `isProxy` is omitted the validator refuses
+// outright, because pure JavaScript has no side-effect-free Proxy detector and
+// a permissive fallback would let a missed Proxy's reflection traps run.

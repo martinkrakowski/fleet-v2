@@ -401,14 +401,32 @@ function missingGeneratedTypesResult(
   };
 }
 
-/** Whether one gate command's argv invokes `lint:arch` (an exact argv element). */
-function isLintArchCommand(command: GateCommand): boolean {
-  return command.argv.some((arg) => arg === 'lint:arch');
+/**
+ * Package-runner tokens whose immediately following argv element is a package
+ * script name (`yarn lint:arch`, `npm run lint:arch`, ...). A script name
+ * anywhere else in an argv — an argument to `node ./scripts/check.js`, say —
+ * does not make the command that script.
+ */
+const PACKAGE_RUNNER_TOKENS = new Set(['yarn', 'npm', 'pnpm', 'bun', 'npx', 'turbo', 'corepack', 'run']);
+
+/** Whether one gate command's argv invokes the named package script at the script position (the last element, right after a package-runner token). */
+function invokesScript(command: GateCommand, script: string): boolean {
+  const argv = command.argv;
+  return (
+    argv.length >= 2 &&
+    argv[argv.length - 1] === script &&
+    PACKAGE_RUNNER_TOKENS.has(argv[argv.length - 2])
+  );
 }
 
-/** Whether one gate command's argv invokes `typecheck` (an exact argv element). */
+/** Whether one gate command's argv invokes `lint:arch` at the package-script position. */
+function isLintArchCommand(command: GateCommand): boolean {
+  return invokesScript(command, 'lint:arch');
+}
+
+/** Whether one gate command's argv invokes `typecheck` at the package-script position. */
 function isTypecheckCommand(command: GateCommand): boolean {
-  return command.argv.some((arg) => arg === 'typecheck');
+  return invokesScript(command, 'typecheck');
 }
 
 /**
@@ -1565,12 +1583,20 @@ export class GatePredicateAdapter implements GatePredicatePort {
 
     // TP5A1: `lint:arch` whose executor classified the run as a typed timeout
     // is the architecture budget expiring, never a finding. Only the typed
-    // signal classifies it: free-text `error` output never does, and a
-    // non-`lint:arch` command or any other failure mode (exit 1, max-buffer,
-    // spawn-error) stays out of this path entirely. The code is read through
-    // its own data property, so a getter is never invoked and an invalid
-    // value was already refused by `isUsableRun`.
-    if (isLintArchCommand(command) && ownDataProperty(run, 'errorCode').value === 'timeout') {
+    // signal classifies it, and only on a run that honours the port contract:
+    // a timeout is a run that never reported its own exit code (`null`) and
+    // carries the executor's error, never a completed run with an exit code.
+    // Free-text `error` output never does, and a non-`lint:arch` command or
+    // any other failure mode (exit 1, max-buffer, spawn-error) stays out of
+    // this path entirely. The code is read through its own data property, so
+    // a getter is never invoked and an invalid value was already refused by
+    // `isUsableRun`.
+    if (
+      isLintArchCommand(command) &&
+      run.exitCode === null &&
+      run.error !== undefined &&
+      ownDataProperty(run, 'errorCode').value === 'timeout'
+    ) {
       return lintArchTimeoutResult(name, run, command, this.nowMs() - started);
     }
 

@@ -1239,6 +1239,86 @@ describe('GatePredicateAdapter typed gate causes (TP5A1)', () => {
     expect(otherResults[2]).not.toHaveProperty('cause');
   });
 
+  it('does not emit lint-arch-timeout when lint:arch is only an argument of another command', async () => {
+    // `node ./scripts/check.js lint:arch` carries lint:arch as a mere argument:
+    // a typed timeout of that command is an ordinary unknown result, never
+    // the lint-arch-timeout cause.
+    const unrelated = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const unrelatedResults = evaluatedResults(
+      await unrelated.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'lint:arch']),
+      ),
+    );
+    expect(unrelatedResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(unrelatedResults[2]).not.toHaveProperty('cause');
+
+    // The same argv invoking the script at the package-script position DOES
+    // emit the cause, so the guard above is not a constant.
+    const real = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const realResults = evaluatedResults(
+      await real.adapter.evaluateGatePredicates(commandRequest(['node', './scripts/check.js', 'yarn', 'lint:arch'])),
+    );
+    expect(realResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', cause: 'lint-arch-timeout' });
+  });
+
+  it('emits lint-arch-timeout only when the run never reported an exit code with an executor error', async () => {
+    // A run claiming exitCode 0 alongside the typed timeout code violates the
+    // port contract (an executor error never yields an exit code): it is never
+    // classified as lint-arch-timeout; the executor error keeps it unknown.
+    const completed = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: 0,
+            signal: null,
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const completedResults = evaluatedResults(
+      await completed.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(completedResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: 0 });
+    expect(completedResults[2]).not.toHaveProperty('cause');
+
+    // A run with no exit code but no executor error is also out of contract:
+    // unknown, no cause.
+    const noError = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', errorCode: 'timeout' }
+        : happyGit(argv),
+    );
+    const noErrorResults = evaluatedResults(
+      await noError.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(noErrorResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(noErrorResults[2]).not.toHaveProperty('cause');
+  });
+
   it('returns fail without lint-arch-timeout when lint:arch exits 1 and unknown when exitCode is null', async () => {
     // Exit 1: the command's own hard failure, never the typed timeout cause.
     const exited = makeRawAdapter((argv) =>

@@ -7,13 +7,28 @@ import { type IsProxy } from "@fleet/shared";
 
 import {
   API_TOKEN_SCOPES,
-  decideApiTokenRotation,
-  decideApiTokenUse,
-  parseApiTokenRecord,
+  decideApiTokenRotation as decideApiTokenRotationRequired,
+  decideApiTokenUse as decideApiTokenUseRequired,
+  parseApiTokenRecord as parseApiTokenRecordRequired,
   type ApiTokenRecord,
 } from "../api-token.js";
 
 const SOURCE = readFileSync(new URL("../api-token.ts", import.meta.url), "utf8");
+
+/** The trusted detector every caller must supply (`node:util`'s real one). */
+const DETECTOR: IsProxy = types.isProxy;
+
+/**
+ * The public functions require a trusted proxy detector (no default exists
+ * in the domain); the tests supply `node:util`'s `types.isProxy` unless a
+ * case overrides it.
+ */
+const parseApiTokenRecord = (raw: unknown, isProxy: IsProxy = DETECTOR) =>
+  parseApiTokenRecordRequired(raw, isProxy);
+const decideApiTokenUse = (input: unknown, isProxy: IsProxy = DETECTOR) =>
+  decideApiTokenUseRequired(input, isProxy);
+const decideApiTokenRotation = (input: unknown, isProxy: IsProxy = DETECTOR) =>
+  decideApiTokenRotationRequired(input, isProxy);
 
 const ISSUED = "2026-11-26T12:00:00Z";
 const EXPIRES = "2026-11-27T12:00:00Z";
@@ -87,7 +102,7 @@ function getterRecord(base: ApiTokenRecord): object {
 }
 
 /** Every public entry point, applied to one hostile input each. */
-function applyAll(input: unknown, isProxy?: IsProxy): Array<{ outcome: string; reason?: string }> {
+function applyAll(input: unknown, isProxy: IsProxy = DETECTOR): Array<{ outcome: string; reason?: string }> {
   return [
     parseApiTokenRecord(input, isProxy),
     decideApiTokenUse(input, isProxy),
@@ -491,10 +506,20 @@ describe("hostile inputs", () => {
       outcome: "refused",
       reason: "invalid-record",
     });
-    // With no detector a throwing trap is caught and refused anyway.
-    for (const result of applyAll(proxy)) {
+    // With a detector that detects nothing, every throwing trap is caught
+    // by the snapshot and the input is refused anyway.
+    for (const result of applyAll(proxy, () => false)) {
       expect(result.outcome).toBe("refused");
     }
+  });
+
+  it("requires a trusted proxy detector on every public entry point", () => {
+    // The detector is a required parameter: no optional `isProxy?` and no
+    // permissive default may exist, or a Proxy could be accepted silently.
+    expect(SOURCE).not.toMatch(/isProxy\?\s*:/);
+    expect(SOURCE).not.toMatch(/NO_DETECTOR/);
+    expect(SOURCE).not.toMatch(/\(\)\s*=>\s*false/);
+    expect(SOURCE).toMatch(/isProxy: IsProxy/);
   });
 
   it("refuses oversized strings, oversized arrays, and enormous length properties", () => {

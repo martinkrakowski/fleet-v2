@@ -11,9 +11,9 @@
  *
  * Hostile-input rule (every public function): every untrusted value is read
  * exactly once through `snapshotPlainData`, which refuses null-hostile
- * shapes, accessors (getters never run), Proxies (via the injected
- * detector), symbol keys, sparse arrays, cycles, oversized strings and
- * non-plain prototypes with a typed refusal. After the snapshot the root is
+ * shapes, accessors (getters never run), Proxies (via the required,
+ * caller-supplied detector), symbol keys, sparse arrays, cycles, oversized
+ * strings and non-plain prototypes with a typed refusal. After the snapshot the root is
  * verified to be a non-null non-array object and its own keys are screened
  * via `Reflect.ownKeys` against the prototype-polluting names, `length` and
  * the exact allowed keys, because the snapshot copies an own `__proto__` key
@@ -98,9 +98,6 @@ export type ApiTokenRotationResult =
   | { readonly outcome: "refused"; readonly reason: ApiTokenRefusalReason };
 
 const API_TOKEN_SCOPE_SET: ReadonlySet<string> = new Set<string>(API_TOKEN_SCOPES);
-
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
 
 const RECORD_KEYS: readonly string[] = [
   "tokenId",
@@ -322,13 +319,16 @@ function snapObject(
 
 /**
  * Parse one untrusted API token record. The record is read once through
- * `snapshotPlainData` (getters never run, Proxies refused via the injected
- * detector); every field is validated before a record is produced. Returns
- * `{ outcome: "refused", reason: "invalid-record" }` on every hostile or
- * malformed shape, never a throw, and never echoes the digest.
+ * `snapshotPlainData` (getters never run, Proxies refused via the required
+ * detector — the caller passes a trusted detector such as `node:util`'s
+ * `types.isProxy`; there is no default, because a missing detector would
+ * silently accept a Proxy); every field is validated before a record is
+ * produced. Returns `{ outcome: "refused", reason: "invalid-record" }` on
+ * every hostile or malformed shape, never a throw, and never echoes the
+ * digest.
  */
-export function parseApiTokenRecord(raw: unknown, isProxy?: IsProxy): ApiTokenParseResult {
-  const snap = snapObject(raw, isProxy ?? NO_DETECTOR, RECORD_LIMITS);
+export function parseApiTokenRecord(raw: unknown, isProxy: IsProxy): ApiTokenParseResult {
+  const snap = snapObject(raw, isProxy, RECORD_LIMITS);
   if (snap === null) {
     return INVALID_RECORD;
   }
@@ -370,9 +370,8 @@ function digestsMatch(presented: string, stored: string): boolean {
  * 5. otherwise the use is allowed — the success result never carries the
  *    stored digest.
  */
-export function decideApiTokenUse(input: unknown, isProxy?: IsProxy): ApiTokenUseResult {
-  const detector = isProxy ?? NO_DETECTOR;
-  const wrapper = snapshotPlainData(input, detector, WRAPPER_LIMITS);
+export function decideApiTokenUse(input: unknown, isProxy: IsProxy): ApiTokenUseResult {
+  const wrapper = snapshotPlainData(input, isProxy, WRAPPER_LIMITS);
   if (!wrapper.ok) {
     return { outcome: "refused", reason: wrapperReason(wrapper.path) };
   }
@@ -456,9 +455,8 @@ export function decideApiTokenUse(input: unknown, isProxy?: IsProxy): ApiTokenUs
  * (`invalid-input`), revocation (`revoked`) and the validity window
  * (`not-yet-valid`, `expired`).
  */
-export function decideApiTokenRotation(input: unknown, isProxy?: IsProxy): ApiTokenRotationResult {
-  const detector = isProxy ?? NO_DETECTOR;
-  const wrapper = snapshotPlainData(input, detector, WRAPPER_LIMITS);
+export function decideApiTokenRotation(input: unknown, isProxy: IsProxy): ApiTokenRotationResult {
+  const wrapper = snapshotPlainData(input, isProxy, WRAPPER_LIMITS);
   if (!wrapper.ok) {
     return { outcome: "refused", reason: wrapperReason(wrapper.path) };
   }

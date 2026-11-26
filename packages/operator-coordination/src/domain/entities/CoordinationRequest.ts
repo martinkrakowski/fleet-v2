@@ -12,6 +12,7 @@
  */
 
 import { GRANT_RECORD_VERSION } from '../coordination-records.js';
+import { describeRejectedValue } from '../record-input.js';
 import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
@@ -71,6 +72,55 @@ function readOwnDataValue(record: object, key: string): unknown {
   return descriptor.value;
 }
 
+/**
+ * Every field of a request record, read once. The first three are the
+ * validated enums, so a hostile record is refused by the field the operator
+ * most needs named; the rest follow the record's declaration order.
+ */
+const RECORD_KEYS = [
+  'kind',
+  'state',
+  'deliveryStatus',
+  'id',
+  'projectId',
+  'actionScope',
+  'expectedHeadSha',
+  'proposalDigest',
+  'policyRevision',
+  'decisionRevision',
+  'grantId',
+  'consumptions',
+  'acknowledgements',
+  'deliveryGapReason',
+  'revision',
+  'createdAtIso',
+  'updatedAtIso',
+  'policyGrant',
+  'mergeGrant',
+  'grantRecordVersion',
+  'grantAttemptId',
+  'releaseRoot',
+  'releaseNonce',
+  'shadowImportGrant',
+] as const;
+
+/**
+ * A plain copy of the record's own data properties, each read exactly once
+ * through its descriptor. A getter never runs, a Proxy `get` trap is never
+ * invoked, and everything after this point validates and stores this snapshot,
+ * never the raw record, so no later read can disagree with a validated value.
+ */
+function snapshotRecord(record: object): Record<string, unknown> {
+  const snapshot: Record<string, unknown> = {};
+  for (const key of RECORD_KEYS) {
+    const value = readOwnDataValue(record, key);
+    if (value !== undefined) {
+      snapshot[key] = value;
+    }
+  }
+  return snapshot;
+}
+
 function readGrantProperty(
   record: CoordinationRequestRecord,
   propertyName: 'policyGrant' | 'mergeGrant' | 'shadowImportGrant',
@@ -109,10 +159,11 @@ export class CoordinationRequest {
     // Invariants are validated in fromRecord.
   }
 
-  static fromRecord(record: CoordinationRequestRecord): CoordinationRequest {
-    if (typeof record !== 'object' || record === null) {
+  static fromRecord(input: CoordinationRequestRecord): CoordinationRequest {
+    if (typeof input !== 'object' || input === null) {
       throw new Error('CoordinationRequest requires a record');
     }
+    const record = snapshotRecord(input) as unknown as CoordinationRequestRecord;
     for (const field of [
       'id',
       'projectId',
@@ -133,15 +184,19 @@ export class CoordinationRequest {
         throw new Error(`CoordinationRequest ${field} must be a non-empty string or null`);
       }
     }
-    const kind = CoordinationKind.create(record.kind);
+    // Everything below reads the descriptor snapshot taken above, so each
+    // field of the input was read exactly once.
+    const kindValue: unknown = record.kind;
+    const kind = CoordinationKind.create(kindValue);
     if (!kind.success || kind.value === undefined) {
-      throw new Error(`CoordinationRequest has an invalid kind: ${String(record.kind)}`);
+      throw new Error('CoordinationRequest has an invalid kind: ' + describeRejectedValue(kindValue));
     }
-    const state = CoordinationState.create(record.state);
+    const stateValue: unknown = record.state;
+    const state = CoordinationState.create(stateValue);
     if (!state.success || state.value === undefined) {
-      throw new Error(`CoordinationRequest has an invalid state: ${String(record.state)}`);
+      throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(stateValue));
     }
-    const policyGrant = CoordinationRequest.readPolicyGrant(record);
+    const policyGrant = CoordinationRequest.readPolicyGrant(record, kind.value.getValue());
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
     const shadowImportGrant = CoordinationRequest.readShadowImportGrant(record);
     // A standing shadow import grant (owner decision 2026-11-18) is head-free
@@ -152,7 +207,7 @@ export class CoordinationRequest {
       if (shadowImportGrant === undefined) {
         throw new Error('CoordinationRequest merge:import-shadow requires a shadowImportGrant');
       }
-      if (record.kind !== 'action-decision') {
+      if (kindValue !== 'action-decision') {
         throw new Error('CoordinationRequest merge:import-shadow grant must be an action-decision');
       }
       if (record.expectedHeadSha !== null) {
@@ -164,10 +219,17 @@ export class CoordinationRequest {
       );
     }
     const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
-    if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
-      throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
+    const deliveryStatusValue: unknown = record.deliveryStatus;
+    if (
+      typeof deliveryStatusValue !== 'string' ||
+      !DELIVERY_STATUSES.includes(deliveryStatusValue)
+    ) {
+      throw new Error(
+        'CoordinationRequest has an invalid delivery status: ' +
+          describeRejectedValue(deliveryStatusValue),
+      );
     }
-    if (record.deliveryStatus === 'delivery-gap') {
+    if (deliveryStatusValue === 'delivery-gap') {
       if (typeof record.deliveryGapReason !== 'string' || record.deliveryGapReason.length === 0) {
         throw new Error('CoordinationRequest requires a delivery gap reason for a delivery gap');
       }
@@ -179,8 +241,13 @@ export class CoordinationRequest {
     }
     const consumptions = CoordinationRequest.readConsumptions(record.consumptions);
     const acknowledgements = CoordinationRequest.readAcknowledgements(record.acknowledgements);
+    // The stored record is the validated snapshot, never the raw input: it is
+    // a plain object, so spreading it runs no getter and no Proxy trap.
     const normalized: MutableCoordinationRequestRecord = {
       ...record,
+      kind: kind.value.getValue(),
+      state: state.value.getValue(),
+      deliveryStatus: deliveryStatusValue as CoordinationRequestRecord['deliveryStatus'],
       consumptions,
       acknowledgements,
     };
@@ -288,7 +355,10 @@ export class CoordinationRequest {
     return Object.freeze(acknowledgements.map((acknowledgement) => ({ ...acknowledgement })));
   }
 
-  private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
+  private static readPolicyGrant(
+    record: CoordinationRequestRecord,
+    validatedKind: CoordinationKindValue,
+  ): PolicyGrantRecord | undefined {
     const raw = readGrantProperty(
       record,
       'policyGrant',
@@ -362,7 +432,7 @@ export class CoordinationRequest {
       acceptanceReceiptId: collected.acceptanceReceiptId,
     };
     
-    if (record.kind !== 'action-decision') {
+    if (validatedKind !== 'action-decision') {
       throw new Error('CoordinationRequest policy grant must be an action-decision');
     }
     

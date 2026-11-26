@@ -332,6 +332,7 @@ type Coverage = FixtureCoverage | ExemptCoverage;
 
 const EXPECTED_INVENTORY: readonly DiscoveredPolicy[] = [
   { file: 'packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts', exportName: 'ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY' },
+  { file: 'packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts', exportName: 'ORGANIZATION_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/AttemptRepositoryAdapter.adapter.ts', exportName: 'ATTEMPT_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/CutoverJournalAdapter.adapter.ts', exportName: 'CUTOVER_JOURNAL_STORE_VERSION_POLICY' },
   { file: 'packages/work-execution/src/infrastructure/adapters/CutoverJournalAdapter.adapter.ts', exportName: 'CUTOVER_SHADOW_PARK_JOURNAL_STORE_VERSION_POLICY' },
@@ -376,7 +377,9 @@ const COVERAGE: ReadonlyMap<string, Coverage> = new Map<string, Coverage>([
   ['packages/work-execution/src/infrastructure/adapters/LanePlanRepositoryAdapter.adapter.ts::PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/RelaunchPlanRepositoryAdapter.adapter.ts::RELAUNCH_PLAN_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/SeatObservationRepositoryAdapter.adapter.ts::SEAT_OBSERVATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts::ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
 ]);
 
 const FIXTURE_DIR = path.join(
@@ -406,7 +409,7 @@ describe('store schema-version policy discovery and coverage', () => {
     expect(discovered).toEqual(EXPECTED_INVENTORY);
   });
 
-  // Cost bound: exactly one dynamic import per discovered adapter file (17),
+  // Cost bound: exactly one dynamic import per discovered adapter file (18),
   // sequential. Adapter modules transitively pull real dependencies, so under
   // a fully loaded host the import phase needs far more than the default
   // 5-second per-test timeout; this is an explicit bound, not an unbounded wait.
@@ -797,13 +800,10 @@ describe('validateSchemaVersionPolicyValue', () => {
       acceptedVersions: proxyFakeSlice,
     });
     expect(proxyResult.ok).toBe(true);
-    if (proxyResult.ok) {
-      expect(proxyResult.policy.acceptedVersions).toEqual([1]);
+    if (!proxyResult.ok) {
+      throw new Error(`expected ok, got ${proxyResult.error}`);
     }
-    // And the copy is validated: a fabricated [999] for writer 1 would have
-    // been an invalid accepted policy (future/invalid version), so a constant
-    // or identity copy path fails this assertion.
-    expect([999].some((version) => version > 1)).toBe(true);
+    expect(proxyResult.policy.acceptedVersions).toEqual([1]);
   });
 
   it('refuses a Proxy over [1, 999] whose get trap reports length 1 while its own length descriptor says 2', () => {

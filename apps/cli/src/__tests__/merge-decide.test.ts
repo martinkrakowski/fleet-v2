@@ -167,11 +167,15 @@ async function queueSnapshot(
 }
 
 /** Seed one queued entry for the decided pair, like the conductor would. */
-async function seedQueueEntry(runtime: FleetCliRuntime, pullRequest = 7): Promise<void> {
+async function seedQueueEntry(
+  runtime: FleetCliRuntime,
+  pullRequest = 7,
+  headOid: string = HEAD,
+): Promise<void> {
   const decision = await runtime.execution.mergeQueueRepository.enqueueMergeEntry({
     repository: { owner: OWNER, repo: REPO },
     pullRequest,
-    headOid: HEAD,
+    headOid,
     tier: 0,
     enqueuedBy: 'cli',
     runId: null,
@@ -229,7 +233,22 @@ describe('merge decide', () => {
     expect(results[0]?.outcome).toBe('dry-run');
   });
 
-  it('answers not-ready not-queue-head (exit 1) and journals nothing when an earlier live queue entry of the same repository holds the head', async () => {
+  it('exits 0 and journals would-merge for a queued entry that is not the queue head (an earlier entry holds the head)', async () => {
+    const forge = greenForgeFake();
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
+    await seedQueueEntry(runtime, 3);
+    await seedQueueEntry(runtime, 7);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(0);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('journalled');
+    expect(printed['reasonCode']).toBe('would-merge');
+    expect(await journalRowsFor(stateDir, null)).not.toHaveLength(0);
+  });
+
+  it('refuses not-queued (exit 1) and journals nothing when the pair is not a queued entry', async () => {
     const forge = greenForgeFake();
     const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
     await seedQueueEntry(runtime, 3);
@@ -239,11 +258,32 @@ describe('merge decide', () => {
 
     expect(result.code).toBe(1);
     const printed = JSON.parse(result.out) as Record<string, unknown>;
-    expect(printed['outcome']).toBe('not-ready');
-    expect(printed['reasonCode']).toBe('not-queue-head');
+    expect(printed['outcome']).toBe('refused');
+    expect(printed['reasonCode']).toBe('not-queued');
     expect(forge.calls).toHaveLength(0);
     expect(await journalRowsFor(stateDir, null)).toHaveLength(0);
     expect(await queueSnapshot(runtime)).toEqual(before);
+  });
+
+  it('journals would-merge for a queued entry at an older head and leaves the queue file byte-identical, as on a refusal', async () => {
+    const OLD_HEAD = 'fedcba987654ef0123456789abcdef0123456789';
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, greenForgeFake().run);
+    await seedQueueEntry(runtime, 7, OLD_HEAD);
+    const queueFile = path.join(stateDir, 'merge-queue.json');
+    const before = await fs.readFile(queueFile);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(0);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('journalled');
+    expect(printed['reasonCode']).toBe('would-merge');
+    expect((await fs.readFile(queueFile)).equals(before)).toBe(true);
+
+    const refused = await runDecide(runtime, decideArgv(9));
+    expect(refused.code).toBe(1);
+    expect((JSON.parse(refused.out) as Record<string, unknown>)['reasonCode']).toBe('not-queued');
+    expect((await fs.readFile(queueFile)).equals(before)).toBe(true);
   });
 
   it('survives twenty concurrent journal writers: every decide row and every appended conduct row is present, none lost or torn', async () => {

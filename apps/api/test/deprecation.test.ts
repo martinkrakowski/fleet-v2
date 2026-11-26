@@ -594,52 +594,53 @@ describe("deprecationHeadersFor — field value refusals", () => {
   });
 });
 
-describe("deprecationHeadersFor — re-read consistency", () => {
-  it("refuses with hostile-input when an element read as an entry during validation reads back as a primitive during lookup", () => {
+describe("deprecationHeadersFor — validated snapshot", () => {
+  it("builds headers from the values validated, even when a Proxy returns different valid values on later reads", () => {
     const key = routeKeyOf("teams");
-    let reads = 0;
-    const flipping = new Proxy([entry()], {
+    const validatedDeprecated = ["2026-01-01", "T00", ":00", ":00", "Z"].join("");
+    const laterDeprecated = ["2026-03-03", "T00", ":00", ":00", "Z"].join("");
+    const laterSunset = ["2026-12-12", "T00", ":00", ":00", "Z"].join("");
+    const laterSuccessor = `${V1_PREFIX}later`;
+    const later: Record<string, string> = {
+      deprecatedAtIso: laterDeprecated,
+      sunsetAtIso: laterSunset,
+      successorPath: laterSuccessor,
+    };
+    const reads: Record<string, number> = {};
+    const flippingEntry = new Proxy(entry({ deprecatedAtIso: validatedDeprecated }), {
       getOwnPropertyDescriptor(target, prop) {
-        if (prop === "0") {
-          reads += 1;
-          if (reads > 1) {
-            return { value: 7, writable: true, enumerable: true, configurable: true };
-          }
+        const name = String(prop);
+        reads[name] = (reads[name] ?? 0) + 1;
+        if (reads[name] > 1 && name in later) {
+          return { value: later[name], writable: true, enumerable: true, configurable: true };
         }
         return Reflect.getOwnPropertyDescriptor(target, prop);
       },
     });
-    expect(deprecationHeadersFor(flipping, key, GOOD_NOW)).toEqual({
-      ok: false,
-      reason: "hostile-input",
+    const result = deprecationHeadersFor([flippingEntry], key, GOOD_NOW);
+    expect(result).toEqual({
+      ok: true,
+      headers: { Deprecation: `@${Math.floor(Date.parse(validatedDeprecated) / 1000)}` },
     });
-    expect(reads).toBeGreaterThan(1);
+    expect(Object.values(reads).every((count) => count === 1)).toBe(true);
   });
 
-  it("refuses with hostile-input when a routeKey validated as one string reads back as another during lookup", () => {
+  it("matches the route against the validated routeKey even when a Proxy returns another key on a later read", () => {
     const key = routeKeyOf("teams");
-    const base = entry();
     let reads = 0;
-    const flippingEntry = new Proxy(base, {
+    const flippingEntry = new Proxy(entry(), {
       getOwnPropertyDescriptor(target, prop) {
         if (prop === "routeKey") {
           reads += 1;
           if (reads > 1) {
-            return {
-              value: routeKeyOf("other"),
-              writable: true,
-              enumerable: true,
-              configurable: true,
-            };
+            return { value: routeKeyOf("other"), writable: true, enumerable: true, configurable: true };
           }
         }
         return Reflect.getOwnPropertyDescriptor(target, prop);
       },
     });
-    expect(deprecationHeadersFor([flippingEntry], key, GOOD_NOW)).toEqual({
-      ok: false,
-      reason: "hostile-input",
-    });
-    expect(reads).toBeGreaterThan(1);
+    const result = deprecationHeadersFor([flippingEntry], key, GOOD_NOW);
+    expect(result.ok && Object.keys(result.headers)).toEqual(["Deprecation"]);
+    expect(reads).toBe(1);
   });
 });

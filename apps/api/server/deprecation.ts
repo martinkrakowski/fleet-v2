@@ -130,9 +130,16 @@ function checkTimestampField(
   return { ok: true, ms };
 }
 
+type ValidatedEntry = {
+  readonly routeKey: string;
+  readonly deprecatedAtIso: string;
+  readonly sunsetAtIso: string | null;
+  readonly successorPath: string | null;
+};
+
 function validateRegistry(
   registry: unknown,
-): { ok: true; length: number; routeKeys: readonly string[] } | { ok: false; reason: string } {
+): { ok: true; entries: readonly ValidatedEntry[] } | { ok: false; reason: string } {
   // `Array.isArray` itself can throw on a revoked Proxy, so it is inside the
   // guarded region too: a Proxy that cannot be interrogated is hostile input,
   // never a propagated exception.
@@ -154,23 +161,25 @@ function validateRegistry(
   }
 
   const seenRouteKeys = new Set<string>();
+  const entries: ValidatedEntry[] = [];
   for (let index = 0; index < length; index += 1) {
     const entryResult = validateEntry(registry, index, seenRouteKeys);
     if (!entryResult.ok) {
       return entryResult;
     }
+    entries.push(entryResult.entry);
   }
-  // The validated length is returned and reused by the caller: re-reading
-  // `registry.length` through a Proxy could diverge from what was validated
-  // (bypassing the 500-entry bound) or throw outside any guard.
-  return { ok: true, length, routeKeys: Array.from(seenRouteKeys) };
+  // The caller works only from this plain snapshot of the values that were
+  // validated; the registry is never read again, so a Proxy cannot supply
+  // different values on a later read.
+  return { ok: true, entries };
 }
 
 function validateEntry(
   registry: unknown[],
   index: number,
   seenRouteKeys: Set<string>,
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true; entry: ValidatedEntry } | { ok: false; reason: string } {
   let elementDescriptor: PropertyDescriptor | undefined;
   let element: unknown;
   try {
@@ -301,7 +310,15 @@ function validateEntry(
     }
   }
 
-  return { ok: true };
+  return {
+    ok: true,
+    entry: {
+      routeKey,
+      deprecatedAtIso: deprecatedAtIso as string,
+      sunsetAtIso: sunsetAtIso as string | null,
+      successorPath: successorPath as string | null,
+    },
+  };
 }
 
 function checkControlCharArgument(
@@ -351,126 +368,8 @@ export function deprecationHeadersFor(
     return registryResult;
   }
 
-  // Re-read through descriptors again, inside try/catch: the traps a
-  // validation-time inspection bypassed are not trusted here either, and a
-  // Proxy may throw — or supply values that were never validated — on these
-  // later reads. Every re-read field is therefore re-checked with the same
-  // field rules; any divergence from what validation saw is refused. The loop
-  // bound is the validated length from `validateRegistry`, never a fresh
-  // `registry.length` read through the Proxy (a divergent length could bypass
-  // the 500-entry bound and a throwing `get` trap would escape unguarded);
-  // the bounded re-read keeps lookup `O(n)`, `n <= MAX_DEPRECATIONS`.
-  const list = registry as unknown[];
-  const validatedLength = registryResult.length;
-  const validatedRouteKeys = registryResult.routeKeys;
-  let match: {
-    readonly routeKey: string;
-    readonly deprecatedAtIso: string;
-    readonly sunsetAtIso: string | null;
-    readonly successorPath: string | null;
-  } | undefined;
-  for (let index = 0; index < validatedLength; index += 1) {
-    let routeKeyValue: unknown;
-    let deprecatedValue: unknown;
-    let sunsetValue: unknown;
-    let successorValue: unknown;
-    try {
-      const elementDescriptor = Object.getOwnPropertyDescriptor(list, index);
-      if (elementDescriptor === undefined || !isDataProperty(elementDescriptor)) {
-        return { ok: false, reason: "hostile-input" };
-      }
-      const entry = elementDescriptor.value;
-      if (typeof entry !== "object" || entry === null) {
-        return { ok: false, reason: "hostile-input" };
-      }
-      const target = entry as object;
-      const routeKeyDescriptor = Object.getOwnPropertyDescriptor(target, "routeKey");
-      if (routeKeyDescriptor === undefined || !isDataProperty(routeKeyDescriptor)) {
-        return { ok: false, reason: "hostile-input" };
-      }
-      routeKeyValue = routeKeyDescriptor.value;
-      if (routeKeyValue !== validatedRouteKeys[index]) {
-        return { ok: false, reason: "hostile-input" };
-      }
-      if (routeKeyValue !== routeKey) {
-        continue;
-      }
-      const deprecatedDescriptor = Object.getOwnPropertyDescriptor(target, "deprecatedAtIso");
-      const sunsetDescriptor = Object.getOwnPropertyDescriptor(target, "sunsetAtIso");
-      const successorDescriptor = Object.getOwnPropertyDescriptor(target, "successorPath");
-      for (const descriptor of [deprecatedDescriptor, sunsetDescriptor, successorDescriptor]) {
-        if (descriptor === undefined || !isDataProperty(descriptor)) {
-          return { ok: false, reason: "hostile-input" };
-        }
-      }
-      deprecatedValue = deprecatedDescriptor!.value;
-      sunsetValue = sunsetDescriptor!.value;
-      successorValue = successorDescriptor!.value;
-    } catch {
-      return { ok: false, reason: "hostile-input" };
-    }
-
-    if (typeof routeKeyValue === "string" && hasControlCharacter(routeKeyValue)) {
-      return { ok: false, reason: "control-character" };
-    }
-    if (
-      typeof routeKeyValue !== "string" ||
-      routeKeyValue === "" ||
-      routeKeyValue.length > ROUTE_KEY_MAX_LENGTH
-    ) {
-      return { ok: false, reason: "invalid-entry" };
-    }
-
-    const deprecatedResult = checkTimestampField(deprecatedValue);
-    if (!deprecatedResult.ok) {
-      return deprecatedResult;
-    }
-
-    let sunsetAtMs: number | null = null;
-    if (sunsetValue !== null) {
-      if (typeof sunsetValue !== "string") {
-        return { ok: false, reason: "invalid-entry" };
-      }
-      if (hasControlCharacter(sunsetValue)) {
-        return { ok: false, reason: "control-character" };
-      }
-      if (sunsetValue.length > TIMESTAMP_MAX_LENGTH) {
-        return { ok: false, reason: "invalid-timestamp" };
-      }
-      const sunsetMs = parseStrictIsoUtcMs(sunsetValue);
-      if (sunsetMs === null) {
-        return { ok: false, reason: "invalid-timestamp" };
-      }
-      sunsetAtMs = sunsetMs;
-      if (sunsetAtMs < deprecatedResult.ms) {
-        return { ok: false, reason: "sunset-before-deprecation" };
-      }
-    }
-
-    if (successorValue !== null) {
-      if (typeof successorValue !== "string") {
-        return { ok: false, reason: "invalid-entry" };
-      }
-      if (hasControlCharacter(successorValue)) {
-        return { ok: false, reason: "control-character" };
-      }
-      if (
-        successorValue.length > SUCCESSOR_PATH_MAX_LENGTH ||
-        successorValue.includes("..") ||
-        !SUCCESSOR_PATH_RE.test(successorValue)
-      ) {
-        return { ok: false, reason: "invalid-successor-path" };
-      }
-    }
-
-    match = {
-      routeKey: routeKeyValue,
-      deprecatedAtIso: deprecatedValue as string,
-      sunsetAtIso: sunsetValue as string | null,
-      successorPath: successorValue as string | null,
-    };
-    break;
-  }
+  // Lookup uses only the validated snapshot; the registry is not read again.
+  const match = registryResult.entries.find((candidate) => candidate.routeKey === routeKey);
   if (match === undefined) {
     return { ok: true, headers: {} };
   }

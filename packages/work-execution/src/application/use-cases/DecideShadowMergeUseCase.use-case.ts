@@ -305,9 +305,9 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
 
   /**
    * Read-only peek at the real merge queue: `queued` when a live entry exists
-   * for this repository and pull request: `queued` or `ready` at the requested
-   * head, or `queued`, `ready` or `parked` with reason `update-refused` at a
-   * different head (superseded by the requested head, by the same predicate
+   * for this repository and pull request: `queued`, `ready` or `parked` with
+   * reason `checks` at the requested head, or those same states or `parked` with
+   * reason `update-refused` at a different head (superseded by the requested head, by the same predicate
    * `decideMergeEnqueue` uses). `not-queued` when none does (any other parked
    * reason, dropped, merged, superseded, unknown state, or absent),
    * `unreadable` when the peek fails or is malformed (fail closed).
@@ -338,7 +338,10 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
         if (entry.repoDigest !== request.repoDigest) {
           return false;
         }
-        const live = entry.state === 'queued' || entry.state === 'ready';
+        const live =
+          entry.state === 'queued' ||
+          entry.state === 'ready' ||
+          (entry.state === 'parked' && entry.reason === 'checks');
         if (live && sameMergeQueueIdentity(entry, target)) {
           return true;
         }

@@ -18,7 +18,6 @@ import { types } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import {
-  ACTOR_PATTERN,
   canActAs,
   decideMembershipChange as decideMembershipChangeImpl,
   isZonedIsoDateTime,
@@ -30,6 +29,7 @@ import {
   validateMembershipRecord as validateMembershipRecordImpl,
   validateMembersList as validateMembersListImpl,
 } from "../entities/index.js";
+import { ACTOR_PATTERN } from "../sign-in-link.js";
 
 const isProxy = types.isProxy as (value: unknown) => boolean;
 
@@ -373,13 +373,29 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     expect(rec.ok).toBe(false);
     const list = validateMembersList([hostile], isProxy);
     expect(list.ok).toBe(false);
-    const decided = decideMembershipChange(
-      [record()],
-      change("change-role", { actor: "alice", role: "maintainer" }),
+    // The Proxy must itself reach decideMembershipChange (as a member and as
+    // the change); a plain change against a plain list would be refused as
+    // last-owner without ever touching it.
+    const decidedMember = decideMembershipChange(
+      [hostile],
+      change("add", { actor: "eve", role: "viewer" }),
       NOW,
       isProxy,
     );
-    expect(decided.ok).toBe(false);
+    expect(decidedMember.ok).toBe(false);
+    if (!decidedMember.ok) {
+      expect(decidedMember.reason).not.toBe("last-owner");
+    }
+    const decidedChange = decideMembershipChange(
+      [record()],
+      hostile as never,
+      NOW,
+      isProxy,
+    );
+    expect(decidedChange.ok).toBe(false);
+    if (!decidedChange.ok) {
+      expect(decidedChange.reason).not.toBe("last-owner");
+    }
     expect(trapRan).toBe(false);
   });
 
@@ -425,6 +441,9 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
 
   it("refuses a Proxy with throwing traps as a typed result when no detector is supplied", () => {
     const throwingTraps = {
+      get() {
+        throw new Error("trap");
+      },
       getPrototypeOf() {
         throw new Error("trap");
       },
@@ -475,6 +494,75 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     expect(canActAs("owner", roleProxy)).toBe(false);
   });
 
+  it("never reads a field through a Proxy get trap that flip-flops: a role that reads superadmin on one read is not what is validated or returned", () => {
+    // Without a detector the Proxy is not detected; fields must still be read
+    // once through their own data descriptors, never through [[Get]].
+    let reads = 0;
+    const flipFlop = new Proxy(record({ role: "viewer" }), {
+      get(target, key) {
+        reads += 1;
+        return key === "role" ? (reads % 2 === 1 ? "viewer" : "superadmin") : Reflect.get(target, key);
+      },
+    });
+    const result = validateMembershipRecordImpl(flipFlop);
+    if (result.ok) {
+      expect(result.record.role).toBe("viewer");
+    }
+    expect(reads).toBe(0);
+    const flipChange = new Proxy(change("add", { role: "viewer" }), {
+      get(target, key) {
+        reads += 1;
+        return key === "role" ? "superadmin" : Reflect.get(target, key);
+      },
+    });
+    const parsed = validateMembershipChangeImpl(flipChange);
+    if (parsed.ok && parsed.change.kind !== "remove") {
+      expect(parsed.change.role).toBe("viewer");
+    }
+    const decided = decideMembershipChangeImpl(members(OWNER()), flipChange, NOW);
+    if (decided.ok) {
+      expect(decided.members.every((entry) => isValidRole(entry.role))).toBe(true);
+    }
+    expect(reads).toBe(0);
+  });
+
+  it("never runs a Proxy get trap from any of the four functions, so a throwing get trap cannot escape", () => {
+    let getRan = 0;
+    const hostile = <T extends object>(target: T): T =>
+      new Proxy(target, {
+        get() {
+          getRan += 1;
+          throw new Error("get trap ran");
+        },
+      });
+    expect(() => {
+      validateMembershipRecordImpl(hostile(record()));
+      validateMembershipChangeImpl(hostile(change("add")));
+      validateMembersListImpl([hostile(record())]);
+      validateMembersListImpl(hostile([record()]));
+      decideMembershipChangeImpl(members(OWNER()), hostile(change("add")), NOW);
+      decideMembershipChangeImpl([hostile(record())], change("add"), NOW);
+    }).not.toThrow();
+    expect(getRan).toBe(0);
+  });
+
+  it("refuses an extra own key on the members array and a garbage role on a remove change", () => {
+    const withExtra = [record()];
+    Object.defineProperty(withExtra, "note", {
+      value: "x",
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    expect(validateMembersList(withExtra).ok).toBe(false);
+    const garbage = validateMembershipChange(change("remove", { role: "superadmin" }));
+    expect(garbage.ok).toBe(false);
+    if (!garbage.ok) {
+      expect(garbage.reason).toBe("invalid-role");
+    }
+    expect(validateMembershipChange(change("remove", { role: "viewer" })).ok).toBe(true);
+  });
+
   it("refuses an array whose prototype supplies a getter at a missing index without invoking the getter", () => {
     let getterRan = false;
     const hole: unknown[] = new Array(1);
@@ -489,7 +577,8 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     const list = validateMembersList(hole);
     expect(list.ok).toBe(false);
     if (!list.ok) {
-      expect(list.reason).toBe("sparse-members-list");
+      // A non-plain array prototype is refused before any index is read.
+      expect(list.reason).toBe("invalid-members-list");
     }
     const decided = decideMembershipChange(
       hole,
@@ -524,7 +613,20 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
       const list = validateMembersList(hostileList);
       expect(list.ok).toBe(false);
       if (!list.ok) {
-        expect(list.reason).toBe("forbidden-key");
+        // An extra own key on the array itself is refused with the list reason.
+        expect(list.reason).toBe("invalid-members-list");
+      }
+      const hostileElement = record();
+      Object.defineProperty(hostileElement, key, {
+        value: 1,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      const elementList = validateMembersList([hostileElement]);
+      expect(elementList.ok).toBe(false);
+      if (!elementList.ok) {
+        expect(elementList.reason).toBe("forbidden-key");
       }
       const hostileChange = change("add");
       Object.defineProperty(hostileChange, key, {

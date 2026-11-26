@@ -18,19 +18,28 @@
  * nowIso)` contract works. When a detector is supplied, a detectable Proxy
  * is refused before any reflection operation runs; a supplied value that is
  * not a function is refused (`proxy-detector-required`) and a detector that
- * throws is refused as `detector-threw`. Without a detector, every
- * reflection operation is itself guarded, so a throwing Proxy trap becomes
- * a typed refusal (a Proxy that lies consistently in every trap is an
- * accepted residual).
+ * throws is refused as `detector-threw`. Every untrusted input is copied
+ * ONCE by `snapshotPlainData` (through its own data descriptors, so no
+ * getter and no Proxy `get` trap ever runs and no value can change between
+ * check and use); only the frozen snapshot is validated. Without a
+ * detector, a throwing Proxy trap is a typed refusal (a Proxy that lies
+ * consistently in every trap is an accepted residual).
  *
  * Cost bound: `decideMembershipChange` is O(n) over `members` (one
  * validation pass plus one indexing pass), bounded by
  * `MAX_MEMBERS = 10_000`; `canActAs` (Role.vo) is O(1).
  */
 
-import type { IsProxy } from "@fleet/shared";
+import { snapshotPlainData, type IsProxy } from "@fleet/shared";
 
-import { isZonedIsoDateTime, ORGANIZATION_ID_PATTERN } from "./record-guards.js";
+import {
+  checkSnapshotKeys,
+  isZonedIsoDateTime,
+  ORGANIZATION_ID_PATTERN,
+  readRecord,
+  type RecordRefusal,
+} from "./record-guards.js";
+import { ACTOR_PATTERN } from "../sign-in-link.js";
 import {
   canActAs,
   FORBIDDEN_KEY_SET,
@@ -41,13 +50,6 @@ import {
 export { canActAs, isValidRole };
 export { isZonedIsoDateTime, ORGANIZATION_ID_PATTERN };
 export type { Role };
-
-/**
- * Copied verbatim from `apps/api/server/wiring/session-exchange.ts:35`
- * (`ACTOR_PATTERN`); packages may not import apps, so the pattern is
- * duplicated here with the citation as its source of truth.
- */
-export const ACTOR_PATTERN = /^[A-Za-z0-9._@-]{1,128}$/;
 
 /** An organization's membership list is bounded. */
 export const MAX_MEMBERS = 10_000;
@@ -109,103 +111,47 @@ export type MembershipDecision =
   | { readonly ok: true; readonly members: readonly MembershipRecord[] }
   | { readonly ok: false; readonly reason: string };
 
+/** A detector that detects nothing, used when the caller supplies none. */
+const NO_DETECTOR: IsProxy = () => false;
+
 /**
- * Screen the caller-supplied proxy detector and the value through it. The
- * detector is the FIRST operation on every untrusted value: an absent or
- * non-function detector is `proxy-detector-required`, a throwing detector
- * is `detector-threw`, and a positive detection is `proxy-detected`.
- * Nothing else (no `Object.getPrototypeOf`, no `Reflect.ownKeys`, no
- * descriptor read) touches the value until it has been screened here, so
- * no hostile trap can run through the reflection operations below.
+ * Resolve the optional proxy detector: absent means no detection, a
+ * supplied non-function is refused (`proxy-detector-required`). A detector
+ * that throws is reported by the snapshot as `detector-threw`.
  *
- * Cost bound: O(1) — one type check and one detector call.
+ * Cost bound: O(1).
  */
-function screenProxy(
+function resolveDetector(
   isProxy: unknown,
-  value: unknown,
-): { ok: true; isProxy: boolean } | { ok: false; reason: string } {
+): { ok: true; detector: IsProxy } | { ok: false; reason: string } {
   if (isProxy === undefined) {
-    return { ok: true, isProxy: false };
+    return { ok: true, detector: NO_DETECTOR };
   }
   if (typeof isProxy !== "function") {
     return { ok: false, reason: "proxy-detector-required" };
   }
-  let is: boolean;
-  try {
-    is = (isProxy as IsProxy)(value) === true;
-  } catch {
-    return { ok: false, reason: "detector-threw" };
-  }
-  return { ok: true, isProxy: is };
+  return { ok: true, detector: isProxy as IsProxy };
 }
 
-/** True when the value is a plain, non-array object (already screened). */
-function isPlainObject(value: unknown): boolean {
-  try {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return false;
-    }
-    const proto = Object.getPrototypeOf(value);
-    return proto === Object.prototype || proto === null;
-  } catch {
-    return false;
-  }
-}
-
-/** Array.isArray that refuses (false) instead of throwing on a revoked Proxy. */
-function safeIsArray(value: unknown): value is unknown[] {
-  try {
-    return Array.isArray(value);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Inspect an object's own string keys without reading values: refuses
- * symbols, prototype-polluting keys and accessor properties (getters and
- * setters are detected via `Object.getOwnPropertyDescriptor` and never
- * invoked). Returns the refusal reason, or null.
- *
- * Cost bound: O(k) over the object's own keys, bounded by the allowed-key
- * set sizes (at most 6 for a record, 5 for a change).
- */
-function inspectOwnKeys(
-  value: object,
-  allowedKeys: ReadonlySet<string>,
-): string | null {
-  try {
-    return inspectOwnKeysUnguarded(value, allowedKeys);
-  } catch {
-    return "invalid-input";
-  }
-}
-
-function inspectOwnKeysUnguarded(
-  value: object,
-  allowedKeys: ReadonlySet<string>,
-): string | null {
-  const keys = Reflect.ownKeys(value);
-  for (const key of keys) {
-    if (typeof key !== "string") {
-      return "invalid-input";
-    }
-    // Prototype-polluting keys are refused before any shape or count check.
-    if (FORBIDDEN_KEY_SET.has(key)) {
+/** Map a typed record refusal to this module's stable reason codes. */
+function recordRefusalCode(refusal: RecordRefusal): string {
+  switch (refusal.kind) {
+    case "snapshot":
+      if (refusal.reason === "accessor") {
+        return "getter-not-allowed";
+      }
+      // `invalid-limits` is how the snapshot reports a detector that throws
+      // while screening its own (fixed, valid) limits argument.
+      return refusal.reason === "detector-threw" || refusal.reason === "invalid-limits"
+        ? "detector-threw"
+        : "invalid-input";
+    case "forbidden-key":
       return "forbidden-key";
-    }
-    if (!allowedKeys.has(key)) {
+    case "unknown-key":
+      return FORBIDDEN_KEY_SET.has(refusal.key) ? "forbidden-key" : "invalid-input";
+    default:
       return "invalid-input";
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor !== undefined && "get" in descriptor) {
-      return "getter-not-allowed";
-    }
   }
-  if (keys.length > allowedKeys.size) {
-    return "invalid-input";
-  }
-  return null;
 }
 
 /**
@@ -249,18 +195,24 @@ export function validateMembershipRecord(
   value: unknown,
   isProxy?: IsProxy,
 ): { ok: true; record: MembershipRecord } | { ok: false; reason: string } {
-  const screened = screenProxy(isProxy, value);
-  if (!screened.ok) {
-    return { ok: false, reason: screened.reason };
+  const detector = resolveDetector(isProxy);
+  if (!detector.ok) {
+    return { ok: false, reason: detector.reason };
   }
-  if (screened.isProxy || !isPlainObject(value)) {
-    return { ok: false, reason: "invalid-input" };
+  const read = readRecord(value, detector.detector, RECORD_ALLOWED_KEYS);
+  if (!read.ok) {
+    return { ok: false, reason: recordRefusalCode(read.refusal) };
   }
-  const keyReason = inspectOwnKeys(value as object, RECORD_ALLOWED_KEYS);
-  if (keyReason !== null) {
-    return { ok: false, reason: keyReason };
-  }
-  const record = value as Record<string, unknown>;
+  return validateRecordSnapshot(read.value);
+}
+
+/**
+ * Validate an already-snapshotted record (a frozen copy: every field was
+ * read once through its own data descriptor) and build the frozen result.
+ */
+function validateRecordSnapshot(
+  record: Record<string, unknown>,
+): { ok: true; record: MembershipRecord } | { ok: false; reason: string } {
   const fieldReason = checkRecordFields(record);
   if (fieldReason !== null) {
     return { ok: false, reason: fieldReason };
@@ -297,70 +249,53 @@ export function validateMembersList(
   members: unknown,
   isProxy?: IsProxy,
 ): { ok: true; members: readonly MembershipRecord[] } | { ok: false; reason: string } {
-  const listScreen = screenProxy(isProxy, members);
-  if (!listScreen.ok) {
-    return { ok: false, reason: listScreen.reason };
+  const detector = resolveDetector(isProxy);
+  if (!detector.ok) {
+    return { ok: false, reason: detector.reason };
   }
-  if (typeof members !== "object" || members === null || !safeIsArray(members)) {
-    return { ok: false, reason: "invalid-members-list" };
-  }
-  if (listScreen.isProxy) {
-    return { ok: false, reason: "invalid-members-list" };
-  }
-  const array = members as unknown[];
-  if (array.length > MAX_MEMBERS) {
-    return { ok: false, reason: "too-many-members" };
-  }
-  // Scan the array's own keys for accessors and polluting keys BEFORE any
-  // element read, so a getter at an index is detected via its property
-  // descriptor and never invoked. `length` is a built-in own
-  // non-enumerable property and is skipped; the scan is O(n + k), still
-  // bounded by MAX_MEMBERS plus any extra own keys.
-  try {
-    for (const key of Reflect.ownKeys(array as object)) {
-      if (typeof key !== "string") {
-        return { ok: false, reason: "invalid-members-list" };
-      }
-      if (key === "length") {
-        continue;
-      }
-      if (FORBIDDEN_KEY_SET.has(key)) {
-        return { ok: false, reason: "forbidden-key" };
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(array, key);
-      if (descriptor !== undefined && "get" in descriptor) {
+  // One snapshot of the whole list: every index and field is read once,
+  // through its own data descriptor (an inherited getter at a hole, an
+  // accessor, a Proxy `get` trap or a flip-flopping value never runs), and
+  // an extra own key on the array is refused. Everything below validates
+  // the frozen snapshot only.
+  const snapshot = snapshotPlainData(members, detector.detector, {
+    maxDepth: 2,
+    maxKeys: RECORD_ALLOWED_KEYS.size + 1,
+    maxArrayLength: MAX_MEMBERS,
+    maxNodes: MAX_MEMBERS * (RECORD_ALLOWED_KEYS.size + 1) + 1,
+    maxStringLength: 4096,
+  });
+  if (!snapshot.ok) {
+    switch (snapshot.reason) {
+      case "too-many-items":
+        return { ok: false, reason: "too-many-members" };
+      case "sparse-array":
+        return { ok: false, reason: "sparse-members-list" };
+      case "accessor":
         return { ok: false, reason: "getter-not-allowed" };
-      }
+      case "detector-threw":
+      case "invalid-limits":
+        return { ok: false, reason: "detector-threw" };
+      default:
+        return { ok: false, reason: "invalid-members-list" };
     }
-  } catch {
+  }
+  if (!Array.isArray(snapshot.value)) {
     return { ok: false, reason: "invalid-members-list" };
   }
-  // Length is already bounded above, so this single pass is O(n) with
-  // n <= MAX_MEMBERS. Each element becomes a frozen validated copy; the
-  // caller's array and its elements are never mutated.
   const validated: MembershipRecord[] = [];
-  for (let i = 0; i < array.length; i += 1) {
-    // Read through the OWN property descriptor only: `i in array` is true
-    // for an index supplied by the prototype, and `array[i]` would then run
-    // an inherited getter. An index with no own descriptor is a hole.
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(array, i);
-    } catch {
+  for (const entry of snapshot.value as unknown[]) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       return { ok: false, reason: "invalid-members-list" };
     }
-    if (descriptor === undefined) {
-      return { ok: false, reason: "sparse-members-list" };
+    const keyRefusal = checkSnapshotKeys(entry as Record<string, unknown>, RECORD_ALLOWED_KEYS);
+    if (keyRefusal !== null) {
+      const code = recordRefusalCode(keyRefusal);
+      return { ok: false, reason: code === "invalid-input" ? "invalid-members-list" : code };
     }
-    if (!("value" in descriptor)) {
-      return { ok: false, reason: "getter-not-allowed" };
-    }
-    const element = validateMembershipRecord(descriptor.value, isProxy);
+    const element = validateRecordSnapshot(entry as Record<string, unknown>);
     if (!element.ok) {
-      return {
-        ok: false,
-        reason: element.reason === "invalid-input" ? "invalid-members-list" : element.reason,
-      };
+      return { ok: false, reason: element.reason };
     }
     validated.push(element.record);
   }
@@ -378,18 +313,15 @@ export function validateMembershipChange(
   change: unknown,
   isProxy?: IsProxy,
 ): { ok: true; change: MembershipChange } | { ok: false; reason: string } {
-  const screened = screenProxy(isProxy, change);
-  if (!screened.ok) {
-    return { ok: false, reason: screened.reason };
+  const detector = resolveDetector(isProxy);
+  if (!detector.ok) {
+    return { ok: false, reason: detector.reason };
   }
-  if (screened.isProxy || !isPlainObject(change)) {
-    return { ok: false, reason: "invalid-input" };
+  const read = readRecord(change, detector.detector, CHANGE_ALLOWED_KEYS);
+  if (!read.ok) {
+    return { ok: false, reason: recordRefusalCode(read.refusal) };
   }
-  const keyReason = inspectOwnKeys(change as object, CHANGE_ALLOWED_KEYS);
-  if (keyReason !== null) {
-    return { ok: false, reason: keyReason };
-  }
-  const value = change as Record<string, unknown>;
+  const value = read.value;
   const kind = value.kind;
   if (kind !== "add" && kind !== "change-role" && kind !== "remove") {
     return { ok: false, reason: "invalid-kind" };
@@ -405,6 +337,11 @@ export function validateMembershipChange(
     return { ok: false, reason: "invalid-actor" };
   }
   if (kind === "remove") {
+    // A remove carries no role, but a `role` key that is present must
+    // still be a valid role: garbage is refused instead of silently ignored.
+    if (Object.hasOwn(value, "role") && !isValidRole(value.role)) {
+      return { ok: false, reason: "invalid-role" };
+    }
     return {
       ok: true,
       change: Object.freeze({
@@ -456,7 +393,7 @@ export function decideMembershipChange(
   nowIso: unknown,
   isProxy?: IsProxy,
 ): MembershipDecision {
-  const detectorCheck = screenProxy(isProxy, null);
+  const detectorCheck = resolveDetector(isProxy);
   if (!detectorCheck.ok) {
     return { ok: false, reason: detectorCheck.reason };
   }

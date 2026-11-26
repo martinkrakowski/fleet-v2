@@ -278,6 +278,23 @@ async function emitStopEvent(
   }
 }
 
+/**
+ * Carries a missed audit write onto the stop result itself, so a boundary that
+ * flattens the audited outcome to the plain port surface reports the gap
+ * instead of dropping it. A recorded audit returns the result unchanged. The
+ * stop stays recorded either way; a same-key retry re-emits the identical
+ * event id to the idempotent sink. O(1).
+ */
+export function flagAuditGap<TResult extends object>(
+  outcome: AuditedStopOutcome<TResult>,
+): TResult & { readonly auditGap?: true } {
+  if (!outcome.auditGap) {
+    return outcome.result;
+  }
+  const flagged: TResult & { readonly auditGap: true } = { ...outcome.result, auditGap: true };
+  return flagged;
+}
+
 /** True only for exactly `{ outcome: 'recorded' }`; anything else is a gap. */
 function isRecordedOutcome(outcome: unknown): boolean {
   try {

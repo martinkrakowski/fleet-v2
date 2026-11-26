@@ -27,7 +27,10 @@ import type {
   AuthorityEventSinkPort,
   AuthorityEventSinkResult,
 } from '../../application/ports/out/AuthorityEventSinkPort.out-port.js';
-import type { StopAuthorityEvent } from '../../domain/authority-event-mapping.js';
+import {
+  authorityEventForStop,
+  type StopAuthorityEvent,
+} from '../../domain/authority-event-mapping.js';
 
 /** The journal file name inside the state directory. */
 export const AUTHORITY_EVENTS_FILE = 'authority-events.jsonl';
@@ -55,6 +58,32 @@ export interface AuthorityEventJournalAdapterOptions {
   readonly stateDir?: string;
   /** File name inside the state directory; defaults to `authority-events.jsonl`. */
   readonly fileName?: string;
+}
+
+/**
+ * The supplier-side field rules (actor pattern, no ASCII control characters,
+ * non-empty organization id, zoned ISO time) are the pure mapper's: the four
+ * mapped values are read through own descriptors (never a getter) and run
+ * through `authorityEventForStop`, so the sink refuses exactly what the mapper
+ * refuses. O(1); never throws.
+ */
+function hasValidatedFields(event: object): boolean {
+  try {
+    const read = (key: string): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(event, key);
+      return descriptor !== undefined && descriptor.get === undefined && descriptor.set === undefined
+        ? descriptor.value
+        : undefined;
+    };
+    return authorityEventForStop({
+      eventId: read('eventId'),
+      actor: read('actor'),
+      organizationId: read('organizationId'),
+      atIso: read('atIso'),
+    }).ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -104,6 +133,9 @@ function isWellFormedStopEvent(event: unknown): event is StopAuthorityEvent {
       return false;
     }
   };
+  if (!hasValidatedFields(event)) {
+    return false;
+  }
   return (
     text('eventId', 128) &&
     text('actor', 128) &&
@@ -188,7 +220,13 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
         let content: string;
         try {
           content = await fs.readFile(this.filePath as string, 'utf8');
-        } catch {
+        } catch (error) {
+          // Only a missing journal is an empty one. Any other read failure
+          // (permissions, a directory, an I/O error) cannot prove the event
+          // is not already recorded, so it refuses rather than appending.
+          if ((error as { code?: unknown } | null)?.code !== 'ENOENT') {
+            return { outcome: 'refused' as const, reason: 'unavailable' as const };
+          }
           content = '';
         }
         const lines = content.length === 0 ? [] : content.split('\n').filter((line) => line.length > 0);

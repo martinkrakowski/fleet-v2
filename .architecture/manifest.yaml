@@ -859,6 +859,7 @@ bounded_contexts:
       - { adapter: GhReviewThreadHelperAdapter, implements: ReviewThreadHelperPort, integration: reviewed-github-cli-subprocess }
       - { adapter: LaneEditSaveAdapter, implements: LaneEditSavePort, integration: injected-command-executor-recorded-host-git }
       - { adapter: CutoverJournalAdapter, implements: CutoverJournalPort, integration: local-keyed-run-journal }
+      - { adapter: AuthorityEventJournalAdapter, implements: AuthorityEventSinkPort, integration: local-keyed-run-journal }
       - { adapter: RelaunchPlanRepositoryAdapter, implements: RelaunchPlanRepositoryPort, integration: local-transactional-store }
       - { adapter: CutoverRecordRepositoryAdapter, implements: CutoverRecordRepositoryPort, integration: local-transactional-store }
       - { adapter: ShadowEvidenceAdapter, implements: ShadowEvidencePort, integration: local-transactional-store }

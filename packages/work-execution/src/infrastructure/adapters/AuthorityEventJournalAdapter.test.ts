@@ -117,4 +117,46 @@ describe('AuthorityEventJournalAdapter', () => {
     const fresh = new AuthorityEventJournalAdapter();
     await expect(fresh.record(event)).resolves.toEqual({ outcome: 'recorded' });
   });
+
+  it('refuses a non-ENOENT read failure with unavailable and appends nothing, instead of treating it as an empty journal', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const event = stopEvent();
+    const existing = JSON.stringify(event);
+    await fs.writeFile(filePath, `${existing}\n`, 'utf8');
+    // Write-only: the read fails with EACCES while an append would succeed, so
+    // only the read-failure guard stops a duplicate line being appended.
+    await fs.chmod(filePath, 0o200);
+    try {
+      const journal = new AuthorityEventJournalAdapter({ stateDir });
+      await expect(journal.record(event)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'unavailable',
+      });
+    } finally {
+      await fs.chmod(filePath, 0o600);
+    }
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${existing}\n`);
+  });
+
+  it('refuses events whose actor, organization id or time the mapper rejects with invalid-event and writes nothing', async () => {
+    const stateDir = await tempStateDir();
+    const journal = new AuthorityEventJournalAdapter({ stateDir });
+    const bad: Partial<StopAuthorityEvent>[] = [
+      { actor: 'op:cli' },
+      { actor: 'op.cli' + String.fromCharCode(7) },
+      { eventId: 'stop:' + String.fromCharCode(10) + 'x' },
+      { organizationId: '' },
+      { atIso: '2026-11-26T08:30:00' },
+      { atIso: 'not a time' },
+    ];
+    for (const override of bad) {
+      const event = { ...stopEvent(), ...override } as StopAuthorityEvent;
+      await expect(journal.record(event)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-event',
+      });
+    }
+    await expect(fs.readFile(path.join(stateDir, 'authority-events.jsonl'), 'utf8')).rejects.toThrow();
+  });
 });

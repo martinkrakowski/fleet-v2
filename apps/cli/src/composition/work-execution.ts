@@ -62,6 +62,7 @@ import {
   readGateDeclaredEnvironmentDigest,
   readGateToolchainVersions,
   sha256HexDigest,
+  flagAuditGap,
   withStopAuthorityEvents,
   type AgyRunnerAdapter,
   type AttemptArtifactAdapter,
@@ -764,7 +765,9 @@ export function composeExecution(input: ComposeExecutionInput) {
       return {
         stopAttempt: async (
           request: Parameters<typeof audited.stopAttempt>[0],
-        ) => (await audited.stopAttempt(request)).result,
+        ) =>
+          // A missed audit write is surfaced on the result itself, never dropped.
+          flagAuditGap(await audited.stopAttempt(request)),
       };
     })(),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({

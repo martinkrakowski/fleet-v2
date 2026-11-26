@@ -15,7 +15,7 @@ import type {
   AuthorityEventSinkResult,
 } from '../../ports/out/AuthorityEventSinkPort.out-port.js';
 import type { StopAuthorityEvent } from '../../../domain/authority-event-mapping.js';
-import { withStopAuthorityEvents } from '../with-authority-events.js';
+import { flagAuditGap, withStopAuthorityEvents } from '../with-authority-events.js';
 
 /** A ULID-shaped identifier built at runtime, never a literal. */
 function ulid(seed: number): string {
@@ -349,5 +349,21 @@ describe('withStopAuthorityEvents', () => {
     expect(outcome.result).toBe(refused);
     expect(outcome).toEqual({ result: refused, auditGap: false });
     expect(events).toEqual([]);
+  });
+});
+
+describe('flagAuditGap', () => {
+  it('adds auditGap true to a copy of the result when the audit write was missed, leaving the original untouched', () => {
+    const result = { outcome: 'terminated', marker: 'kept' };
+    const flagged = flagAuditGap({ result, auditGap: true });
+    expect(flagged).toEqual({ outcome: 'terminated', marker: 'kept', auditGap: true });
+    expect(result).toEqual({ outcome: 'terminated', marker: 'kept' });
+  });
+
+  it('returns the very same result object, without an auditGap key, when the audit write was recorded', () => {
+    const result = { outcome: 'terminated' };
+    const flagged = flagAuditGap({ result, auditGap: false });
+    expect(flagged).toBe(result);
+    expect(Object.hasOwn(flagged, 'auditGap')).toBe(false);
   });
 });

@@ -77,6 +77,7 @@ import {
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
   resolveImplementerSeat,
+  flagAuditGap,
   withStopAuthorityEvents,
   type ImplementerSeatResolution,
   type StopAuthorityEventContext,
@@ -301,9 +302,9 @@ function auditedStopAttemptUseCase(
   const audited = withStopAuthorityEvents(useCase, sink, context);
   return {
     execute: async (input?: unknown) =>
-      (await audited.stopAttempt(input as StopAttemptRequest)).result,
+      flagAuditGap(await audited.stopAttempt(input as StopAttemptRequest)),
     stopAttempt: async (request: StopAttemptRequest) =>
-      (await audited.stopAttempt(request)).result,
+      flagAuditGap(await audited.stopAttempt(request)),
   };
 }
 
@@ -316,7 +317,7 @@ function auditedRequestLaneRunStopUseCase(
   const audited = withStopAuthorityEvents(useCase, sink, context);
   return {
     requestLaneRunStop: async (request) =>
-      (await audited.requestLaneRunStop(request)).result,
+      flagAuditGap(await audited.requestLaneRunStop(request)),
   };
 }
 

@@ -1611,7 +1611,7 @@ describe('pinned-build freshness (DB1)', () => {
 
     it('reports UNKNOWN when strings carry control characters, never printing them', async () => {
       const baseline = await baselineLines();
-      const controls = ['\u0000', '\u001b[31m', '\u0007', '\u007f', '\u0085', '\u2028', '\u202e'];
+      const controls = ['\u0000', '\u001b[31m', '\u0007', '\u007f', '\u0085', ' ', '‮'];
       for (const control of controls) {
         const lines = await sweepWith({
           pinnedCommit: SHA_A,

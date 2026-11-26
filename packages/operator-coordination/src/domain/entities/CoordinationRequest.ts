@@ -148,7 +148,7 @@ export class CoordinationRequest {
     if (!state.success || state.value === undefined) {
       throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(stateValue));
     }
-    const policyGrant = CoordinationRequest.readPolicyGrant(record);
+    const policyGrant = CoordinationRequest.readPolicyGrant(record, kind.value.getValue());
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
     const shadowImportGrant = CoordinationRequest.readShadowImportGrant(record);
     // A standing shadow import grant (owner decision 2026-11-18) is head-free
@@ -193,8 +193,15 @@ export class CoordinationRequest {
     }
     const consumptions = CoordinationRequest.readConsumptions(record.consumptions);
     const acknowledgements = CoordinationRequest.readAcknowledgements(record.acknowledgements);
+    // The spread below performs ordinary property Gets, so kind, state and
+    // deliveryStatus are overwritten with the validated descriptor-read
+    // values: the stored record is built only from the snapshot that was
+    // checked, never from a later Proxy read that could disagree with it.
     const normalized: MutableCoordinationRequestRecord = {
       ...record,
+      kind: kind.value.getValue(),
+      state: state.value.getValue(),
+      deliveryStatus: deliveryStatusValue as CoordinationRequestRecord['deliveryStatus'],
       consumptions,
       acknowledgements,
     };
@@ -302,7 +309,10 @@ export class CoordinationRequest {
     return Object.freeze(acknowledgements.map((acknowledgement) => ({ ...acknowledgement })));
   }
 
-  private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
+  private static readPolicyGrant(
+    record: CoordinationRequestRecord,
+    validatedKind: CoordinationKindValue,
+  ): PolicyGrantRecord | undefined {
     const raw = readGrantProperty(
       record,
       'policyGrant',
@@ -376,7 +386,7 @@ export class CoordinationRequest {
       acceptanceReceiptId: collected.acceptanceReceiptId,
     };
     
-    if (record.kind !== 'action-decision') {
+    if (validatedKind !== 'action-decision') {
       throw new Error('CoordinationRequest policy grant must be an action-decision');
     }
     

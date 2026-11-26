@@ -41,6 +41,7 @@ import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
+import { readJournaledWouldAlreadyMerged, withoutJournaledAlreadyMerged } from './shadow-merge-skip.js';
 import {
   findMergeQueueHead,
   orderMergeQueue,
@@ -66,7 +67,7 @@ import {
   sameMergeEntryContent,
   type MergeNotificationEvent,
 } from '../../domain/merge-pass-transitions.js';
-import { buildMergeKey, head12Of, parseLaneRunKey, type MergeKeyAction } from '../../domain/lane-run-keys.js';
+import { buildMergeKey, head12Of, type MergeKeyAction } from '../../domain/lane-run-keys.js';
 import {
   LANE_RUN_JOURNAL_ENTRY_VERSION,
   type LaneRunJournalEntryRecord,
@@ -399,149 +400,6 @@ function callAllowed(nowIso: string, deadlineIso: string): boolean {
   return computeCallBudget({ nowIso, deadlineIso, normalTimeoutMs: NORMAL_CALL_TIMEOUT_MS }).allowed;
 }
 
-type ShadowSkipAction = 'would-already-merged' | 'would-supersede';
-
-interface ShadowSkipIndex {
-  /** Every `would-already-merged` dry-run key for this repository, any head. */
-  readonly alreadyMergedKeys: ReadonlySet<string>;
-  /** Pull requests that have a `would-already-merged` dry-run under any head. */
-  readonly alreadyMergedPullRequests: ReadonlySet<number>;
-  /** Every `would-supersede` dry-run key for this repository. */
-  readonly supersededKeys: ReadonlySet<string>;
-}
-
-type AlreadyMergedIndex =
-  | ({ readonly outcome: 'indexed' } & ShadowSkipIndex)
-  | { readonly outcome: 'budget-exhausted' };
-
-function openShadowSkipIndex(): Extract<AlreadyMergedIndex, { outcome: 'indexed' }> {
-  return {
-    outcome: 'indexed',
-    alreadyMergedKeys: new Set<string>(),
-    alreadyMergedPullRequests: new Set<number>(),
-    supersededKeys: new Set<string>(),
-  };
-}
-
-/**
- * One dry-run result that can exclude a shadow entry. It counts only when
- * `kind === 'result'`, `outcome === 'dry-run'` and `reasonCode` is the parsed
- * merge action (`would-already-merged` or `would-supersede`). A closed intent
- * (`shadow-intent-closed`), an open intent, a non-merge key, another
- * repository, a non-integer pull request, or a throwing getter is not a hit.
- */
-function shadowSkipHit(
-  record: unknown,
-  repoDigest: string,
-): { readonly key: string; readonly action: ShadowSkipAction; readonly pullRequest: number } | null {
-  try {
-    const view = record as {
-      kind: unknown;
-      outcome: unknown;
-      reasonCode: unknown;
-      key: unknown;
-    };
-    const kind = view.kind;
-    const outcome = view.outcome;
-    const reasonCode = view.reasonCode;
-    const key = view.key;
-    if (kind !== 'result' || outcome !== 'dry-run' || typeof key !== 'string' || typeof reasonCode !== 'string') {
-      return null;
-    }
-    const parsed = parseLaneRunKey(key);
-    if (
-      parsed === null ||
-      parsed.kind !== 'merge' ||
-      parsed.repoDigest !== repoDigest ||
-      !Number.isSafeInteger(parsed.pullRequest) ||
-      parsed.pullRequest < 1 ||
-      reasonCode !== parsed.action
-    ) {
-      return null;
-    }
-    if (parsed.action !== 'would-already-merged' && parsed.action !== 'would-supersede') {
-      return null;
-    }
-    return { key, action: parsed.action, pullRequest: parsed.pullRequest };
-  } catch {
-    return null;
-  }
-}
-
-/** One pass over the prefix listing. A record that cannot be read is ignored. */
-function shadowSkipIndexFromRecords(records: readonly unknown[], repoDigest: string): ShadowSkipIndex {
-  const alreadyMergedKeys = new Set<string>();
-  const alreadyMergedPullRequests = new Set<number>();
-  const supersededKeys = new Set<string>();
-  for (const record of records) {
-    const hit = shadowSkipHit(record, repoDigest);
-    if (hit === null) {
-      continue;
-    }
-    if (hit.action === 'would-already-merged') {
-      alreadyMergedKeys.add(hit.key);
-      alreadyMergedPullRequests.add(hit.pullRequest);
-      continue;
-    }
-    supersededKeys.add(hit.key);
-  }
-  return { alreadyMergedKeys, alreadyMergedPullRequests, supersededKeys };
-}
-
-/**
- * True when this shadow entry is already settled in the journal: its current
- * head has a `would-already-merged` dry-run, or that pull request has a
- * `would-already-merged` dry-run under any head and this head already has a
- * `would-supersede` dry-run. An unreadable head or a refused key is not a
- * match, so the entry stays live and its supersede can still be journaled once.
- */
-function matchesJournaledAlreadyMerged(
-  repoDigest: string,
-  entry: MergeQueueEntryRecord,
-  index: ShadowSkipIndex,
-): boolean {
-  const head12 = head12Of(entry.headOid);
-  if (head12 === null) {
-    return false;
-  }
-  const alreadyMerged = buildMergeKey({
-    repoDigest,
-    pullRequest: entry.pullRequest,
-    head12,
-    action: 'would-already-merged',
-    attemptOrdinal: null,
-    retry: null,
-  });
-  if (alreadyMerged.ok && index.alreadyMergedKeys.has(alreadyMerged.key)) {
-    return true;
-  }
-  // Without the supersede on this head the entry stays live: the next pass
-  // still has to journal `would-supersede` once.
-  if (!index.alreadyMergedPullRequests.has(entry.pullRequest)) {
-    return false;
-  }
-  const superseded = buildMergeKey({
-    repoDigest,
-    pullRequest: entry.pullRequest,
-    head12,
-    action: 'would-supersede',
-    attemptOrdinal: null,
-    retry: null,
-  });
-  return superseded.ok && index.supersededKeys.has(superseded.key);
-}
-
-function withoutJournaledAlreadyMerged(
-  repoDigest: string,
-  ordered: readonly MergeQueueEntryRecord[],
-  index: ShadowSkipIndex,
-): readonly MergeQueueEntryRecord[] {
-  if (index.alreadyMergedKeys.size === 0) {
-    return ordered;
-  }
-  return ordered.filter((entry) => !matchesJournaledAlreadyMerged(repoDigest, entry, index));
-}
-
 /** The queue adapter signals a passed deadline with a dedicated error. */
 function isQueueDeadlineError(error: unknown): boolean {
   return error instanceof Error && error.name === 'MergeQueueDeadlineError';
@@ -625,14 +483,18 @@ export class RunMergePassUseCase implements RunMergePassPort {
     // Entries are ordered and the head chosen within the request's base
     // partition; an omitted base keeps the main-only read (v1 behaviour).
     const ordered = orderMergeQueue(repoRecords, request.repoDigest, request.baseBranch);
-    const head = findMergeQueueHead(ordered, request.repoDigest, request.baseBranch);
     // Shadow only: one prefix read of journaled shadow dry-runs, then drop a
     // head that already has `would-already-merged`, or that has
     // `would-supersede` after the pull request was merged under another head.
     // `repoRecords` stays whole so `updatesInLastHour` still sees every record.
-    // `head` is the real queue head and is what `actOnEntry` uses for
-    // `isQueueHead`; `passHead` is that head only while it remains a candidate.
-    const indexed = await this.readJournaledWouldAlreadyMerged(request);
+    // `head` is the head of the filtered queue, shared with the shadow decide.
+    const indexed = await readJournaledWouldAlreadyMerged({
+      journal: this.deps.journal,
+      repoDigest: request.repoDigest,
+      shadow: request.policy.shadow === true,
+      nowIso: this.deps.nowIso(),
+      deadlineIso: request.deadlineIso,
+    });
     if (indexed.outcome === 'budget-exhausted') {
       return { outcome: 'budget-exhausted', reasonCode: null, entries };
     }
@@ -640,9 +502,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
       request.policy.shadow === true
         ? withoutJournaledAlreadyMerged(request.repoDigest, ordered, indexed)
         : ordered;
-    const passHead =
-      head !== null && candidates.some((candidate) => candidate.entryId === head.entryId) ? head : null;
-    const live = selectEntriesForPass(candidates, passHead, Date.parse(this.deps.nowIso()));
+    const head = findMergeQueueHead(candidates, request.repoDigest, request.baseBranch);
+    const live = selectEntriesForPass(candidates, head, Date.parse(this.deps.nowIso()));
 
     // D-DT9: the budget is checked before every entry's outbound reads,
     // including the halt re-read below.
@@ -674,42 +535,6 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     return { outcome: 'completed', reasonCode: null, entries };
-  }
-
-  /**
-   * Journaled shadow dry-runs for this repository, from one `listForKeyPrefix`
-   * of `merge/<repoDigest>/`. Live passes do not read. A missing method, a
-   * throw, or a non-array answer fails open to empty sets. A spent budget
-   * does not call the port. A record counts only when it is a `dry-run`
-   * result whose reasonCode is the parsed merge action.
-   */
-  private async readJournaledWouldAlreadyMerged(request: RunMergePassRequest): Promise<AlreadyMergedIndex> {
-    if (request.policy.shadow !== true) {
-      return openShadowSkipIndex();
-    }
-    if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
-      return { outcome: 'budget-exhausted' };
-    }
-    const listForKeyPrefix = this.deps.journal.listForKeyPrefix;
-    if (listForKeyPrefix === undefined) {
-      return openShadowSkipIndex();
-    }
-    let records: unknown;
-    try {
-      records = await listForKeyPrefix.call(this.deps.journal, `merge/${request.repoDigest}/`);
-    } catch {
-      return openShadowSkipIndex();
-    }
-    if (!Array.isArray(records)) {
-      return openShadowSkipIndex();
-    }
-    const index = shadowSkipIndexFromRecords(records, request.repoDigest);
-    return {
-      outcome: 'indexed',
-      alreadyMergedKeys: index.alreadyMergedKeys,
-      alreadyMergedPullRequests: index.alreadyMergedPullRequests,
-      supersededKeys: index.supersededKeys,
-    };
   }
 
   private isValidRequest(request: RunMergePassRequest): boolean {

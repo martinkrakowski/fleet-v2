@@ -1,11 +1,11 @@
 /**
- * CE2: the dirty-worktree fact's optional `headAdvanced` key. The fact is
- * asserted directly: present (`true`/`false`) only when BOTH the inspection's
- * `checkedOutCommit` and the attempt's collected `headCommit` are valid
- * lowercase 40-hex SHAs, and it is their strict inequality (a difference, not
- * a proven advance — SPLIT_NEXT: the recollect must verify ancestry). The key
- * is absent for a missing, malformed, uppercase or getter-backed
- * `checkedOutCommit`. No port other than a fake `worktreeInspect` is touched.
+ * CE2 / FY03F: the dirty-worktree fact. The fact is asserted directly:
+ * `headAdvanced` (`true`/`false`) is the strict inequality of the inspection's
+ * `checkedOutCommit` and the attempt's collected `headCommit` (a difference,
+ * not a proven advance - SPLIT_NEXT: the recollect must verify ancestry).
+ * When either head is missing, malformed, uppercase or getter-backed there is
+ * no fact at all (`undefined`), as on the resume path. No port other than a
+ * fake `worktreeInspect` is touched.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -111,23 +111,21 @@ describe('dirtyWorktreeFactOf headAdvanced (CE2)', () => {
     });
   });
 
-  it('leaves headAdvanced absent for a missing, malformed, uppercase or getter-backed checkedOutCommit', async () => {
+  it('returns no fact for a missing, malformed, uppercase or getter-backed checkedOutCommit', async () => {
     const attempt = attemptFixture();
     // Missing key.
     const missing = inspectionFixture();
     Reflect.deleteProperty(missing as unknown as Record<string, unknown>, 'checkedOutCommit');
-    expect(await dirtyWorktreeFactOf(ctxOf(missing), attempt)).toEqual({ trackedFilesChanged: 0 });
+    expect(await dirtyWorktreeFactOf(ctxOf(missing), attempt)).toBeUndefined();
     // Malformed values.
     for (const checkedOutCommit of [null, undefined, 7, 'main', HEAD.slice(0, 12), OTHER_HEAD.toUpperCase()]) {
       expect(
         await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit } as unknown as Partial<WorktreeInspection>)), attempt),
         String(checkedOutCommit),
-      ).toEqual({
-        trackedFilesChanged: 0,
-      });
+      ).toBeUndefined();
     }
-    // Getter-backed: the accessor's descriptor value is absent, so the fact
-    // is returned without the key and without running the getter.
+    // Getter-backed: the accessor's descriptor value is absent, so no fact
+    // is returned and the getter never runs.
     let getterRuns = 0;
     const getterBacked = inspectionFixture() as unknown as Record<string, unknown>;
     Reflect.deleteProperty(getterBacked, 'checkedOutCommit');
@@ -138,22 +136,18 @@ describe('dirtyWorktreeFactOf headAdvanced (CE2)', () => {
         return OTHER_HEAD;
       },
     });
-    expect(await dirtyWorktreeFactOf(ctxOf(getterBacked), attempt)).toEqual({ trackedFilesChanged: 0 });
+    expect(await dirtyWorktreeFactOf(ctxOf(getterBacked), attempt)).toBeUndefined();
     expect(getterRuns).toBe(0);
   });
 
-  it('leaves headAdvanced absent when the attempt artifacts are unreadable or headCommit is malformed', async () => {
+  it('returns no fact when the attempt artifacts are unreadable or headCommit is malformed', async () => {
     // Missing artifacts.
     const noArtifacts = attemptFixture();
     Reflect.deleteProperty(noArtifacts as unknown as Record<string, unknown>, 'artifacts');
-    expect(await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit: OTHER_HEAD })), noArtifacts)).toEqual({
-      trackedFilesChanged: 0,
-    });
+    expect(await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit: OTHER_HEAD })), noArtifacts)).toBeUndefined();
     // Malformed headCommit.
     const shortHead = attemptFixture({ artifacts: { headCommit: 'abc', commitsSinceBase: [], collectedArtifactPaths: [], notes: 'missing' } });
-    expect(await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit: OTHER_HEAD })), shortHead)).toEqual({
-      trackedFilesChanged: 0,
-    });
+    expect(await dirtyWorktreeFactOf(ctxOf(inspectionFixture({ checkedOutCommit: OTHER_HEAD })), shortHead)).toBeUndefined();
   });
 
   it('still counts tracked paths and stays undefined for an unwired port or unreadable inspection', async () => {

@@ -17,6 +17,7 @@ export * from "./CollectAttemptArtifactsUseCase.use-case.js";
 export * from "./CommitEditOnlyAttemptUseCase.use-case.js";
 export * from "./CompareScorecardUseCase.use-case.js";
 export * from "./conductor-driver-lease-keeper.js";
+export * from "./DecideShadowMergeUseCase.use-case.js";
 export * from "./DeclareLaneActivityUseCase.use-case.js";
 export * from "./DispatchAttemptUseCase.use-case.js";
 export * from "./EnqueueMergeUseCase.use-case.js";

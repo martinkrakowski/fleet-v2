@@ -39,6 +39,7 @@ import type {
 import { decideMergeStep, isMergedHeadRetroMergeEligible, premergeLoginsMatch } from '../../domain/merge-queue-decider.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { parseBaseBranch } from '../../domain/base-branch.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
 import {
   findMergeQueueHead,
@@ -621,8 +622,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const repoRecords = records.filter(
       (record) => typeof record === 'object' && record !== null && record.repoDigest === request.repoDigest,
     );
-    const ordered = orderMergeQueue(repoRecords, request.repoDigest);
-    const head = findMergeQueueHead(ordered, request.repoDigest);
+    // Entries are ordered and the head chosen within the request's base
+    // partition; an omitted base keeps the main-only read (v1 behaviour).
+    const ordered = orderMergeQueue(repoRecords, request.repoDigest, request.baseBranch);
+    const head = findMergeQueueHead(ordered, request.repoDigest, request.baseBranch);
     // Shadow only: one prefix read of journaled shadow dry-runs, then drop a
     // head that already has `would-already-merged`, or that has
     // `would-supersede` after the pull request was merged under another head.
@@ -730,7 +733,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
       request.projectId.length <= MAX_PROJECT_ID_LENGTH &&
       typeof request.policy?.policyRevision === 'string' &&
       request.policy.policyRevision.length > 0 &&
-      isZonedIsoDateTime(request.deadlineIso)
+      isZonedIsoDateTime(request.deadlineIso) &&
+      (request.baseBranch === undefined || parseBaseBranch(request.baseBranch) !== undefined)
     );
   }
 

@@ -377,6 +377,7 @@ bounded_contexts:
           - StartChainUseCase
           - ListMergeQueueUseCase
           - RunMergePassUseCase
+          - DecideShadowMergeUseCase
           - RunDaemonTickUseCase
           - InspectDaemonStatusUseCase
           - WatchTrainHealthUseCase
@@ -439,6 +440,7 @@ bounded_contexts:
             - ManageReleasePort
             - StartChainPort
             - RunMergePassPort
+            - DecideShadowMergePort
             - ListMergeQueuePort
             - ImportTrainStatePort
             - ExportLegacyTrainStatePort
@@ -638,6 +640,7 @@ bounded_contexts:
       StartChainPort: "Start a chain for a project: validate the chain name, record a ChainRecord v1 as a keyed intent, then create chain/<name> from the recorded main commit through the forge and reconcile the result; an existing branch at that commit reconciles as started, one at another commit refuses, and a repeated call with the same key returns the recorded outcome without a second forge call."
       ChainRepositoryPort: "Store and read ChainRecord v1 records per project with compare-and-set on the record revision; an unreadable or unknown-version record is reported, never treated as absent; it performs no forge or git action."
       RunMergePassPort: "Run one bounded merge pass for one repository under its lease: gather facts, run the pure decider once per live entry with at most one keyed action each (intent before action), reconcile ambiguous outcomes and write successor entries and notifications; unknown facts never yield a merge act. Entries are ordered and judged per (repository, base branch) and the strict up-to-date check is against the pull request's own base."
+      DecideShadowMergePort: "Journal, for one pull request head, the shadow merge decision the merge pass would reach for the base branch the pair was queued for: one keyed dry-run intent and result under the merge-pr key, read-only on the forge and on the queue, with no queue write; when an earlier live entry holds the base partition's head the decision is the pass's not-queue-head wait, never a would-merge."
       ListMergeQueuePort: "List merge-queue entries live-first in queue order with the head of each base branch named, read-only, without mutating state."
       DaemonJobPort: "Describe one registered daemon job (jobId, leaseScope) and run one bounded pass with nowIso and deadlineIso, returning completed, budget-exhausted, skipped or refused outcomes."
       DaemonLeasePort: "Hold one daemon job lease by scope: acquire by CAS over a null or lapsed lease, renew and release by its holder with its fence, and check or read without writing; the fence never goes back."

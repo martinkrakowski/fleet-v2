@@ -26,10 +26,17 @@ export function describeProjectRepositoryContract(
       expect(found?.record).toEqual(record);
       expect(found?.revision).toBe(0);
 
-      // The returned record is a copy: mutating it must not touch the store.
-      const mutable = { ...record } as { -readonly [K in keyof ProjectRecord]: ProjectRecord[K] };
-      mutable.displayName = 'tampered';
-      expect((await port.findProject('org-a', 'proj-1'))?.record.displayName).toBe('Project 1');
+      // Every object the port hands out is a copy: mutating each returned
+      // object must not touch the stored project.
+      type Mutable = { -readonly [K in keyof ProjectRecord]: ProjectRecord[K] };
+      (found!.record as Mutable).displayName = 'tampered-find';
+      ((await port.listProjects('org-a'))[0]!.record as Mutable).displayName = 'tampered-list';
+      if (outcome.status === 'saved') {
+        (outcome.record as Mutable).displayName = 'tampered-create';
+      }
+      const reread = await port.findProject('org-a', 'proj-1');
+      expect(reread?.record.displayName).toBe('Project 1');
+      expect((await port.listProjects('org-a'))[0]?.record.displayName).toBe('Project 1');
     });
 
     it('an unknown (organizationId, projectId) reads as null', async () => {
@@ -173,6 +180,17 @@ export function describeProjectRepositoryContract(
         reason: 'invalid-record',
       });
       expect(getterReads).toBe(0);
+      // A Proxy over a fully VALID record: only the Proxy detector can refuse it.
+      const validProxy = new Proxy(makeProject(), {});
+      expect(await port.createProject(validProxy)).toEqual({
+        status: 'refused',
+        reason: 'invalid-record',
+      });
+      expect(await port.saveProject(validProxy, 0)).toEqual({
+        status: 'refused',
+        reason: 'invalid-record',
+      });
+      expect(await port.findProject('org-a', 'proj-1')).toBeNull();
       expect(await port.createProject(new Proxy({}, {}) as unknown as ProjectRecord)).toEqual({
         status: 'refused',
         reason: 'invalid-record',

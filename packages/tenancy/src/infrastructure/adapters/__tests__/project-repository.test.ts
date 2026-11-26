@@ -131,38 +131,33 @@ describe('OrganizationRepositoryAdapter projects (file mode)', () => {
     const target = path.join(stateDir, 'projects.json');
     const adapter = new OrganizationRepositoryAdapter({ stateDir });
 
-    await fs.writeFile(target, '{ not json');
-    await expect(adapter.findProject('org-a', 'proj-1')).rejects.toBeInstanceOf(
-      StateFileUnreadableError,
-    );
-    expect((await fs.readdir(path.join(stateDir, 'quarantine'))).length).toBe(1);
-    await fs.rm(path.join(stateDir, 'quarantine'), { recursive: true, force: true });
-
-    await fs.writeFile(target, JSON.stringify({ projectId: 'proj-1' }));
-    await expect(adapter.listProjects('org-a')).rejects.toBeInstanceOf(StateFileUnreadableError);
-    await fs.rm(path.join(stateDir, 'quarantine'), { recursive: true, force: true });
-
-    // A malformed record: missing every required field.
-    await fs.writeFile(
-      target,
-      JSON.stringify([{ schemaVersion: 1, revision: 0, projectId: 'proj-1' }]),
-    );
-    await expect(adapter.findProject('org-a', 'proj-1')).rejects.toBeInstanceOf(
-      StateFileUnreadableError,
-    );
-    await fs.rm(path.join(stateDir, 'quarantine'), { recursive: true, force: true });
-
-    // A duplicate (organizationId, projectId) key must not let the last win.
-    await fs.writeFile(
-      target,
-      JSON.stringify([
-        { schemaVersion: 1, revision: 0, ...project() },
-        { schemaVersion: 1, revision: 3, ...project({ displayName: 'Duplicate' }) },
-      ]),
-    );
-    await expect(adapter.listProjects('org-a')).rejects.toBeInstanceOf(StateFileUnreadableError);
-    const quarantine = await fs.readdir(path.join(stateDir, 'quarantine'));
-    expect(quarantine.length).toBeGreaterThan(0);
+    const quarantineDir = path.join(stateDir, 'quarantine');
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['invalid JSON', '{ not json'],
+      ['non-array JSON', JSON.stringify({ projectId: 'proj-1' })],
+      [
+        'a malformed record missing every required field',
+        JSON.stringify([{ schemaVersion: 1, revision: 0, projectId: 'proj-1' }]),
+      ],
+      [
+        'a duplicate (organizationId, projectId) key',
+        JSON.stringify([
+          { schemaVersion: 1, revision: 0, ...project() },
+          { schemaVersion: 1, revision: 3, ...project({ displayName: 'Duplicate' }) },
+        ]),
+      ],
+    ];
+    for (const [label, bytes] of cases) {
+      await fs.writeFile(target, bytes);
+      await expect(adapter.listProjects('org-a'), label).rejects.toBeInstanceOf(
+        StateFileUnreadableError,
+      );
+      // The unreadable bytes are kept as exactly one quarantine copy.
+      const copies = await fs.readdir(quarantineDir);
+      expect(copies.length, label).toBe(1);
+      expect(await fs.readFile(path.join(quarantineDir, copies[0]!), 'utf8'), label).toBe(bytes);
+      await fs.rm(quarantineDir, { recursive: true, force: true });
+    }
   });
 
   it('refuses symlinked and oversized projects.json files with StateFileUnreadableError and no quarantine copy', async () => {

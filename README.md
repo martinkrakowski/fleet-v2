@@ -4,7 +4,7 @@ An open-source assembly line for agentic work, with [Waves](https://github.com/m
 
 Approved work becomes a frozen brief, a disposable lane, a commit, verification, an independent review, fixes, and an authorised merge. The process persists. Workers are disposable. Memory travels into the next brief only when an orchestrator selects it.
 
-Fleet is a CLI-first modular system in four bounded contexts, built on a hexagonal architecture generated and checked by [Hexagen](https://github.com/hexagen-monaco/hexagen-monaco) from `.architecture/manifest.yaml`. Domain code is pure. Application code depends on ports. Filesystem, subprocess, network and vendor code live in infrastructure adapters.
+Fleet is a CLI-first modular system in the business contexts declared in `bounded_contexts`, built on a hexagonal architecture generated and checked by [Hexagen](https://github.com/hexagen-monaco/hexagen-monaco) from `.architecture/manifest.yaml`. Domain code is pure. Application code depends on ports. Filesystem, subprocess, network and vendor code live in infrastructure adapters.
 
 ## Status (2026-10-27)
 

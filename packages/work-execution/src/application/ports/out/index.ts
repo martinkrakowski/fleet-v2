@@ -19,6 +19,7 @@ export * from "./ChainLandingPort.out-port.js";
 export * from "./ChainRepositoryPort.out-port.js";
 export * from "./ChangeSignalPort.out-port.js";
 export * from "./CiStatePort.out-port.js";
+export * from "./CloudProviderPort.out-port.js";
 export * from "./CommandExecutorPort.out-port.js";
 export * from "./ConductorDriverLeasePort.out-port.js";
 export * from "./ConductorForgeGrantPort.out-port.js";

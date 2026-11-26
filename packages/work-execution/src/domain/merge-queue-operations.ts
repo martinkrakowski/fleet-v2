@@ -210,20 +210,24 @@ function findDuplicateLiveEntry(
   return ordered.find((entry) => sameMergeQueueIdentity(entry, targetIdentity));
 }
 
-function isSupersedablePredecessor(
+export function isSupersedablePredecessor(
   predecessor: MergeQueueEntryRecord,
-  input: MergeEnqueueInput,
+  input: Pick<MergeEnqueueInput, 'repository' | 'pullRequest' | 'headOid'>,
 ): boolean {
-  if (predecessor.headOid === input.headOid) {
+  try {
+    if (predecessor.headOid === input.headOid) {
+      return false;
+    }
+    if (predecessor.pullRequest !== input.pullRequest) {
+      return false;
+    }
+    return (
+      predecessor.repository.owner === input.repository.owner &&
+      predecessor.repository.repo === input.repository.repo
+    );
+  } catch {
     return false;
   }
-  if (predecessor.pullRequest !== input.pullRequest) {
-    return false;
-  }
-  return (
-    predecessor.repository.owner === input.repository.owner &&
-    predecessor.repository.repo === input.repository.repo
-  );
 }
 
 function trySupersedeEnqueue(

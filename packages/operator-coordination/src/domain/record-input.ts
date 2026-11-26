@@ -4,6 +4,26 @@
  */
 
 /**
+ * A rejected value as a refusal may print it: a fixed category derived from
+ * `typeof` and the array slot only. It never coerces, reads a property or
+ * triggers a Proxy trap, and never echoes the value. O(1) time and space; a
+ * revoked Proxy (where `Array.isArray` throws) is reported as `<object>`.
+ */
+export function describeRejectedValue(value: unknown): string {
+  if (value === null) {
+    return '<null>';
+  }
+  try {
+    if (Array.isArray(value)) {
+      return '<array>';
+    }
+  } catch {
+    return '<object>';
+  }
+  return '<' + typeof value + '>';
+}
+
+/**
  * A plain object with exactly the given own enumerable string keys, values
  * read through their own property descriptors (so no getter ever runs).
  * Anything else — a non-object, a prototype outside Object.prototype/null, a

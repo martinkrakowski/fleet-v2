@@ -183,6 +183,17 @@ export function validateSchemaVersionPolicyValue(
     if (typeof lengthValue !== 'number' || !Number.isInteger(lengthValue) || lengthValue < 0) {
       return { ok: false, error: 'accepted-versions-not-array' };
     }
+    // The get trap is untrusted: the length it reports must agree with the
+    // array's own `length` descriptor, which a Proxy cannot make disagree with
+    // its own elements without being caught here. O(1).
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(accepted, 'length');
+    if (
+      lengthDescriptor === undefined ||
+      !('value' in lengthDescriptor) ||
+      lengthDescriptor.value !== lengthValue
+    ) {
+      return { ok: false, error: 'accepted-versions-not-array' };
+    }
     acceptedLength = lengthValue;
   } catch {
     // A Proxy whose get trap throws on `length` is refused, not propagated.
@@ -793,6 +804,26 @@ describe('validateSchemaVersionPolicyValue', () => {
     // been an invalid accepted policy (future/invalid version), so a constant
     // or identity copy path fails this assertion.
     expect([999].some((version) => version > 1)).toBe(true);
+  });
+
+  it('refuses a Proxy over [1, 999] whose get trap reports length 1 while its own length descriptor says 2', () => {
+    const understatedLength = new Proxy([1, 999], {
+      get(target, property) {
+        if (property === 'length') {
+          return 1;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expect(
+      validateSchemaVersionPolicyValue({ writerVersion: 1, acceptedVersions: understatedLength }),
+    ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
+    // Control: the same elements through a consistent array are refused for the
+    // real reason (999 is a future version), so the guard above is what refuses
+    // the Proxy rather than the element values.
+    expect(
+      validateSchemaVersionPolicyValue({ writerVersion: 1, acceptedVersions: [1, 999] }),
+    ).toEqual({ ok: false, error: 'future-version-accepted' });
   });
 
   it('refuses a Proxy array whose element traps throw mid-loop with accepted-versions-not-array without throwing', () => {

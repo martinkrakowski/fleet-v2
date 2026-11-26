@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@fleet/installation": "workspace:*",
+    "@fleet/shared": "workspace:*",
     "@fleet/tooling": "workspace:*"
   },
   "devDependencies": {

@@ -25,6 +25,7 @@ import {
   TrainHealthStateReadAdapter,
   WatchTrainHealthUseCase,
   RunMergePassUseCase,
+  DecideShadowMergeUseCase,
   computeCallBudget,
   isZonedIsoDateTime,
   mergeQueueRepositoryDigest,
@@ -36,6 +37,7 @@ import {
   type MergePolicyPort,
   type MergePolicySource,
   type MergeForgeActionPort,
+  type DecideShadowMergePort,
   MergeQueueRepositoryAdapter,
   SpdSayHostAudibleAlertAdapter,
   type HostAudibleAlertPort,
@@ -104,6 +106,8 @@ export interface ComposedDaemon {
   readonly lease: DaemonLeaseAdapter;
   readonly events: DaemonEventProjectionAdapter;
   readonly runMergePass: RunMergePassUseCase;
+  /** S1U2: the shadow merge decider behind `merge decide`; no queue writes, no live action. */
+  readonly decideShadowMerge: DecideShadowMergePort;
   readonly runDaemonTick: RunDaemonTickUseCase;
   readonly inspectDaemonStatus: InspectDaemonStatusPort;
   readonly setDaemonPause: SetDaemonPausePort;
@@ -277,6 +281,17 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     newUlid: () => newUlid(),
     nowIso: now,
   });
+  // S1U2: the same collaborators as the pass, minus the queue writes and the
+  // notifier; the decider owns no queue writer and never performs a live action.
+  const decideShadowMerge = new DecideShadowMergeUseCase({
+    forgeRead: input.mergeForgeRead,
+    verification,
+    journal: input.conductor.laneRunJournal,
+    halt: input.conductor.halt,
+    queue: input.mergeQueueRepository,
+    newUlid: () => newUlid(),
+    nowIso: now,
+  });
   // CO8/CO8a: the chain-refresh job runs in shadow mode only (an invalid written
   // mode resolves to `invalid`, never `live`). The forge facade exposes the
   // branch-head read and refuses every action, so no code path here can merge,
@@ -423,6 +438,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     lease,
     events,
     runMergePass,
+    decideShadowMerge,
     runDaemonTick,
     inspectDaemonStatus,
     setDaemonPause,

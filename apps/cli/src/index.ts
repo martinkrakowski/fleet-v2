@@ -278,6 +278,12 @@ export function exitCodeForResult(result: unknown, group?: string, subcommand?: 
       if (group === 'questions' && subcommand === 'wait') {
         return outcome === 'answered' || outcome === 'acknowledged' ? 0 : 1;
       }
+      // `merge decide` journals a shadow decision: only a journalled (or
+      // already-journalled) decision completes; every refusal-family and
+      // not-ready/budget-exhausted outcome is exit 1.
+      if (group === 'merge' && subcommand === 'decide') {
+        return outcome === 'journalled' || outcome === 'already-journalled' ? 0 : 1;
+      }
       if (NON_ZERO_OUTCOMES.has(outcome)) return 1;
     }
   }
@@ -762,6 +768,7 @@ Commands:
   relaunch request-grant --plan-digest <64 hex> --policy-revision <revision> [--now <iso>]
   relaunch apply --plan-digest <64 hex> [--apply --grant <id>] [--save-inputs <json>] [--adopt-inputs <json>] [--now <iso>] [--deadline <iso>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
+  merge decide --repository owner/repo --pull-request <n> --head <40 hex> [--base main|chain/<name>] [--timeout <duration>]
   merge import --repository owner/repo --legacy-state-dir <path> [--apply --grant <id> --project <id>] (no --authority)
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   cutover shadow record-day --repository owner/repo --legacy-state-dir <path> [--day YYYY-MM-DD]

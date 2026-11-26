@@ -128,6 +128,12 @@ function projectSnapshotRefusal(
     case "proxy":
       return "project record must be a plain object, not a Proxy";
     case "accessor":
+      // An accessor refusal carries the property path; a top-level path must
+      // equal an allowed key exactly, so naming the field is safe and the
+      // property value is never echoed.
+      if (path !== null && allowedKeys.has(path)) {
+        return `project record ${path} has a getter or setter property`;
+      }
       return "project record has a getter or setter property";
     case "not-plain":
       return "project record must be a plain object";

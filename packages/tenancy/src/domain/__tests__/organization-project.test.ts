@@ -204,6 +204,8 @@ describe("organization and project validators refuse hostile and malformed input
     expect(getterRan).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain("getter or setter");
+      // The refusal names the field the accessor sits on.
+      expect(result.reason).toContain("displayName");
     }
   });
 

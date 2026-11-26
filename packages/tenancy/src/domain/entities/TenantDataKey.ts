@@ -7,10 +7,11 @@
  * Hostile-input posture: validators refuse null, undefined, non-objects,
  * arrays, array-likes, non-plain prototypes, getters/setters (never read),
  * Proxies (via the injected detector, never through reflection traps),
- * oversized strings and prototype-polluting own keys, each with a typed
- * refusal, never a throw and never a pass. The record is never enumerated:
- * its fixed fields are read by name through property descriptors, so extra
- * own keys are inert bulk whose count can never drive the cost.
+ * oversized strings, prototype-polluting own keys and extra own keys, each
+ * with a typed refusal, never a throw and never a pass. The record's own
+ * keys are enumerated once: a key count over the seven allowed fields is
+ * refused before any iteration, and every remaining key must be one of the
+ * declared fields, so a record can never carry undeclared data.
  */
 
 import type { IsProxy } from "@fleet/shared";
@@ -58,6 +59,11 @@ const TENANT_DATA_KEY_FIELDS: readonly string[] = [
   "createdAtIso",
   "retiredAtIso",
 ];
+
+/** The same fields as a set, so an enumerated own key is checked in O(1). */
+const TENANT_DATA_KEY_FIELD_KEYS: ReadonlySet<string> = new Set(
+  TENANT_DATA_KEY_FIELDS,
+);
 
 /**
  * Prototype-polluting own keys. A record carrying any of these as an own
@@ -123,13 +129,17 @@ export type ParseTenantDataKeyRecordResult =
  * `DEFAULT_ORGANIZATION_ID`: an absent, null, undefined, empty or invalid
  * organisation id is a refusal.
  *
- * Cost bound: O(1) regardless of the input's own-key count — the record is
- * never enumerated. The seven fixed fields are each read by name with one
- * `Object.getOwnPropertyDescriptor` call, and the three prototype-polluting
- * key names are each checked with one further named descriptor lookup: a
- * fixed handful of hash lookups plus bounded per-field checks over bounded
- * strings. Extra own keys are never read, never copied and never counted, so
- * hostile bulk is inert by construction rather than refused by enumeration.
+ * Extra own keys are refused: the record's own keys are enumerated once
+ * with `Reflect.ownKeys` (so symbol-keyed extras are seen too), a key count
+ * above the seven allowed fields is refused before any iteration, and every
+ * remaining key must be one of the declared fields or the record is
+ * refused — the unknown key's name and value are never echoed. This
+ * enumeration is the minimum work any correct extra-key refusal must do;
+ * apart from it the parse stays O(1): the seven fixed fields are each read
+ * by name with one `Object.getOwnPropertyDescriptor` call, the three
+ * prototype-polluting key names are each checked with one further named
+ * descriptor lookup, and every per-field check runs over a length-capped
+ * string, so no cost follows string content or a hostile value's size.
  */
 export function parseTenantDataKeyRecord(
   input: unknown,
@@ -160,6 +170,22 @@ export function parseTenantDataKeyRecord(
     for (const polluting of PROTOTYPE_POLLUTING_KEYS) {
       if (Object.getOwnPropertyDescriptor(input, polluting) !== undefined) {
         return keyRefused(`tenant data key record has the prototype-polluting key ${polluting}`);
+      }
+    }
+    // Extra own keys are refused: the count is checked before iterating,
+    // and every surviving key must be a declared field. Symbol-keyed own
+    // properties are included, so an undeclared key cannot hide behind a
+    // symbol. Key names and values are never echoed into the reason.
+    const ownKeys = Reflect.ownKeys(input);
+    if (ownKeys.length > TENANT_DATA_KEY_FIELDS.length) {
+      return keyRefused("tenant data key record has too many own keys");
+    }
+    for (const ownKey of ownKeys) {
+      if (typeof ownKey !== "string") {
+        return keyRefused("tenant data key record has a symbol own key");
+      }
+      if (!TENANT_DATA_KEY_FIELD_KEYS.has(ownKey)) {
+        return keyRefused("tenant data key record has an extra unknown key");
       }
     }
     // Read exactly the fixed fields, each by one named descriptor lookup.
@@ -275,9 +301,9 @@ export type KeyUseDecision =
  *    (superseded keys never encrypt new data; they still unwrap existing
  *    wrapped data).
  *
- * Cost bound: O(1) in the input's own-key count — one parse that never
- * enumerates the record plus a fixed number of equality and pattern checks
- * over bounded strings.
+ * Cost bound: one parse pass — the own-key enumeration is the minimum any
+ * correct extra-key refusal needs, and every other step is a fixed number
+ * of equality and pattern checks over bounded strings.
  */
 export function decideKeyUse(
   record: unknown,

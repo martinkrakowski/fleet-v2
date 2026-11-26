@@ -8,19 +8,20 @@
  * constant-refuse implementation (positive cases assert acceptance with
  * exact field values).
  *
- * Cost bounds under test: `parseTenantDataKeyRecord` never enumerates the
- * record — it performs a fixed number of named descriptor reads (the seven
- * fixed fields plus the three prototype-polluting key names) and bounded
- * per-field checks over bounded strings; `decideKeyUse` adds one parse pass
- * and a fixed number of equality and pattern checks. Both are O(1) in the
- * input's own-key count, which the bulk-key test proves directly.
+ * Cost bounds under test: `parseTenantDataKeyRecord` enumerates the
+ * record's own keys once — the minimum any correct extra-key refusal must
+ * do — refusing before any iteration when the key count exceeds the seven
+ * allowed fields, and every other step is a fixed number of named
+ * descriptor reads and bounded per-field checks over length-capped strings;
+ * `decideKeyUse` adds one parse pass and a fixed number of equality and
+ * pattern checks.
  *
  * Hostile-input posture: every case below proves a typed refusal (never a
  * throw, never a pass) for null, undefined, non-objects, arrays,
  * array-likes, non-plain prototypes, getters (never invoked), Proxies
  * (traps never run when the detector is supplied), enormous lengths,
- * prototype-polluting own keys, and oversized strings. Extra own keys are
- * proven inert: never read, never copied, never refused by enumeration.
+ * prototype-polluting own keys, extra own keys and oversized strings, each
+ * without echoing the offending name or value.
  */
 import { types } from "node:util";
 
@@ -134,7 +135,7 @@ describe("parseTenantDataKeyRecord refuses hostile and malformed input", () => {
     }
   });
 
-  it("refuses prototype-polluting keys and never reads extra keys", () => {
+  it("refuses prototype-polluting keys and extra keys without echoing", () => {
     for (const key of ["__proto__", "constructor", "prototype"]) {
       const hostile = { ...validKey() } as Record<string, unknown>;
       Object.defineProperty(hostile, key, { value: 1, enumerable: true, writable: true, configurable: true });
@@ -148,34 +149,41 @@ describe("parseTenantDataKeyRecord refuses hostile and malformed input", () => {
     }
     const secretKey = ["unknown", "Key"].join("");
     const secretValue = ["hidden", "Value"].join("");
-    // Extra own keys are never enumerated: the parser reads only its fixed
-    // fields by name, so hostile bulk is inert — accepted on the record it
-    // cannot affect and never copied onto the parsed output.
+    // A record with an undeclared own key is refused: the parser enumerates
+    // the own keys and allows only its declared fields, and the unknown
+    // key's name and value are never echoed into the reason.
     const padded = validKey({ [secretKey]: secretValue });
-    const result = parseTenantDataKeyRecord(padded, isProxy);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(Object.keys(result.record).sort()).toEqual(
-        ["createdAtIso", "keyId", "organizationId", "retiredAtIso", "status", "wrappedKeyRef"],
-      );
-      expect(JSON.stringify(result.record)).not.toContain(secretValue);
+    const extra = parseTenantDataKeyRecord(padded, isProxy);
+    expect(extra.ok).toBe(false);
+    if (!extra.ok) {
+      expect(extra.reason).toBe("tenant data key record has an extra unknown key");
+      expect(extra.reason).not.toContain(secretKey);
+      expect(extra.reason).not.toContain(secretValue);
+    }
+    // A symbol-keyed extra cannot hide behind a symbol either.
+    const withSymbol: Record<string | symbol, unknown> = validKey();
+    withSymbol[Symbol("extra")] = secretValue;
+    const symbolKey = parseTenantDataKeyRecord(withSymbol, isProxy);
+    expect(symbolKey.ok).toBe(false);
+    if (!symbolKey.ok) {
+      expect(symbolKey.reason).toBe("tenant data key record has a symbol own key");
+      expect(symbolKey.reason).not.toContain(secretValue);
     }
   });
 
-  it("parses a record padded with thousands of extra own keys without cost proportional to them", () => {
-    // Far past any fixed field count: the parser reads only its seven named
-    // fields with descriptor lookups, so bulk keys are never enumerated,
-    // never copied, and can never make the parse cost proportional to their
-    // count.
+  it("refuses a record padded with thousands of extra own keys", () => {
+    // Far past any fixed field count: the parser refuses on the own-key
+    // count before iterating, so hostile bulk is refused without any of the
+    // extra keys being read or echoed.
     const padded: Record<string, unknown> = { ...validKey() };
     for (let i = 0; i < 4096; i += 1) {
       padded[`filler-${i}`] = i;
     }
     const result = parseTenantDataKeyRecord(padded, isProxy);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.record.keyId).toBe("data-key-1");
-      expect(result.record.organizationId).toBe("acme");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("tenant data key record has too many own keys");
+      expect(result.reason).not.toContain("filler-");
     }
   });
 

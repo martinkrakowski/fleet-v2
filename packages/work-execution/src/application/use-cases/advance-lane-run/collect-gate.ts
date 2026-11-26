@@ -5,6 +5,7 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
@@ -103,17 +104,20 @@ export async function runCollectBody(ctx: AdvanceStepContext,
       nowIso: request.nowIso,
     });
     if (committed.outcome === 'refused') {
-      // SN1: edits outside the owned paths are preserved and the worktree is
-      // normalized before the refusal is journalled, so the next attempt
-      // starts from a clean worktree; other refusals keep `edit-only-refused`.
-      let reasonCode: 'edit-only-refused' | 'edits-outside-owned-paths' = 'edit-only-refused';
-      const normalize =
-        committed.reason === 'diff-findings' ||
-        committed.reason === 'outside-allowed-paths' ||
-        committed.reason === 'staged-content-findings';
-      if (normalize) {
-        reasonCode = 'edits-outside-owned-paths';
-      }
+      // SN1 / CB8: edits outside the owned paths, diff-check findings and
+      // staged-content findings each carry their own reason code now, and
+      // all three preserve and normalize the worktree before the refusal is
+      // journalled, so the next attempt starts from a clean worktree; other
+      // refusals keep `edit-only-refused`.
+      const reasonCode: LaneRunResultReasonCode =
+        committed.reason === 'outside-allowed-paths'
+          ? 'edits-outside-owned-paths'
+          : committed.reason === 'diff-findings'
+            ? 'edit-only-diff-findings'
+            : committed.reason === 'staged-content-findings'
+              ? 'staged-content-findings'
+              : 'edit-only-refused';
+      const normalize = reasonCode !== 'edit-only-refused';
       // SN1: the refused result is journaled BEFORE anything is reset or
       // cleaned. If the append fails, the worktree is untouched, so a re-run
       // reads the same refusal and parks; it can never see a clean tree and
@@ -156,15 +160,16 @@ export async function runCollectBody(ctx: AdvanceStepContext,
 }
 
 /**
- * SN1: after a `diff-findings` or `outside-allowed-paths` commit refusal the
- * worktree keeps edits outside the owned paths. They are preserved as a patch
- * outside the worktree (deterministic path `<worktree>.<attempt>.outside-owned.patch`),
- * the tracked edits are reset to the head and the untracked files are removed,
+ * SN1 / CB8: after a `diff-findings`, `outside-allowed-paths` or
+ * `staged-content-findings` commit refusal the worktree keeps edits outside
+ * the owned paths. They are preserved as a patch outside the worktree
+ * (deterministic path `<worktree>.<attempt>.outside-owned.patch`), the
+ * tracked edits are reset to the head and the untracked files are removed,
  * so the next attempt starts from a clean worktree. A missing recovery port,
  * invalid patch inputs, an attempt without a conducted runner, a missing
  * optional method or a failed step never throws and never blocks the refusal:
- * the `edits-outside-owned-paths` journal result and the `step-refused` /
- * `collect` park happen regardless.
+ * the refused journal result (the refusal's own reason code) and the
+ * `step-refused` / `collect` park happen regardless.
  */
 async function normalizeRefusedWorktree(
   ctx: AdvanceStepContext,

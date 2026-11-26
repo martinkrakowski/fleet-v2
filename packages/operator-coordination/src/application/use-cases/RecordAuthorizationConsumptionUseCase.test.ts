@@ -514,6 +514,30 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
   });
 
+  it.each([
+    { label: 'a numeric', root: 5 },
+    { label: 'a relative', root: 'srv/a' },
+    { label: 'a dot-dot', root: '/srv/../a' },
+  ])('refuses with release-grant-root-mismatch when the request names $label root and the record has one', async ({ root }) => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: root },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+  });
+
+  it('refuses with release-grant-root-mismatch when the record carries no release root and the request names an invalid one', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord({ releaseRoot: undefined }));
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: 5 },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+  });
+
   // RR1 fix round: the idempotent replay return sits after the digest
   // recompute, so a record whose stored coordinates were tampered with after
   // consumption is refused on replay instead of replaying the receipt.

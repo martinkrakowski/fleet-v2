@@ -2,6 +2,7 @@
 
 export * from "./attention-compaction.js";
 export * from "./attention-item-records.js";
+export * from "./authority-event.js";
 export * from "./coordination-records.js";
 export * from "./decision-signing.js";
 export * from "./entities/index.js";

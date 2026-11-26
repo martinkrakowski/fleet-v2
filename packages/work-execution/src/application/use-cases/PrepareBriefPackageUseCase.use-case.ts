@@ -331,12 +331,16 @@ function checkSeatPlan(
 }
 
 /** Early request-shape validation: required fields, owned paths, limits, model and seat tool. */
-function validateBriefFields(request: PrepareBriefPackageRequest): string | null {
-  const requiredFields: readonly (keyof PrepareBriefPackageRequest)[] = [
-    'workOrderId',
-    'laneId',
-    'baseCommit',
-  ];
+function validateBriefFields(
+  request: PrepareBriefPackageRequest,
+  options: { readonly requireBaseCommit: boolean },
+): string | null {
+  // RB4: a start-time static check runs before the base commit exists (the
+  // worktree's tip is resolved after the reservation), so the base-commit
+  // requirement stays with the prepare-time check that names it.
+  const requiredFields: readonly (keyof PrepareBriefPackageRequest)[] = options.requireBaseCommit
+    ? ['workOrderId', 'laneId', 'baseCommit']
+    : ['workOrderId', 'laneId'];
   const missingFields = requiredFields.filter((field) => !isNonEmpty(request[field]));
   if (missingFields.length > 0) {
     return `Missing required brief fields: ${missingFields.join(', ')}`;
@@ -569,6 +573,61 @@ function validateReviewerAndPlan(
   return { plan: seatPlanCheck.plan };
 }
 
+/**
+ * RB4: every brief-step refusal that depends only on the request itself — no
+ * worktree, no file read, no authoring call — run before a start reserves
+ * capacity. It replays, in `build`'s order, `validateBriefFields` (without
+ * the `baseCommit` requirement: the worktree's tip is unknown before the
+ * reservation), `validateFrozenInputs`, `validatePathsAndSpec` and
+ * `validateReviewerAndPlan`; `validatePlacement` (`worktreePath`,
+ * `expectedArtifacts`) is skipped because the start supplies the worktree
+ * path from its reservation. The reasons are byte-identical to the ones
+ * `prepareBriefPackage` returns for the same request, so a start refusal
+ * reads exactly like the brief refusal it would have become.
+ *
+ * Pure: no I/O, no port calls, no mutation of the request. Cost bound: one
+ * pass over a bounded set of own properties per check (field list, prefix
+ * array, decision and reference arrays), each string comparison length-
+ * bounded by the same constants prepare uses; `AcceptanceSpec.create`,
+ * `SeatPlan.create` and `snapshotPlainDataRecord` read own descriptors only
+ * and never invoke getters. A request that is not a non-null, non-array
+ * object is refused (`request must be an object`), as is `null`,
+ * `undefined` or any wrong primitive; a `Proxy` that lies consistently in
+ * every trap is an accepted residual.
+ */
+export function validateStaticBriefRequest(
+  request: PrepareBriefPackageRequest,
+): { readonly ok: true } | {
+  readonly ok: false;
+  readonly reason: string;
+  readonly reasonClass?: 'acceptance-spec-shell';
+} {
+  if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+    return { ok: false, reason: 'request must be an object' };
+  }
+  const fieldsError = validateBriefFields(request, { requireBaseCommit: false });
+  if (fieldsError !== null) {
+    return { ok: false, reason: fieldsError };
+  }
+  const frozenCheck = validateFrozenInputs(request);
+  if (!frozenCheck.ok) {
+    return { ok: false, reason: frozenCheck.reason };
+  }
+  const pathsCheck = validatePathsAndSpec(request);
+  if ('reason' in pathsCheck) {
+    return {
+      ok: false,
+      reason: pathsCheck.reason,
+      ...(pathsCheck.reasonClass !== undefined ? { reasonClass: pathsCheck.reasonClass } : {}),
+    };
+  }
+  const reviewerCheck = validateReviewerAndPlan(request);
+  if ('reason' in reviewerCheck) {
+    return { ok: false, reason: reviewerCheck.reason };
+  }
+  return { ok: true };
+}
+
 /** Everything a prepare would write or freeze, or the reason it would refuse. */
 type BuiltBriefPackage =
   | { readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' }
@@ -636,7 +695,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     // what was validated. A request that cannot be copied (a throwing
     // getter, a function value) is refused by the callers' catch.
     const request: PrepareBriefPackageUseCaseRequest = structuredClone(callerRequest);
-    const fieldsError = validateBriefFields(request);
+    const fieldsError = validateBriefFields(request, { requireBaseCommit: true });
     if (fieldsError !== null) {
       return { reason: fieldsError };
     }

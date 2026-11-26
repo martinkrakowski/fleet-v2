@@ -99,7 +99,19 @@ export interface RunMergePassDependencies {
 const MAX_QUEUE_RECORDS = 5000;
 const MAX_ENTRIES_PER_PASS = 100;
 const MAX_PROJECT_ID_LENGTH = 256;
+/**
+ * One merge key is an intent plus at most one final result. A longer
+ * `listForKey` answer is refused unread so a hostile length cannot be walked.
+ */
+const MAX_SHADOW_KEY_LISTING = 64;
+const MAX_SHADOW_FIELD_LENGTH = 256;
+const HEAD_OID_PATTERN = /^[0-9a-f]{40}$/;
 const REASON_TOKEN_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** Closed before `actOnShadowAlreadyMerged`, which settles both keys itself. */
+const ALREADY_MERGED_CLOSE_EXEMPTIONS: ReadonlySet<string> = new Set<string>([
+  'would-already-merged',
+  'merge-pr',
+]);
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const REPO_DIGEST_PATTERN = /^[0-9a-f]{12}$/;
@@ -113,6 +125,165 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   }
   const proto: unknown = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+/** Fields copied off one journal row before any later branch reads them. */
+interface ShadowKeyEntryView {
+  readonly kind: string;
+  readonly outcome: string | null;
+  readonly reasonCode: string | null;
+  readonly detail: string | null;
+  readonly linkedId: string | null;
+  readonly runId: string | null;
+}
+
+type ShadowKeyListing =
+  | { readonly ok: true; readonly entries: readonly ShadowKeyEntryView[] }
+  | { readonly ok: false };
+
+/**
+ * One key's `listForKey` answer. Refuses null, a non-array (including an
+ * array-like or a primitive), a hole, an accessor, a non-plain element, a
+ * prototype-polluting key, a symbol key, or a length above
+ * `MAX_SHADOW_KEY_LISTING`. Own data descriptors only, so a getter is never
+ * invoked. A Proxy whose traps lie consistently is an accepted residual.
+ * Cost: O(k) for this one key, a fixed set of fields per entry, no nested walk.
+ */
+function readShadowKeyListing(list: unknown): ShadowKeyListing {
+  try {
+    if (!Array.isArray(list)) {
+      return { ok: false };
+    }
+    if (Object.getOwnPropertySymbols(list).length > 0 || hasPollutingOwnKey(list)) {
+      return { ok: false };
+    }
+    const lengthDesc = Object.getOwnPropertyDescriptor(list, 'length');
+    if (lengthDesc === undefined || !isDataDescriptor(lengthDesc)) {
+      return { ok: false };
+    }
+    const length = lengthDesc.value;
+    if (
+      typeof length !== 'number' ||
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > MAX_SHADOW_KEY_LISTING
+    ) {
+      return { ok: false };
+    }
+    const entries: ShadowKeyEntryView[] = [];
+    for (let index = 0; index < length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(list, index)) {
+        return { ok: false };
+      }
+      const elementDesc = Object.getOwnPropertyDescriptor(list, index);
+      if (elementDesc === undefined || !isDataDescriptor(elementDesc)) {
+        return { ok: false };
+      }
+      const read = readShadowKeyEntry(elementDesc.value);
+      if (!read.ok) {
+        return { ok: false };
+      }
+      entries.push(read.entry);
+    }
+    return { ok: true, entries };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Exact retro `would-merge`: dry-run, detail `retro`, linked to this 40-hex head. */
+function isRetroMergeResult(candidate: ShadowKeyEntryView, headOid: string): boolean {
+  return (
+    candidate.kind === 'result' &&
+    candidate.outcome === 'dry-run' &&
+    candidate.reasonCode === 'would-merge' &&
+    candidate.detail === 'retro' &&
+    typeof headOid === 'string' &&
+    HEAD_OID_PATTERN.test(headOid) &&
+    candidate.linkedId === headOid
+  );
+}
+
+function isDataDescriptor(descriptor: PropertyDescriptor): boolean {
+  return (
+    typeof descriptor.get !== 'function' &&
+    typeof descriptor.set !== 'function' &&
+    Object.prototype.hasOwnProperty.call(descriptor, 'value')
+  );
+}
+
+function hasPollutingOwnKey(value: object): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(value, '__proto__') ||
+    Object.prototype.hasOwnProperty.call(value, 'constructor') ||
+    Object.prototype.hasOwnProperty.call(value, 'prototype')
+  );
+}
+
+function readShadowKeyEntry(
+  value: unknown,
+): { readonly ok: true; readonly entry: ShadowKeyEntryView } | { readonly ok: false } {
+  if (!isPlainObject(value)) {
+    return { ok: false };
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0 || hasPollutingOwnKey(value)) {
+    return { ok: false };
+  }
+  const kind = readOwnString(value, 'kind', true);
+  const outcome = readOwnString(value, 'outcome', false);
+  const reasonCode = readOwnString(value, 'reasonCode', false);
+  const detail = readOwnString(value, 'detail', false);
+  const linkedId = readOwnString(value, 'linkedId', false);
+  const runId = readOwnString(value, 'runId', false);
+  if (
+    !kind.ok ||
+    kind.value === null ||
+    !outcome.ok ||
+    !reasonCode.ok ||
+    !detail.ok ||
+    !linkedId.ok ||
+    !runId.ok
+  ) {
+    return { ok: false };
+  }
+  return {
+    ok: true,
+    entry: {
+      kind: kind.value,
+      outcome: outcome.value,
+      reasonCode: reasonCode.value,
+      detail: detail.value,
+      linkedId: linkedId.value,
+      runId: runId.value,
+    },
+  };
+}
+
+function readOwnString(
+  value: object,
+  name: string,
+  required: boolean,
+): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, name);
+  } catch {
+    return { ok: false };
+  }
+  if (descriptor === undefined) {
+    return required ? { ok: false } : { ok: true, value: null };
+  }
+  if (!isDataDescriptor(descriptor)) {
+    return { ok: false };
+  }
+  const field: unknown = descriptor.value;
+  if (field === null) {
+    return required ? { ok: false } : { ok: true, value: null };
+  }
+  if (typeof field !== 'string' || field.length === 0 || field.length > MAX_SHADOW_FIELD_LENGTH) {
+    return { ok: false };
+  }
+  return { ok: true, value: field };
 }
 
 /**
@@ -622,7 +793,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     if (request.policy.shadow === true) {
-      await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+      const closed = await this.closeOpenShadowIntents(
+        request,
+        current,
+        this.shadowIntentExemptions(decision),
+      );
+      if (closed !== null) {
+        return closed;
+      }
     }
     if (decision.kind === 'act' && decision.action === 'veto' && this.shadowVetoBound(request)) {
       const vetoReport = await this.performShadowVeto(request, current, decision.expectedHeadOid);
@@ -641,7 +819,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
       };
       decision = decideMergeStep(current, unrecorded, request.policy, this.deps.nowIso());
       if (request.policy.shadow === true) {
-        await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+        const closed = await this.closeOpenShadowIntents(
+          request,
+          current,
+          this.shadowIntentExemptions(decision),
+        );
+        if (closed !== null) {
+          return closed;
+        }
       }
     }
     return this.actOnDecision(request, current, decision, facts);
@@ -672,6 +857,18 @@ export class RunMergePassUseCase implements RunMergePassPort {
     return null;
   }
 
+  /**
+   * Actions `closeOpenShadowIntents` must leave open. An already-merged wait
+   * settles `merge-pr` inside `actOnShadowAlreadyMerged`; closing it here would
+   * stamp `shadow-intent-closed` before retro eligibility is evaluated.
+   */
+  private shadowIntentExemptions(decision: MergeStepDecision): string | ReadonlySet<string> | null {
+    if (decision.kind === 'wait' && decision.reason === 'already-merged') {
+      return ALREADY_MERGED_CLOSE_EXEMPTIONS;
+    }
+    return this.actingShadowAction(decision);
+  }
+
   /** Shadow mode with both advisory veto ports bound (OG-16a). */
   private shadowVetoBound(request: RunMergePassRequest): boolean {
     return (
@@ -686,6 +883,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
    * shadow-effective liveness can exclude the entry, preceded on the first
    * observation by the retro `would-merge` when the decider would have merged
    * that exact head with every required check created before the merge.
+   * `already-journalled` on the retro intent is not proof a retro row exists:
+   * the merge-pr key is re-read once. Only an exact retro row, a completed
+   * open intent, or a terminal non-retro result continues. An empty key is
+   * `retro-incomplete` and is re-read next pass.
    */
   private async actOnShadowAlreadyMerged(
     request: RunMergePassRequest,
@@ -713,15 +914,25 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
     this.ensureBudget(request); // D-DT9: guard before the journal read
     const existing = await this.deps.journal.listForKey(built.key);
-    if (existing.some((candidate) => candidate.kind === 'result')) {
+    const existingRead = readShadowKeyListing(existing);
+    if (!existingRead.ok) {
+      return this.report(entry, 'no-action', 'entry-failed', null);
+    }
+    if (existingRead.entries.some((candidate) => candidate.kind === 'result')) {
+      // The head is already settled. Close a leftover merge-pr intent.
+      // Intents already closed by passes prior to this fix stay lost.
+      const closed = await this.closeOpenShadowIntentForAction(request, entry, 'merge-pr');
+      if (closed !== null && closed.decision !== 'journalled') {
+        return closed;
+      }
       return this.report(entry, 'no-action', 'already-journalled', null);
     }
     if (isMergedHeadRetroMergeEligible(entry, facts, request.policy, this.deps.nowIso())) {
       // A refused retro append must not be followed by `would-already-merged`:
       // that result is the first-observation mark, and writing it would
-      // make the retro unrecoverable. An already-journalled `would-merge`
-      // (a prior pass wrote it, then stopped) still continues, so the
-      // already-merged pair can be completed.
+      // make the retro unrecoverable. `already-journalled` is re-read below;
+      // it continues only when the key already holds its one result or the
+      // open intent can be completed as retro.
       const retro = await this.journalShadowAct(
         request,
         entry,
@@ -737,11 +948,94 @@ export class RunMergePassUseCase implements RunMergePassPort {
         },
         'retro',
       );
-      if (retro.decision !== 'journalled' && retro.reasonCode !== 'already-journalled') {
-        return retro;
+      if (retro.decision !== 'journalled') {
+        if (retro.reasonCode !== 'already-journalled') {
+          return retro;
+        }
+        const settled = await this.settleRetroMergeAfterDuplicate(request, entry);
+        if (settled !== null) {
+          return settled;
+        }
+      }
+    } else {
+      // Not eligible. Close an open merge-pr intent before would-already-merged.
+      // Intents already closed by passes prior to this fix stay lost.
+      const closed = await this.closeOpenShadowIntentForAction(request, entry, 'merge-pr');
+      if (closed !== null && closed.decision !== 'journalled') {
+        return closed;
       }
     }
     return this.journalShadowOutcome(request, entry, 'would-already-merged', null);
+  }
+
+  /**
+   * The merge-pr key after `journalWould` reported `already-journalled`.
+   * Returns null to continue on to `would-already-merged`, or the refusal
+   * to surface when nothing further may be written.
+   */
+  private async settleRetroMergeAfterDuplicate(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+  ): Promise<MergePassEntryReport | null> {
+    const head12 = head12Of(entry.headOid);
+    const built = buildMergeKey({
+      repoDigest: request.repoDigest,
+      pullRequest: entry.pullRequest,
+      head12: head12 ?? '',
+      action: 'merge-pr',
+      attemptOrdinal: null,
+      retry: null,
+    });
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'key-refused', null);
+    }
+    this.ensureBudget(request); // D-DT9: guard before the retro re-list
+    const listed = await this.deps.journal.listForKey(built.key);
+    const read = readShadowKeyListing(listed);
+    if (!read.ok) {
+      return this.report(entry, 'no-action', 'entry-failed', null);
+    }
+    let retroFound = false;
+    let hasResult = false;
+    let openIntent: ShadowKeyEntryView | null = null;
+    for (const candidate of read.entries) {
+      if (candidate.kind === 'result') {
+        hasResult = true;
+        if (isRetroMergeResult(candidate, entry.headOid)) {
+          retroFound = true;
+        }
+      } else if (candidate.kind === 'intent' && openIntent === null) {
+        openIntent = candidate;
+      }
+    }
+    if (retroFound) {
+      return null;
+    }
+    if (openIntent !== null && !hasResult) {
+      // accepted: eligibility was evaluated this pass.
+      const completed = await this.appendDryRunResult(
+        request,
+        entry,
+        built.key,
+        openIntent.runId,
+        'would-merge',
+        'retro',
+        entry.headOid,
+      );
+      if (completed.decision !== 'journalled') {
+        return completed;
+      }
+      return null;
+    }
+    if (hasResult) {
+      // A non-retro result (ordinary would-merge, shadow-intent-closed, or
+      // any other result) is terminal: the key holds one result, so it can
+      // never become a retro row. Write no retro row and continue.
+      return null;
+    }
+    // Only an empty listing is incomplete. would-already-merged is not
+    // written, so a later pass re-reads the entry.
+    return this.report(entry, 'no-action', 'retro-incomplete', null);
   }
 
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
@@ -803,7 +1097,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
     await this.journalShadowOutcome(request, predecessor, 'would-supersede', null);
     // Luna (minor): the predecessor head's own open intents are closed here —
     // the head is superseded, so nothing keyed on it can act again this pass.
-    await this.closeOpenShadowIntents(request, predecessor, 'would-supersede');
+    const closedPredecessor = await this.closeOpenShadowIntents(request, predecessor, 'would-supersede');
+    if (closedPredecessor !== null) {
+      return closedPredecessor;
+    }
     const built = buildSupersession(predecessor, decision.liveHeadOid, this.deps.newUlid());
     if (!built.ok) {
       return this.report(entry, 'no-action', 'entry-refused', null);
@@ -848,7 +1145,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
       return this.journalShadowOutcome(request, acting, 'would-park', next.reason);
     }
     if (request.policy.shadow === true) {
-      await this.closeOpenShadowIntents(request, acting, this.actingShadowAction(next));
+      const closed = await this.closeOpenShadowIntents(
+        request,
+        acting,
+        this.shadowIntentExemptions(next),
+      );
+      if (closed !== null) {
+        return closed;
+      }
     }
     if (next.kind === 'act' && next.action === 'veto' && this.shadowVetoBound(request)) {
       const unrecorded: MergeStepFacts = {
@@ -1185,15 +1489,22 @@ export class RunMergePassUseCase implements RunMergePassPort {
 
     this.ensureBudget(request); // D-DT9: guard before the journal read
     const existing = await this.deps.journal.listForKey(key);
-    if (existing.some((candidate) => candidate.kind === 'result')) {
+    const read = readShadowKeyListing(existing);
+    if (!read.ok) {
+      return this.report(entry, 'no-action', 'entry-failed', null);
+    }
+    if (read.entries.some((candidate) => candidate.kind === 'result')) {
       return this.report(entry, 'no-action', 'already-journalled', null);
     }
-    const openIntent = existing.find((candidate) => candidate.kind === 'intent');
+    const openIntent = read.entries.find((candidate) => candidate.kind === 'intent');
     if (openIntent !== undefined) {
       // A pass whose budget ran out between the intent and its result left
       // the intent open: this pass completes the pair instead of reporting
       // it journalled forever. A dry-run has no external effect, so only
       // the result is written; no second intent.
+      // accepted: eligibility was evaluated this pass. An open merge-pr
+      // intent completed here is stamped with this pass's detail (`retro`
+      // when the caller already decided the retro), even if a live pass opened it.
       return this.appendDryRunResult(request, entry, key, openIntent.runId, reasonCode, detail, linkedId);
     }
 
@@ -1285,47 +1596,81 @@ export class RunMergePassUseCase implements RunMergePassPort {
   private async closeOpenShadowIntents(
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
-    except: string | null,
-  ): Promise<void> {
+    except: string | ReadonlySet<string> | null,
+  ): Promise<MergePassEntryReport | null> {
     const head12 = head12Of(entry.headOid);
     if (head12 === null) {
-      return;
+      return null;
     }
     for (const action of [
       'merge-pr', 'update-branch', 'post-status', 'would-notify',
       'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged',
     ] as const) {
-      if (action === except) {
+      if (except !== null && (typeof except === 'string' ? action === except : except.has(action))) {
         continue;
       }
-      const built = buildMergeKey({
-        repoDigest: request.repoDigest,
-        pullRequest: entry.pullRequest,
-        head12,
-        action,
-        attemptOrdinal: null,
-        retry: null,
-      });
-      if (!built.ok) {
-        continue;
+      const closed = await this.closeOpenShadowIntentForAction(request, entry, action);
+      if (closed !== null && closed.decision !== 'journalled') {
+        return closed;
       }
-      this.ensureBudget(request); // D-DT9: guard before the journal read
-      const existing = await this.deps.journal.listForKey(built.key);
-      const openIntent = existing.find((candidate) => candidate.kind === 'intent');
-      if (openIntent === undefined || existing.some((candidate) => candidate.kind === 'result')) {
-        continue;
-      }
-      this.ensureBudget(request); // D-DT9: guard before the result append
-      // The key has no run in it: the result names the intent's own run.
-      await this.appendDryRunResult(
-        request,
-        entry,
-        built.key,
-        openIntent.runId,
-        'shadow-intent-closed',
-        null,
-      );
     }
+    return null;
+  }
+
+  /**
+   * Close one open shadow intent on `action` as `shadow-intent-closed`.
+   * Null when there is nothing to close (no open intent, or a result is
+   * already on the key). A refused append is returned and the caller writes
+   * nothing further for this entry.
+   */
+  private async closeOpenShadowIntentForAction(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    action: MergeKeyAction,
+  ): Promise<MergePassEntryReport | null> {
+    const head12 = head12Of(entry.headOid);
+    if (head12 === null) {
+      return null;
+    }
+    const built = buildMergeKey({
+      repoDigest: request.repoDigest,
+      pullRequest: entry.pullRequest,
+      head12,
+      action,
+      attemptOrdinal: null,
+      retry: null,
+    });
+    if (!built.ok) {
+      return null;
+    }
+    this.ensureBudget(request); // D-DT9: guard before the journal read
+    const existing = await this.deps.journal.listForKey(built.key);
+    const read = readShadowKeyListing(existing);
+    if (!read.ok) {
+      return this.report(entry, 'no-action', 'entry-failed', null);
+    }
+    let openIntent: ShadowKeyEntryView | null = null;
+    let hasResult = false;
+    for (const candidate of read.entries) {
+      if (candidate.kind === 'result') {
+        hasResult = true;
+      } else if (candidate.kind === 'intent' && openIntent === null) {
+        openIntent = candidate;
+      }
+    }
+    if (openIntent === null || hasResult) {
+      return null;
+    }
+    this.ensureBudget(request); // D-DT9: guard before the result append
+    // The key has no run in it: the result names the intent's own run.
+    return this.appendDryRunResult(
+      request,
+      entry,
+      built.key,
+      openIntent.runId,
+      'shadow-intent-closed',
+      null,
+    );
   }
 
   /** D-DT9: no outbound call may start with under 2 s left on the pass budget. */

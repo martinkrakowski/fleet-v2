@@ -54,6 +54,12 @@ export type CiRunnerSlotState = 'active' | 'inactive' | 'unknown';
  */
 export type LoginShellState = 'intact' | 'mangled' | 'unknown';
 
+/** What the disk-quota probe read from the host's declared usage file. */
+export interface DiskQuotaUsage {
+  readonly usedBytes: number;
+  readonly totalBytes: number;
+}
+
 /** Every side effect the doctor performs, injected by the caller. */
 export interface DoctorProbes {
   /** Whether the named host is reachable (an ssh alias or `local`). */
@@ -123,4 +129,12 @@ export interface DoctorProbes {
    * compatible; a missing probe reports `UNKNOWN` per ssh host.
    */
   loginShell?(host: string): Promise<LoginShellState>;
+  /**
+   * The disk quota usage declared on the host: used and total bytes, read
+   * from the host's fixed usage file. `undefined` when the answer is
+   * absent, malformed or out of range. Optional so existing `DoctorProbes`
+   * fakes stay compatible; a missing probe reports `UNKNOWN` per ssh host
+   * that declares a runner.
+   */
+  diskQuotaUsage?(host: string): Promise<DiskQuotaUsage | undefined>;
 }

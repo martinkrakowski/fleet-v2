@@ -70,22 +70,34 @@ export function decideOutsideTenantAdmission(
   if (organizationId === DEFAULT_ORGANIZATION_ID) {
     return { admitted: true };
   }
-  if (typeof gate !== "object" || gate === null || Array.isArray(gate)) {
+  const gateObject = gate as object;
+  // Every intrinsic reflection on `gate` is wrapped: a revoked Proxy makes
+  // even `Array.isArray` throw, and a Proxy can arm a throwing
+  // `getPrototypeOf` trap. Any escape here refuses as `invalid-gate`.
+  let prototype: object | null;
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(gateObject);
+    prototype = Object.getPrototypeOf(gateObject);
+  } catch {
     return { admitted: false, reason: "invalid-gate" };
   }
-  const prototype = Object.getPrototypeOf(gate);
-  if (prototype !== Object.prototype && prototype !== null) {
+  if (isArray || prototype !== Object.prototype && prototype !== null) {
     return { admitted: false, reason: "invalid-gate" };
   }
   let ownKeys: readonly PropertyKey[];
   try {
-    ownKeys = Reflect.ownKeys(gate);
+    ownKeys = Reflect.ownKeys(gateObject);
   } catch {
     return { admitted: false, reason: "invalid-gate" };
   }
+  // The key set must be exactly the three canonical keys: length, string
+  // type, pollution and membership are all checked, so a Proxy reporting
+  // three unrelated keys while fabricating descriptors is refused.
   if (ownKeys.length !== GATE_KEYS.length) {
     return { admitted: false, reason: "invalid-gate" };
   }
+  const seen: ReadonlySet<PropertyKey> = new Set(ownKeys);
   for (const key of ownKeys) {
     if (typeof key !== "string") {
       return { admitted: false, reason: "invalid-gate" };
@@ -93,12 +105,18 @@ export function decideOutsideTenantAdmission(
     if (key === "__proto__" || key === "constructor" || key === "prototype") {
       return { admitted: false, reason: "invalid-gate" };
     }
+    if (!GATE_KEYS.includes(key)) {
+      return { admitted: false, reason: "invalid-gate" };
+    }
+  }
+  if (seen.size !== GATE_KEYS.length) {
+    return { admitted: false, reason: "invalid-gate" };
   }
   const fields: Record<string, unknown> = {};
   for (const key of GATE_KEYS) {
     let descriptor: PropertyDescriptor | undefined;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(gate, key);
+      descriptor = Object.getOwnPropertyDescriptor(gateObject, key);
     } catch {
       return { admitted: false, reason: "invalid-gate" };
     }

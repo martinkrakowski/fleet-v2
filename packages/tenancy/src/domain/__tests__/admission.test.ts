@@ -194,6 +194,51 @@ describe("decideOutsideTenantAdmission refuses hostile Proxy gates without throw
     });
   });
 
+  it("refuses a Proxy whose getPrototypeOf trap throws", () => {
+    const target = { ...openGate };
+    const proxy = new Proxy(target, {
+      getPrototypeOf(): object | null {
+        throw new Error("never surfaced");
+      },
+    });
+    expect(decideOutsideTenantAdmission(OTHER_ORG, proxy)).toEqual({
+      admitted: false,
+      reason: "invalid-gate",
+    });
+  });
+
+  it("refuses a revoked Proxy without throwing", () => {
+    const target = { ...openGate };
+    const { proxy, revoke } = Proxy.revocable(target, {});
+    revoke();
+    expect(decideOutsideTenantAdmission(OTHER_ORG, proxy)).toEqual({
+      admitted: false,
+      reason: "invalid-gate",
+    });
+  });
+
+  it("refuses a Proxy that reports three unrelated keys while fabricating valid descriptors", () => {
+    const target = { ...openGate };
+    const fakeDescriptor: PropertyDescriptor = {
+      enumerable: true,
+      value: "open",
+      writable: true,
+      configurable: true,
+    };
+    const proxy = new Proxy(target, {
+      ownKeys(): ArrayLike<string> {
+        return ["a", "b", "c"];
+      },
+      getOwnPropertyDescriptor(): PropertyDescriptor {
+        return fakeDescriptor;
+      },
+    });
+    expect(decideOutsideTenantAdmission(OTHER_ORG, proxy)).toEqual({
+      admitted: false,
+      reason: "invalid-gate",
+    });
+  });
+
   it("refuses a Proxy reporting a non-data accessor descriptor for state", () => {
     const target = { ...openGate };
     const proxy = new Proxy(target, {

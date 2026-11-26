@@ -2,3 +2,4 @@
 
 export * from "./Organization.js";
 export * from "./Project.js";
+export * from "./record-guards.js";

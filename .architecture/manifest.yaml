@@ -1242,9 +1242,12 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: []
+          out: [InstallationTokenBrokerPort, KmsSignerPort]
       infrastructure:
         adapters: []
+    contracts:
+      InstallationTokenBrokerPort: "Issue one short-lived, scope-pinned installation token for one scoped forge credential: the request must name the credential's organization (the repository's owner segment), repository and single permission exactly, the TTL must be a finite integer in (0, 3600], and the credential must be unexpired at the caller-supplied nowIso; every untrusted input is read once through a bounded plain-data snapshot with no getter invoked and no Proxy trap fired, prototype-polluting, extra, missing, symbol and non-enumerable keys are refused, and every failure is a typed {ok: false, reason} result; the App private key never appears in any request, result or exported type, tokens are branded opaque strings, and expiry checks are fail-closed."
+      KmsSignerPort: "Sign one bounded UTF-8 payload (at most 65_536 bytes) with one registered KMS key: a missing or non-string keyHandle health is invalid-request, any health other than healthy — on the handle or on the signer itself — fails closed with unavailable, an unknown or algorithm-mismatched handle is unknown-key, and every untrusted input is read once through a bounded plain-data snapshot with no getter invoked and no Proxy trap fired; key material never appears in any request, result or exported type, signatures are branded opaque strings, and every failure is a typed {ok: false, reason} result."
 
 context_mappings:
   - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; AcceptanceReceiptReadAdapter (telemetry, OT2b) reads receipts through its own read-only InspectAcceptanceEvidenceUseCase instance; dependency is declared on work-execution." }

@@ -95,13 +95,10 @@ describe("sign-in-link module purity", () => {
     ];
     for (const result of results) {
       expect(result.outcome).toBe("refused");
-      // The presented (wrong) digest is never echoed anywhere; a bare
-      // refusal echoes nothing at all, and a refusal that carries the
-      // caller's own record may only contain the record it was handed.
+      // Neither the presented (wrong) digest nor the stored one is ever
+      // echoed anywhere in a refusal.
       expect(JSON.stringify(result)).not.toContain(wrong);
-      if (result.outcome === "refused" && !("record" in result)) {
-        expect(JSON.stringify(result)).not.toContain(stored);
-      }
+      expect(JSON.stringify(result)).not.toContain(stored);
     }
   });
 });
@@ -133,6 +130,19 @@ describe("decideSignInLinkIssue", () => {
     expect(result.outcome).toBe("issued");
     if (result.outcome !== "issued") throw new Error("unreachable");
     expect(result.record.expiresAtIso).toBe(new Date(Date.parse(NOW) + 60_000).toISOString());
+  });
+
+  it("refuses an issue whose expiry would roll past the four-digit year as invalid-input", () => {
+    // 23:45 + 15 minutes lands in year 10000, where `toISOString()` emits an
+    // extended year this module would itself reject.
+    expect(
+      decideSignInLinkIssue(issueInput({ nowIso: "9999-12-31T23:45:00.000Z" })),
+    ).toEqual({ outcome: "refused", reason: "invalid-input" });
+    // An issue whose expiry stays inside year 9999 is still fine.
+    const ok = decideSignInLinkIssue(issueInput({ nowIso: "9999-12-31T23:00:00.000Z" }));
+    expect(ok.outcome).toBe("issued");
+    if (ok.outcome !== "issued") throw new Error("unreachable");
+    expect(ok.record.expiresAtIso).toBe("9999-12-31T23:15:00.000Z");
   });
 
   it("refuses ttlMs out of range (0, negative, non-integer, over 15 minutes) as invalid-input", () => {
@@ -177,8 +187,9 @@ describe("decideSignInLinkRedemption", () => {
     expect(result.outcome).toBe("refused");
     if (result.outcome !== "refused" || result.reason !== "mismatch") throw new Error("unreachable");
     expect(result.record?.failedAttempts).toBe(1);
-    expect(result.record?.secretDigest).toBe(record.secretDigest);
+    expect("secretDigest" in (result.record as object)).toBe(false);
     expect(JSON.stringify(result)).not.toContain(wrong);
+    expect(JSON.stringify(result)).not.toContain(record.secretDigest);
   });
 
   it("refuses second redemption after success as already-redeemed even with matching digest", () => {
@@ -289,7 +300,8 @@ describe("decideSignInLinkRedemption", () => {
       getterRecord(base),
       throwingProxy(),
       Object.defineProperty({ ...base }, "__proto__", { value: null, enumerable: true }),
-      { ...base, extra: 1 },
+      Object.defineProperty({ ...base }, "constructor", { value: 1, enumerable: true }),
+      Object.defineProperty({ ...base }, "prototype", { value: 1, enumerable: true }),
       { ...base, secretDigest: undefined },
     ];
     for (const hostile of hostileRecords) {
@@ -322,5 +334,24 @@ describe("decideSignInLinkRedemption", () => {
     expect(SOURCE).not.toMatch(/secretDigest !==/);
     expect(SOURCE).not.toMatch(/presentedDigest !==/);
     expect(SECRET_DIGEST_LENGTH).toBe(64);
+  });
+
+  it("snapshots records without enumerating own properties, keeping the cost fixed", () => {
+    // The snapshot must never enumerate the input's own properties: that
+    // would make its cost grow with the property count instead of staying at
+    // the required fixed-field O(1) bound.
+    expect(SOURCE).not.toMatch(/getOwnPropertyNames/);
+    expect(SOURCE).not.toMatch(/Reflect\.ownKeys/);
+    expect(SOURCE).not.toMatch(/Object\.keys/);
+    // Hostile names are screened directly, without enumeration.
+    expect(SOURCE).toMatch(/for \(const key of FORBIDDEN_KEYS\)/);
+    // An object carrying many extra benign own properties is still processed
+    // by reading only the fixed field set.
+    const noisy: Record<string, unknown> = { ...issuedRecord() };
+    for (let i = 0; i < 5000; i += 1) {
+      noisy[`extra-${i}`] = i;
+    }
+    const result = decideSignInLinkRedemption(noisy, "a".repeat(64), NOW);
+    expect(result.outcome).toBe("redeemed");
   });
 });

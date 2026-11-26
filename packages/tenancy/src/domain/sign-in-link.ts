@@ -18,7 +18,10 @@
  *
  * Cost bounds:
  * - Record and input snapshots inspect a fixed field set with
- *   `Object.getOwnPropertyDescriptor`: O(1).
+ *   `Object.getOwnPropertyDescriptor`: O(1). Own properties outside that
+ *   fixed set are never enumerated — enumeration would make the cost grow
+ *   with the input's property count — so extra benign keys are ignored and
+ *   only a fixed set of hostile names is screened.
  * - String length bounds are checked before regex/parsing: O(1).
  * - Digest comparison runs a fixed 64-iteration XOR loop: O(1) constant time.
  */
@@ -52,6 +55,12 @@ export type SignInLinkRecord = {
   readonly failedAttempts: number;
 };
 
+/**
+ * A `SignInLinkRecord` with the stored digest redacted. Refusals echo only
+ * this shape: the stored digest is never echoed back to a caller.
+ */
+export type SignInLinkRedactedRecord = Omit<SignInLinkRecord, "secretDigest">;
+
 export type SignInLinkRefusalReason =
   | "expired"
   | "already-redeemed"
@@ -68,7 +77,7 @@ export type SignInLinkRedemptionResult =
   | {
       readonly outcome: "refused";
       readonly reason: SignInLinkRefusalReason;
-      readonly record?: SignInLinkRecord;
+      readonly record?: SignInLinkRedactedRecord;
     };
 
 const ISSUE_INPUT_KEYS = ["linkId", "actor", "secretDigest", "nowIso", "ttlMs"] as const;
@@ -82,14 +91,27 @@ const RECORD_KEYS = [
   "redeemedAtIso",
   "failedAttempts",
 ] as const;
-const POLLUTING_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+/** Own-property names that are refused outright, checked without enumeration. */
+const FORBIDDEN_KEYS = ["__proto__", "constructor", "prototype", "length"] as const;
+
+/**
+ * The largest instant a four-digit-year ISO-8601 string can name:
+ * `Date.UTC(9999, 11, 31, 23, 59, 59, 999)`. Issuing a link whose expiry
+ * would pass this bound would format as an extended year (`+010000-…`)
+ * through `toISOString()`, which this module's own validator rejects, so it
+ * is refused up front.
+ */
+const MAX_ISO_INSTANT_MS = 253402300799999;
 
 /**
  * Snapshot an unknown value as a plain record whose own data properties are
  * exactly `keys` (the keys in `optional` may be absent). No getter ever runs:
- * fields are read through property descriptors only. Returns null on any
- * hostile shape. Cost bound: O(1) — one bounded descriptor pass over a fixed
- * key set, a fixed prototype check and fixed key checks.
+ * fields are read through property descriptors only, and hostile names are
+ * screened without enumerating own properties. Returns null on any hostile
+ * shape. Cost bound: O(1) — a fixed number of descriptor reads over fixed key
+ * sets, one prototype check, no enumeration of the input's own properties
+ * (extra benign keys are ignored; the fixed hostile-name screen catches
+ * prototype-polluting keys and array-like `length` fields).
  */
 function snapPlainObject(
   input: unknown,
@@ -116,9 +138,6 @@ function snapPlainObject(
   }
   const snap: Record<string, unknown> = {};
   for (const key of keys) {
-    if (POLLUTING_KEYS.has(key)) {
-      return null;
-    }
     const descriptor = descriptors[key];
     if (descriptor === undefined) {
       if (optional.has(key)) {
@@ -131,19 +150,15 @@ function snapPlainObject(
     }
     snap[key] = descriptor.value;
   }
-  let ownNames: readonly string[];
   try {
-    ownNames = Object.getOwnPropertyNames(input);
+    for (const key of FORBIDDEN_KEYS) {
+      if (Object.getOwnPropertyDescriptor(input, key) !== undefined) {
+        return null;
+      }
+    }
   } catch {
+    // A throwing Proxy trap is hostile; a lying one is an accepted residual.
     return null;
-  }
-  for (const key of ownNames) {
-    if (POLLUTING_KEYS.has(key)) {
-      return null;
-    }
-    if (!keys.includes(key)) {
-      return null;
-    }
   }
   return snap;
 }
@@ -253,12 +268,19 @@ export function decideSignInLinkIssue(input: {
   if (Number.isNaN(nowMs)) {
     return INVALID;
   }
+  const expiresMs = nowMs + ttlMs;
+  // A `nowIso` near year 9999 would push the expiry past the four-digit-year
+  // range and `toISOString()` would emit an extended year (`+010000-…`) that
+  // this module's own validator refuses, so such an issue is refused here.
+  if (expiresMs > MAX_ISO_INSTANT_MS) {
+    return INVALID;
+  }
   const record: SignInLinkRecord = {
     linkId: snap.linkId,
     actor: snap.actor,
     secretDigest: snap.secretDigest,
     issuedAtIso: snap.nowIso,
-    expiresAtIso: new Date(nowMs + ttlMs).toISOString(),
+    expiresAtIso: new Date(expiresMs).toISOString(),
     redeemedAtIso: null,
     failedAttempts: 0,
   };
@@ -299,6 +321,17 @@ function toRecord(snap: Record<string, unknown>): SignInLinkRecord {
   };
 }
 
+function toRedactedRecord(snap: Record<string, unknown>): SignInLinkRedactedRecord {
+  return {
+    linkId: snap.linkId as string,
+    actor: snap.actor as string,
+    issuedAtIso: snap.issuedAtIso as string,
+    expiresAtIso: snap.expiresAtIso as string,
+    redeemedAtIso: (snap.redeemedAtIso ?? null) as string | null,
+    failedAttempts: snap.failedAttempts as number,
+  };
+}
+
 /**
  * Decide one redemption attempt in a fixed order:
  *
@@ -308,11 +341,11 @@ function toRecord(snap: Record<string, unknown>): SignInLinkRecord {
  * 3. `failedAttempts >= MAX_SIGN_IN_ATTEMPTS` is `too-many-attempts`;
  * 4. outside `[issuedAtIso, expiresAtIso)` is `expired`;
  * 5. a constant-time digest comparison — a mismatch is `mismatch` with the
- *    failed-attempt count incremented;
+ *    failed-attempt count incremented on a digest-redacted record;
  * 6. otherwise the link is redeemed at `nowIso`.
  *
  * Neither the presented digest nor the recorded one is ever echoed in a
- * refusal.
+ * refusal: the mismatch refusal carries the record without `secretDigest`.
  */
 export function decideSignInLinkRedemption(
   record: unknown,
@@ -350,7 +383,7 @@ export function decideSignInLinkRedemption(
     return {
       outcome: "refused",
       reason: "mismatch",
-      record: { ...toRecord(snap), failedAttempts: (snap.failedAttempts as number) + 1 },
+      record: { ...toRedactedRecord(snap), failedAttempts: (snap.failedAttempts as number) + 1 },
     };
   }
   return { outcome: "redeemed", record: { ...toRecord(snap), redeemedAtIso: nowIso } };

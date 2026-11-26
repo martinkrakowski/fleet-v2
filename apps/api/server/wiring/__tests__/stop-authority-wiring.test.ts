@@ -201,6 +201,11 @@ describe("API stop authority event wiring (FC12D)", () => {
       afterRevision: null,
     });
 
+    // Brief discrepancy (accepted by the coordinator): the FC12D brief expects an
+    // exact replay to answer `already-requested`. The real wiring refuses it as
+    // `journal-refused` (duplicate entry id); `already-requested` is only
+    // reachable with a fresh entry id, as the web stop route mints one per
+    // call. This test pins the real behaviour for both.
     // The brief's retry requirement: the exact same request, byte for byte.
     // The run journal refuses a replayed entry id (`duplicate-entry-id`), so
     // the use case answers `refused/journal-refused` — and appends nothing:

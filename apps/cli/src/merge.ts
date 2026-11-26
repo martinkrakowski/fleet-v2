@@ -18,6 +18,13 @@ import {
 import type { CommandHandler } from './commands/payload.js';
 import type { InspectMergeReadinessResult } from '@fleet/work-execution';
 import type { ImportTrainStateRefusal } from '@fleet/work-execution';
+import type {
+  BaseBranchValue,
+  DecideShadowMergeRequest,
+  DecideShadowMergeResult,
+} from '@fleet/work-execution';
+import { parseBaseBranch } from '@fleet/work-execution';
+import { toDaemonRepositoryRefs } from './composition/daemon.js';
 import type { FleetCliRuntime } from './composition.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -57,6 +64,46 @@ function requiredEntryId(p: Payload, subcommand: string): string {
 
 /** CO25: the default `--timeout` for one readiness read (30 s). */
 const DEFAULT_READINESS_TIMEOUT_MS = 30 * 1000;
+/** S1U2: the default and the cap for one `merge decide` shadow decision. */
+const DEFAULT_DECIDE_TIMEOUT_MS = 20_000;
+
+/** The outcomes a decide result may carry; anything else is a malformed result. */
+const DECIDE_OUTCOMES: ReadonlySet<string> = new Set([
+  'journalled',
+  'already-journalled',
+  'not-ready',
+  'refused',
+  'budget-exhausted',
+]);
+
+/** The full typed shape one decide result must carry: a known outcome, a non-empty string reasonCode and a string-or-null journalKey. */
+function isDecideResultShape(value: unknown): value is DecideShadowMergeResult {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const view = value as { outcome?: unknown; reasonCode?: unknown; journalKey?: unknown };
+  if (!DECIDE_OUTCOMES.has(view.outcome as string)) {
+    return false;
+  }
+  if (typeof view.reasonCode !== 'string' || view.reasonCode.length === 0) {
+    return false;
+  }
+  return view.journalKey === null || typeof view.journalKey === 'string';
+}
+const MAX_DECIDE_TIMEOUT_MS = 120_000;
+
+/** S1U2: the base the pair was queued for; `main` unless `--base` says otherwise. */
+function decideBaseBranchOf(p: Payload): BaseBranchValue {
+  const raw = optStr(p, 'base');
+  if (raw === undefined) {
+    return 'main';
+  }
+  const parsed = parseBaseBranch(raw);
+  if (parsed === undefined) {
+    throw new CliUsageError('merge decide: --base must be main or chain/<lowercase-dashes>');
+  }
+  return parsed;
+}
 /** CO25: one required context name pattern (mirrors the CLI repository segments). */
 const CONTEXT_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -323,6 +370,68 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue
       throw new CliUsageError('merge export requires --repository owner/repo');
     }
     return rt.execution.exportLegacyTrainState.exportLegacyTrainState({ repository });
+  },
+  decide: async (p, rt) => {
+    const repository = repositoryFromPayload(p);
+    if (repository === undefined) {
+      throw new CliUsageError('merge decide requires --repository owner/repo');
+    }
+    const pullRequest = requiredPullRequest(p, 'decide');
+    const headOid = optionalHead(p, 'decide');
+    if (headOid === null) {
+      throw new CliUsageError('merge decide requires --head <40 hex>');
+    }
+    const timeoutMs = parseDurationOption(p, 'timeout', DEFAULT_DECIDE_TIMEOUT_MS);
+    if (timeoutMs <= 0 || timeoutMs > MAX_DECIDE_TIMEOUT_MS) {
+      throw new CliUsageError('merge decide: --timeout must be between 1ms and 120s');
+    }
+    const baseBranch = decideBaseBranchOf(p);
+    const deadlineIso = new Date(Date.now() + timeoutMs).toISOString();
+
+    let policyAnswer: Awaited<ReturnType<typeof rt.daemon.mergePolicy.readMergePolicy>> | null = null;
+    try {
+      policyAnswer = await rt.daemon.mergePolicy.readMergePolicy();
+    } catch {
+      policyAnswer = null;
+    }
+    if (policyAnswer === null || policyAnswer.outcome !== 'known') {
+      return { outcome: 'refused', reasonCode: 'policy-unavailable', journalKey: null };
+    }
+    const refs = toDaemonRepositoryRefs(policyAnswer);
+    if (!Array.isArray(refs)) {
+      return { outcome: 'refused', reasonCode: 'repository-not-configured', journalKey: null };
+    }
+    const ref = refs.find((candidate) => candidate.owner === repository.owner && candidate.repo === repository.repo);
+    if (ref === undefined) {
+      return { outcome: 'refused', reasonCode: 'repository-not-configured', journalKey: null };
+    }
+    if (ref.policy.shadow !== true) {
+      return { outcome: 'refused', reasonCode: 'policy-not-shadow', journalKey: null };
+    }
+    const request: DecideShadowMergeRequest = {
+      repository: { owner: ref.owner, repo: ref.repo },
+      repoDigest: ref.repoDigest,
+      projectId: ref.projectId,
+      policy: ref.policy,
+      pullRequest,
+      headOid,
+      baseBranch,
+      deadlineIso,
+    };
+    try {
+      const port: unknown = rt.daemon.decideShadowMerge;
+      const method = (port as { decideShadowMerge?: unknown } | null)?.decideShadowMerge;
+      if (typeof method !== 'function') {
+        return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+      }
+      const result: unknown = await (method as (...args: unknown[]) => Promise<unknown>).call(port, request);
+      if (!isDecideResultShape(result)) {
+        return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+      }
+      return result;
+    } catch {
+      return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
+    }
   },
   ready: async (p, rt) => {
     const repository = repositoryFromPayload(p);

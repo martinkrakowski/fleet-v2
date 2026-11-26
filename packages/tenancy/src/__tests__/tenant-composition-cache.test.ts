@@ -392,6 +392,67 @@ describe("createTenantCompositionCache", () => {
   );
 
   it(
+    "keeps size within maxEntries when compose re-enters get for the same tenant and the nested compose returns null",
+    () => {
+      // maxEntries: 2. The outer compose for A re-enters get for A itself
+      // and the nested compose returns null. The nested failure must not
+      // release the outer reservation for A, otherwise the outer compose
+      // can afterwards cache B and C before storing A, leaving 3 entries
+      // against a bound of 2.
+      const calls: Array<{ readonly principal: string; readonly organizationId: string }> = [];
+      let composingA = false;
+      const cache: TenantCompositionCache<Instance> = createTenantCompositionCache<Instance>(
+        (key): Instance => {
+          calls.push(key);
+          if (key.organizationId === "org-a") {
+            // A nested same-key compose (only reachable on an impl that
+            // re-composes a reserved key) returns null, as in the finding.
+            if (composingA) {
+              return null as unknown as Instance;
+            }
+            composingA = true;
+            try {
+              // Outer A: re-enter for the same key before A is stored.
+              void cache.get(key.principal, key.organizationId);
+              // Then fill: B is admitted while A's reservation still holds.
+              const b = cache.get(key.principal, "org-b");
+              expect(b.ok).toBe(true);
+              // C would be the third entry: refused while both slots are
+              // reserved/held, proving the reservation was not released.
+              expect(cache.get(key.principal, "org-c")).toEqual({
+                ok: false,
+                reason: "cache-full",
+              });
+            } finally {
+              composingA = false;
+            }
+            return { tag: "composed-org-a" };
+          }
+          return { tag: `composed-${key.organizationId}` };
+        },
+        { maxEntries: 2 },
+      );
+      const a = cache.get(VALID_PRINCIPAL, "org-a");
+      expect(a).toEqual({ ok: true, value: { tag: "composed-org-a" } });
+      // Exactly 2 entries: A and B. The nested get for A neither composed
+      // recursively nor released A's reservation.
+      expect(cache.size()).toBe(2);
+      expect(calls).toEqual([
+        { principal: VALID_PRINCIPAL, organizationId: "org-a" },
+        { principal: VALID_PRINCIPAL, organizationId: "org-b" },
+      ]);
+      expect(cache.get(VALID_PRINCIPAL, "org-b").ok).toBe(true);
+      // A repeat get still resolves from the cache.
+      const again = cache.get(VALID_PRINCIPAL, "org-a");
+      expect(again.ok && a.ok).toBe(true);
+      if (again.ok && a.ok) {
+        expect(again.value).toBe(a.value);
+      }
+      expect(cache.size()).toBe(2);
+    },
+  );
+
+  it(
     "keeps size within maxEntries when compose re-enters get for another tenant before its own entry is stored",
     () => {
       // With maxEntries: 1, composing tenant A synchronously calls get for

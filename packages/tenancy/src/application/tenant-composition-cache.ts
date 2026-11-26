@@ -180,6 +180,15 @@ export function createTenantCompositionCache<T>(
       if (cached !== undefined) {
         return { ok: true, value: cached.value };
       }
+      // A key already reserved by an in-flight outer `compose` is refused
+      // outright: the reservation belongs to the outer call, so a nested
+      // get for the same key must neither re-compose it nor (on failure)
+      // release the outer reservation. Refusing here also keeps the
+      // reservation count exact when `maxEntries > 1`, where the capacity
+      // arithmetic alone would admit a same-key re-entry.
+      if (pending.has(key)) {
+        return { ok: false, reason: "cache-full" };
+      }
       // Full: refuse without evicting anything and without composing.
       // Reserved (in-flight) slots count towards the bound, so composing
       // tenant A cannot admit tenant B re-entrantly and end up exceeding
@@ -191,8 +200,8 @@ export function createTenantCompositionCache<T>(
         return { ok: false, reason: "compose-failed" };
       }
       // Reserve the slot before composing; a re-entrant get for this same
-      // key during compose then sees the reservation (cache-full) instead
-      // of composing recursively.
+      // key during compose then sees the reservation above (cache-full)
+      // instead of composing recursively, and never releases it.
       pending.add(key);
       let value: T;
       try {

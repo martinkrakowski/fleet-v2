@@ -75,6 +75,21 @@ const DECIDE_OUTCOMES: ReadonlySet<string> = new Set([
   'refused',
   'budget-exhausted',
 ]);
+
+/** The full typed shape one decide result must carry: a known outcome, a non-empty string reasonCode and a string-or-null journalKey. */
+function isDecideResultShape(value: unknown): value is DecideShadowMergeResult {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const view = value as { outcome?: unknown; reasonCode?: unknown; journalKey?: unknown };
+  if (!DECIDE_OUTCOMES.has(view.outcome as string)) {
+    return false;
+  }
+  if (typeof view.reasonCode !== 'string' || view.reasonCode.length === 0) {
+    return false;
+  }
+  return view.journalKey === null || typeof view.journalKey === 'string';
+}
 const MAX_DECIDE_TIMEOUT_MS = 120_000;
 
 /** S1U2: the base the pair was queued for; `main` unless `--base` says otherwise. */
@@ -410,13 +425,10 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue
         return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
       }
       const result: unknown = await (method as (...args: unknown[]) => Promise<unknown>).call(port, request);
-      if (
-        result === null || typeof result !== 'object' || Array.isArray(result) ||
-        !DECIDE_OUTCOMES.has((result as { outcome?: unknown }).outcome as string)
-      ) {
+      if (!isDecideResultShape(result)) {
         return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
       }
-      return result as DecideShadowMergeResult;
+      return result;
     } catch {
       return { outcome: 'refused', reasonCode: 'decide-failed', journalKey: null };
     }

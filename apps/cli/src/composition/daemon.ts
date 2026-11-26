@@ -288,7 +288,6 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     verification,
     journal: input.conductor.laneRunJournal,
     halt: input.conductor.halt,
-    queue: input.mergeQueueRepository,
     newUlid: () => newUlid(),
     nowIso: now,
   });

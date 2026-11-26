@@ -376,6 +376,8 @@ describe('merge decide', () => {
   it.each([
     ['an array', [] as unknown],
     ['an object without an outcome', { reasonCode: 'would-merge', journalKey: null } as unknown],
+    ['an object without a reasonCode', { outcome: 'journalled', journalKey: null } as unknown],
+    ['an object without a journalKey', { outcome: 'journalled', reasonCode: 'would-merge' } as unknown],
   ])('refuses decide-failed (exit 1) when the use case returns %s instead of a typed result', async (_label, bogus) => {
     const fake = greenForgeFake();
     const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, fake.run);

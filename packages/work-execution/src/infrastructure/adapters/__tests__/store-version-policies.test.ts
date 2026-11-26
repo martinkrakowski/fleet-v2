@@ -93,7 +93,15 @@ function isPlainObjectPrototype(value: object): boolean {
 export function validateSchemaVersionPolicyValue(
   raw: unknown,
 ): PolicyValidationResult {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+  // Array.isArray is a structural op, but on a revoked Proxy even it throws;
+  // the check is guarded so a revoked Proxy is refused, never propagated.
+  let policyIsArray = false;
+  try {
+    policyIsArray = Array.isArray(raw);
+  } catch {
+    return { ok: false, error: 'not-an-object' };
+  }
+  if (typeof raw !== 'object' || raw === null || policyIsArray) {
     return { ok: false, error: 'not-an-object' };
   }
   const candidate = raw as object;
@@ -155,41 +163,69 @@ export function validateSchemaVersionPolicyValue(
     return { ok: false, error: 'accessor-property' };
   }
   const accepted = acceptedDescriptor.value;
-  if (!Array.isArray(accepted)) {
+  // Array.isArray on a revoked Proxy throws; guard it, then read `length`
+  // through a guarded access because a Proxy of an array routes `.length`
+  // through its `get` trap, which may throw. The length is read exactly once
+  // and cached, so a trap that lies about `length` between reads is defeated
+  // by the cached value (O(1) reads, no iteration before the bound check).
+  let acceptedIsArray = false;
+  try {
+    acceptedIsArray = Array.isArray(accepted);
+  } catch {
     return { ok: false, error: 'accepted-versions-not-array' };
   }
-  if (accepted.length > MAX_ACCEPTED_VERSIONS) {
+  if (!acceptedIsArray) {
+    return { ok: false, error: 'accepted-versions-not-array' };
+  }
+  let acceptedLength: number;
+  try {
+    const lengthValue: unknown = (accepted as unknown as { length: unknown }).length;
+    if (typeof lengthValue !== 'number' || !Number.isInteger(lengthValue) || lengthValue < 0) {
+      return { ok: false, error: 'accepted-versions-not-array' };
+    }
+    acceptedLength = lengthValue;
+  } catch {
+    // A Proxy whose get trap throws on `length` is refused, not propagated.
+    return { ok: false, error: 'accepted-versions-not-array' };
+  }
+  if (acceptedLength > MAX_ACCEPTED_VERSIONS) {
     // O(1): returns before any element is touched.
     return { ok: false, error: 'accepted-versions-too-long' };
   }
   const seen = new Set<number>();
   let minimum: number | undefined;
   let includesWriter = false;
-  for (let index = 0; index < accepted.length; index += 1) {
-    if (!Object.hasOwn(accepted, String(index))) {
-      return { ok: false, error: 'accepted-versions-hole' };
+  try {
+    for (let index = 0; index < acceptedLength; index += 1) {
+      if (!Object.hasOwn(accepted, String(index))) {
+        return { ok: false, error: 'accepted-versions-hole' };
+      }
+      const elementDescriptor = Object.getOwnPropertyDescriptor(accepted, index);
+      if (elementDescriptor === undefined || !('value' in elementDescriptor)) {
+        return { ok: false, error: 'accessor-property' };
+      }
+      const version = elementDescriptor.value;
+      if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
+        return { ok: false, error: 'invalid-accepted-version' };
+      }
+      if (version > writerVersion) {
+        return { ok: false, error: 'future-version-accepted' };
+      }
+      if (version === writerVersion) {
+        includesWriter = true;
+      }
+      if (seen.has(version)) {
+        return { ok: false, error: 'duplicate-version' };
+      }
+      seen.add(version);
+      if (minimum === undefined || version < minimum) {
+        minimum = version;
+      }
     }
-    const elementDescriptor = Object.getOwnPropertyDescriptor(accepted, index);
-    if (elementDescriptor === undefined || !('value' in elementDescriptor)) {
-      return { ok: false, error: 'accessor-property' };
-    }
-    const version = elementDescriptor.value;
-    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
-      return { ok: false, error: 'invalid-accepted-version' };
-    }
-    if (version > writerVersion) {
-      return { ok: false, error: 'future-version-accepted' };
-    }
-    if (version === writerVersion) {
-      includesWriter = true;
-    }
-    if (seen.has(version)) {
-      return { ok: false, error: 'duplicate-version' };
-    }
-    seen.add(version);
-    if (minimum === undefined || version < minimum) {
-      minimum = version;
-    }
+  } catch {
+    // A Proxy array whose has/getOwnPropertyDescriptor traps throw mid-loop is
+    // refused, not propagated.
+    return { ok: false, error: 'accepted-versions-not-array' };
   }
   if (!includesWriter) {
     return { ok: false, error: 'missing-version' };
@@ -201,9 +237,18 @@ export function validateSchemaVersionPolicyValue(
     // Contiguity: min..writerVersion with no gaps.
     return { ok: false, error: 'missing-version' };
   }
+  let acceptedCopy: readonly number[];
+  try {
+    // The cached length is authoritative; slice copies in O(n) bounded by
+    // MAX_ACCEPTED_VERSIONS. A Proxy whose traps throw during the copy is
+    // refused, not propagated.
+    acceptedCopy = accepted.slice() as number[];
+  } catch {
+    return { ok: false, error: 'accepted-versions-not-array' };
+  }
   return {
     ok: true,
-    policy: { writerVersion, acceptedVersions: accepted.slice() as number[] },
+    policy: { writerVersion, acceptedVersions: acceptedCopy },
   };
 }
 
@@ -614,5 +659,75 @@ describe('validateSchemaVersionPolicyValue', () => {
       {},
     );
     expect(validateSchemaVersionPolicyValue(consistent).ok).toBe(true);
+  });
+
+  it('refuses a revoked Proxy policy with not-an-object without throwing', () => {
+    const { proxy: revoked, revoke } = Proxy.revocable(
+      { writerVersion: 1, acceptedVersions: [1] },
+      {},
+    );
+    revoke();
+    // Even a structural check (Array.isArray) throws on a revoked Proxy; the
+    // validator must return a typed refusal, never propagate the TypeError.
+    expect(validateSchemaVersionPolicyValue(revoked)).toEqual({
+      ok: false,
+      error: 'not-an-object',
+    });
+  });
+
+  it('refuses a revoked Proxy used as acceptedVersions with accepted-versions-not-array without throwing', () => {
+    const { proxy: revokedAccepted, revoke } = Proxy.revocable([1], {});
+    revoke();
+    expect(
+      validateSchemaVersionPolicyValue({
+        writerVersion: 1,
+        acceptedVersions: revokedAccepted,
+      }),
+    ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
+  });
+
+  it('refuses a Proxy array whose length trap throws or lies and whose element descriptor trap throws without throwing', () => {
+    const throwingLength = new Proxy([1], {
+      get(_target, property) {
+        if (property === 'length') {
+          throw new Error('length trap');
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    expect(
+      validateSchemaVersionPolicyValue({
+        writerVersion: 1,
+        acceptedVersions: throwingLength,
+      }),
+    ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
+  });
+
+  it('refuses a Proxy array whose element traps throw mid-loop with accepted-versions-not-array without throwing', () => {
+    const lyingLength = new Proxy([1], {
+      get(_target, property) {
+        if (property === 'length') {
+          return ['many'];
+        }
+        return Reflect.get(_target, property);
+      },
+    });
+    expect(
+      validateSchemaVersionPolicyValue({
+        writerVersion: 1,
+        acceptedVersions: lyingLength,
+      }),
+    ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
+    const throwingDescriptor = new Proxy([1], {
+      getOwnPropertyDescriptor() {
+        throw new Error('descriptor trap');
+      },
+    });
+    expect(
+      validateSchemaVersionPolicyValue({
+        writerVersion: 1,
+        acceptedVersions: throwingDescriptor,
+      }),
+    ).toEqual({ ok: false, error: 'accepted-versions-not-array' });
   });
 });

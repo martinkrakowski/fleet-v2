@@ -83,6 +83,9 @@ function readOwnDataProp(
  * coercion (`toString`, `Symbol.toPrimitive`) ever runs and no unbounded
  * string is ever interpolated.
  */
+/** Roles arrays longer than this are refused in O(1) without scanning. */
+const MAX_ROLES_ENTRIES = 64;
+
 function boundedHostLabel(value: unknown): string {
   if (typeof value !== "string") return typeof value;
   return value.length > 128 ? `${value.slice(0, 128)}…` : `'${value}'`;
@@ -318,17 +321,27 @@ export class RunnerForAttemptAdapter
     let denseRoles = false;
     let hasLaneRunner = false;
     if (typeof roles === "object" && roles !== null && !types.isProxy(roles) && Array.isArray(roles)) {
-      denseRoles = true;
-      const rolesObj = roles as object;
-      for (let i = 0; i < roles.length; i += 1) {
-        const entry = readOwnDataProp(rolesObj, String(i));
-        if (!entry.ok || entry.value === undefined) {
-          // An accessor is refused without invoking it; `undefined` is a
-          // sparse hole (no own data property at that index).
-          denseRoles = false;
-          break;
+      // An enormous array is refused in O(1) before any scan: the length is
+      // bounded, so no untrusted length ever drives a full scan.
+      if (roles.length <= MAX_ROLES_ENTRIES) {
+        denseRoles = true;
+        const rolesObj = roles as object;
+        for (let i = 0; i < roles.length; i += 1) {
+          const entry = readOwnDataProp(rolesObj, String(i));
+          if (!entry.ok || entry.value === undefined) {
+            // An accessor is refused without invoking it; `undefined` is a
+            // sparse hole (no own data property at that index).
+            denseRoles = false;
+            break;
+          }
+          // Every entry must be a plain string: a wrong primitive (number,
+          // boolean, object, ...) is malformed roles, refused like a hole.
+          if (typeof entry.value !== "string") {
+            denseRoles = false;
+            break;
+          }
+          if (entry.value === "lane-runner") hasLaneRunner = true;
         }
-        if (entry.value === "lane-runner") hasLaneRunner = true;
       }
     }
     if (!denseRoles || !hasLaneRunner) {

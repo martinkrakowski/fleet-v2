@@ -727,6 +727,67 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
     }
   });
 
+  it("refuses an enormous dense roles array by length without scanning it", () => {
+    // Far above any sane roles bound; every entry is lane-runner, so only the
+    // length bound can refuse it. Fails against an unbounded scan that would
+    // accept such an array.
+    const huge: unknown[] = new Array(10_000).fill("lane-runner");
+    const adapter = new RunnerForAttemptAdapter({
+      hosts: { "runner-b": { ...hostSpec(), roles: huge } } as never,
+      legacyRunner: {
+        describeCapabilities: () => expectedRunnerBOverride,
+        async startSession() {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+        async inspectSession(): Promise<RunnerSessionStatus> {
+          throw new Error("legacy stub");
+        },
+        async stopSession(): Promise<StopRunnerSessionResult> {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+      },
+    });
+    const result = adapter.runnerForHostName("runner-b");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/lane-runner/);
+    }
+  });
+
+  it("refuses roles whose entries are not all strings (wrong-primitive entries are malformed roles)", () => {
+    const make = (roles: unknown): RunnerForAttemptAdapter =>
+      new RunnerForAttemptAdapter({
+        hosts: { "runner-b": { ...hostSpec(), roles } } as never,
+        legacyRunner: {
+          describeCapabilities: () => expectedRunnerBOverride,
+          async startSession() {
+            return { outcome: "refused", reason: "legacy stub" };
+          },
+          async inspectSession(): Promise<RunnerSessionStatus> {
+            throw new Error("legacy stub");
+          },
+          async stopSession(): Promise<StopRunnerSessionResult> {
+            return { outcome: "refused", reason: "legacy stub" };
+          },
+        },
+      });
+    // Each array contains lane-runner but at least one non-string entry;
+    // only a per-entry string check refuses them.
+    for (const roles of [
+      ["lane-runner", 7],
+      [7, "lane-runner"],
+      ["lane-runner", true],
+      ["lane-runner", null],
+      ["lane-runner", { role: "lane-runner" }],
+    ]) {
+      const result = make(roles).runnerForHostName("runner-b");
+      expect(result.ok, JSON.stringify(roles)).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toMatch(/lane-runner/);
+      }
+    }
+  });
+
   it("refuses a host of kind agy", () => {
     const adapter = new RunnerForAttemptAdapter({
       hosts: { "runner-b": hostSpec({ kind: "agy" }) } as never,

@@ -75,6 +75,18 @@ function readOwnDataProp(
   return { ok: false };
 }
 
+/**
+ * A bounded, non-coercing label for an invalid host name in a refusal: an
+ * over-long string is truncated to 128 characters and a non-string is
+ * described by its `typeof` only, so no attacker-controlled object
+ * coercion (`toString`, `Symbol.toPrimitive`) ever runs and no unbounded
+ * string is ever interpolated.
+ */
+function boundedHostLabel(value: unknown): string {
+  if (typeof value !== "string") return typeof value;
+  return value.length > 128 ? `${value.slice(0, 128)}…` : `'${value}'`;
+}
+
 export interface RunnerForAttemptAdapterOptions {
   /**
    * The current installation's hosts by name (the loader-validated host-map
@@ -261,7 +273,7 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
   runnerForHostName(hostName: string): RunnerForAttemptResult {
     // `isValidHostName` throws on null/undefined, so the typeof check is first.
     if (typeof hostName !== "string" || !isValidHostName(hostName)) {
-      const shown = typeof hostName === "string" ? `'${hostName}'` : String(hostName);
+      const shown = boundedHostLabel(hostName);
       return { ok: false, reason: `invalid host name ${shown}` };
     }
 
@@ -269,8 +281,8 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
     if (
       hosts === null ||
       typeof hosts !== "object" ||
-      Array.isArray(hosts) ||
-      types.isProxy(hosts)
+      types.isProxy(hosts) ||
+      Array.isArray(hosts)
     ) {
       return {
         ok: false,
@@ -290,19 +302,30 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
     }
     const spec = specRead.value as object;
 
-    // The host must carry the lane-runner role in a real, dense array.
+    // The host must carry the lane-runner role in a real, dense array whose
+    // entries are plain data: `types.isProxy` is checked before
+    // `Array.isArray` (a revoked Proxy throws on any operation), and every
+    // index is read through `readOwnDataProp`, so an own accessor at an
+    // index is refused rather than invoked.
     const rolesRead = readOwnDataProp(spec, "roles");
     const roles = rolesRead.ok ? rolesRead.value : undefined;
-    let denseRoles = Array.isArray(roles) && !types.isProxy(roles);
-    if (denseRoles) {
-      for (let i = 0; i < (roles as readonly unknown[]).length; i += 1) {
-        if (!Object.hasOwn(roles as readonly unknown[], i)) {
+    let denseRoles = false;
+    let hasLaneRunner = false;
+    if (typeof roles === "object" && roles !== null && !types.isProxy(roles) && Array.isArray(roles)) {
+      denseRoles = true;
+      const rolesObj = roles as object;
+      for (let i = 0; i < roles.length; i += 1) {
+        const entry = readOwnDataProp(rolesObj, String(i));
+        if (!entry.ok || entry.value === undefined) {
+          // An accessor is refused without invoking it; `undefined` is a
+          // sparse hole (no own data property at that index).
           denseRoles = false;
           break;
         }
+        if (entry.value === "lane-runner") hasLaneRunner = true;
       }
     }
-    if (!denseRoles || !(roles as readonly string[]).includes("lane-runner")) {
+    if (!denseRoles || !hasLaneRunner) {
       return {
         ok: false,
         reason: `host ${hostName} does not serve the lane-runner role`,
@@ -315,8 +338,8 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
     if (
       runner === null ||
       typeof runner !== "object" ||
-      Array.isArray(runner) ||
-      types.isProxy(runner)
+      types.isProxy(runner) ||
+      Array.isArray(runner)
     ) {
       return {
         ok: false,
@@ -432,8 +455,8 @@ export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
     if (
       caps === null ||
       typeof caps !== "object" ||
-      Array.isArray(caps) ||
-      types.isProxy(caps)
+      types.isProxy(caps) ||
+      Array.isArray(caps)
     ) {
       return null;
     }

@@ -1159,7 +1159,7 @@ describe('hostile prototype fall-through and lying Proxies (fix round 2)', () =>
     expect(resolveRunnerTunnelTargets(asInstallation(hostile))).toEqual([]);
   });
 
-  it('RunnerTunnelSetAdapter builds from descriptors without ever invoking a Proxy get trap', () => {
+  it('RunnerTunnelSetAdapter refuses a lying Proxy by identity without ever invoking its get trap', () => {
     const adapter = new RunnerTunnelAdapter({});
     // The Proxy reports Array.prototype (so it passes the prototype check) and
     // honest descriptors, but its `get` trap throws whenever an element is
@@ -1174,11 +1174,9 @@ describe('hostile prototype fall-through and lying Proxies (fix round 2)', () =>
         return Reflect.get(target, key);
       },
     });
-    let built: RunnerTunnelSetAdapter | undefined;
-    expect(() => {
-      built = new RunnerTunnelSetAdapter(asMembers(lyingGet));
-    }).not.toThrow();
-    expect(built).toBeInstanceOf(RunnerTunnelSetAdapter);
+    // A Proxy is refused by identity (`types.isProxy`), so no trap runs and the
+    // thrown error is the named TypeError, not the trap's own Error.
+    expect(() => new RunnerTunnelSetAdapter(asMembers(lyingGet))).toThrow(TypeError);
     // A Proxy whose descriptor traps throw during the copy is refused as a
     // TypeError instead of letting the trap escape.
     const throwingDescriptor = new Proxy([adapter] as unknown as readonly RunnerTunnelAdapter[], {
@@ -1265,5 +1263,42 @@ describe('hostile class, Proxy and accessor input (fix round 1, continued)', () 
     expect(resolveRunnerTunnelTargets(installationWithHosts({ 'runner-a': sshHostFixture('alias-a', 4166) }))).toEqual([
       { hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 },
     ]);
+  });
+});
+
+describe('Proxy refusal by identity, not by what a trap reports (fix round 3)', () => {
+  it('RunnerTunnelSetAdapter refuses a Proxy-wrapped array that reports Array.prototype and a revoked Proxy, as TypeErrors', () => {
+    const adapter = new RunnerTunnelAdapter({});
+    // Reports Array.prototype and a valid length/descriptor, so only identity refuses it.
+    const lying = new Proxy([adapter], {});
+    expect(() => new RunnerTunnelSetAdapter(lying as unknown as readonly RunnerTunnelAdapter[])).toThrow(
+      TypeError,
+    );
+    const revocable = Proxy.revocable([adapter], {});
+    revocable.revoke();
+    expect(() => new RunnerTunnelSetAdapter(revocable.proxy as unknown as readonly RunnerTunnelAdapter[])).toThrow(
+      TypeError,
+    );
+  });
+
+  it('resolveRunnerTunnelTargets answers [] for revoked Proxy installation, hosts, host and roles instead of throwing', () => {
+    const revoked = (): object => {
+      const r = Proxy.revocable({}, {});
+      r.revoke();
+      return r.proxy;
+    };
+    const asInstallation = (v: unknown): FleetInstallation => v as FleetInstallation;
+    expect(resolveRunnerTunnelTargets(asInstallation(revoked()))).toEqual([]);
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: revoked() }))).toEqual([]);
+    expect(
+      resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': revoked() } })),
+    ).toEqual([]);
+    const host = { ...sshHostFixture('alias-a', 4166), roles: revoked() };
+    expect(resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': host } }))).toEqual([]);
+    // A Proxy roles array that reports Array.prototype and includes lane-runner is still refused.
+    const proxyRoles = { ...sshHostFixture('alias-a', 4166), roles: new Proxy(['lane-runner'], {}) };
+    expect(
+      resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': proxyRoles } })),
+    ).toEqual([]);
   });
 });

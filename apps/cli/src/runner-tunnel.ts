@@ -16,6 +16,7 @@
 
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
+import { types } from 'node:util';
 
 /** What `ensureTunnel` decided before the first pass. */
 export type RunnerTunnelStartOutcome =
@@ -330,6 +331,12 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
     // read through its own property descriptor (a getter is never invoked).
     // Any hostile trap the validation touches refuses the input as a
     // TypeError instead of escaping.
+    // `types.isProxy` is checked before anything else: it never runs a trap and
+    // answers true for a revoked Proxy, whose `Array.isArray` would throw. A
+    // Proxy can also lie through `getPrototypeOf`, so it is refused outright.
+    if (types.isProxy(members)) {
+      throw new TypeError('RunnerTunnelSetAdapter: members must not be a Proxy');
+    }
     if (!Array.isArray(members)) {
       throw new TypeError('RunnerTunnelSetAdapter: members must be an array');
     }

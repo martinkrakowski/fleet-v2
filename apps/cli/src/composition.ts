@@ -20,6 +20,7 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { types } from 'node:util';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
@@ -490,7 +491,12 @@ export interface RunnerTunnelTarget {
 const POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  // A Proxy is refused before `Array.isArray` (which throws on a revoked
+  // Proxy) or any trap can run; `types.isProxy` invokes no trap. O(1).
+  if (types.isProxy(value) || Array.isArray(value)) {
     return false;
   }
   // Only an exactly plain prototype is accepted, so a class instance or an
@@ -525,8 +531,9 @@ function isAccessor(record: Record<string, unknown>, key: string): boolean {
 
 /** Array membership without ever calling a method or a getter on the array. */
 function rolesIncludeLaneRunner(roles: readonly unknown[]): boolean {
-  // Proxy guard: a plain Array prototype is the only accepted shape.
-  if (Object.getPrototypeOf(roles) !== Array.prototype) {
+  // Proxy guard: a Proxy (even one reporting Array.prototype) is refused, and
+  // a plain Array prototype is the only accepted shape.
+  if (types.isProxy(roles) || Object.getPrototypeOf(roles) !== Array.prototype) {
     return false;
   }
   // Cost O(roles.length), capped at 1024; holes and accessors are skipped.

@@ -94,10 +94,6 @@ const LIMITS_KEYS: readonly string[] = ['maxWallSeconds', 'maxCpuSeconds', 'maxE
 
 const STATES: readonly AttemptQuotaState[] = ['running', 'sealing', 'destroyed'];
 
-function defaultIsProxy(): boolean {
-  return false;
-}
-
 /** The kept decision, as a fresh literal so no input value can leak in. */
 const KEEP: AttemptReapDecision = Object.freeze({ action: 'keep' });
 
@@ -165,6 +161,11 @@ function isBoundedPositiveSafeInteger(value: unknown, upperBound: number): value
  * `snapshotPlainData` with the injected `isProxy` detector (production
  * callers pass `types.isProxy`); the detector runs before any reflection.
  *
+ * A trusted detector is required: without one the input cannot be screened
+ * for Proxies, so an absent or non-function `isProxy` is refused outright
+ * rather than read with an always-false default that would let Proxies
+ * through.
+ *
  * Fail-closed: an unreadable input is refused; a readable `running`/`sealing`
  * attempt with a valid `attemptId` is reaped as `invalid-input` on any
  * post-snapshot validation failure; a `destroyed` attempt with any invalid
@@ -172,8 +173,11 @@ function isBoundedPositiveSafeInteger(value: unknown, upperBound: number): value
  */
 export function decideAttemptReap(
   input: unknown,
-  isProxy: IsProxy = defaultIsProxy,
+  isProxy?: IsProxy,
 ): AttemptReapDecision {
+  if (typeof isProxy !== 'function') {
+    return refused();
+  }
   const snapshot = snapshotPlainData(input, isProxy, SNAPSHOT_LIMITS);
   if (!snapshot.ok) {
     return refused();

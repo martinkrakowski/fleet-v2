@@ -11,6 +11,7 @@ import { types } from 'node:util';
 
 import {
   decideAttemptReap,
+  type AttemptReapDecision,
   MAX_CPU_SECONDS_LIMIT,
   MAX_EGRESS_BYTES_LIMIT,
   MAX_WALL_SECONDS_LIMIT,
@@ -42,6 +43,13 @@ function keepInput(overrides: Record<string, unknown> = {}): Record<string, unkn
     nowIso: overrides.nowIso === undefined ? NOW : overrides.nowIso,
   };
 }
+
+/**
+ * Runs the decider the way trusted production callers do, with `types.isProxy`
+ * as the separate positional `isProxy` parameter. This lane's fix requires a
+ * trusted detector; an absent one is refused, never defaulted to a no-op.
+ */
+const reap = (input: unknown): AttemptReapDecision => decideAttemptReap(input, types.isProxy);
 
 /** A revoked Proxy throws on every trap, including [[GetPrototypeOf]]. */
 function revokedProxy(): unknown {
@@ -87,12 +95,12 @@ describe('decideAttemptReap boundaries and precedence', () => {
     const input = keepInput({
       limits: { maxWallSeconds: 1800, maxCpuSeconds: 10, maxEgressBytes: 100 },
     });
-    expect(decideAttemptReap(input)).toEqual({ action: 'keep' });
-    expect(decideAttemptReap(keepInput())).toEqual({ action: 'keep' });
+    expect(reap(input)).toEqual({ action: 'keep' });
+    expect(reap(keepInput())).toEqual({ action: 'keep' });
   });
 
   it('reaps with lease-expired at the exact leaseExpiresAtIso instant', () => {
-    expect(decideAttemptReap(keepInput({ nowIso: LEASE }))).toEqual({
+    expect(reap(keepInput({ nowIso: LEASE }))).toEqual({
       action: 'reap',
       reason: 'lease-expired',
     });
@@ -103,24 +111,24 @@ describe('decideAttemptReap boundaries and precedence', () => {
     const msOver = keepInput({
       limits: { maxWallSeconds: 1799, maxCpuSeconds: 10_000, maxEgressBytes: 10_000 },
     });
-    expect(decideAttemptReap(msOver)).toEqual({ action: 'reap', reason: 'wall-time' });
+    expect(reap(msOver)).toEqual({ action: 'reap', reason: 'wall-time' });
     // exactly one second over, with an integral-second clock reading
     const sOver = keepInput({
       limits: { maxWallSeconds: 1799, maxCpuSeconds: 10_000, maxEgressBytes: 10_000 },
       nowIso: '2026-11-26T00:30:01.000Z',
     });
-    expect(decideAttemptReap(sOver)).toEqual({ action: 'reap', reason: 'wall-time' });
+    expect(reap(sOver)).toEqual({ action: 'reap', reason: 'wall-time' });
   });
 
   it('reaps with cpu-quota when cpuSeconds exceeds maxCpuSeconds by one', () => {
     expect(
-      decideAttemptReap(keepInput({ attempt: { cpuSeconds: 101 } })),
+      reap(keepInput({ attempt: { cpuSeconds: 101 } })),
     ).toEqual({ action: 'reap', reason: 'cpu-quota' });
   });
 
   it('reaps with egress-quota when egressBytes exceeds maxEgressBytes by one', () => {
     expect(
-      decideAttemptReap(keepInput({ attempt: { egressBytes: 1001 } })),
+      reap(keepInput({ attempt: { egressBytes: 1001 } })),
     ).toEqual({ action: 'reap', reason: 'egress-quota' });
   });
 
@@ -130,25 +138,25 @@ describe('decideAttemptReap boundaries and precedence', () => {
       limits: { maxWallSeconds: 60, maxCpuSeconds: 1, maxEgressBytes: 1 },
       nowIso: LEASE,
     });
-    expect(decideAttemptReap(all)).toEqual({ action: 'reap', reason: 'lease-expired' });
+    expect(reap(all)).toEqual({ action: 'reap', reason: 'lease-expired' });
 
     const noLease = keepInput({
       attempt: { cpuSeconds: 999, egressBytes: 999 },
       limits: { maxWallSeconds: 60, maxCpuSeconds: 1, maxEgressBytes: 1 },
     });
-    expect(decideAttemptReap(noLease)).toEqual({ action: 'reap', reason: 'wall-time' });
+    expect(reap(noLease)).toEqual({ action: 'reap', reason: 'wall-time' });
 
     const noWall = keepInput({
       attempt: { cpuSeconds: 999, egressBytes: 999 },
       limits: { maxWallSeconds: 3600, maxCpuSeconds: 1, maxEgressBytes: 1 },
     });
-    expect(decideAttemptReap(noWall)).toEqual({ action: 'reap', reason: 'cpu-quota' });
+    expect(reap(noWall)).toEqual({ action: 'reap', reason: 'cpu-quota' });
 
     const noCpu = keepInput({
       attempt: { egressBytes: 999 },
       limits: { maxWallSeconds: 3600, maxCpuSeconds: 100, maxEgressBytes: 1 },
     });
-    expect(decideAttemptReap(noCpu)).toEqual({ action: 'reap', reason: 'egress-quota' });
+    expect(reap(noCpu)).toEqual({ action: 'reap', reason: 'egress-quota' });
   });
 
   it('keeps a valid destroyed attempt idempotently even when lease is expired and all quotas are exceeded', () => {
@@ -156,11 +164,11 @@ describe('decideAttemptReap boundaries and precedence', () => {
       attempt: { state: 'destroyed', cpuSeconds: 999_999, egressBytes: 999_999 },
       nowIso: '2027-01-01T00:00:00.000Z',
     });
-    expect(decideAttemptReap(destroyed)).toEqual({ action: 'keep' });
+    expect(reap(destroyed)).toEqual({ action: 'keep' });
   });
 
   it('keeps a sealing attempt within quotas like a running one', () => {
-    expect(decideAttemptReap(keepInput({ attempt: { state: 'sealing' } }))).toEqual({
+    expect(reap(keepInput({ attempt: { state: 'sealing' } }))).toEqual({
       action: 'keep',
     });
   });
@@ -180,7 +188,7 @@ describe('decideAttemptReap hostile inputs', () => {
       { length: 1, 0: {} },
       new Map(),
     ]) {
-      expect(decideAttemptReap(bad)).toEqual({ action: 'refused', reason: 'invalid-input' });
+      expect(reap(bad)).toEqual({ action: 'refused', reason: 'invalid-input' });
     }
   });
 
@@ -193,15 +201,15 @@ describe('decideAttemptReap hostile inputs', () => {
 
     const onRoot = keepInput();
     Object.defineProperty(onRoot, 'nowIso', { get: getter, enumerable: true });
-    expect(decideAttemptReap(onRoot)).toEqual({ action: 'refused', reason: 'invalid-input' });
+    expect(reap(onRoot)).toEqual({ action: 'refused', reason: 'invalid-input' });
 
     const onAttempt = keepInput();
     Object.defineProperty(onAttempt['attempt'], 'cpuSeconds', { get: getter, enumerable: true });
-    expect(decideAttemptReap(onAttempt)).toEqual({ action: 'refused', reason: 'invalid-input' });
+    expect(reap(onAttempt)).toEqual({ action: 'refused', reason: 'invalid-input' });
 
     const onLimits = keepInput();
     Object.defineProperty(onLimits['limits'], 'maxCpuSeconds', { get: getter, enumerable: true });
-    expect(decideAttemptReap(onLimits)).toEqual({ action: 'refused', reason: 'invalid-input' });
+    expect(reap(onLimits)).toEqual({ action: 'refused', reason: 'invalid-input' });
 
     expect(getterRuns).toBe(0);
   });
@@ -250,23 +258,23 @@ describe('decideAttemptReap hostile inputs', () => {
 
   it('refuses NaN, Infinity, and -0 counters or limits from the single snapshot', () => {
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0]) {
-      expect(decideAttemptReap(withAttempt('cpuSeconds', bad))).toEqual({
+      expect(reap(withAttempt('cpuSeconds', bad))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
-      expect(decideAttemptReap(withAttempt('egressBytes', bad))).toEqual({
+      expect(reap(withAttempt('egressBytes', bad))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
-      expect(decideAttemptReap(withLimits('maxWallSeconds', bad))).toEqual({
+      expect(reap(withLimits('maxWallSeconds', bad))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
-      expect(decideAttemptReap(withLimits('maxCpuSeconds', bad))).toEqual({
+      expect(reap(withLimits('maxCpuSeconds', bad))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
-      expect(decideAttemptReap(withLimits('maxEgressBytes', bad))).toEqual({
+      expect(reap(withLimits('maxEgressBytes', bad))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
@@ -278,7 +286,7 @@ describe('decideAttemptReap hostile inputs', () => {
 
     // own __proto__ data key at the root: with a running attempt this is a
     // post-snapshot extra-key failure, so it reaps
-    expect(decideAttemptReap(withRoot('__proto__', { polluted: true }))).toEqual({
+    expect(reap(withRoot('__proto__', { polluted: true }))).toEqual({
       action: 'reap',
       reason: 'invalid-input',
     });
@@ -290,13 +298,13 @@ describe('decideAttemptReap hostile inputs', () => {
       writable: true,
       configurable: true,
     });
-    expect(decideAttemptReap(destroyedProtoLimits)).toEqual(refusedShape);
+    expect(reap(destroyedProtoLimits)).toEqual(refusedShape);
     // prototype-polluting named keys as extra keys (running attempt → reap)
-    expect(decideAttemptReap(withRoot('constructor', 1))).toEqual({
+    expect(reap(withRoot('constructor', 1))).toEqual({
       action: 'reap',
       reason: 'invalid-input',
     });
-    expect(decideAttemptReap(withLimits('prototype', 1))).toEqual({
+    expect(reap(withLimits('prototype', 1))).toEqual({
       action: 'reap',
       reason: 'invalid-input',
     });
@@ -304,41 +312,41 @@ describe('decideAttemptReap hostile inputs', () => {
     // symbol key on limits
     const withSymbol = keepInput();
     Reflect.defineProperty(withSymbol['limits'] as object, Symbol.for('k'), { value: 1, enumerable: true });
-    expect(decideAttemptReap(withSymbol)).toEqual(refusedShape);
+    expect(reap(withSymbol)).toEqual(refusedShape);
 
     // non-enumerable key
     const hidden = keepInput();
     Object.defineProperty(hidden, 'hidden', { value: 1, enumerable: false });
-    expect(decideAttemptReap(hidden)).toEqual(refusedShape);
+    expect(reap(hidden)).toEqual(refusedShape);
 
     // extra and missing keys at each level: with a valid running attempt all
     // of these are post-snapshot validation failures, so they reap
     const reapedInvalid = { action: 'reap', reason: 'invalid-input' };
-    expect(decideAttemptReap(withRoot('extra', 1))).toEqual(reapedInvalid);
-    expect(decideAttemptReap(withAttempt('extra', 1))).toEqual(reapedInvalid);
-    expect(decideAttemptReap(withLimits('extra', 1))).toEqual(reapedInvalid);
+    expect(reap(withRoot('extra', 1))).toEqual(reapedInvalid);
+    expect(reap(withAttempt('extra', 1))).toEqual(reapedInvalid);
+    expect(reap(withLimits('extra', 1))).toEqual(reapedInvalid);
 
     const missingRoot = keepInput();
     delete missingRoot['nowIso'];
-    expect(decideAttemptReap(missingRoot)).toEqual(reapedInvalid);
+    expect(reap(missingRoot)).toEqual(reapedInvalid);
 
     const missingAttemptKey = keepInput();
     delete (missingAttemptKey['attempt'] as Record<string, unknown>)['cpuSeconds'];
-    expect(decideAttemptReap(missingAttemptKey)).toEqual(reapedInvalid);
+    expect(reap(missingAttemptKey)).toEqual(reapedInvalid);
 
     const missingLimitsKey = keepInput();
     delete (missingLimitsKey['limits'] as Record<string, unknown>)['maxEgressBytes'];
-    expect(decideAttemptReap(missingLimitsKey)).toEqual(reapedInvalid);
+    expect(reap(missingLimitsKey)).toEqual(reapedInvalid);
 
     // the same key failures on a destroyed attempt are refused instead
     const destroyedMissingNow = keepInput({ attempt: { state: 'destroyed' } });
     delete destroyedMissingNow['nowIso'];
-    expect(decideAttemptReap(destroyedMissingNow)).toEqual(refusedShape);
+    expect(reap(destroyedMissingNow)).toEqual(refusedShape);
   });
 
   it('refuses unknown or non-reaper attempt states rather than treating them as keep', () => {
     for (const state of ['none', 'created', 'loaded', 'sealed', 'failed', '', 'RUNNING', 7, null, true]) {
-      expect(decideAttemptReap(withAttempt('state', state))).toEqual({
+      expect(reap(withAttempt('state', state))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
@@ -355,18 +363,18 @@ describe('decideAttemptReap hostile inputs', () => {
       null,
     ];
     for (const bad of badValues) {
-      expect(decideAttemptReap(withAttempt('cpuSeconds', bad))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withAttempt('egressBytes', bad))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withLimits('maxWallSeconds', bad))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withLimits('maxCpuSeconds', bad))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withLimits('maxEgressBytes', bad))).toEqual(reapedInvalid);
+      expect(reap(withAttempt('cpuSeconds', bad))).toEqual(reapedInvalid);
+      expect(reap(withAttempt('egressBytes', bad))).toEqual(reapedInvalid);
+      expect(reap(withLimits('maxWallSeconds', bad))).toEqual(reapedInvalid);
+      expect(reap(withLimits('maxCpuSeconds', bad))).toEqual(reapedInvalid);
+      expect(reap(withLimits('maxEgressBytes', bad))).toEqual(reapedInvalid);
     }
     // limits above their exported upper bounds
-    expect(decideAttemptReap(withLimits('maxWallSeconds', MAX_WALL_SECONDS_LIMIT + 1))).toEqual(reapedInvalid);
-    expect(decideAttemptReap(withLimits('maxCpuSeconds', MAX_CPU_SECONDS_LIMIT + 1))).toEqual(reapedInvalid);
-    expect(decideAttemptReap(withLimits('maxEgressBytes', MAX_EGRESS_BYTES_LIMIT + 1))).toEqual(reapedInvalid);
+    expect(reap(withLimits('maxWallSeconds', MAX_WALL_SECONDS_LIMIT + 1))).toEqual(reapedInvalid);
+    expect(reap(withLimits('maxCpuSeconds', MAX_CPU_SECONDS_LIMIT + 1))).toEqual(reapedInvalid);
+    expect(reap(withLimits('maxEgressBytes', MAX_EGRESS_BYTES_LIMIT + 1))).toEqual(reapedInvalid);
     // limit of zero is not positive
-    expect(decideAttemptReap(withLimits('maxCpuSeconds', 0))).toEqual(reapedInvalid);
+    expect(reap(withLimits('maxCpuSeconds', 0))).toEqual(reapedInvalid);
 
     for (const badIso of [
       '2026-11-26 00:00:00Z',
@@ -378,19 +386,19 @@ describe('decideAttemptReap hostile inputs', () => {
       '2026-11-26T00:00:00+00:00',
       '2026-11-26T00:00:00.000001Z',
     ]) {
-      expect(decideAttemptReap(withAttempt('startedAtIso', badIso))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withAttempt('leaseExpiresAtIso', badIso))).toEqual(reapedInvalid);
-      expect(decideAttemptReap(withRoot('nowIso', badIso))).toEqual(reapedInvalid);
+      expect(reap(withAttempt('startedAtIso', badIso))).toEqual(reapedInvalid);
+      expect(reap(withAttempt('leaseExpiresAtIso', badIso))).toEqual(reapedInvalid);
+      expect(reap(withRoot('nowIso', badIso))).toEqual(reapedInvalid);
     }
 
     // clock before start
     expect(
-      decideAttemptReap(keepInput({ nowIso: '2026-11-25T23:59:59.999Z' })),
+      reap(keepInput({ nowIso: '2026-11-25T23:59:59.999Z' })),
     ).toEqual(reapedInvalid);
 
     // sealing behaves like running for post-snapshot failures
     expect(
-      decideAttemptReap(keepInput({ attempt: { state: 'sealing', cpuSeconds: -1 } })),
+      reap(keepInput({ attempt: { state: 'sealing', cpuSeconds: -1 } })),
     ).toEqual(reapedInvalid);
   });
 
@@ -401,34 +409,34 @@ describe('decideAttemptReap hostile inputs', () => {
         attempt: { state: 'destroyed', ...(overrides.attempt as Record<string, unknown> | undefined) },
         ...Object.fromEntries(Object.entries(overrides).filter(([k]) => k !== 'attempt')),
       });
-    expect(decideAttemptReap(destroyed({ limits: { maxCpuSeconds: -1 } }))).toEqual(refusedShape);
-    expect(decideAttemptReap(destroyed({ attempt: { cpuSeconds: -1 } }))).toEqual(refusedShape);
-    expect(decideAttemptReap(destroyed({ attempt: { startedAtIso: 'bad' } }))).toEqual(refusedShape);
-    expect(decideAttemptReap(destroyed({ nowIso: 'bad' }))).toEqual(refusedShape);
+    expect(reap(destroyed({ limits: { maxCpuSeconds: -1 } }))).toEqual(refusedShape);
+    expect(reap(destroyed({ attempt: { cpuSeconds: -1 } }))).toEqual(refusedShape);
+    expect(reap(destroyed({ attempt: { startedAtIso: 'bad' } }))).toEqual(refusedShape);
+    expect(reap(destroyed({ nowIso: 'bad' }))).toEqual(refusedShape);
     // missing root key with destroyed attempt
     const missingNow = keepInput({ attempt: { state: 'destroyed' } });
     delete missingNow['nowIso'];
-    expect(decideAttemptReap(missingNow)).toEqual(refusedShape);
+    expect(reap(missingNow)).toEqual(refusedShape);
     // extra attempt key with a destroyed attempt: refused, never keep
     const destroyedExtra = keepInput({ attempt: { state: 'destroyed' } });
     (destroyedExtra['attempt'] as Record<string, unknown>)['extra'] = 1;
-    expect(decideAttemptReap(destroyedExtra)).toEqual(refusedShape);
+    expect(reap(destroyedExtra)).toEqual(refusedShape);
     const badId = keepInput({ attempt: { state: 'destroyed', attemptId: 'not ok!' } });
-    expect(decideAttemptReap(badId)).toEqual(refusedShape);
+    expect(reap(badId)).toEqual(refusedShape);
   });
 
   it('refuses invalid attemptId shapes', () => {
     for (const id of ['', '  ', 'has space', 'has/slash', 'has+plus', 7, null, {}, 'x'.repeat(129)]) {
-      expect(decideAttemptReap(withAttempt('attemptId', id))).toEqual({
+      expect(reap(withAttempt('attemptId', id))).toEqual({
         action: 'refused',
         reason: 'invalid-input',
       });
     }
-    expect(decideAttemptReap({ ...keepInput(), attempt: 'nope' })).toEqual({
+    expect(reap({ ...keepInput(), attempt: 'nope' })).toEqual({
       action: 'refused',
       reason: 'invalid-input',
     });
-    expect(decideAttemptReap({ ...keepInput(), limits: 'nope' })).toEqual({
+    expect(reap({ ...keepInput(), limits: 'nope' })).toEqual({
       action: 'refused',
       reason: 'invalid-input',
     });
@@ -438,13 +446,13 @@ describe('decideAttemptReap hostile inputs', () => {
     const weirdId = 'secret-id-🦠';
     const weirdTime = '2026-11-26T00:00:00.077Z';
     const results = [
-      decideAttemptReap(keepInput({ attempt: { attemptId: weirdId, startedAtIso: weirdTime } })),
-      decideAttemptReap(withAttempt('attemptId', weirdId)),
-      decideAttemptReap(withAttempt('cpuSeconds', -42)),
-      decideAttemptReap(withRoot('nowIso', weirdTime)),
-      decideAttemptReap(withLimits('maxEgressBytes', 987654321)),
-      decideAttemptReap(keepInput({ nowIso: LEASE })),
-      decideAttemptReap(null),
+      reap(keepInput({ attempt: { attemptId: weirdId, startedAtIso: weirdTime } })),
+      reap(withAttempt('attemptId', weirdId)),
+      reap(withAttempt('cpuSeconds', -42)),
+      reap(withRoot('nowIso', weirdTime)),
+      reap(withLimits('maxEgressBytes', 987654321)),
+      reap(keepInput({ nowIso: LEASE })),
+      reap(null),
     ];
     for (const result of results) {
       expect(JSON.stringify(result)).not.toContain('secret-id');
@@ -454,22 +462,28 @@ describe('decideAttemptReap hostile inputs', () => {
     }
   });
 
-  it('uses the injected isProxy as a separate positional parameter, defaulting to a no-op detector', () => {
-    // default detector accepts the plain input
-    expect(decideAttemptReap(keepInput())).toEqual({ action: 'keep' });
+  it('refuses when no trusted Proxy detector is supplied and honours the injected positional detector', () => {
+    // absent detector: the input cannot be screened for Proxies, so it is
+    // refused rather than read with an always-false default
+    expect(decideAttemptReap(keepInput())).toEqual({
+      action: 'refused',
+      reason: 'invalid-input',
+    });
     // a detector claiming everything is a Proxy refuses, and is not read as a field
     const alwaysProxy = () => true;
     expect(decideAttemptReap(keepInput(), alwaysProxy)).toEqual({
       action: 'refused',
       reason: 'invalid-input',
     });
+    // the trusted detector on the same input keeps it
+    expect(reap(keepInput())).toEqual({ action: 'keep' });
   });
 
   it('accepts strings up to the snapshot bounds and refuses oversized strings via the snapshot', () => {
     // a 128-char attemptId fits the regex bound
-    expect(decideAttemptReap(withAttempt('attemptId', 'a'.repeat(128)))).toEqual({ action: 'keep' });
+    expect(reap(withAttempt('attemptId', 'a'.repeat(128)))).toEqual({ action: 'keep' });
     // a > 256-char string is refused by the snapshot's maxStringLength
-    expect(decideAttemptReap(withAttempt('attemptId', 'a'.repeat(300)))).toEqual({
+    expect(reap(withAttempt('attemptId', 'a'.repeat(300)))).toEqual({
       action: 'refused',
       reason: 'invalid-input',
     });

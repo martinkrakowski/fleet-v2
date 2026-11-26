@@ -996,15 +996,13 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     expect(pairedResult.entries.map((row) => row.entryId)).toEqual([foreignHead.entryId]);
   });
 
-  it('a pass over more than MAX_ENTRIES_PER_PASS candidates with the real queue head shadow-skipped forges exactly 100 non-head entries and pins no queue head', async () => {
-    // Asserts: with 102 queue records where the real queue head (pullRequest 1,
-    // ordered[0]) is excluded by an own-head would-already-merged, the pass
-    // forges exactly MAX_ENTRIES_PER_PASS (100) entries; the excluded head
-    // costs no forge read and is absent from the report. The chosen nowIso
-    // makes the rotation offset 1 (step = 100: 100*100 mod 101 = 1), so with
-    // passHead null the 100 live entries are pullRequest 3..102 — pullRequest 2
-    // is rotated past too. If passHead had wrongly been pinned the window would
-    // be 99 and offset computed differently, which these counts would expose.
+  it('a pass over more than MAX_ENTRIES_PER_PASS candidates with the real queue head shadow-skipped forges exactly 100 entries and pins the next live entry as the queue head', async () => {
+    // Asserts: with 102 queue records where the first record (pullRequest 1)
+    // is excluded by an own-head would-already-merged, the pass forges exactly
+    // MAX_ENTRIES_PER_PASS (100) entries; the excluded entry costs no forge
+    // read and is absent from the report. S1U6: the queue head is taken from
+    // the filtered queue, so pullRequest 2 is the head and is always selected,
+    // with the remaining 99 rotated from pullRequest 3..102.
     // Cost bound: O(N) over 102 queue records (under MAX_QUEUE_RECORDS = 5000)
     // and 100 selected entries (MAX_ENTRIES_PER_PASS), one prefix listing.
     const records = Array.from({ length: 102 }, (_, index) =>
@@ -1024,7 +1022,7 @@ describe('RunMergePassUseCase shadow skip of journaled would-already-merged', ()
     expect(result.entries.some((row) => row.entryId === excludedHead.entryId)).toBe(false);
     expect(result.entries.every((row) => row.head12 === HEAD12)).toBe(true);
     const reported = new Set(result.entries.map((row) => row.entryId));
-    expect(reported.has(records[1].entryId)).toBe(false);
+    expect(reported.has(records[1].entryId)).toBe(true);
   });
 
   it('a local would-already-merged under H2 without a local would-supersede plus a foreign would-supersede on H1 leaves the H1 entry live while the settled sibling is skipped', async () => {

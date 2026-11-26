@@ -229,7 +229,22 @@ describe('merge decide', () => {
     expect(results[0]?.outcome).toBe('dry-run');
   });
 
-  it('answers not-ready not-queue-head (exit 1) and journals nothing when an earlier live queue entry of the same repository holds the head', async () => {
+  it('exits 0 and journals would-merge for a queued entry that is not the queue head (an earlier entry holds the head)', async () => {
+    const forge = greenForgeFake();
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
+    await seedQueueEntry(runtime, 3);
+    await seedQueueEntry(runtime, 7);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(0);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('journalled');
+    expect(printed['reasonCode']).toBe('would-merge');
+    expect(await journalRowsFor(stateDir, null)).not.toHaveLength(0);
+  });
+
+  it('refuses not-queued (exit 1) and journals nothing when the pair is not a queued entry', async () => {
     const forge = greenForgeFake();
     const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
     await seedQueueEntry(runtime, 3);
@@ -239,8 +254,8 @@ describe('merge decide', () => {
 
     expect(result.code).toBe(1);
     const printed = JSON.parse(result.out) as Record<string, unknown>;
-    expect(printed['outcome']).toBe('not-ready');
-    expect(printed['reasonCode']).toBe('not-queue-head');
+    expect(printed['outcome']).toBe('refused');
+    expect(printed['reasonCode']).toBe('not-queued');
     expect(forge.calls).toHaveLength(0);
     expect(await journalRowsFor(stateDir, null)).toHaveLength(0);
     expect(await queueSnapshot(runtime)).toEqual(before);

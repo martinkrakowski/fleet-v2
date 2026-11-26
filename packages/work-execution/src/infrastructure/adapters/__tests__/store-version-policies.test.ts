@@ -361,7 +361,6 @@ const EXPECTED_INVENTORY: readonly DiscoveredPolicy[] = [
  * pre-version record for it — "no pre-version records ever existed".
  */
 const COVERAGE: ReadonlyMap<string, Coverage> = new Map<string, Coverage>([
-  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; every writer stamped schemaVersion, so no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/AttemptRepositoryAdapter.adapter.ts::ATTEMPT_STORE_VERSION_POLICY', { fixture: 'attempts.legacy.json' }],
   ['packages/work-execution/src/infrastructure/adapters/LaneRunRepositoryAdapter.adapter.ts::LANE_RUN_STORE_VERSION_POLICY', { fixture: 'lane-runs.legacy.json' }],
   ['packages/work-execution/src/infrastructure/adapters/LaneRunJournalAdapter.adapter.ts::LANE_RUN_JOURNAL_STORE_VERSION_POLICY', { fixture: 'run-journal.legacy.json' }],

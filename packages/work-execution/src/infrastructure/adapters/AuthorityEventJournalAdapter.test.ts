@@ -52,6 +52,21 @@ function stopEvent(eventId?: string): StopAuthorityEvent {
   };
 }
 
+/** Journal files in a state dir, sorted, without the lock file. */
+async function journalFiles(dir: string): Promise<string[]> {
+  return (await fs.readdir(dir)).filter((name) => !name.endsWith('.lock')).sort();
+}
+
+/** Every non-empty line across the live journal, its archives and any staged file. */
+async function allJournalLines(dir: string): Promise<string[]> {
+  const lines: string[] = [];
+  for (const name of await journalFiles(dir)) {
+    const content = await fs.readFile(path.join(dir, name), 'utf8');
+    lines.push(...content.split('\n').filter((line) => line.length > 0));
+  }
+  return lines;
+}
+
 describe('AuthorityEventJournalAdapter', () => {
   it('appends one JSONL line per recorded event and answers recorded', async () => {
     const stateDir = await tempStateDir();
@@ -337,25 +352,137 @@ describe('AuthorityEventJournalAdapter', () => {
     expect(await fs.readFile(path.join(stateDir, topArchive), 'utf8')).toBe('prior\n');
   });
 
-  it('restores the live file from the archive when the post-rotation append fails', async () => {
+  it('leaves the live journal whole and no staged residue when staging the fresh live file fails', async () => {
     const stateDir = await tempStateDir();
     const filePath = path.join(stateDir, 'authority-events.jsonl');
-    const archivePath = path.join(stateDir, 'authority-events.1.jsonl');
     const prior = `${JSON.stringify(stopEvent('kept'))}\n`;
     await fs.writeFile(filePath, prior, 'utf8');
-    const append = vi.spyOn(fs, 'appendFile').mockRejectedValue(new Error('append denied'));
+    const write = vi.spyOn(fs, 'writeFile').mockRejectedValue(new Error('write denied'));
     const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
     await expect(journal.record(stopEvent('fresh'))).resolves.toEqual({
       outcome: 'refused',
       reason: 'unavailable',
     });
-    expect(append).toHaveBeenCalled();
-    // The rotation still archived the prior lines, byte-identical...
-    expect(await fs.readFile(archivePath, 'utf8')).toBe(prior);
-    // ...and the failed append did not leave the live file missing or partial.
+    expect(write).toHaveBeenCalled();
     expect(await fs.readFile(filePath, 'utf8')).toBe(prior);
-    expect(await fs.readdir(stateDir).then((names) => names.sort())).toEqual(
-      ['authority-events.1.jsonl', 'authority-events.jsonl'],
-    );
+    expect(await journalFiles(stateDir)).toEqual(['authority-events.jsonl']);
+  });
+
+  it('heals a partial write whose cleanup also fails: the next record leaves no partial line and loses no event', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const kept = stopEvent('kept');
+    const prior = `${JSON.stringify(kept)}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    const realAppend = fs.appendFile.bind(fs);
+    const realWrite = fs.writeFile.bind(fs);
+    const realUnlink = fs.unlink.bind(fs);
+    const isLock = (target: unknown): boolean => String(target).endsWith('.lock');
+    // Every journal write lands half its bytes and then fails, and every
+    // journal unlink fails: the worst case for any best-effort restore.
+    vi.spyOn(fs, 'appendFile').mockImplementation(async (target, data, options) => {
+      await realAppend(target, String(data).slice(0, 12), options as never);
+      throw new Error('disk full');
+    });
+    vi.spyOn(fs, 'writeFile').mockImplementation(async (target, data, options) => {
+      if (isLock(target)) {
+        return realWrite(target, data, options as never);
+      }
+      await realWrite(target, String(data).slice(0, 12), options as never);
+      throw new Error('disk full');
+    });
+    vi.spyOn(fs, 'unlink').mockImplementation(async (target) => {
+      if (isLock(target)) {
+        return realUnlink(target);
+      }
+      throw new Error('unlink denied');
+    });
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    const fresh = stopEvent('fresh');
+    await expect(journal.record(fresh)).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    vi.restoreAllMocks();
+    // The faults are gone: the very next call recovers and records.
+    await expect(journal.record(fresh)).resolves.toEqual({ outcome: 'recorded' });
+    const lines = await allJournalLines(stateDir);
+    // No partial line survives anywhere: every line parses as a whole event.
+    for (const line of lines) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+    expect(lines.filter((line) => line === JSON.stringify(kept))).toHaveLength(1);
+    expect(lines.filter((line) => line === JSON.stringify(fresh))).toHaveLength(1);
+    expect(await journalFiles(stateDir)).not.toContain('authority-events.jsonl.next');
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(fresh)}\n`);
+  });
+
+  it('reuses the archive an interrupted rotation already linked instead of archiving the same journal twice', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const prior = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    const realUnlink = fs.unlink.bind(fs);
+    // The archive link succeeds, then retiring the live path fails.
+    vi.spyOn(fs, 'unlink').mockImplementation(async (target) => {
+      if (String(target).endsWith('.lock')) {
+        return realUnlink(target);
+      }
+      throw new Error('unlink denied');
+    });
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    const fresh = stopEvent('fresh');
+    await expect(journal.record(fresh)).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    vi.restoreAllMocks();
+    await expect(journal.record(fresh)).resolves.toEqual({ outcome: 'recorded' });
+    expect(await journalFiles(stateDir)).toEqual(['authority-events.1.jsonl', 'authority-events.jsonl']);
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.1.jsonl'), 'utf8')).toBe(prior);
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(fresh)}\n`);
+  });
+
+  it('promotes a staged journal when a rotation stopped after retiring the live file', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const prior = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    const realLink = fs.link.bind(fs);
+    // Promotion of the staged file into the live path fails once.
+    vi.spyOn(fs, 'link').mockImplementation(async (existing, target) => {
+      if (String(target) === filePath) {
+        throw new Error('link denied');
+      }
+      return realLink(existing, target);
+    });
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    const fresh = stopEvent('fresh');
+    await expect(journal.record(fresh)).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    vi.restoreAllMocks();
+    // Live is absent, the archive holds the prior journal, the staged file holds the new one.
+    await expect(fs.readFile(filePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    // The retry heals by promotion and reports the event as already recorded.
+    await expect(journal.record(fresh)).resolves.toEqual({ outcome: 'recorded' });
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(fresh)}\n`);
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.1.jsonl'), 'utf8')).toBe(prior);
+    expect(await journalFiles(stateDir)).toEqual(['authority-events.1.jsonl', 'authority-events.jsonl']);
+  });
+
+  it('discards an incomplete staged file beside a live journal and rotates normally', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const prior = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    await fs.writeFile(`${filePath}.next`, '{"eventId":"half', 'utf8');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    const fresh = stopEvent('fresh');
+    await expect(journal.record(fresh)).resolves.toEqual({ outcome: 'recorded' });
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.1.jsonl'), 'utf8')).toBe(prior);
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(fresh)}\n`);
+    expect(await journalFiles(stateDir)).toEqual(['authority-events.1.jsonl', 'authority-events.jsonl']);
   });
 });

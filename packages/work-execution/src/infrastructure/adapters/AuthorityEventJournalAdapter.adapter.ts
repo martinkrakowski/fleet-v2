@@ -12,18 +12,29 @@
  *
  * When the durable live journal reaches the configured event cap
  * (`maxEvents`, default `MAX_AUTHORITY_JOURNAL_EVENTS`) the next record
- * rotates it: the live file is hard-linked to
- * `<stem>.<next>.jsonl` inside the state directory and the live path is
- * unlinked, then the new event appends to a fresh live file. Rotation
- * never rewrites prior lines and never uses `fs.rename` (a rename could
- * clobber an archive created concurrently); it retries `EEXIST` within a
- * bounded `MAX_ROTATION_ATTEMPTS` budget, driven by an attempt counter
- * so even an archive number at the top of the safe-integer range (where
- * `n += 1` loses precision) cannot make the retry loop spin forever. If
- * the post-rotation append fails, the live file — already unlinked by
- * the rotation — is restored from the archive it was just linked to, so
- * a refusal never leaves the required live journal missing or partial.
- * An `eventId` that has rotated
+ * rotates it, crash-safely and self-healing, under the same lock, using
+ * only no-clobber `fs.link`, `fs.unlink` and exclusive (`wx`) create (never
+ * `fs.rename`, which could clobber an archive created concurrently):
+ *
+ *  1. the new event is staged in full in `<live>.next` (exclusive create);
+ *  2. the live file is hard-linked to `<stem>.<next>.jsonl` (an `EEXIST`
+ *     name is skipped within a bounded `MAX_ROTATION_ATTEMPTS`, driven by
+ *     an attempt counter so an archive number at the top of the
+ *     safe-integer range cannot spin forever); an archive that is already
+ *     a hard link to the live file (an earlier rotation that stopped
+ *     before step 3) is reused, never duplicated;
+ *  3. the live path is unlinked;
+ *  4. the staged file is hard-linked to the live path and then unlinked.
+ *
+ * The live path is therefore never partially written: it is either the
+ * complete prior journal or, between steps 3 and 4, absent while the staged
+ * file holds the complete new journal. There is no best-effort restore to
+ * fail. Every later `record` first heals what a crash or a failed step left
+ * behind: a staged file with no live file is promoted to the live path; a
+ * staged file next to a live file (a rotation that stopped before step 3,
+ * or after step 4) is removed, and an archive that shares the live file's
+ * inode is reused by the retry. A failed rotation refuses as `unavailable`
+ * and loses no event. An `eventId` that has rotated
  * into an archive is **not** re-read from archives for idempotency, so a
  * same-key retry after rotation may append once more to the fresh live
  * file; the `eventId` is identical, so downstream consumers de-duplicate.
@@ -242,74 +253,148 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
       this.filePath === null ? null : `${this.filePath}.lock`;
   }
 
+  /** The staging path of a rotation's fresh live file. */
+  private stagePath(): string {
+    return `${this.filePath as string}.next`;
+  }
+
   /**
-   * Rotate the full live journal to `<stem>.<n>.jsonl` inside `stateDir`:
-   * pick the next unused positive integer from existing archive names
-   * (strictly `^<stem>.(\d+).jsonl$`, canonical safe integers), then
-   * hard-link the live file to the archive and unlink the live path —
-   * `fs.link` + `fs.unlink`, never `fs.rename` or a `wx` reservation,
-   * because a rename would clobber an archive another worker created
-   * between the scan and the link. `EEXIST` from `fs.link` increments the
-   * candidate number and retries within `MAX_ROTATION_ATTEMPTS`; any other
-   * failure leaves the live file intact and refuses as `unavailable`.
-   * On success it answers the archive path it created, so a failed
-   * post-rotation append can restore the live file from that archive
-   * (a hard link to the identical prior bytes).
+   * Heal what an interrupted rotation left behind, before anything is read.
+   * A staged file with no live file is the complete new journal of a
+   * rotation that stopped between unlink and promotion: it is promoted. A
+   * staged file beside a live file is a rotation that stopped earlier (the
+   * live file is still the whole prior journal) or later (the staged file
+   * is already the live file's other name): it is removed. Answers false
+   * when the state cannot be healed, so the caller refuses.
    */
-  private async rotate(): Promise<
-    { outcome: 'ok'; archivePath: string } | { outcome: 'refused' }
-  > {
+  private async heal(): Promise<boolean> {
+    const live = this.filePath as string;
+    const staged = this.stagePath();
+    try {
+      await fs.lstat(staged);
+    } catch (error) {
+      return (error as { code?: unknown } | null)?.code === 'ENOENT';
+    }
+    try {
+      let liveExists = true;
+      try {
+        await fs.lstat(live);
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== 'ENOENT') {
+          return false;
+        }
+        liveExists = false;
+      }
+      if (liveExists) {
+        await fs.unlink(staged);
+        return true;
+      }
+      // Promote only a complete staged journal (one well-formed final line).
+      // An incomplete one cannot come from an interrupted rotation, which
+      // stages in full before it retires the live file; it is discarded, so
+      // the journal can never stay wedged on it.
+      const content = await fs.readFile(staged, 'utf8');
+      if (!content.endsWith('\n') || eventIdOfLine(content.trimEnd().split('\n').pop()) === null) {
+        await fs.unlink(staged);
+        return true;
+      }
+      await fs.link(staged, live);
+      await fs.unlink(staged);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** True when both paths are the same file (a hard link of each other). */
+  private async sameFile(a: string, b: string): Promise<boolean> {
+    try {
+      const [first, second] = await Promise.all([fs.lstat(a), fs.lstat(b)]);
+      return first.dev === second.dev && first.ino === second.ino;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Rotate the full live journal to `<stem>.<n>.jsonl` inside `stateDir`
+   * and leave a fresh live file holding `line`: see the header for the four
+   * steps. The next number comes from the existing archive names (strictly
+   * `^<stem>.(\d+).jsonl$`, canonical safe integers). Any failure refuses
+   * as `unavailable`; the live file is only ever unlinked once the staged
+   * replacement is complete and the archive is a link of the live file.
+   */
+  private async rotate(line: string): Promise<boolean> {
     // `this.filePath` is non-null whenever rotation is reachable; the cast
     // is local and only avoids re-narrowing across closures.
     const filePath = this.filePath as string;
+    const staged = this.stagePath();
     const directory = path.dirname(filePath);
     const stem = path.basename(filePath).replace(/\.jsonl$/, '');
     const archivePattern = new RegExp(
       `^${escapeRegExp(stem)}\\.(\\d+)\\.jsonl$`,
     );
-    const entries = await fs.readdir(directory);
-    let maxExisting = 0;
-    for (const entry of entries) {
-      const match = archivePattern.exec(entry);
-      if (match === null) {
-        continue;
-      }
-      const n = Number(match[1]);
-      if (!Number.isSafeInteger(n) || n <= 0 || !/^(0|[1-9]\d*)$/.test(match[1])) {
-        continue;
-      }
-      maxExisting = Math.max(maxExisting, n);
-    }
-    // The loop is driven by an explicit attempt counter, not by the
-    // candidate number itself: at the top of the safe-integer range
-    // (e.g. an archive named `<stem>.9007199254740991.jsonl` makes
-    // `maxExisting` equal `Number.MAX_SAFE_INTEGER`) `n += 1` no longer
-    // changes `n`, so incrementing `n` in the loop header could spin
-    // forever. Any candidate at or past `Number.MAX_SAFE_INTEGER` is
-    // refused instead of retried.
-    let n = maxExisting;
-    for (let attempt = 0; attempt < MAX_ROTATION_ATTEMPTS; attempt += 1) {
-      if (n >= Number.MAX_SAFE_INTEGER) {
-        return { outcome: 'refused' as const };
-      }
-      n += 1;
-      const archivePath = path.join(directory, `${stem}.${n}.jsonl`);
-      try {
-        await fs.link(filePath, archivePath);
-      } catch (error) {
-        if ((error as { code?: unknown } | null)?.code === 'EEXIST') {
+    try {
+      const entries = await fs.readdir(directory);
+      let maxExisting = 0;
+      for (const entry of entries) {
+        const match = archivePattern.exec(entry);
+        if (match === null) {
           continue;
         }
-        return { outcome: 'refused' as const };
+        const n = Number(match[1]);
+        if (!Number.isSafeInteger(n) || n <= 0 || !/^(0|[1-9]\d*)$/.test(match[1])) {
+          continue;
+        }
+        maxExisting = Math.max(maxExisting, n);
       }
+      // 1. Stage the complete fresh live file. A failure removes whatever
+      // was staged (a leftover is also removed by the next `heal`).
       try {
-        await fs.unlink(filePath);
+        await fs.writeFile(staged, line, { encoding: 'utf8', flag: 'wx' });
       } catch {
-        return { outcome: 'refused' as const };
+        await fs.unlink(staged).catch(() => undefined);
+        return false;
       }
-      return { outcome: 'ok' as const, archivePath };
+      // 2. Archive: reuse a link of the live file left by an earlier
+      // attempt, otherwise link the next unused number. The loop is driven
+      // by an explicit attempt counter, not by the candidate number: at the
+      // top of the safe-integer range (an archive named
+      // `<stem>.9007199254740991.jsonl`) `n += 1` no longer changes `n`, so
+      // incrementing `n` in the loop header could spin forever. A candidate
+      // at or past `Number.MAX_SAFE_INTEGER` is refused instead of retried.
+      let archived = false;
+      if (maxExisting > 0) {
+        archived = await this.sameFile(filePath, path.join(directory, `${stem}.${maxExisting}.jsonl`));
+      }
+      let n = maxExisting;
+      for (let attempt = 0; !archived && attempt < MAX_ROTATION_ATTEMPTS; attempt += 1) {
+        if (n >= Number.MAX_SAFE_INTEGER) {
+          break;
+        }
+        n += 1;
+        try {
+          await fs.link(filePath, path.join(directory, `${stem}.${n}.jsonl`));
+          archived = true;
+        } catch (error) {
+          if ((error as { code?: unknown } | null)?.code !== 'EEXIST') {
+            break;
+          }
+        }
+      }
+      if (!archived) {
+        await fs.unlink(staged).catch(() => undefined);
+        return false;
+      }
+      // 3. Retire the live path, 4. promote the staged file. A failure here
+      // leaves the staged file for the next `heal`/`rotate`; nothing is lost.
+      await fs.unlink(filePath);
+      await fs.link(staged, filePath);
+      await fs.unlink(staged).catch(() => undefined);
+      return true;
+    } catch {
+      return false;
     }
-    return { outcome: 'refused' as const };
   }
 
   async record(event: StopAuthorityEvent): Promise<AuthorityEventSinkResult> {
@@ -331,6 +416,9 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
     }
     try {
       return await withFileLock(this.lockPath, async () => {
+        if (!(await this.heal())) {
+          return { outcome: 'refused' as const, reason: 'unavailable' as const };
+        }
         let content: string;
         try {
           content = await fs.readFile(this.filePath as string, 'utf8');
@@ -354,36 +442,13 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
         if (lines.some((line) => eventIdOfLine(line) === event.eventId)) {
           return { outcome: 'recorded' as const };
         }
+        const line = `${serializeEvent(event)}\n`;
         if (lines.length >= this.maxEvents) {
-          const rotation = await this.rotate();
-          if (rotation.outcome !== 'ok') {
-            return { outcome: 'refused' as const, reason: 'unavailable' as const };
-          }
-          try {
-            await fs.appendFile(this.filePath as string, `${serializeEvent(event)}\n`, 'utf8');
-          } catch {
-            // The rotation already unlinked the live path, so a failed
-            // append must not leave it missing or partial: restore the
-            // live file from the archive (a hard link to the identical
-            // pre-rotation bytes), removing any partial append first.
-            // Best effort — if even the restore fails, the refusal is
-            // still returned and nothing is dropped silently beyond
-            // what the rotation itself already preserved in the archive.
-            try {
-              await fs.unlink(this.filePath as string);
-            } catch {
-              /* nothing partial to remove */
-            }
-            try {
-              await fs.link(rotation.archivePath, this.filePath as string);
-            } catch {
-              /* restore failed; refusal below still reports unavailable */
-            }
-            return { outcome: 'refused' as const, reason: 'unavailable' as const };
-          }
-          return { outcome: 'recorded' as const };
+          return (await this.rotate(line))
+            ? { outcome: 'recorded' as const }
+            : { outcome: 'refused' as const, reason: 'unavailable' as const };
         }
-        await fs.appendFile(this.filePath as string, `${serializeEvent(event)}\n`, 'utf8');
+        await fs.appendFile(this.filePath as string, line, 'utf8');
         return { outcome: 'recorded' as const };
       });
     } catch {

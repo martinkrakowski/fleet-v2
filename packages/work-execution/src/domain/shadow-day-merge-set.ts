@@ -167,6 +167,55 @@ function readFleetEntry(raw: unknown): { readonly pullRequest: number; readonly 
   return { pullRequest: record.pullRequest, headOid: record.headOid as string };
 }
 
+/**
+ * The exact instant an accepted ISO-8601 timestamp names, in nanoseconds
+ * since the epoch, or null when the string does not match the accepted
+ * shape. `Date.parse` keeps only whole milliseconds, so two stamps that
+ * differ past the millisecond — e.g. `...T10:00:00Z` and
+ * `...T10:00:00.000000001Z` — compare equal through it although the fleet
+ * row is later; this parser keeps up to nine fractional digits and the
+ * written offset exact, so the ordering verdict below reads the true
+ * instant. Inputs are already shape- and calendar-validated at the
+ * boundary, so null is a defensive fallback only.
+ */
+const INSTANT_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
+
+function instantNanos(iso: string): bigint | null {
+  const match = INSTANT_PATTERN.exec(iso);
+  if (match === null) {
+    return null;
+  }
+  const [, year, month, dayOfMonth, hour, minute, second, fraction, offset] = match;
+  const dayMs = Date.UTC(Number(year), Number(month) - 1, Number(dayOfMonth));
+  if (Number.isNaN(dayMs)) {
+    return null;
+  }
+  // Date.UTC returns a whole-day instant with a zero time, so this division is exact.
+  let seconds = BigInt(dayMs / 1000) + BigInt(Number(hour)) * 3600n + BigInt(Number(minute)) * 60n + BigInt(Number(second));
+  if (offset !== 'Z') {
+    const magnitude = BigInt(Number(offset.slice(1, 3))) * 3600n + BigInt(Number(offset.slice(4, 6))) * 60n;
+    seconds -= offset[0] === '-' ? -magnitude : magnitude;
+  }
+  const nanos = fraction === undefined ? 0n : BigInt(fraction.padEnd(9, '0'));
+  return seconds * 1_000_000_000n + nanos;
+}
+
+/** An instant in nanoseconds floored to its whole second (toward negative infinity). */
+function floorToSecond(nanos: bigint): bigint {
+  const rem = nanos % 1_000_000_000n;
+  return rem < 0n ? nanos - rem - 1_000_000_000n : nanos - rem;
+}
+
+/** The exact instant as nanoseconds, falling back to millisecond precision for a defensively unmatched shape. */
+function exactOrMillis(iso: string): bigint {
+  const exact = instantNanos(iso);
+  if (exact !== null) {
+    return exact;
+  }
+  const ms = Date.parse(iso);
+  return BigInt(Number.isNaN(ms) ? 0 : ms) * 1_000_000n;
+}
+
 /** Whether the instant `iso` names falls inside the half-open window `[start, end)`. */
 function inWindow(iso: string, start: number, end: number): boolean {
   const instant = new Date(iso).getTime();
@@ -185,20 +234,43 @@ function inDay(iso: string, day: string): boolean {
 }
 
 /**
+ * The batch PRs whose own `batch`/`opened` event exists anywhere in the shell
+ * log — deliberately with NO day-window filter on the opened event, because a
+ * batch opened before the window still owns merges inside it. Matched on PR
+ * number alone, never on `(pullRequest, headOid)`: `update-branch` can move a
+ * batch PR's head between its opening and its merge.
+ */
+function batchOpenedPullRequests(events: readonly ShellTrainEvent[]): Set<number> {
+  const pullRequests = new Set<number>();
+  for (const event of events) {
+    if (event.kind === 'batch' && event.outcome === 'opened' && event.pullRequest !== null) {
+      pullRequests.add(event.pullRequest);
+    }
+  }
+  return pullRequests;
+}
+
+/**
  * The shell side of the merge set: every `result` event with outcome
  * `merged` and a non-null head, inside the day window; when
- * `excludeBatchMerges` is true, batch-member merges are dropped and counted
- * separately. `mergesCompared` counts the kept merges whose own time falls
- * inside day D itself — the value the later 20-merge floor consumes.
+ * `excludeBatchMerges` is true, batch-member merges and the own merges of
+ * batch-opened PRs are dropped and counted separately, with each dropped
+ * merge's `(pullRequest, headOid)` pair recorded so the fleet side can drop
+ * its matching rows too. `mergesCompared` counts the kept merges whose own
+ * time falls inside day D itself — the value the later 20-merge floor
+ * consumes.
  */
 function shellSet(events: readonly ShellTrainEvent[], day: string, start: number, end: number, excludeBatchMerges: boolean): {
   readonly items: readonly ShellMergeItem[];
   readonly excludedBatchMerges: number;
+  readonly excludedPullRequests: ReadonlySet<number>;
   readonly mergesCompared: number;
 } {
   const items: ShellMergeItem[] = [];
+  const excludedPullRequests = new Set<number>();
   let excludedBatchMerges = 0;
   let mergesCompared = 0;
+  const batchPullRequests = excludeBatchMerges ? batchOpenedPullRequests(events) : new Set<number>();
   for (const event of events) {
     if (event.kind !== 'result' || event.outcome !== 'merged' || event.headOid === null) {
       continue;
@@ -206,8 +278,11 @@ function shellSet(events: readonly ShellTrainEvent[], day: string, start: number
     if (!inWindow(event.atIso, start, end)) {
       continue;
     }
-    if (excludeBatchMerges && event.detailCode === 'batch-member') {
+    if (excludeBatchMerges && (event.detailCode === 'batch-member' || (event.pullRequest !== null && batchPullRequests.has(event.pullRequest)))) {
       excludedBatchMerges += 1;
+      if (event.pullRequest !== null) {
+        excludedPullRequests.add(event.pullRequest);
+      }
       continue;
     }
     if (inDay(event.atIso, day)) {
@@ -215,7 +290,7 @@ function shellSet(events: readonly ShellTrainEvent[], day: string, start: number
     }
     items.push({ pullRequest: event.pullRequest ?? 0, headOid: event.headOid, atIso: event.atIso });
   }
-  return { items, excludedBatchMerges, mergesCompared };
+  return { items, excludedBatchMerges, excludedPullRequests, mergesCompared };
 }
 
 /** Whether a result's key is a one-way merge key belonging to this repo. */
@@ -389,12 +464,46 @@ function judgeComparison(
   shellItems: { readonly items: readonly ShellMergeItem[]; readonly excludedBatchMerges: number; readonly mergesCompared: number },
   day: string,
 ): ShadowDayMergeSetEvaluation {
+  // Temporal ordering on top of the set comparison: a fleet would-merge only
+  // counts for a shell merge it was recorded at or before. The shell train
+  // stamps whole seconds while the fleet stamps finer, so the FLEET instant is
+  // floored to the whole second before it is compared with the shell merge's
+  // own stamp: a fleet row 0.9 s into the shell merge's second passes, one at
+  // the next whole second fails. Instants are read exactly (not through
+  // `Date.parse`'s millisecond truncation) and offsets compare by instant. The
+  // earliest matching fleet row decides, so a later re-journal never
+  // disqualifies a pair the first row already covers. The same
+  // earliest-per-pair reduction dedupes the fleet side for the comparator
+  // itself: the merge set is a SET of pairs, and the journal may legitimately
+  // carry several rows for one pair, which must compare as one member, not as
+  // an invalid duplicate.
+  const earliestFleetRows = new Map<string, FleetMergeItem>();
+  for (const item of fleetItems) {
+    const key = `${item.pullRequest}@${item.headOid}`;
+    const previous = earliestFleetRows.get(key);
+    if (previous === undefined || exactOrMillis(item.recordedAtIso) < exactOrMillis(previous.recordedAtIso)) {
+      earliestFleetRows.set(key, item);
+    }
+  }
+  const dedupedFleetItems = [...earliestFleetRows.values()];
   const comparison = compareShadowMergeSets({
-    fleet: fleetItems.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
+    fleet: dedupedFleetItems.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
     shell: shellItems.items.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
   });
 
-  const surviving = survivingDivergences(comparison.divergences, fleetItems, shellItems.items, day);
+  const orderingDivergences: { key: string; code: string }[] = [];
+  for (const shellItem of shellItems.items) {
+    const key = `${shellItem.pullRequest}@${shellItem.headOid}`;
+    const earliest = earliestFleetRows.get(key);
+    if (earliest === undefined) {
+      continue;
+    }
+    if (floorToSecond(exactOrMillis(earliest.recordedAtIso)) > exactOrMillis(shellItem.atIso)) {
+      orderingDivergences.push({ key, code: 'fleet-recorded-after-merge' });
+    }
+  }
+
+  const surviving = survivingDivergences([...comparison.divergences, ...orderingDivergences], dedupedFleetItems, shellItems.items, day);
   // The comparator caps its divergence list; beyond the cap an omitted
   // divergence may yet be same-day, so an all-grace listed set can never
   // certify a pass — the verdict stays open instead.
@@ -425,7 +534,14 @@ function evaluateMergeSet(parsed: ParsedMergeSetSnapshot): ShadowDayMergeSetEval
     return evaluation(fleetItems.refusal, shellItems.mergesCompared, shellItems.excludedBatchMerges, 0, 0);
   }
 
-  return judgeComparison(fleetItems.items, shellItems, day);
+  // An excluded batch merge with a daemon row must not become
+  // `missing-in-shell`: drop the fleet rows of every excluded pull request (by number, since update-branch can move a head) before
+  // the comparison runs.
+  const keptFleetItems = shellItems.excludedPullRequests.size === 0
+    ? fleetItems.items
+    : fleetItems.items.filter((item) => !shellItems.excludedPullRequests.has(item.pullRequest));
+
+  return judgeComparison(keptFleetItems, shellItems, day);
 }
 
 function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
@@ -530,9 +646,10 @@ function resolveHead(index: ReadonlyMap<string, ReadonlySet<string>>, pullReques
 /**
  * How many of the comparator's divergences still count as same-day: an
  * `invalid-item` divergence always counts; otherwise the divergence's own
- * event time — the shell merge's time for one missing on the fleet side,
- * the fleet result's time for one missing on the shell side — must fall
- * inside day D itself, not just the wider grace window.
+ * event time — the shell merge's time for one missing on the fleet side or
+ * recorded after the merge, the fleet result's time for one missing on the
+ * shell side — must fall inside day D itself, not just the wider grace
+ * window.
  */
 function survivingDivergences(
   divergences: readonly { readonly key: string; readonly code: string }[],
@@ -558,7 +675,7 @@ function survivingDivergences(
       surviving += 1;
       continue;
     }
-    const iso = divergence.code === 'missing-in-fleet'
+    const iso = divergence.code === 'missing-in-fleet' || divergence.code === 'fleet-recorded-after-merge'
       ? shellTimes.get(divergence.key)
       : fleetTimes.get(divergence.key) ?? shellTimes.get(divergence.key);
     if (iso !== undefined && inDay(iso, day)) {

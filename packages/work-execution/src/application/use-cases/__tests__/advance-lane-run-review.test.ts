@@ -1215,7 +1215,9 @@ describe('AdvanceLaneRunUseCase review reconcile (K5-4b)', () => {
   });
 
   it('a receipt with an unknown verdict twice parks ambiguous with the review step as qualifier after the one retry', async () => {
-    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // RM2: a one-seat review plan, so two unknowns exhaust every eligible seat.
+    const oneSeat = { ...collectedAttempt(), seatPlan: { ...REVIEW_SEAT_PLAN, review: [REVIEW_SEAT_PLAN.review[0]!] } };
+    const harness = await makeHarness(runRecord(), [oneSeat]);
     await conduct(harness, 'brief-check', NOW);
     // The brief-check passes so the run reaches code-review; the review under test is code-review.
     expect(await advance(harness)).toEqual({

@@ -581,7 +581,7 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     expect(manyPrefixes).toHaveLength(4097);
   });
 
-  it('findings are refused diff-findings, the workspace is never called and the journal names only the count', async () => {
+  it('findings are refused diff-findings, the workspace is never called and the journal names the rule and path only (CB8)', async () => {
     const lane = makeLane({ initialDiffOutcome: { outcome: 'findings', findings: FINDINGS } });
     const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
     expect(result).toMatchObject({
@@ -592,8 +592,31 @@ describe('CommitEditOnlyAttemptUseCase', () => {
     expect(lane.commits).toHaveLength(0);
     const entry = lane.journal.entries[0]!;
     expect(entry.status).toBe('refused');
-    expect(entry.detail).toBe('edit-only commit refused: 1 diff-check finding(s)');
-    expect(entry.detail).not.toContain('secret.txt');
+    // CB8: the detail carries the finding's rule and path (never a matched
+    // value, never line content), bounded to five findings and 300 chars.
+    expect(entry.detail).toBe(
+      'edit-only commit refused: diff-findings (secret-shape@packages/example/secret.txt)',
+    );
+    expect(entry.detail).not.toContain('=');
+  });
+
+  it('a token-shaped rule in a hostile finding is written as <rule-omitted>, never journaled verbatim (fix round 1 item 1)', async () => {
+    // Built by concatenation: a fixture shaped like a GitHub token
+    // (`ghp_` + 20 alphanumerics), never a real token.
+    const tokenShapedRule = 'ghp_' + 'abcdefghijklmnopqrst';
+    const lane = makeLane({
+      initialDiffOutcome: {
+        outcome: 'findings',
+        findings: [{ path: 'packages/example/secret.txt', line: 3, rule: tokenShapedRule }],
+      },
+    });
+    const result = await lane.useCase.commitEditOnlyAttempt({ attemptId: 'attempt-1' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'diff-findings' });
+    const entry = lane.journal.entries[0]!;
+    expect(entry.detail).toBe(
+      'edit-only commit refused: diff-findings (<rule-omitted>@packages/example/secret.txt)',
+    );
+    expect(entry.detail).not.toContain('ghp');
   });
 
   it('a diff error and an unreachable diff check are unknown', async () => {

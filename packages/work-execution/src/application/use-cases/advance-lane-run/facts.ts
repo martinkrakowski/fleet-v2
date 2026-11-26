@@ -220,7 +220,12 @@ export async function gatherFacts(ctx: AdvanceStepContext,
         );
 
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
-  const head12 = latest === null ? null : head12Of(latest.artifacts?.headCommit);
+  // Fix round 2: the lane's full head sha travels with `head12` so the decider
+  // can compare the PR head at full sha precision; absent when the attempt
+  // carries no artifacts or a non-hex head.
+  const headCommit = latest === null ? null : latest.artifacts?.headCommit ?? null;
+  const head12 = head12Of(headCommit);
+  const headSha = head12 === null ? null : headCommit;
   const acceptance = await acceptanceFactsOf(ctx, record, state, entries, latest, head12, request.halted);
 
   const reservations = await ctx.deps.executionJournal.listActiveReservations();
@@ -286,6 +291,7 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     roundSeatIndexes,
     attempt,
     head12,
+    headSha,
     acceptedHead12: acceptance.acceptedHead12,
     gate: laneRunGateFact(entries, record.runId, head12),
     gateCongestion: laneRunGateCongestion(entries, record.runId, head12),

@@ -1849,6 +1849,7 @@ describe('accepting, premerge, PR and CI states', () => {
 });
 
 describe('merging state', () => {
+  const FULL_HEAD = `${HEAD}${'0'.repeat(28)}`;
   it('M1: merging without a PR is inconsistent', () => {
     const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD });
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
@@ -1891,7 +1892,7 @@ describe('merging state', () => {
 
   it('M6: after the premerge success, without a policy grant parks owner-merge', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
@@ -1900,27 +1901,27 @@ describe('merging state', () => {
 
   it('KS7b M5: a behind branch no longer parks; the queue updates it, so the run enqueues', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
-      pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
+      pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true },
     });
     expect(decide(record({}), facts)).toMatchObject({ kind: 'act', step: 'merge-enqueue' });
   });
 
   it('KS7b M8: after the premerge success, otherwise acts merge-enqueue under the round/head key', () => {
-    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
+    const facts = baseFacts({ state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, attempt: attemptFact() });
     expect(decide(record({}), facts)).toEqual({
       kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });
   });
 
   it('KS7b: no merge act, trainFree or branchBehind remains: a pr-open merging run never acts merge', () => {
-    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
+    const facts = baseFacts({ state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, attempt: attemptFact() });
     expect(decide(record({}), facts)).not.toMatchObject({ step: 'merge' });
   });
 
   it('KS7b: the pending enqueue hand-off is reconciled, never acted again', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
@@ -1930,7 +1931,7 @@ describe('merging state', () => {
 
   it('KS7b: a merged PR ends the run even while the enqueue intent is unread', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
@@ -1938,7 +1939,7 @@ describe('merging state', () => {
 
   it('KS7b: a halt parks a pending enqueue hand-off instead of reconciling it', () => {
     const facts = baseFacts({
-      state: 'merging', halted: true, head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      state: 'merging', halted: true, head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
@@ -1948,8 +1949,8 @@ describe('merging state', () => {
 
   const queueFacts = (mergeEnqueue: LaneRunFacts['mergeEnqueue']): LaneRunFacts =>
     baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
-      pr: { state: 'open', head12: HEAD, containsLaneHead: true }, mergeEnqueue,
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
+      pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, mergeEnqueue,
     });
 
   it('KS7b: a fixable queue drop with a round left enters fixing', () => {
@@ -1980,7 +1981,7 @@ describe('merging state', () => {
 
   it('KS7a-2: a Tier 2 merging hold with no post acts premerge before the owner-merge park', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
+      state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
       preMergeReviewWired: false,
     });
     expect(decide(record({}), facts)).toEqual({
@@ -1991,8 +1992,8 @@ describe('merging state', () => {
   describe('PMR1: the pre-merge request from merging', () => {
     const mergingFacts = (extra: Partial<LaneRunFacts> = {}): LaneRunFacts =>
       baseFacts({
-        state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(),
-        pr: { state: 'open', head12: HEAD, containsLaneHead: true }, ...extra,
+        state: 'merging', head12: HEAD, headSha: FULL_HEAD, acceptedHead12: HEAD, attempt: attemptFact(),
+        pr: { state: 'open', head12: HEAD, headSha: FULL_HEAD, containsLaneHead: true }, ...extra,
       });
     const requestAct = (seatIndex: number, retry: 1 | null): LaneRunDecision => ({
       kind: 'act', step: 'pre-merge',
@@ -2136,6 +2137,128 @@ describe('merging state', () => {
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  describe('RM3: a Tier 2 run never publishes premerge success off its exact head', () => {
+    const OTHER = 'ffffffffffff';
+
+    it('RM3: a parked owner-merge run reconciles its unread premerge intent (G3a) — G5 never lets the hold act while parked', () => {
+      const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+      const facts = baseFacts({
+        state: 'parked', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'none',
+        pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact(),
+        pendingIntent: { key: `${RUN_ID}/r0/premerge@${HEAD}`, step: 'premerge', reconciliation: 'unread' },
+      });
+      assertDecision(facts, rec, decide(rec, facts), {
+        kind: 'reconcile', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`,
+      });
+    });
+
+    it('RM3: a Tier 2 released hold with the PR head moved off the run head waits premerge-pending, on the act and after a posted success', () => {
+      const prMoved = { state: 'open' as const, head12: OTHER, containsLaneHead: true };
+      const actFacts = baseFacts({
+        state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'none',
+        pr: prMoved, attempt: attemptFact(), merge: { oneWayDoor: false, policyGrant: false },
+      });
+      assertDecision(actFacts, record({}), decide(record({}), actFacts), { kind: 'wait', reason: 'premerge-pending' });
+      const successFacts = baseFacts({
+        state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: prMoved, attempt: attemptFact(),
+      });
+      assertDecision(successFacts, record({}), decide(record({}), successFacts), { kind: 'wait', reason: 'premerge-pending' });
+    });
+
+    it('RM3 fix round 2: a PR head move that shares the 12-character prefix waits premerge-pending at full sha precision, on the act and after a posted success', () => {
+      const headSha = `${HEAD}${'0'.repeat(28)}`;
+      const movedSha = `${HEAD}${'f'.repeat(28)}`;
+      const prMoved = { state: 'open' as const, head12: HEAD, headSha: movedSha, containsLaneHead: true };
+      const actFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'none',
+        pr: prMoved, attempt: attemptFact(), merge: { oneWayDoor: false, policyGrant: false },
+      });
+      assertDecision(actFacts, record({}), decide(record({}), actFacts), { kind: 'wait', reason: 'premerge-pending' });
+      const successFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: prMoved, attempt: attemptFact(),
+      });
+      assertDecision(successFacts, record({}), decide(record({}), successFacts), { kind: 'wait', reason: 'premerge-pending' });
+      // The same head at full sha precision still falls through to merge-enqueue.
+      const sameFacts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, headSha, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      expect(decide(record({}), sameFacts)).toEqual({
+        kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      });
+      // Tier 1 is unchanged: the same-prefix move never holds a Tier 1 released premerge.
+      const tier1Facts = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: prMoved, attempt: attemptFact(),
+      });
+      expect(decide(record({ tier: 1 }), tier1Facts)).toEqual({
+        kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      });
+    });
+
+    it('RM3 helper round 2: a queue outcome on a Tier 2 run whose PR head the queue moved is handled, never masked by premerge-pending', () => {
+      const headSha = `${HEAD}${'0'.repeat(28)}`;
+      const movedSha = `${HEAD}${'f'.repeat(28)}`;
+      const queued = (mergeEnqueue: LaneRunFacts['mergeEnqueue']): LaneRunFacts => baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, headSha: movedSha, containsLaneHead: true }, attempt: attemptFact(), mergeEnqueue,
+      });
+      expect(decide(record({}), queued('none'))).toEqual({ kind: 'wait', reason: 'premerge-pending' });
+      assertDecision(queued('dropped-fixable'), record({}), decide(record({}), queued('dropped-fixable')), { kind: 'enter', to: 'fixing' });
+      assertDecision(queued('held'), record({}), decide(record({}), queued('held')), {
+        kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
+      });
+      assertDecision(queued('stuck'), record({}), decide(record({}), queued('stuck')), {
+        kind: 'park', reason: 'step-refused', qualifier: 'merge-enqueue', parkedFrom: 'merging',
+      });
+    });
+
+    it('RM3 helper round: a missing full sha on either side stays premerge-pending, never trusting a shared 12-character prefix', () => {
+      const headSha = `${HEAD}${'0'.repeat(28)}`;
+      const missingLane = baseFacts({
+        state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, headSha, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      assertDecision(missingLane, record({}), decide(record({}), missingLane), { kind: 'wait', reason: 'premerge-pending' });
+      const missingPr = baseFacts({
+        state: 'merging', head12: HEAD, headSha, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success',
+        pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      assertDecision(missingPr, record({}), decide(record({}), missingPr), { kind: 'wait', reason: 'premerge-pending' });
+    });
+
+    it('RM3: a head move after premerge success re-enters gating (G7 unchanged), and the new head posts pending, never success', () => {
+      const movedFacts = baseFacts({
+        state: 'merging', head12: OTHER, acceptedHead12: HEAD, preMerge: 'none', premergePost: 'success',
+        pr: { state: 'open', head12: OTHER, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      assertDecision(movedFacts, record({}), decide(record({}), movedFacts), { kind: 'enter', to: 'gating' });
+      // The new head's journal key holds no premerge result: once the run is
+      // accepted at the new head, the hold is `wait` and the act posts pending.
+      const newHeadFacts = baseFacts({
+        state: 'merging', head12: OTHER, acceptedHead12: OTHER, preMerge: 'none', premergePost: 'none',
+        pr: { state: 'open', head12: OTHER, containsLaneHead: true }, attempt: attemptFact(), merge: { oneWayDoor: false, policyGrant: false },
+        preMergeReviewWired: false,
+      });
+      assertDecision(newHeadFacts, record({}), decide(record({}), newHeadFacts), {
+        kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${OTHER}`, round: 0, seatIndex: 0, head12: OTHER, retry: null,
+      });
+    });
+
+    it('RM3: Tier 1 is unchanged — a PR head mismatch never holds a Tier 1 released premerge', () => {
+      const rec = record({ tier: 1 });
+      const facts = baseFacts({
+        state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'none', premergePost: 'success',
+        pr: { state: 'open', head12: OTHER, containsLaneHead: true }, attempt: attemptFact(),
+      });
+      assertDecision(facts, rec, decide(rec, facts), {
+        kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      });
     });
   });
 });

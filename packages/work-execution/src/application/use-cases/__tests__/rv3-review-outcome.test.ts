@@ -1062,7 +1062,9 @@ describe('RV3: the WB5a-store-c saved minor-only FAIL receipt end to end', () =>
 
     // A run whose review verdict is unknown retries once and parks ambiguous,
     // never fixing and never passed.
-    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // RM2: a one-seat review plan, so two unknowns exhaust every eligible seat.
+    const oneSeat = { ...collectedAttempt(), seatPlan: { ...SEAT_PLAN, review: [SEAT_PLAN.review[0]!] } };
+    const harness = await makeHarness(runRecord(), [oneSeat]);
     await conduct(harness, 'code-review', NOW);
     harness.setReviewAnswer(async (request) => ({
       outcome: 'receipt',

@@ -340,7 +340,7 @@ bounded_contexts:
     layers:
       domain:
         entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink, MergeRecord]
-        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState]
+        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState, SpendCap]
       application:
         use_cases:
           - RegisterWorkOrderUseCase

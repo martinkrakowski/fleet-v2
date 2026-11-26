@@ -18,6 +18,13 @@ export type OwnerQuestionState = 'open' | 'answered' | 'rejected' | 'expired' | 
 /** How an answer reached the record. */
 export type OwnerQuestionAnswerVia = 'web' | 'cli' | 'signed-decision';
 
+/** The record schema version this reader writes; absent on disk reads as 1. */
+export const OWNER_QUESTION_RECORD_VERSION = 2 as const;
+
+/** Who may read a question's answer. Anything unknown reads as 'owner-only'. */
+export const OWNER_QUESTION_AUDIENCES = ['owner-only', 'any'] as const;
+export type OwnerQuestionAudience = (typeof OWNER_QUESTION_AUDIENCES)[number];
+
 /** One selectable option with the consequence of choosing it. */
 export interface OwnerQuestionOptionRecord {
   readonly id: string;
@@ -47,6 +54,8 @@ export interface OwnerQuestionAnswerRecord {
   readonly answeredVia: OwnerQuestionAnswerVia;
   readonly answeredAt: string;
   readonly sessionId: string | null;
+  /** Who answered: 'owner' or `agent:<id>`. Optional in the TS interface until FVM2b tightens the writers. */
+  readonly actor?: string;
 }
 
 /** The acknowledgement that the asker saw the answer. */
@@ -72,6 +81,13 @@ export interface OwnerQuestionRecord {
   readonly expiresAt: string | null;
   readonly answer: OwnerQuestionAnswerRecord | null;
   readonly acknowledgement: OwnerQuestionAcknowledgementRecord | null;
+  /**
+   * The record schema version the reader accepted (the stored value, not the
+   * written one). Optional until FVM2b makes writers emit it.
+   */
+  readonly schemaVersion?: number;
+  /** Who may read the answer; unknown or legacy reads as 'owner-only'. */
+  readonly audience?: OwnerQuestionAudience;
   /** The caller's idempotency key (for the conductor, its step key); absent when the ask named none. Never changes once stored. */
   readonly idempotencyKey?: string;
 }

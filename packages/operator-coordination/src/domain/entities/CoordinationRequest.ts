@@ -72,6 +72,55 @@ function readOwnDataValue(record: object, key: string): unknown {
   return descriptor.value;
 }
 
+/**
+ * Every field of a request record, read once. The first three are the
+ * validated enums, so a hostile record is refused by the field the operator
+ * most needs named; the rest follow the record's declaration order.
+ */
+const RECORD_KEYS = [
+  'kind',
+  'state',
+  'deliveryStatus',
+  'id',
+  'projectId',
+  'actionScope',
+  'expectedHeadSha',
+  'proposalDigest',
+  'policyRevision',
+  'decisionRevision',
+  'grantId',
+  'consumptions',
+  'acknowledgements',
+  'deliveryGapReason',
+  'revision',
+  'createdAtIso',
+  'updatedAtIso',
+  'policyGrant',
+  'mergeGrant',
+  'grantRecordVersion',
+  'grantAttemptId',
+  'releaseRoot',
+  'releaseNonce',
+  'shadowImportGrant',
+] as const;
+
+/**
+ * A plain copy of the record's own data properties, each read exactly once
+ * through its descriptor. A getter never runs, a Proxy `get` trap is never
+ * invoked, and everything after this point validates and stores this snapshot,
+ * never the raw record, so no later read can disagree with a validated value.
+ */
+function snapshotRecord(record: object): Record<string, unknown> {
+  const snapshot: Record<string, unknown> = {};
+  for (const key of RECORD_KEYS) {
+    const value = readOwnDataValue(record, key);
+    if (value !== undefined) {
+      snapshot[key] = value;
+    }
+  }
+  return snapshot;
+}
+
 function readGrantProperty(
   record: CoordinationRequestRecord,
   propertyName: 'policyGrant' | 'mergeGrant' | 'shadowImportGrant',
@@ -110,10 +159,11 @@ export class CoordinationRequest {
     // Invariants are validated in fromRecord.
   }
 
-  static fromRecord(record: CoordinationRequestRecord): CoordinationRequest {
-    if (typeof record !== 'object' || record === null) {
+  static fromRecord(input: CoordinationRequestRecord): CoordinationRequest {
+    if (typeof input !== 'object' || input === null) {
       throw new Error('CoordinationRequest requires a record');
     }
+    const record = snapshotRecord(input) as unknown as CoordinationRequestRecord;
     for (const field of [
       'id',
       'projectId',
@@ -134,16 +184,14 @@ export class CoordinationRequest {
         throw new Error(`CoordinationRequest ${field} must be a non-empty string or null`);
       }
     }
-    // kind, state and deliveryStatus are read through their own property
-    // descriptors and validated from that snapshot: a getter never runs, a
-    // revoked or hostile Proxy trap becomes a named refusal, and no later
-    // read can disagree with the validated value.
-    const kindValue = readOwnDataValue(record, 'kind');
+    // Everything below reads the descriptor snapshot taken above, so each
+    // field of the input was read exactly once.
+    const kindValue: unknown = record.kind;
     const kind = CoordinationKind.create(kindValue);
     if (!kind.success || kind.value === undefined) {
       throw new Error('CoordinationRequest has an invalid kind: ' + describeRejectedValue(kindValue));
     }
-    const stateValue = readOwnDataValue(record, 'state');
+    const stateValue: unknown = record.state;
     const state = CoordinationState.create(stateValue);
     if (!state.success || state.value === undefined) {
       throw new Error('CoordinationRequest has an invalid state: ' + describeRejectedValue(stateValue));
@@ -171,7 +219,7 @@ export class CoordinationRequest {
       );
     }
     const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
-    const deliveryStatusValue = readOwnDataValue(record, 'deliveryStatus');
+    const deliveryStatusValue: unknown = record.deliveryStatus;
     if (
       typeof deliveryStatusValue !== 'string' ||
       !DELIVERY_STATUSES.includes(deliveryStatusValue)
@@ -193,10 +241,8 @@ export class CoordinationRequest {
     }
     const consumptions = CoordinationRequest.readConsumptions(record.consumptions);
     const acknowledgements = CoordinationRequest.readAcknowledgements(record.acknowledgements);
-    // The spread below performs ordinary property Gets, so kind, state and
-    // deliveryStatus are overwritten with the validated descriptor-read
-    // values: the stored record is built only from the snapshot that was
-    // checked, never from a later Proxy read that could disagree with it.
+    // The stored record is the validated snapshot, never the raw input: it is
+    // a plain object, so spreading it runs no getter and no Proxy trap.
     const normalized: MutableCoordinationRequestRecord = {
       ...record,
       kind: kind.value.getValue(),

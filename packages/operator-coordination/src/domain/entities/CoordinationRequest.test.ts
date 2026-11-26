@@ -241,4 +241,41 @@ describe('CoordinationRequest.fromRecord', () => {
     expect(message).toBe('CoordinationRequest has an invalid delivery status: <string>');
     expect(message).not.toContain(token);
   });
+  it('reads every field of a record Proxy exactly once through its descriptor and never through a get trap', () => {
+    const target = baseRecord() as Record<string, unknown>;
+    let getCalls = 0;
+    const descriptorReads = new Map<string, number>();
+    const hostile = new Proxy(target, {
+      get() {
+        getCalls += 1;
+        throw new Error('get trap must never run');
+      },
+      getOwnPropertyDescriptor(t, key) {
+        descriptorReads.set(String(key), (descriptorReads.get(String(key)) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+    });
+    const request = CoordinationRequest.fromRecord(hostile as unknown as CoordinationRequestRecord);
+    expect(getCalls).toBe(0);
+    for (const key of ['kind', 'state', 'deliveryStatus', 'id', 'actionScope', 'revision']) {
+      expect(descriptorReads.get(key)).toBe(1);
+    }
+    expect([...descriptorReads.values()].every((count) => count === 1)).toBe(true);
+    expect(request.toRecord().kind).toBe('action-decision');
+    expect(request.toRecord().state).toBe('proposed');
+    expect(request.toRecord().deliveryStatus).toBe('pending');
+    expect(request.getId()).toBe('req-1');
+  });
+
+  it('stores the descriptor snapshot, so a value that changes after the snapshot cannot reach the stored record', () => {
+    const target = baseRecord() as Record<string, unknown>;
+    const hostile = new Proxy(target, {
+      get(t, key) {
+        // A raw read would see a different, unvalidated value.
+        return key === 'state' ? 'approved' : Reflect.get(t, key);
+      },
+    });
+    const request = CoordinationRequest.fromRecord(hostile as unknown as CoordinationRequestRecord);
+    expect(request.toRecord().state).toBe('proposed');
+  });
 });

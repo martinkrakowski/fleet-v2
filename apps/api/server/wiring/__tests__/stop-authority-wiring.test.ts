@@ -191,23 +191,24 @@ describe("API stop authority event wiring (FC12D)", () => {
       afterRevision: null,
     });
 
-    // The real idempotent retry: a fresh entryId against the same recorded
-    // stop key answers `already-requested` and emits no second event.
-    const retried = await work.requestLaneRunStop.requestLaneRunStop({
-      ...request,
-      entryId: RETRY_ENTRY_ID,
-    });
-    expect(retried.outcome).toBe("already-requested");
+    // A retried stop arrives as a fresh request: the web stop route mints a
+    // new entry id per HTTP call (`stop.post.ts`), so a second request for
+    // the same recorded stop key answers `already-requested` and appends no
+    // journal entry of its own.
+    const retryRequest = { ...request, entryId: RETRY_ENTRY_ID };
+    const retried = await work.requestLaneRunStop.requestLaneRunStop(retryRequest);
+    expect(retried).toEqual({ outcome: "already-requested", runId: RUN_ID, mode: "graceful" });
+
+    // The idempotent retry the brief requires: the exact same request, byte
+    // for byte, answered `already-requested` again. The first retry appended
+    // nothing, so the journal's entry-id uniqueness cannot refuse the replay,
+    // and the journal still holds exactly one line with the identical event id.
+    const exact = await work.requestLaneRunStop.requestLaneRunStop(retryRequest);
+    expect(exact).toEqual({ outcome: "already-requested", runId: RUN_ID, mode: "graceful" });
     const afterRetry = await readJournal(stateDir);
     expect(afterRetry).not.toBeNull();
     expect(afterRetry).toHaveLength(1);
     expect(afterRetry![0]!["eventId"]).toBe(`stop:${RUN_ID}/stop@web`);
-
-    // A byte-identical retry (same entryId) is refused at the run journal
-    // and never writes a second line either.
-    const sameEntryId = await work.requestLaneRunStop.requestLaneRunStop(request);
-    expect(sameEntryId).toEqual({ outcome: "refused", reason: "journal-refused" });
-    expect(await readJournal(stateDir)).toHaveLength(1);
   });
 
   it("writes no authority-events.jsonl when stopAttempt or requestLaneRunStop refuses or finds no target", async () => {

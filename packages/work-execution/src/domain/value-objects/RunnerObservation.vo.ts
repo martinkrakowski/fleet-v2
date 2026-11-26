@@ -5,6 +5,8 @@
  * reported separately and never collapse into one "running" flag.
  */
 
+import { describeRejectedValue } from './AttemptState.vo.js';
+
 export interface RunnerObservationProps {
   readonly observedAtIso: string;
   readonly runnerReachable: 'reachable' | 'unreachable' | 'unknown';
@@ -33,10 +35,10 @@ export class RunnerObservation {
       return { success: false, error: new Error('RunnerObservation requires a non-empty observedAtIso') };
     }
     if (!REACHABILITY_VALUES.includes(props.runnerReachable)) {
-      return { success: false, error: new Error(`Invalid runner reachability: ${String(props.runnerReachable)}`) };
+      return { success: false, error: new Error('Invalid runner reachability: ' + describeRejectedValue(props.runnerReachable)) };
     }
     if (!WORKER_COMMAND_VALUES.includes(props.workerCommand)) {
-      return { success: false, error: new Error(`Invalid worker command phase: ${String(props.workerCommand)}`) };
+      return { success: false, error: new Error('Invalid worker command phase: ' + describeRejectedValue(props.workerCommand)) };
     }
     if (props.sessionId !== null && !isNonEmptyString(props.sessionId)) {
       return { success: false, error: new Error('RunnerObservation sessionId must be non-empty or null') };

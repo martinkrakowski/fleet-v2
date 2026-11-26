@@ -22,6 +22,7 @@ import {
   decideTestProviderSelectability,
   isTestProviderSelectable,
 } from "./provider-terms-fixture.js";
+import type { ProviderTermsRegistry } from "../provider-terms.js";
 
 const isProxy = types.isProxy.bind(types);
 
@@ -33,13 +34,18 @@ const VALID_PASS = {
   reviewer: "reviewer@example.test",
 };
 
-/** Register exactly one pass for `provider-one`. */
-function onePassRegistry(): { ok: true } {
+/**
+ * Build the one-pass fixture registry through the factory and return the
+ * registry the factory itself produced, so selection tests exercise what
+ * `createTestProviderTermsRegistry` recorded rather than a hand-built
+ * literal.
+ */
+function onePassRegistry(): ProviderTermsRegistry {
   const built = createTestProviderTermsRegistry([VALID_PASS], isProxy);
   if (!built.ok) {
     throw new Error(`fixture registry refused: ${built.reason}`);
   }
-  return built;
+  return built.registry;
 }
 
 describe("provider-terms registry shape", () => {
@@ -130,15 +136,22 @@ describe("test-fixture registry selection", () => {
   it("builds a registry from a valid one-entry pass list and selects that exact providerId", () => {
     const built = createTestProviderTermsRegistry([VALID_PASS], isProxy);
     expect(built.ok).toBe(true);
-    expect(decideTestProviderSelectability({ passes: [VALID_PASS] }, VALID_PROVIDER_ID, isProxy)).toEqual({
+    if (!built.ok) {
+      return; // narrows `built` for the assertions below
+    }
+    // The registry the factory itself produced carries the recorded pass:
+    // it selects the pass's exact providerId, proving the factory recorded
+    // the supplied pass rather than returning an empty registry.
+    expect(built.registry.passes).toEqual([VALID_PASS]);
+    expect(decideTestProviderSelectability(built.registry, VALID_PROVIDER_ID, isProxy)).toEqual({
       selectable: true,
     });
-    expect(isTestProviderSelectable({ passes: [VALID_PASS] }, VALID_PROVIDER_ID, isProxy)).toBe(true);
-    void onePassRegistry;
+    expect(isTestProviderSelectable(built.registry, VALID_PROVIDER_ID, isProxy)).toBe(true);
+    expect(onePassRegistry().passes).toEqual([VALID_PASS]);
   });
 
-  it("refuses with no-recorded-pass for any other id on a populated fixture registry", () => {
-    expect(decideTestProviderSelectability({ passes: [VALID_PASS] }, "other-provider", isProxy)).toEqual({
+  it("refuses with no-recorded-pass for any other id on the factory-built registry", () => {
+    expect(decideTestProviderSelectability(onePassRegistry(), "other-provider", isProxy)).toEqual({
       selectable: false,
       reason: "no-recorded-pass",
     });
@@ -345,7 +358,142 @@ describe("test-fixture registry selection", () => {
     for (const id of ["anything", VALID_PROVIDER_ID, "unknown-provider"]) {
       expect(isProviderSelectable(id)).toBe(false);
     }
-    expect(isTestProviderSelectable({ passes: [VALID_PASS] }, "unknown-provider", isProxy)).toBe(false);
+    expect(isTestProviderSelectable(onePassRegistry(), "unknown-provider", isProxy)).toBe(false);
+  });
+});
+
+describe("hostile fixture inputs", () => {
+  it("refuses null and undefined fixture providerId values with invalid-provider-id", () => {
+    for (const id of [null, undefined]) {
+      expect(decideTestProviderSelectability(onePassRegistry(), id, isProxy)).toEqual({
+        selectable: false,
+        reason: "invalid-provider-id",
+      });
+      expect(isTestProviderSelectable(onePassRegistry(), id, isProxy)).toBe(false);
+    }
+  });
+
+  it("refuses null and undefined pass fields with the field's typed reason", () => {
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, providerId: null }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-provider-id",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewedAtIso: null }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewed-at",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewer: null }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewer",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, providerId: undefined }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-provider-id",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewedAtIso: undefined }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewed-at",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewer: undefined }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewer",
+    });
+  });
+
+  it("refuses function-valued pass fields without calling them", () => {
+    let called = false;
+    const fn = (): string => {
+      called = true;
+      return VALID_PROVIDER_ID;
+    };
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, providerId: fn }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-provider-id",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewedAtIso: fn }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewed-at",
+    });
+    expect(createTestProviderTermsRegistry([{ ...VALID_PASS, reviewer: fn }], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-reviewer",
+    });
+    expect(called).toBe(false);
+  });
+
+  it("refuses oversized pass strings with the field's typed reason", () => {
+    expect(
+      createTestProviderTermsRegistry(
+        [{ ...VALID_PASS, providerId: "a".repeat(64) }],
+        isProxy,
+      ),
+    ).toEqual({ ok: false, reason: "invalid-provider-id" });
+    expect(
+      createTestProviderTermsRegistry(
+        [{ ...VALID_PASS, reviewedAtIso: `2026-01-02T03:04:05.000${"0".repeat(4096)}Z` }],
+        isProxy,
+      ),
+    ).toEqual({ ok: false, reason: "invalid-reviewed-at" });
+    expect(
+      createTestProviderTermsRegistry([{ ...VALID_PASS, reviewer: "r".repeat(4097) }], isProxy),
+    ).toEqual({ ok: false, reason: "invalid-reviewer" });
+  });
+
+  it("refuses a registry whose passes array exceeds the 64-entry bound", () => {
+    const giant = Array.from({ length: 65 }, (_, i) => ({
+      ...VALID_PASS,
+      providerId: `provider-${i}`,
+    }));
+    expect(decideTestProviderSelectability({ passes: giant }, "provider-0", isProxy)).toEqual({
+      selectable: false,
+      reason: "invalid-registry",
+    });
+  });
+
+  it("refuses array-index getters on the passes array without invoking the getter", () => {
+    let getterRan = false;
+    const passes: unknown[] = [];
+    Object.defineProperty(passes, 0, {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return VALID_PASS;
+      },
+    });
+    expect(createTestProviderTermsRegistry(passes, isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-pass-entry",
+    });
+    expect(getterRan).toBe(false);
+    expect(decideTestProviderSelectability({ passes }, VALID_PROVIDER_ID, isProxy)).toEqual({
+      selectable: false,
+      reason: "invalid-registry",
+    });
+    expect(getterRan).toBe(false);
+  });
+
+  it("refuses own constructor and prototype keys on pass entries and the registry", () => {
+    const constructorEntry = JSON.parse(
+      '{"providerId":"provider-one","reviewedAtIso":"2026-01-02T03:04:05.000Z","reviewer":"r","constructor":{}}',
+    );
+    expect(createTestProviderTermsRegistry([constructorEntry], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-pass-entry",
+    });
+    const prototypeEntry = JSON.parse(
+      '{"providerId":"provider-one","reviewedAtIso":"2026-01-02T03:04:05.000Z","reviewer":"r","prototype":{}}',
+    );
+    expect(createTestProviderTermsRegistry([prototypeEntry], isProxy)).toEqual({
+      ok: false,
+      reason: "invalid-pass-entry",
+    });
+    const pollutedRegistry = JSON.parse(
+      '{"passes":[],"constructor":{}}',
+    );
+    expect(decideTestProviderSelectability(pollutedRegistry, VALID_PROVIDER_ID, isProxy)).toEqual({
+      selectable: false,
+      reason: "invalid-registry",
+    });
   });
 });
 

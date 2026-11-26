@@ -46,10 +46,23 @@ const GATE_KEYS: readonly string[] = ["state", "recordedBy", "recordedAtIso"];
 const MAX_RECORDED_BY_LENGTH = 256;
 
 /**
- * Decide outside-organisation admission. Pure and constant-time: O(1) —
- * an immediate `Reflect.ownKeys` length check, then a fixed 3-key
- * descriptor pass over exactly the canonical keys, three bounded field
- * checks and one id-pattern test.
+ * Decide outside-organisation admission. Pure.
+ *
+ * Cost bound: O(N) in the number of the gate's own keys, for exactly one
+ * super-constant step — the `Reflect.ownKeys` enumeration, which must walk
+ * every own key and allocate one array of length N before an oversized key
+ * set can be refused. That enumeration is irreducible: extra, symbol,
+ * non-enumerable and prototype-polluting own keys are visible only through
+ * it, and no fixed set of descriptor probes can detect them, so the exact
+ * key-set check cannot be made O(1) on an arbitrary object. The function
+ * performs no allocation of its own beyond that one intrinsic array:
+ * duplicate keys are caught without a set (with `length === 3` and every
+ * key a canonical member, a duplicate would leave a canonical key absent,
+ * and that key's descriptor probe refuses), and the three field values are
+ * held in locals, so auxiliary memory is the single intrinsic `ownKeys`
+ * array and nothing else. Everything after the enumeration is O(1): a
+ * fixed 3-key descriptor pass, three bounded field checks and one
+ * id-pattern test.
  *
  * The default organisation is always admitted, even against a closed
  * gate: this decision is about outside tenants, and the retired default
@@ -93,11 +106,13 @@ export function decideOutsideTenantAdmission(
   }
   // The key set must be exactly the three canonical keys: length, string
   // type, pollution and membership are all checked, so a Proxy reporting
-  // three unrelated keys while fabricating descriptors is refused.
+  // three unrelated keys while fabricating descriptors is refused. With
+  // `length === 3` and every key a canonical member, a duplicated key would
+  // leave a canonical key absent and that key's descriptor probe below
+  // refuses, so no set is needed to catch duplicates.
   if (ownKeys.length !== GATE_KEYS.length) {
     return { admitted: false, reason: "invalid-gate" };
   }
-  const seen: ReadonlySet<PropertyKey> = new Set(ownKeys);
   for (const key of ownKeys) {
     if (typeof key !== "string") {
       return { admitted: false, reason: "invalid-gate" };
@@ -109,10 +124,9 @@ export function decideOutsideTenantAdmission(
       return { admitted: false, reason: "invalid-gate" };
     }
   }
-  if (seen.size !== GATE_KEYS.length) {
-    return { admitted: false, reason: "invalid-gate" };
-  }
-  const fields: Record<string, unknown> = {};
+  let state: unknown;
+  let recordedBy: unknown;
+  let recordedAtIso: unknown;
   for (const key of GATE_KEYS) {
     let descriptor: PropertyDescriptor | undefined;
     try {
@@ -128,22 +142,27 @@ export function decideOutsideTenantAdmission(
     ) {
       return { admitted: false, reason: "invalid-gate" };
     }
-    fields[key] = descriptor.value;
+    if (key === "state") {
+      state = descriptor.value;
+    } else if (key === "recordedBy") {
+      recordedBy = descriptor.value;
+    } else {
+      recordedAtIso = descriptor.value;
+    }
   }
-  if (fields.state === "closed") {
+  if (state === "closed") {
     return { admitted: false, reason: "gate-closed" };
   }
-  if (fields.state !== "open") {
+  if (state !== "open") {
     return { admitted: false, reason: "invalid-gate-state" };
   }
-  const recordedBy = fields.recordedBy;
   if (typeof recordedBy !== "string" || recordedBy.length > MAX_RECORDED_BY_LENGTH) {
     return { admitted: false, reason: "invalid-recorded-by" };
   }
   if (recordedBy.trim().length === 0) {
     return { admitted: false, reason: "invalid-recorded-by" };
   }
-  if (!isZonedIsoDateTime(fields.recordedAtIso)) {
+  if (!isZonedIsoDateTime(recordedAtIso)) {
     return { admitted: false, reason: "invalid-recorded-at" };
   }
   return { admitted: true };

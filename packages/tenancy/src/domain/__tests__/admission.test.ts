@@ -1,9 +1,12 @@
 /**
  * Tests for the pure outside-organisation admission decision (FC3C).
  *
- * Cost bound under test: `decideOutsideTenantAdmission` is O(1) — an
- * immediate `Reflect.ownKeys` length check followed by a fixed 3-key
- * descriptor pass, three bounded field checks and one id-pattern test.
+ * Cost bound under test: `decideOutsideTenantAdmission` performs exactly
+ * one super-constant step — the `Reflect.ownKeys` enumeration that makes
+ * the exact key-set check possible — which is O(N) in the gate's own key
+ * count and allocates a single array of length N (the function allocates
+ * nothing else). Every other check is O(1): a fixed 3-key descriptor pass,
+ * three bounded field checks and one id-pattern test.
  *
  * Every test title states what it asserts, and its body proves it. A
  * constant `{ admitted: false }` implementation fails the admit cases;

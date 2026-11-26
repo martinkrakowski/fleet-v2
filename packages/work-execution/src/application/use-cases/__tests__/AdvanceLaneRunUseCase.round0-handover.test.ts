@@ -781,11 +781,15 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     readonly events?: string[];
   }
 
-  /** Whether the real journal already holds the refused edits-outside-owned-paths result. */
+  /** Whether the real journal already holds one of the refused finding/path results (CB8 codes). */
   async function refusedResultJournaled(harness: Harness): Promise<boolean> {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     return entries.some(
-      (entry) => entry.kind === 'result' && entry.reasonCode === 'edits-outside-owned-paths',
+      (entry) =>
+        entry.kind === 'result' &&
+        (entry.reasonCode === 'edits-outside-owned-paths' ||
+          entry.reasonCode === 'edit-only-diff-findings' ||
+          entry.reasonCode === 'staged-content-findings'),
     );
   }
 
@@ -886,7 +890,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
       outcome: 'acted',
       step: 'collect',
       result: 'refused',
-      reasonCode: 'edits-outside-owned-paths',
+      reasonCode: 'edit-only-diff-findings',
     });
     // Ordering: the refused result is journaled before anything is preserved,
     // reset or cleaned, and the preserve comes before the reset and the clean.
@@ -902,7 +906,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     expect(run.collectRequests).toEqual([]);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries).toContainEqual(
-      expect.objectContaining({ kind: 'result', outcome: 'refused', reasonCode: 'edits-outside-owned-paths' }),
+      expect.objectContaining({ kind: 'result', outcome: 'refused', reasonCode: 'edit-only-diff-findings' }),
     );
   });
 
@@ -915,7 +919,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     const run = await collectBodyWith(harness, [
       { outcome: 'refused', reason: 'staged-content-findings', findings: [] },
     ]);
-    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'staged-content-findings' });
     expect(harness.preserveRequests).toHaveLength(1);
     expect(harness.resetRequests).toHaveLength(1);
     expect(run.cleanRequests).toHaveLength(1);
@@ -950,7 +954,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
       undefined,
       { events },
     );
-    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-diff-findings' });
     expect(events).toEqual(['preserve:after-journal']);
     expect(harness.resetRequests).toEqual([]);
     expect(run.cleanRequests).toEqual([]);
@@ -967,7 +971,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     const run = await collectBodyWith(harness, [
       { outcome: 'refused', reason: 'diff-findings', findings: [] },
     ]);
-    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-diff-findings' });
     expect(harness.preserveRequests).toHaveLength(1);
     expect(run.cleanRequests).toEqual([]);
   });
@@ -1008,7 +1012,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
       undefined,
       { skipIntent: true },
     );
-    expect(second.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(second.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-diff-findings' });
     expect(second.collectRequests).toEqual([]);
   });
 
@@ -1057,7 +1061,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     expect(harness.preserveRequests).toEqual([]);
   });
 
-  it('8. a missing worktreeRecovery still journals edits-outside-owned-paths (the park happens)', async () => {
+  it('8. a missing worktreeRecovery still journals edit-only-diff-findings (the park happens)', async () => {
     const harness = await makeHarness(
       runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
       [seat0Cancelled(), endedCollectAttempt()],
@@ -1066,10 +1070,10 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
     const run = await collectBodyWith(harness, [
       { outcome: 'refused', reason: 'diff-findings', findings: [] },
     ]);
-    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-diff-findings' });
   });
 
-  it('9. a missing removeUntrackedFiles still journals edits-outside-owned-paths after preserve and reset, in order', async () => {
+  it('9. a missing removeUntrackedFiles still journals edit-only-diff-findings after preserve and reset, in order', async () => {
     const harness = await makeHarness(
       runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
       [seat0Cancelled(), endedCollectAttempt()],
@@ -1088,7 +1092,7 @@ describe('AdvanceLaneRunUseCase round-0 pivot handover (GB3c)', () => {
         return { outcome: 'reset', headCommit: COMMIT_A };
       },
     });
-    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edits-outside-owned-paths' });
+    expect(run.result).toMatchObject({ result: 'refused', reasonCode: 'edit-only-diff-findings' });
     expect(events).toEqual(['preserve:after-journal', 'reset:after-journal']);
     expect(run.cleanRequests).toEqual([]); // no removeUntrackedFiles was wired
     expect(harness.resetRequests).toEqual([]); // the override recovery ran, not the harness fake

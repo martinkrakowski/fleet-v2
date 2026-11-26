@@ -11,6 +11,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { OwnerQuestionRecord } from '../../../domain/owner-question-records.js';
+import { OWNER_QUESTION_RECORD_VERSION } from '../../../domain/owner-question-records.js';
 import { OwnerQuestion, sameOwnerQuestionAsk } from '../../../domain/entities/OwnerQuestion.js';
 import { OwnerQuestionIdempotencyKeyConflictError } from '../../../application/ports/out/OwnerQuestionRepositoryPort.out-port.js';
 import { OwnerQuestionRepositoryAdapter } from '../OwnerQuestionRepositoryAdapter.adapter.js';
@@ -71,7 +72,13 @@ describe('OwnerQuestion idempotencyKey (domain)', () => {
   it('omits the property entirely when no key was given', () => {
     const record = OwnerQuestion.fromRecord(questionRecord()).toRecord();
     expect('idempotencyKey' in record).toBe(false);
-    expect(JSON.stringify(record)).toBe(JSON.stringify(questionRecord()));
+    expect(JSON.stringify(record)).toBe(
+      JSON.stringify({
+        ...questionRecord(),
+        schemaVersion: OWNER_QUESTION_RECORD_VERSION,
+        audience: 'owner-only',
+      }),
+    );
   });
 
   it('refuses malformed keys without echoing the input', () => {

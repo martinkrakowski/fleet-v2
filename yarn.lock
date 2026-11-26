@@ -461,6 +461,20 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/cloud-runtime@workspace:packages/cloud-runtime":
+  version: 0.0.0-use.local
+  resolution: "@fleet/cloud-runtime@workspace:packages/cloud-runtime"
+  dependencies:
+    "@eslint/js": "npm:^9.0.0"
+    "@fleet/shared": "workspace:*"
+    "@fleet/work-execution": "workspace:*"
+    eslint: "npm:^9.0.0"
+    typescript: "npm:^5.5.4"
+    typescript-eslint: "npm:^8.0.0"
+    vitest: "npm:^4.1.9"
+  languageName: unknown
+  linkType: soft
+
 "@fleet/evidence-and-acceptance@workspace:*, @fleet/evidence-and-acceptance@workspace:packages/evidence-and-acceptance":
   version: 0.0.0-use.local
   resolution: "@fleet/evidence-and-acceptance@workspace:packages/evidence-and-acceptance"
@@ -578,6 +592,7 @@ __metadata:
   dependencies:
     "@eslint/js": "npm:^9.0.0"
     "@fleet/installation": "workspace:*"
+    "@fleet/shared": "workspace:*"
     eslint: "npm:^9.0.0"
     typescript: "npm:^5.5.4"
     typescript-eslint: "npm:^8.0.0"

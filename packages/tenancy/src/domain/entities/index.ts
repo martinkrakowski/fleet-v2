@@ -4,3 +4,4 @@ export * from "./Membership.js";
 export * from "./Organization.js";
 export * from "./Project.js";
 export * from "./record-guards.js";
+export * from "./TenantDataKey.js";

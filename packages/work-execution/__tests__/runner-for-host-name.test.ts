@@ -2,7 +2,7 @@
 // current installation host by name alone, from that host's OWN declared
 // port, auth file and capabilities, with every refusal naming the cause and
 // never falling back to another host, port, auth file or capability profile.
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import type {
   RunnerIsolationCapabilities,
@@ -13,6 +13,7 @@ import type {
   StopRunnerSessionResult,
 } from "../src/application/ports/out/ExecutionRunnerPort.out-port.js";
 import type { SubprocessResult, SubprocessRunner } from "../src/infrastructure/adapters/ExecutionRunnerAdapter.adapter.js";
+import type { RunnerForHostNamePort } from "../src/application/ports/out/RunnerForAttemptPort.out-port.js";
 import { RunnerForAttemptAdapter } from "../src/infrastructure/adapters/RunnerForAttemptAdapter.adapter.js";
 
 /** A runner-b-shaped declared capability profile (distinct from runner-a's). */
@@ -797,6 +798,14 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
       },
     });
     expect(adapter.runnerForHostName("runner-b").ok).toBe(false);
+  });
+});
+
+describe("RunnerForHostNamePort", () => {
+  it("is an application port the adapter satisfies, so callers need not import the adapter", () => {
+    expectTypeOf<RunnerForAttemptAdapter>().toMatchTypeOf<RunnerForHostNamePort>();
+    const port: RunnerForHostNamePort = new RunnerForAttemptAdapter({ hosts: {} });
+    expect(port.runnerForHostName("runner-b").ok).toBe(false);
   });
 });
 

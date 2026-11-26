@@ -29,6 +29,7 @@ import type {
   RunnerForAttemptPort,
   RunnerForAttemptRequest,
   RunnerForAttemptResult,
+  RunnerForHostNamePort,
 } from "../../application/ports/out/RunnerForAttemptPort.out-port.js";
 import type { CommandExecutorPort } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
@@ -119,7 +120,9 @@ export interface RunnerForAttemptAdapterOptions {
 }
 
 /** The confirm-or-unknown refusal, naming the recorded host. */
-export class RunnerForAttemptAdapter implements RunnerForAttemptPort {
+export class RunnerForAttemptAdapter
+  implements RunnerForAttemptPort, RunnerForHostNamePort
+{
   /** One adapter per host name, built once and cached. */
   private readonly adapters = new Map<string, ExecutionRunnerPort>();
 

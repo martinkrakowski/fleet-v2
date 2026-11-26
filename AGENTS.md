@@ -3,7 +3,7 @@
 This project is a generated, CLI-first hexagonal scaffold. Read
 `.architecture/manifest.yaml` and `docs/architecture.md` before changing it.
 
-- Keep the four business contexts and their declared acyclic dependency direction.
+- Keep the business contexts declared in `bounded_contexts` (`.architecture/manifest.yaml`) and their declared acyclic dependency direction.
 - Domain code is pure. Application code depends on ports. Every filesystem,
   subprocess, network, database and vendor dependency belongs in infrastructure.
 - Refine typed contracts before implementing a station. Generated empty ports and

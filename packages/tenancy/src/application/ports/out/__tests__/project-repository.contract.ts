@@ -107,6 +107,22 @@ export function describeProjectRepositoryContract(
       expect(unchanged.revision).toBe(0);
     });
 
+    it('refuses saveProject with invalid-record when expectedRevision is the largest safe integer because revision + 1 would overflow', async () => {
+      const port = createPort();
+      await port.createProject(makeProject());
+      const stored = (await port.findProject('org-a', 'proj-1'))!;
+      // The increment `MAX_SAFE_INTEGER + 1` would leave the safe-integer
+      // range, so the compare-and-swap is refused before any state changes —
+      // regardless of the stored revision (here 0).
+      expect(await port.saveProject(stored.record, Number.MAX_SAFE_INTEGER)).toEqual({
+        status: 'refused',
+        reason: 'invalid-record',
+      });
+      const unchanged = (await port.findProject('org-a', 'proj-1'))!;
+      expect(unchanged.record.displayName).toBe('Project 1');
+      expect(unchanged.revision).toBe(0);
+    });
+
     it('lists only the required organizationId projects in insertion order', async () => {
       const port = createPort();
       await port.createProject(makeProject({ projectId: 'proj-2', displayName: 'Second' }));

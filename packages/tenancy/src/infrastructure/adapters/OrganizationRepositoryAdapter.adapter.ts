@@ -500,6 +500,13 @@ export class OrganizationRepositoryAdapter implements OrganizationRepositoryPort
       // Cost bound: O(1) — fixed numeric checks.
       return { status: 'refused', reason: 'invalid-record' };
     }
+    if (expectedRevision === Number.MAX_SAFE_INTEGER) {
+      // Overflow guard: the compare-and-swap would store `expectedRevision + 1`,
+      // which leaves the safe-integer range — a revision that is persisted but
+      // rejected on read. Refuse before the in-memory map or the store file is
+      // touched. Cost bound: O(1) — one comparison.
+      return { status: 'refused', reason: 'invalid-record' };
+    }
     const snapshot = snapshotProjectInput(record);
     if (!snapshot.ok) {
       return { status: 'refused', reason: 'invalid-record' };

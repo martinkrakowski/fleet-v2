@@ -91,6 +91,26 @@ describe('OrganizationRepositoryAdapter projects (file mode)', () => {
     expect(onDisk[0]).toMatchObject({ revision: 1, schemaVersion: 1, displayName: 'Renamed' });
   });
 
+  it('refuses saveProject with invalid-record when the stored revision is the largest safe integer and leaves the store file byte-identical', async () => {
+    // Seed the store at the overflow boundary: the next increment would leave
+    // the safe-integer range, so the save must be refused before the file is
+    // rewritten (previously it persisted the unsafe revision 2 ** 53).
+    const envelope = { ...project(), schemaVersion: 1, revision: Number.MAX_SAFE_INTEGER };
+    const storePath = path.join(stateDir, 'projects.json');
+    await fs.writeFile(storePath, JSON.stringify([envelope]));
+    const adapter = new OrganizationRepositoryAdapter({ stateDir });
+    expect(
+      await adapter.saveProject(project({ displayName: 'Overflowed' }), Number.MAX_SAFE_INTEGER),
+    ).toEqual({ status: 'refused', reason: 'invalid-record' });
+    // No save happened: bytes on disk are unchanged and the stored record and
+    // revision are untouched.
+    expect(await fs.readFile(storePath, 'utf8')).toBe(JSON.stringify([envelope]));
+    expect(await adapter.findProject('org-a', 'proj-1')).toEqual({
+      record: project(),
+      revision: Number.MAX_SAFE_INTEGER,
+    });
+  });
+
   it('throws StateFileUnknownVersionError on unknown schemaVersion in projects.json without quarantining or echoing stored values', async () => {
     await fs.writeFile(
       path.join(stateDir, 'projects.json'),

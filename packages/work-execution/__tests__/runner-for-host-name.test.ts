@@ -688,6 +688,28 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
       }
     }
     expect(invoked).toBe(false);
+
+    // Positive control: the same host shape with plain data capabilities must
+    // resolve, so a constant refusal cannot pass this test.
+    const validAdapter = new RunnerForAttemptAdapter({
+      hosts: baseHosts() as never,
+      legacyRunner: {
+        describeCapabilities: () => expectedRunnerBOverride,
+        async startSession() {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+        async inspectSession(): Promise<RunnerSessionStatus> {
+          throw new Error("legacy stub");
+        },
+        async stopSession(): Promise<StopRunnerSessionResult> {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+      },
+    });
+    const resolved = validAdapter.runnerForHostName("runner-b");
+    if (!resolved.ok) {
+      throw new Error(`positive control refused: ${resolved.reason}`);
+    }
   });
 
   it("refuses a host without the lane-runner role (including non-array, sparse array, and array-like roles)", () => {
@@ -752,6 +774,28 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
     if (!result.ok) {
       expect(result.reason).toMatch(/lane-runner/);
     }
+
+    // Positive control: the same host with ordinary bounded roles must
+    // resolve, so a constant refusal cannot pass this test.
+    const validAdapter = new RunnerForAttemptAdapter({
+      hosts: { "runner-b": hostSpec() } as never,
+      legacyRunner: {
+        describeCapabilities: () => expectedRunnerBOverride,
+        async startSession() {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+        async inspectSession(): Promise<RunnerSessionStatus> {
+          throw new Error("legacy stub");
+        },
+        async stopSession(): Promise<StopRunnerSessionResult> {
+          return { outcome: "refused", reason: "legacy stub" };
+        },
+      },
+    });
+    const valid = validAdapter.runnerForHostName("runner-b");
+    if (!valid.ok) {
+      throw new Error(`positive control refused: ${valid.reason}`);
+    }
   });
 
   it("refuses roles whose entries are not all strings (wrong-primitive entries are malformed roles)", () => {
@@ -785,6 +829,13 @@ describe("RunnerForAttemptAdapter.runnerForHostName", () => {
       if (!result.ok) {
         expect(result.reason).toMatch(/lane-runner/);
       }
+    }
+
+    // Positive control: the same host with all-string roles must resolve, so
+    // a constant refusal cannot pass this test.
+    const valid = make(["lane-runner"]).runnerForHostName("runner-b");
+    if (!valid.ok) {
+      throw new Error(`positive control refused: ${valid.reason}`);
     }
   });
 

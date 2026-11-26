@@ -34,8 +34,8 @@ describe("@fleet/billing scaffold", () => {
     expect(fleetNames).toEqual(["@fleet/shared"]);
   });
 
-  it("src/index.ts exports nothing at runtime", async () => {
+  it("src/index.ts re-exports the domain SpendCap module at runtime (FC9B)", async () => {
     const mod = await import("../index.js");
-    expect(Object.keys(mod)).toEqual([]);
+    expect(Object.keys(mod).sort()).toEqual(["decideSpend", "parseSpendCap", "periodKeyOf"]);
   });
 });

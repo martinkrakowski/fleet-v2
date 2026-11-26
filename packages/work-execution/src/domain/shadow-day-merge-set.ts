@@ -516,6 +516,41 @@ function judgeComparison(
   return evaluation({ status: 'pass', reason: 'merge-set-equal' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, 0);
 }
 
+/**
+ * Drops a fleet would-merge row for pull request P at head H when the shell
+ * merged P at another head H2 that has its own fleet row, and the old row was
+ * recorded at or before that shell merge: a head moved on and the old row is
+ * superseded, not a missing merge. The row's instant is floored to the whole
+ * second before the bound is applied because the shell stamps whole seconds
+ * while the fleet stamps finer, exactly as the ordering rule in
+ * `judgeComparison` does; a row from the next whole second onwards stays a
+ * divergence. One pull request may carry several rows and several merges, so
+ * the lookup holds a list per pull request.
+ */
+function dropSupersededFleetItems(fleetItems: readonly FleetMergeItem[], shellItems: readonly ShellMergeItem[]): readonly FleetMergeItem[] {
+  const fleetPairs = new Set<string>(fleetItems.map((item) => `${item.pullRequest}@${item.headOid}`));
+  const pairedMerges = new Map<number, { headOid: string; atNanos: bigint }[]>();
+  for (const shellItem of shellItems) {
+    if (!fleetPairs.has(`${shellItem.pullRequest}@${shellItem.headOid}`)) {
+      continue;
+    }
+    const merges = pairedMerges.get(shellItem.pullRequest) ?? [];
+    merges.push({ headOid: shellItem.headOid, atNanos: exactOrMillis(shellItem.atIso) });
+    pairedMerges.set(shellItem.pullRequest, merges);
+  }
+  if (pairedMerges.size === 0) {
+    return fleetItems;
+  }
+  return fleetItems.filter((item) => {
+    const merges = pairedMerges.get(item.pullRequest);
+    if (merges === undefined) {
+      return true;
+    }
+    const recordedAt = floorToSecond(exactOrMillis(item.recordedAtIso));
+    return !merges.some((merge) => merge.headOid !== item.headOid && recordedAt <= merge.atNanos);
+  });
+}
+
 /** The S1 rules, over an already-validated snapshot: the shell/fleet set comparison and its divergence verdict. */
 function evaluateMergeSet(parsed: ParsedMergeSetSnapshot): ShadowDayMergeSetEvaluation {
   const { day, repoDigest, excludeBatchMerges, shellEvents, fleetResults, fleetEntries } = parsed;
@@ -541,7 +576,7 @@ function evaluateMergeSet(parsed: ParsedMergeSetSnapshot): ShadowDayMergeSetEval
     ? fleetItems.items
     : fleetItems.items.filter((item) => !shellItems.excludedPullRequests.has(item.pullRequest));
 
-  return judgeComparison(keptFleetItems, shellItems, day);
+  return judgeComparison(dropSupersededFleetItems(keptFleetItems, shellItems.items), shellItems, day);
 }
 
 function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {

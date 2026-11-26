@@ -7,8 +7,10 @@
  *
  * Hostile-input rule (every public function): null, undefined, non-objects,
  * arrays, sparse arrays, array-likes, getters (never read — the snapshot
- * refuses accessors by descriptor), Proxies (via the injected detector),
- * oversized strings, symbol keys and prototype-polluting own keys are each
+ * refuses accessors by descriptor), Proxies (refused via the injected,
+ * caller-supplied detector — an absent detector fails closed because pure
+ * domain code cannot verify plainness by itself), oversized strings, symbol
+ * keys and prototype-polluting own keys are each
  * refused with a typed result, never a throw and never a pass.
  *
  * Both `parseOAuthPendingState` and `decideOAuthCallback` read the untrusted
@@ -81,9 +83,6 @@ const INPUT_KEYS: ReadonlySet<string> = new Set([
   "nowIso",
 ]);
 
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
-
 /** The exact own keys a pending state record may carry, as an array. */
 const PENDING_KEY_LIST = ["stateDigest", "organizationId", "issuedAtIso", "expiresAtIso", "consumed"] as const;
 
@@ -112,13 +111,14 @@ function isValidIsoTimestamp(value: unknown): value is string {
 }
 
 /**
- * Resolve the optional proxy detector: absent means no detection, a supplied
- * non-function is refused. Cost bound: O(1).
+ * Resolve the proxy detector. Pure domain code cannot distinguish a plain
+ * object from a faithful Proxy without a trusted, injected detector (in
+ * production the `types.isProxy` predicate, adapted by infrastructure), so
+ * there is no safe default: an absent or non-function detector fails closed
+ * and no untrusted object is ever read without one. A detector that throws
+ * is reported by the snapshot as a refusal. Cost bound: O(1).
  */
 function resolveDetector(isProxy: unknown): { ok: true; detector: IsProxy } | { ok: false } {
-  if (isProxy === undefined) {
-    return { ok: true, detector: NO_DETECTOR };
-  }
   if (typeof isProxy !== "function") {
     return { ok: false };
   }
@@ -166,8 +166,10 @@ function validatePendingFields(
  * most 8 nodes, strings capped at `MAX_STRING_LENGTH`), then its own keys
  * are checked against the exact five-key set — missing keys, extra keys,
  * symbol keys and prototype-polluting keys are each refused. Every field is
- * validated afterwards in O(1). A non-function or throwing detector is
- * refused too; a refusal never echoes any input value.
+ * validated afterwards in O(1). An absent, non-function or throwing detector
+ * is refused too (pure domain code has no safe default detector, so callers
+ * must inject one — production passes an adapted `types.isProxy`); a refusal
+ * never echoes any input value.
  */
 export function parseOAuthPendingState(
   raw: unknown,

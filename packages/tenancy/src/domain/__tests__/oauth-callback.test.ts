@@ -93,19 +93,19 @@ describe("oauth-callback module purity", () => {
 
 describe("parseOAuthPendingState", () => {
   it("parses a valid unconsumed record with all five fields preserved", () => {
-    const result = parseOAuthPendingState(pendingRecord({ consumed: true }));
+    const result = parseOAuthPendingState(pendingRecord({ consumed: true }), types.isProxy);
     expect(result).toEqual({ ok: true, value: pendingRecord({ consumed: true }) });
   });
 
   it("refuses missing and extra keys as invalid-pending", () => {
     const missing = { ...pendingRecord() } as Record<string, unknown>;
     delete missing.consumed;
-    expect(parseOAuthPendingState(missing)).toEqual({ ok: false, reason: "invalid-pending" });
-    expect(parseOAuthPendingState({ ...pendingRecord(), extra: 1 })).toEqual({
+    expect(parseOAuthPendingState(missing, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState({ ...pendingRecord(), extra: 1 }, types.isProxy)).toEqual({
       ok: false,
       reason: "invalid-pending",
     });
-    expect(parseOAuthPendingState({})).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState({}, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
   });
 
   it("refuses prototype-polluting own keys (__proto__, constructor, prototype)", () => {
@@ -114,33 +114,33 @@ describe("parseOAuthPendingState", () => {
       if (key === "__proto__") {
         Object.defineProperty(hostile, key, { value: null, enumerable: true, configurable: true, writable: true });
       }
-      expect(parseOAuthPendingState(hostile)).toEqual({ ok: false, reason: "invalid-pending" });
+      expect(parseOAuthPendingState(hostile, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
     }
   });
 
   it("refuses arrays, array holes and array-likes as invalid-pending", () => {
     const asArray = [...Object.values(pendingRecord())] as unknown;
     (asArray as unknown[]).length = 6; // sparse
-    expect(parseOAuthPendingState([pendingRecord()])).toEqual({ ok: false, reason: "invalid-pending" });
-    expect(parseOAuthPendingState(asArray)).toEqual({ ok: false, reason: "invalid-pending" });
-    expect(parseOAuthPendingState({ length: 5 })).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState([pendingRecord()], types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState(asArray, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState({ length: 5 }, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
   });
 
   it("refuses enormous strings and an oversized record without echoing them", () => {
-    const result = parseOAuthPendingState(pendingRecord({ stateDigest: "a".repeat(10_000) }));
+    const result = parseOAuthPendingState(pendingRecord({ stateDigest: "a".repeat(10_000) }), types.isProxy);
     expect(result).toEqual({ ok: false, reason: "invalid-pending" });
     const noisy: Record<string, unknown> = { ...pendingRecord() };
     for (let i = 0; i < 100; i += 1) {
       noisy[`extra-${i}`] = "x".repeat(100);
     }
-    expect(parseOAuthPendingState(noisy)).toEqual({ ok: false, reason: "invalid-pending" });
-    expect(JSON.stringify(parseOAuthPendingState(noisy))).not.toContain("x".repeat(100));
+    expect(parseOAuthPendingState(noisy, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(JSON.stringify(parseOAuthPendingState(noisy, types.isProxy))).not.toContain("x".repeat(100));
   });
 
   it("refuses getters without ever running them", () => {
     const hostile = getterObject(pendingRecord(), "organizationId");
-    expect(parseOAuthPendingState(hostile)).toEqual({ ok: false, reason: "invalid-pending" });
-    expect(parseOAuthPendingState(getterObject(pendingRecord(), "stateDigest"))).toEqual({
+    expect(parseOAuthPendingState(hostile, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState(getterObject(pendingRecord(), "stateDigest"), types.isProxy)).toEqual({
       ok: false,
       reason: "invalid-pending",
     });
@@ -160,16 +160,16 @@ describe("parseOAuthPendingState", () => {
 
   it("refuses null, undefined, primitives and symbol-keyed records", () => {
     for (const raw of [null, undefined, 42, "record", true, Symbol("s")]) {
-      expect(parseOAuthPendingState(raw)).toEqual({ ok: false, reason: "invalid-pending" });
+      expect(parseOAuthPendingState(raw, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
     }
     const symbolKey: Record<string | symbol, unknown> = { ...pendingRecord() };
     symbolKey[Symbol("extra")] = 1;
-    expect(parseOAuthPendingState(symbolKey)).toEqual({ ok: false, reason: "invalid-pending" });
+    expect(parseOAuthPendingState(symbolKey, types.isProxy)).toEqual({ ok: false, reason: "invalid-pending" });
   });
 
   it("refuses invalid stateDigest (wrong length, non-hex, non-string)", () => {
     for (const stateDigest of ["a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), "", 42, null]) {
-      expect(parseOAuthPendingState(pendingRecord({ stateDigest: stateDigest as string }))).toEqual({
+      expect(parseOAuthPendingState(pendingRecord({ stateDigest: stateDigest as string }), types.isProxy)).toEqual({
         ok: false,
         reason: "invalid-pending",
       });
@@ -178,7 +178,7 @@ describe("parseOAuthPendingState", () => {
 
   it("refuses invalid organizationId (bad shape, too long, non-string)", () => {
     for (const organizationId of ["", "a".repeat(64), "Org_1", "org/1", "-org", 42, null]) {
-      expect(parseOAuthPendingState(pendingRecord({ organizationId: organizationId as string }))).toEqual({
+      expect(parseOAuthPendingState(pendingRecord({ organizationId: organizationId as string }), types.isProxy)).toEqual({
         ok: false,
         reason: "invalid-pending",
       });
@@ -194,7 +194,7 @@ describe("parseOAuthPendingState", () => {
       { expiresAtIso: 42 },
       { issuedAtIso: null },
     ]) {
-      expect(parseOAuthPendingState(pendingRecord(pair as Partial<OAuthPendingStateRecord>))).toEqual({
+      expect(parseOAuthPendingState(pendingRecord(pair as Partial<OAuthPendingStateRecord>), types.isProxy)).toEqual({
         ok: false,
         reason: "invalid-pending",
       });
@@ -203,24 +203,23 @@ describe("parseOAuthPendingState", () => {
 
   it("refuses lifetimes <= 0 or over 10 minutes", () => {
     expect(
-      parseOAuthPendingState(pendingRecord({ expiresAtIso: ISSUED })),
+      parseOAuthPendingState(pendingRecord({ expiresAtIso: ISSUED }), types.isProxy),
     ).toEqual({ ok: false, reason: "invalid-pending" });
     expect(
       parseOAuthPendingState(
         pendingRecord({
           expiresAtIso: new Date(Date.parse(ISSUED) + OAUTH_PENDING_STATE_MAX_TTL_MS + 1).toISOString(),
-        }),
-      ),
+        }), types.isProxy),
     ).toEqual({ ok: false, reason: "invalid-pending" });
     // Exactly 10 minutes is still accepted.
     expect(
-      parseOAuthPendingState(pendingRecord({ expiresAtIso: EXPIRES })).ok,
+      parseOAuthPendingState(pendingRecord({ expiresAtIso: EXPIRES }), types.isProxy).ok,
     ).toBe(true);
   });
 
   it("refuses non-boolean consumed values", () => {
     for (const consumed of [0, 1, "true", null, undefined]) {
-      expect(parseOAuthPendingState(pendingRecord({ consumed: consumed as unknown as boolean }))).toEqual({
+      expect(parseOAuthPendingState(pendingRecord({ consumed: consumed as unknown as boolean }), types.isProxy)).toEqual({
         ok: false,
         reason: "invalid-pending",
       });
@@ -235,19 +234,39 @@ describe("parseOAuthPendingState", () => {
       });
     }
   });
+
+  it("refuses a record when no isProxy detector is supplied (fail closed: a Proxy would otherwise be accepted while its traps run)", () => {
+    // Pure domain code cannot distinguish a plain object from a faithful
+    // Proxy, so an absent detector must refuse rather than default to one
+    // that detects nothing.
+    expect(parseOAuthPendingState(pendingRecord())).toEqual({
+      ok: false,
+      reason: "invalid-pending",
+    });
+    expect(parseOAuthPendingState(undefined)).toEqual({
+      ok: false,
+      reason: "invalid-pending",
+    });
+    // The same applies to a silent Proxy standing in for a valid record.
+    const silentProxy = new Proxy(pendingRecord(), {});
+    expect(parseOAuthPendingState(silentProxy)).toEqual({
+      ok: false,
+      reason: "invalid-pending",
+    });
+  });
 });
 
 describe("decideOAuthCallback", () => {
   it("accepts at issuedAtIso and inside the window, returning the organizationId", () => {
     for (const nowIso of [ISSUED, "2026-11-26T12:05:00.000Z"]) {
-      const organizationId = expectAccepted(decideOAuthCallback(callbackInput({ nowIso })));
+      const organizationId = expectAccepted(decideOAuthCallback(callbackInput({ nowIso }), types.isProxy));
       expect(organizationId).toBe(ORG);
     }
   });
 
   it("refuses the boundary instant expiresAtIso and any instant before issuedAtIso as expired", () => {
     for (const nowIso of ["2026-11-26T11:59:59.999Z", EXPIRES, "2026-11-26T13:00:00.000Z"]) {
-      expect(decideOAuthCallback(callbackInput({ nowIso }))).toEqual({
+      expect(decideOAuthCallback(callbackInput({ nowIso }), types.isProxy)).toEqual({
         outcome: "refused",
         reason: "expired",
       });
@@ -255,27 +274,27 @@ describe("decideOAuthCallback", () => {
   });
 
   it("refuses each documented field fault with the right reason", () => {
-    expect(decideOAuthCallback(callbackInput({ callbackStateDigest: "b".repeat(64) }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ callbackStateDigest: "b".repeat(64) }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "state-mismatch",
     });
-    expect(decideOAuthCallback(callbackInput({ pending: pendingRecord({ consumed: true }) }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ pending: pendingRecord({ consumed: true }) }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "already-consumed",
     });
-    expect(decideOAuthCallback(callbackInput({ providerError: "provider down" }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: "provider down" }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "provider-denied",
     });
-    expect(decideOAuthCallback(callbackInput({ providerError: true }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: true }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "provider-denied",
     });
-    expect(decideOAuthCallback(callbackInput({ hasCode: false }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ hasCode: false }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "missing-code",
     });
-    expect(decideOAuthCallback(callbackInput({ hasCode: "yes" }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ hasCode: "yes" }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-input",
     });
@@ -283,25 +302,25 @@ describe("decideOAuthCallback", () => {
 
   it("accepts null, false and empty-string providerError with hasCode true, and refuses undefined as invalid-input", () => {
     for (const providerError of [null, false, ""]) {
-      expect(decideOAuthCallback(callbackInput({ providerError }))).toEqual({
+      expect(decideOAuthCallback(callbackInput({ providerError }), types.isProxy)).toEqual({
         outcome: "accepted",
         organizationId: ORG,
       });
     }
-    expect(decideOAuthCallback(callbackInput({ providerError: undefined }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: undefined }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-input",
     });
-    expect(decideOAuthCallback(callbackInput({ providerError: 42 }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: 42 }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-input",
     });
-    expect(decideOAuthCallback(callbackInput({ providerError: "e".repeat(5000) }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: "e".repeat(5000) }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-input",
     });
     // A provider error at the snapshot string cap is still a provider denial.
-    expect(decideOAuthCallback(callbackInput({ providerError: "e".repeat(4096) }))).toEqual({
+    expect(decideOAuthCallback(callbackInput({ providerError: "e".repeat(4096) }), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "provider-denied",
     });
@@ -309,13 +328,13 @@ describe("decideOAuthCallback", () => {
 
   it("refuses an invalid nowIso or callbackStateDigest as invalid-input", () => {
     for (const nowIso of ["garbage", "2026-02-31T12:00:00.000Z", 42, null, "a".repeat(10_000)]) {
-      expect(decideOAuthCallback(callbackInput({ nowIso }))).toEqual({
+      expect(decideOAuthCallback(callbackInput({ nowIso }), types.isProxy)).toEqual({
         outcome: "refused",
         reason: "invalid-input",
       });
     }
     for (const callbackStateDigest of ["a".repeat(63), "a".repeat(65), "A".repeat(64), "", 42, null]) {
-      expect(decideOAuthCallback(callbackInput({ callbackStateDigest }))).toEqual({
+      expect(decideOAuthCallback(callbackInput({ callbackStateDigest }), types.isProxy)).toEqual({
         outcome: "refused",
         reason: "invalid-input",
       });
@@ -323,11 +342,10 @@ describe("decideOAuthCallback", () => {
   });
 
   it("refuses a replay of an accepted callback (consumed: true) as already-consumed", () => {
-    const first = decideOAuthCallback(callbackInput());
+    const first = decideOAuthCallback(callbackInput(), types.isProxy);
     expect(first.outcome).toBe("accepted");
     const replay = decideOAuthCallback(
-      callbackInput({ pending: pendingRecord({ consumed: true }) }),
-    );
+      callbackInput({ pending: pendingRecord({ consumed: true }) }), types.isProxy);
     expect(replay).toEqual({ outcome: "refused", reason: "already-consumed" });
   });
 
@@ -344,7 +362,7 @@ describe("decideOAuthCallback", () => {
       pendingRecord({ stateDigest: "short" }),
       pendingRecord({ issuedAtIso: "garbage" }),
     ]) {
-      expect(decideOAuthCallback(callbackInput({ pending }))).toEqual({
+      expect(decideOAuthCallback(callbackInput({ pending }), types.isProxy)).toEqual({
         outcome: "refused",
         reason: "invalid-pending",
       });
@@ -378,18 +396,18 @@ describe("decideOAuthCallback", () => {
       delete input[key];
       return input;
     };
-    expect(decideOAuthCallback(without("pending"))).toEqual({
+    expect(decideOAuthCallback(without("pending"), types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-pending",
     });
     for (const key of ["callbackStateDigest", "providerError", "hasCode", "nowIso"]) {
-      expect(decideOAuthCallback(without(key))).toEqual({
+      expect(decideOAuthCallback(without(key), types.isProxy)).toEqual({
         outcome: "refused",
         reason: "invalid-input",
       });
     }
     // An entirely empty object misses `pending`, so it is invalid-pending.
-    expect(decideOAuthCallback({})).toEqual({
+    expect(decideOAuthCallback({}, types.isProxy)).toEqual({
       outcome: "refused",
       reason: "invalid-pending",
     });
@@ -404,42 +422,55 @@ describe("decideOAuthCallback", () => {
     }
   });
 
+  it("refuses an input when no isProxy detector is supplied (fail closed: a Proxy would otherwise be accepted while its traps run)", () => {
+    expect(decideOAuthCallback(callbackInput())).toEqual({
+      outcome: "refused",
+      reason: "invalid-input",
+    });
+    expect(decideOAuthCallback(undefined)).toEqual({
+      outcome: "refused",
+      reason: "invalid-input",
+    });
+    // A silent Proxy standing in for a valid input is refused too.
+    expect(decideOAuthCallback(new Proxy(callbackInput(), {}))).toEqual({
+      outcome: "refused",
+      reason: "invalid-input",
+    });
+  });
+
   it("keeps the fixed refusal ordering when two faults are present simultaneously", () => {
     const consumed = callbackInput({ pending: pendingRecord({ consumed: true }) });
     // invalid-pending beats already-consumed.
     expect(
-      decideOAuthCallback(callbackInput({ pending: pendingRecord({ consumed: true, stateDigest: "bad" }) })),
+      decideOAuthCallback(callbackInput({ pending: pendingRecord({ consumed: true, stateDigest: "bad" }) }), types.isProxy),
     ).toEqual({ outcome: "refused", reason: "invalid-pending" });
     // invalid-pending beats expired.
     expect(
       decideOAuthCallback(
-        callbackInput({ pending: pendingRecord({ issuedAtIso: "garbage" }), nowIso: EXPIRES }),
-      ),
+        callbackInput({ pending: pendingRecord({ issuedAtIso: "garbage" }), nowIso: EXPIRES }), types.isProxy),
     ).toEqual({ outcome: "refused", reason: "invalid-pending" });
     // already-consumed beats expired and state-mismatch.
-    expect(decideOAuthCallback({ ...consumed, nowIso: EXPIRES })).toEqual({
+    expect(decideOAuthCallback({ ...consumed, nowIso: EXPIRES }, types.isProxy)).toEqual({
       outcome: "refused",
       reason: "already-consumed",
     });
-    expect(decideOAuthCallback({ ...consumed, callbackStateDigest: "c".repeat(64) })).toEqual({
+    expect(decideOAuthCallback({ ...consumed, callbackStateDigest: "c".repeat(64) }, types.isProxy)).toEqual({
       outcome: "refused",
       reason: "already-consumed",
     });
     // expired beats state-mismatch.
     expect(
       decideOAuthCallback(
-        callbackInput({ nowIso: EXPIRES, callbackStateDigest: "c".repeat(64) }),
-      ),
+        callbackInput({ nowIso: EXPIRES, callbackStateDigest: "c".repeat(64) }), types.isProxy),
     ).toEqual({ outcome: "refused", reason: "expired" });
     // state-mismatch beats provider-denied.
     expect(
       decideOAuthCallback(
-        callbackInput({ callbackStateDigest: "c".repeat(64), providerError: "boom" }),
-      ),
+        callbackInput({ callbackStateDigest: "c".repeat(64), providerError: "boom" }), types.isProxy),
     ).toEqual({ outcome: "refused", reason: "state-mismatch" });
     // provider-denied beats missing-code.
     expect(
-      decideOAuthCallback(callbackInput({ providerError: "boom", hasCode: false })),
+      decideOAuthCallback(callbackInput({ providerError: "boom", hasCode: false }), types.isProxy),
     ).toEqual({ outcome: "refused", reason: "provider-denied" });
   });
 
@@ -447,10 +478,10 @@ describe("decideOAuthCallback", () => {
     const wrong = "f".repeat(63) + "0";
     const providerText = "totally-secret-provider-error";
     const results = [
-      decideOAuthCallback(callbackInput({ callbackStateDigest: wrong })),
-      decideOAuthCallback(callbackInput({ providerError: providerText })),
-      decideOAuthCallback(callbackInput({ pending: pendingRecord({ stateDigest: "short" }) })),
-      decideOAuthCallback(null),
+      decideOAuthCallback(callbackInput({ callbackStateDigest: wrong }), types.isProxy),
+      decideOAuthCallback(callbackInput({ providerError: providerText }), types.isProxy),
+      decideOAuthCallback(callbackInput({ pending: pendingRecord({ stateDigest: "short" }) }), types.isProxy),
+      decideOAuthCallback(null, types.isProxy),
       decideOAuthCallback(throwingProxy(), types.isProxy),
     ];
     for (const result of results) {

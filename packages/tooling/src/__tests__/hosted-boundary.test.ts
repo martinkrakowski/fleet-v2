@@ -201,7 +201,13 @@ describe("scanHostedBoundary on the real repository", () => {
     const expected = readdirSync(join(REPO_ROOT, "packages"), {
       withFileTypes: true,
     })
-      .filter((entry) => entry.isDirectory())
+      .filter(
+        (entry) =>
+          entry.isDirectory() &&
+          // Hosted package directories (tenancy, billing, cloud-*) are not
+          // scanned targets; collectScannedTargets skips them by name.
+          hostedPackageName(`@fleet/${entry.name}`) === null,
+      )
       .map((entry) => `packages/${entry.name}`);
     expected.push("apps/cli", "apps/mcp", "apps/web");
     expect([...listScannedTargets(REPO_ROOT)].sort()).toEqual(expected.sort());

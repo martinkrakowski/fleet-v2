@@ -546,6 +546,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/tenancy@workspace:packages/tenancy":
+  version: 0.0.0-use.local
+  resolution: "@fleet/tenancy@workspace:packages/tenancy"
+  dependencies:
+    "@eslint/js": "npm:^9.0.0"
+    "@fleet/shared": "workspace:*"
+    eslint: "npm:^9.0.0"
+    typescript: "npm:^5.5.4"
+    typescript-eslint: "npm:^8.0.0"
+    vitest: "npm:^4.1.9"
+  languageName: unknown
+  linkType: soft
+
 "@fleet/tooling@workspace:*, @fleet/tooling@workspace:packages/tooling":
   version: 0.0.0-use.local
   resolution: "@fleet/tooling@workspace:packages/tooling"

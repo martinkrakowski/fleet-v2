@@ -17,7 +17,13 @@
  * unlinked, then the new event appends to a fresh live file. Rotation
  * never rewrites prior lines and never uses `fs.rename` (a rename could
  * clobber an archive created concurrently); it retries `EEXIST` within a
- * bounded `MAX_ROTATION_ATTEMPTS` budget. An `eventId` that has rotated
+ * bounded `MAX_ROTATION_ATTEMPTS` budget, driven by an attempt counter
+ * so even an archive number at the top of the safe-integer range (where
+ * `n += 1` loses precision) cannot make the retry loop spin forever. If
+ * the post-rotation append fails, the live file — already unlinked by
+ * the rotation — is restored from the archive it was just linked to, so
+ * a refusal never leaves the required live journal missing or partial.
+ * An `eventId` that has rotated
  * into an archive is **not** re-read from archives for idempotency, so a
  * same-key retry after rotation may append once more to the fresh live
  * file; the `eventId` is identical, so downstream consumers de-duplicate.
@@ -246,8 +252,13 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
    * between the scan and the link. `EEXIST` from `fs.link` increments the
    * candidate number and retries within `MAX_ROTATION_ATTEMPTS`; any other
    * failure leaves the live file intact and refuses as `unavailable`.
+   * On success it answers the archive path it created, so a failed
+   * post-rotation append can restore the live file from that archive
+   * (a hard link to the identical prior bytes).
    */
-  private async rotate(): Promise<'ok' | 'refused'> {
+  private async rotate(): Promise<
+    { outcome: 'ok'; archivePath: string } | { outcome: 'refused' }
+  > {
     // `this.filePath` is non-null whenever rotation is reachable; the cast
     // is local and only avoids re-narrowing across closures.
     const filePath = this.filePath as string;
@@ -269,7 +280,19 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
       }
       maxExisting = Math.max(maxExisting, n);
     }
-    for (let n = maxExisting + 1; n <= maxExisting + MAX_ROTATION_ATTEMPTS; n += 1) {
+    // The loop is driven by an explicit attempt counter, not by the
+    // candidate number itself: at the top of the safe-integer range
+    // (e.g. an archive named `<stem>.9007199254740991.jsonl` makes
+    // `maxExisting` equal `Number.MAX_SAFE_INTEGER`) `n += 1` no longer
+    // changes `n`, so incrementing `n` in the loop header could spin
+    // forever. Any candidate at or past `Number.MAX_SAFE_INTEGER` is
+    // refused instead of retried.
+    let n = maxExisting;
+    for (let attempt = 0; attempt < MAX_ROTATION_ATTEMPTS; attempt += 1) {
+      if (n >= Number.MAX_SAFE_INTEGER) {
+        return { outcome: 'refused' as const };
+      }
+      n += 1;
       const archivePath = path.join(directory, `${stem}.${n}.jsonl`);
       try {
         await fs.link(filePath, archivePath);
@@ -277,16 +300,16 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
         if ((error as { code?: unknown } | null)?.code === 'EEXIST') {
           continue;
         }
-        return 'refused';
+        return { outcome: 'refused' as const };
       }
       try {
         await fs.unlink(filePath);
       } catch {
-        return 'refused';
+        return { outcome: 'refused' as const };
       }
-      return 'ok';
+      return { outcome: 'ok' as const, archivePath };
     }
-    return 'refused';
+    return { outcome: 'refused' as const };
   }
 
   async record(event: StopAuthorityEvent): Promise<AuthorityEventSinkResult> {
@@ -332,10 +355,33 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
           return { outcome: 'recorded' as const };
         }
         if (lines.length >= this.maxEvents) {
-          const rotated = await this.rotate();
-          if (rotated !== 'ok') {
+          const rotation = await this.rotate();
+          if (rotation.outcome !== 'ok') {
             return { outcome: 'refused' as const, reason: 'unavailable' as const };
           }
+          try {
+            await fs.appendFile(this.filePath as string, `${serializeEvent(event)}\n`, 'utf8');
+          } catch {
+            // The rotation already unlinked the live path, so a failed
+            // append must not leave it missing or partial: restore the
+            // live file from the archive (a hard link to the identical
+            // pre-rotation bytes), removing any partial append first.
+            // Best effort — if even the restore fails, the refusal is
+            // still returned and nothing is dropped silently beyond
+            // what the rotation itself already preserved in the archive.
+            try {
+              await fs.unlink(this.filePath as string);
+            } catch {
+              /* nothing partial to remove */
+            }
+            try {
+              await fs.link(rotation.archivePath, this.filePath as string);
+            } catch {
+              /* restore failed; refusal below still reports unavailable */
+            }
+            return { outcome: 'refused' as const, reason: 'unavailable' as const };
+          }
+          return { outcome: 'recorded' as const };
         }
         await fs.appendFile(this.filePath as string, `${serializeEvent(event)}\n`, 'utf8');
         return { outcome: 'recorded' as const };

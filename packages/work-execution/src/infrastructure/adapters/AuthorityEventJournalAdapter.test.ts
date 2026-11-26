@@ -315,4 +315,47 @@ describe('AuthorityEventJournalAdapter', () => {
     );
     expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(rotated)}\n`);
   });
+
+  it('stays bounded and refuses when an archive name is Number.MAX_SAFE_INTEGER, instead of spinning on n += 1', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const live = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, live, 'utf8');
+    // An archive at the top of the safe-integer range makes maxExisting
+    // equal Number.MAX_SAFE_INTEGER; incrementing past it loses precision.
+    const topArchive = 'authority-events.9007199254740991.jsonl';
+    await fs.writeFile(path.join(stateDir, topArchive), 'prior\n', 'utf8');
+    const link = vi.spyOn(fs, 'link');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(stopEvent('fresh'))).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    // Bounded: no attempt is made to link a non-safe-integer archive name.
+    expect(link).not.toHaveBeenCalled();
+    expect(await fs.readFile(filePath, 'utf8')).toBe(live);
+    expect(await fs.readFile(path.join(stateDir, topArchive), 'utf8')).toBe('prior\n');
+  });
+
+  it('restores the live file from the archive when the post-rotation append fails', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const archivePath = path.join(stateDir, 'authority-events.1.jsonl');
+    const prior = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    const append = vi.spyOn(fs, 'appendFile').mockRejectedValue(new Error('append denied'));
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(stopEvent('fresh'))).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    expect(append).toHaveBeenCalled();
+    // The rotation still archived the prior lines, byte-identical...
+    expect(await fs.readFile(archivePath, 'utf8')).toBe(prior);
+    // ...and the failed append did not leave the live file missing or partial.
+    expect(await fs.readFile(filePath, 'utf8')).toBe(prior);
+    expect(await fs.readdir(stateDir).then((names) => names.sort())).toEqual(
+      ['authority-events.1.jsonl', 'authority-events.jsonl'],
+    );
+  });
 });

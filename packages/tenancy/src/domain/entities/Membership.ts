@@ -13,6 +13,14 @@
  * are each refused with a typed `{ ok: false, reason }` result, never a
  * throw and never a pass.
  *
+ * The proxy detector is a REQUIRED argument on every exported validator.
+ * Reflection operations such as `Object.getPrototypeOf` and
+ * `Reflect.ownKeys` can run hostile Proxy traps or throw, so no validator
+ * ever runs without one: an absent or non-function detector is itself a
+ * typed refusal (`proxy-detector-required`), and a detector that throws is
+ * refused as `detector-threw`. With the detector in place, a detectable
+ * Proxy is refused before any reflection operation runs.
+ *
  * Cost bound: `decideMembershipChange` is O(n) over `members` (one
  * validation pass plus one indexing pass), bounded by
  * `MAX_MEMBERS = 10_000`; `canActAs` (Role.vo) is O(1).
@@ -99,12 +107,36 @@ export type MembershipDecision =
   | { readonly ok: true; readonly members: readonly MembershipRecord[] }
   | { readonly ok: false; readonly reason: string };
 
-/** True when the value is a plain, non-array, non-Proxy object. */
-function isPlainObject(value: unknown, isProxy: IsProxy | undefined): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
+/**
+ * Screen the caller-supplied proxy detector and the value through it. The
+ * detector is the FIRST operation on every untrusted value: an absent or
+ * non-function detector is `proxy-detector-required`, a throwing detector
+ * is `detector-threw`, and a positive detection is `proxy-detected`.
+ * Nothing else (no `Object.getPrototypeOf`, no `Reflect.ownKeys`, no
+ * descriptor read) touches the value until it has been screened here, so
+ * no hostile trap can run through the reflection operations below.
+ *
+ * Cost bound: O(1) — one type check and one detector call.
+ */
+function screenProxy(
+  isProxy: unknown,
+  value: unknown,
+): { ok: true; isProxy: boolean } | { ok: false; reason: string } {
+  if (typeof isProxy !== "function") {
+    return { ok: false, reason: "proxy-detector-required" };
   }
-  if (isProxy !== undefined && isProxy(value)) {
+  let is: boolean;
+  try {
+    is = (isProxy as IsProxy)(value) === true;
+  } catch {
+    return { ok: false, reason: "detector-threw" };
+  }
+  return { ok: true, isProxy: is };
+}
+
+/** True when the value is a plain, non-array object (already screened). */
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
   }
   const proto = Object.getPrototypeOf(value);
@@ -186,9 +218,13 @@ function checkRecordFields(record: Record<string, unknown>): string | null {
  */
 export function validateMembershipRecord(
   value: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): { ok: true; record: MembershipRecord } | { ok: false; reason: string } {
-  if (!isPlainObject(value, isProxy)) {
+  const screened = screenProxy(isProxy, value);
+  if (!screened.ok) {
+    return { ok: false, reason: screened.reason };
+  }
+  if (screened.isProxy || !isPlainObject(value)) {
     return { ok: false, reason: "invalid-input" };
   }
   const keyReason = inspectOwnKeys(value as object, RECORD_ALLOWED_KEYS);
@@ -230,12 +266,16 @@ export function validateMembershipRecord(
  */
 export function validateMembersList(
   members: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): { ok: true; members: readonly MembershipRecord[] } | { ok: false; reason: string } {
+  const listScreen = screenProxy(isProxy, members);
+  if (!listScreen.ok) {
+    return { ok: false, reason: listScreen.reason };
+  }
   if (typeof members !== "object" || members === null || !Array.isArray(members)) {
     return { ok: false, reason: "invalid-members-list" };
   }
-  if (isProxy !== undefined && isProxy(members)) {
+  if (listScreen.isProxy) {
     return { ok: false, reason: "invalid-members-list" };
   }
   const array = members as unknown[];
@@ -291,9 +331,13 @@ export function validateMembersList(
  */
 export function validateMembershipChange(
   change: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): { ok: true; change: MembershipChange } | { ok: false; reason: string } {
-  if (!isPlainObject(change, isProxy)) {
+  const screened = screenProxy(isProxy, change);
+  if (!screened.ok) {
+    return { ok: false, reason: screened.reason };
+  }
+  if (screened.isProxy || !isPlainObject(change)) {
     return { ok: false, reason: "invalid-input" };
   }
   const keyReason = inspectOwnKeys(change as object, CHANGE_ALLOWED_KEYS);
@@ -353,7 +397,8 @@ export function validateMembershipChange(
  *   (`add` with `role: 'owner'`).
  * - Every record must name `change.organizationId`.
  * - Only a member with `manage-members` permission may act.
- * - An actor appears at most once per organization.
+ * - An actor appears at most once per organization; an existing list that
+ *   already carries two records for one actor is refused.
  * - The last owner can neither be removed nor demoted.
  *
  * Cost bound: O(n) over `members` (bounded by `MAX_MEMBERS = 10_000`): one
@@ -364,8 +409,12 @@ export function decideMembershipChange(
   members: unknown,
   change: unknown,
   nowIso: unknown,
-  isProxy?: IsProxy,
+  isProxy: IsProxy,
 ): MembershipDecision {
+  const detectorCheck = screenProxy(isProxy, null);
+  if (!detectorCheck.ok) {
+    return { ok: false, reason: detectorCheck.reason };
+  }
   const list = validateMembersList(members, isProxy);
   if (!list.ok) {
     return { ok: false, reason: list.reason };
@@ -380,11 +429,18 @@ export function decideMembershipChange(
   }
   const existing = list.members;
   // One indexing pass: organization consistency, actor index, owner count.
+  // A record whose actor is already indexed means the existing list itself
+  // violates the at-most-once-per-organization invariant, so the change is
+  // refused instead of silently keeping (or overwriting) one of the
+  // duplicate records.
   const byActor = new Map<string, MembershipRecord>();
   let ownerCount = 0;
   for (const record of existing) {
     if (record.organizationId !== decided.organizationId) {
       return { ok: false, reason: "organization-mismatch" };
+    }
+    if (byActor.has(record.actor)) {
+      return { ok: false, reason: "duplicate-actor" };
     }
     byActor.set(record.actor, record);
     if (record.role === "owner") {

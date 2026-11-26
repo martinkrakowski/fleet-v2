@@ -20,18 +20,47 @@ import { describe, expect, it } from "vitest";
 import {
   ACTOR_PATTERN,
   canActAs,
-  decideMembershipChange,
+  decideMembershipChange as decideMembershipChangeImpl,
   isZonedIsoDateTime,
   isValidRole,
   MAX_MEMBERS,
   MEMBERSHIP_ACTIONS,
   ROLES,
-  validateMembershipChange,
-  validateMembershipRecord,
-  validateMembersList,
+  validateMembershipChange as validateMembershipChangeImpl,
+  validateMembershipRecord as validateMembershipRecordImpl,
+  validateMembersList as validateMembersListImpl,
 } from "../entities/index.js";
 
 const isProxy = types.isProxy as (value: unknown) => boolean;
+
+/**
+ * The production validators require a proxy detector (their reflection
+ * operations are guarded by it), so every call below injects the Node
+ * `types.isProxy` detector; a test that omits it exercises the refusal of
+ * a missing detector.
+ */
+function validateMembershipRecord(value: unknown, detector?: unknown) {
+  return validateMembershipRecordImpl(value, (detector ?? isProxy) as (v: unknown) => boolean);
+}
+function validateMembersList(members: unknown, detector?: unknown) {
+  return validateMembersListImpl(members, (detector ?? isProxy) as (v: unknown) => boolean);
+}
+function validateMembershipChange(change: unknown, detector?: unknown) {
+  return validateMembershipChangeImpl(change, (detector ?? isProxy) as (v: unknown) => boolean);
+}
+function decideMembershipChange(
+  members: unknown,
+  change: unknown,
+  nowIso: unknown,
+  detector?: unknown,
+) {
+  return decideMembershipChangeImpl(
+    members,
+    change,
+    nowIso,
+    (detector ?? isProxy) as (v: unknown) => boolean,
+  );
+}
 
 const NOW = "2026-06-01T12:00:00Z";
 const EARLIER = "2026-01-01T00:00:00Z";
@@ -354,6 +383,47 @@ describe("validateMembershipRecord refuses hostile and malformed input", () => {
     expect(trapRan).toBe(false);
   });
 
+  it("refuses validators called without a proxy detector or with a throwing one", () => {
+    // Without a detector the reflection operations could run hostile
+    // Proxy traps, so the detector is required: an omitted or
+    // non-function detector is a typed refusal, never a pass.
+    const rec = validateMembershipRecordImpl(record(), undefined as never);
+    expect(rec.ok).toBe(false);
+    if (!rec.ok) {
+      expect(rec.reason).toBe("proxy-detector-required");
+    }
+    const list = validateMembersListImpl([record()], 42 as never);
+    expect(list.ok).toBe(false);
+    if (!list.ok) {
+      expect(list.reason).toBe("proxy-detector-required");
+    }
+    const changed = validateMembershipChangeImpl(change("add"), null as never);
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) {
+      expect(changed.reason).toBe("proxy-detector-required");
+    }
+    const decided = decideMembershipChangeImpl(
+      [record()],
+      change("add", { actor: "eve", role: "viewer" }),
+      NOW,
+      undefined as never,
+    );
+    expect(decided.ok).toBe(false);
+    if (!decided.ok) {
+      expect(decided.reason).toBe("proxy-detector-required");
+    }
+    // A throwing detector is also refused, and the trap never becomes a
+    // silent pass.
+    const throwing = () => {
+      throw new Error("detector exploded");
+    };
+    const recThrow = validateMembershipRecordImpl(record(), throwing as never);
+    expect(recThrow.ok).toBe(false);
+    if (!recThrow.ok) {
+      expect(recThrow.reason).toBe("detector-threw");
+    }
+  });
+
   it("refuses prototype-polluting keys", () => {
     for (const key of FORBIDDEN_KEYS) {
       const hostile = record();
@@ -642,6 +712,24 @@ describe("decideMembershipChange accepts every valid transition", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("duplicate-actor");
+    }
+  });
+
+  it("refuses a change when the existing members list already carries two records for one actor", () => {
+    // The existing list itself violates at-most-once-per-organization:
+    // dave appears twice, so every change is refused instead of the
+    // second record silently shadowing the first.
+    const duplicated = members(OWNER(), VIEWER(), member("dave", "maintainer"));
+    for (const attempted of [
+      change("add", { actor: "eve", role: "viewer" }),
+      change("change-role", { actor: "carol", role: "viewer" }),
+      change("remove", { actor: "carol" }),
+    ]) {
+      const result = decideMembershipChange(duplicated, attempted, NOW);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("duplicate-actor");
+      }
     }
   });
 

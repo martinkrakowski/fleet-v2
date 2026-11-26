@@ -34,8 +34,14 @@ describe("@fleet/billing scaffold", () => {
     expect(fleetNames).toEqual(["@fleet/shared"]);
   });
 
-  it("src/index.ts re-exports the domain SpendCap module at runtime (FC9B)", async () => {
+  it("src/index.ts re-exports the domain SpendCap and DailyMeter modules at runtime (FC9B, FC-10.3)", async () => {
     const mod = await import("../index.js");
-    expect(Object.keys(mod).sort()).toEqual(["decideSpend", "parseSpendCap", "periodKeyOf"]);
+    expect(Object.keys(mod).sort()).toEqual([
+      "DAILY_METER_MAX_ROWS",
+      "aggregateDailyMeter",
+      "decideSpend",
+      "parseSpendCap",
+      "periodKeyOf",
+    ]);
   });
 });

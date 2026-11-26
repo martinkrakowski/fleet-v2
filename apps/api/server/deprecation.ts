@@ -94,13 +94,27 @@ function isDataProperty(
   );
 }
 
-/** True when `entry` is a non-null, non-array plain object (`Object.prototype` or `null` prototype). */
+/**
+ * True when `entry` is a non-null, non-array plain object (`Object.prototype`
+ * or `null` prototype). `Array.isArray` and `Object.getPrototypeOf` can throw
+ * for a revoked Proxy, so the whole inspection is wrapped: a throwing input is
+ * not a plain object, and the caller turns a throw into `hostile-input`.
+ */
 function isPlainObject(entry: unknown): boolean {
-  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+  try {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return false;
+    }
+    const proto = Object.getPrototypeOf(entry);
+    return proto === Object.prototype || proto === null;
+  } catch (error) {
+    if (error instanceof TypeError) {
+      // Revoked Proxy: rethrow so the caller's guard maps it to `hostile-input`
+      // rather than the weaker `invalid-entry`.
+      throw error;
+    }
     return false;
   }
-  const proto = Object.getPrototypeOf(entry);
-  return proto === Object.prototype || proto === null;
 }
 
 /** Validate one timestamp field; returns a refusal reason, or `null` with the parsed ms. */
@@ -126,11 +140,14 @@ function checkTimestampField(
 function validateRegistry(
   registry: unknown,
 ): { ok: true } | { ok: false; reason: string } {
-  if (!Array.isArray(registry)) {
-    return { ok: false, reason: "invalid-registry" };
-  }
+  // `Array.isArray` itself can throw on a revoked Proxy, so it is inside the
+  // guarded region too: a Proxy that cannot be interrogated is hostile input,
+  // never a propagated exception.
   let length: number;
   try {
+    if (!Array.isArray(registry)) {
+      return { ok: false, reason: "invalid-registry" };
+    }
     const lengthDescriptor = Object.getOwnPropertyDescriptor(registry, "length");
     if (!isDataProperty(lengthDescriptor) || typeof lengthDescriptor.value !== "number") {
       return { ok: false, reason: "hostile-input" };
@@ -176,7 +193,13 @@ function validateEntry(
     return { ok: false, reason: "hostile-input" };
   }
 
-  if (!isPlainObject(element)) {
+  let elementIsPlainObject: boolean;
+  try {
+    elementIsPlainObject = isPlainObject(element);
+  } catch {
+    return { ok: false, reason: "hostile-input" };
+  }
+  if (!elementIsPlainObject) {
     return { ok: false, reason: "invalid-entry" };
   }
 
@@ -330,20 +353,116 @@ export function deprecationHeadersFor(
     return registryResult;
   }
 
-  let match: { readonly routeKey: string; readonly deprecatedAtIso: string; readonly sunsetAtIso: string | null; readonly successorPath: string | null } | undefined;
+  // Re-read through descriptors again, inside try/catch: the traps a
+  // validation-time inspection bypassed are not trusted here either, and a
+  // Proxy may throw — or supply values that were never validated — on these
+  // later reads. Every re-read field is therefore re-checked with the same
+  // field rules; any divergence from what validation saw is refused.
   const list = registry as unknown[];
+  let match: {
+    readonly routeKey: string;
+    readonly deprecatedAtIso: string;
+    readonly sunsetAtIso: string | null;
+    readonly successorPath: string | null;
+  } | undefined;
   for (let index = 0; index < list.length; index += 1) {
-    // Read through descriptors again: the `get` trap that a validation-time
-    // inspection bypassed is not trusted here either.
-    const entry = Object.getOwnPropertyDescriptor(list, index)?.value;
-    if (
-      typeof entry === "object" && entry !== null &&
-      typeof (entry as { routeKey?: unknown }).routeKey === "string" &&
-      (entry as { routeKey: string }).routeKey === routeKey
-    ) {
-      match = entry as typeof match;
-      break;
+    let routeKeyValue: unknown;
+    let deprecatedValue: unknown;
+    let sunsetValue: unknown;
+    let successorValue: unknown;
+    try {
+      const elementDescriptor = Object.getOwnPropertyDescriptor(list, index);
+      if (elementDescriptor === undefined || !isDataProperty(elementDescriptor)) {
+        return { ok: false, reason: "hostile-input" };
+      }
+      const entry = elementDescriptor.value;
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const target = entry as object;
+      const routeKeyDescriptor = Object.getOwnPropertyDescriptor(target, "routeKey");
+      if (routeKeyDescriptor === undefined || !isDataProperty(routeKeyDescriptor)) {
+        return { ok: false, reason: "hostile-input" };
+      }
+      routeKeyValue = routeKeyDescriptor.value;
+      if (typeof routeKeyValue !== "string" || routeKeyValue !== routeKey) {
+        continue;
+      }
+      const deprecatedDescriptor = Object.getOwnPropertyDescriptor(target, "deprecatedAtIso");
+      const sunsetDescriptor = Object.getOwnPropertyDescriptor(target, "sunsetAtIso");
+      const successorDescriptor = Object.getOwnPropertyDescriptor(target, "successorPath");
+      for (const descriptor of [deprecatedDescriptor, sunsetDescriptor, successorDescriptor]) {
+        if (descriptor === undefined || !isDataProperty(descriptor)) {
+          return { ok: false, reason: "hostile-input" };
+        }
+      }
+      deprecatedValue = deprecatedDescriptor!.value;
+      sunsetValue = sunsetDescriptor!.value;
+      successorValue = successorDescriptor!.value;
+    } catch {
+      return { ok: false, reason: "hostile-input" };
     }
+
+    if (typeof routeKeyValue === "string" && hasControlCharacter(routeKeyValue)) {
+      return { ok: false, reason: "control-character" };
+    }
+    if (
+      typeof routeKeyValue !== "string" ||
+      routeKeyValue === "" ||
+      routeKeyValue.length > ROUTE_KEY_MAX_LENGTH
+    ) {
+      return { ok: false, reason: "invalid-entry" };
+    }
+
+    const deprecatedResult = checkTimestampField(deprecatedValue);
+    if (!deprecatedResult.ok) {
+      return deprecatedResult;
+    }
+
+    let sunsetAtMs: number | null = null;
+    if (sunsetValue !== null) {
+      if (typeof sunsetValue !== "string") {
+        return { ok: false, reason: "invalid-entry" };
+      }
+      if (hasControlCharacter(sunsetValue)) {
+        return { ok: false, reason: "control-character" };
+      }
+      if (sunsetValue.length > TIMESTAMP_MAX_LENGTH) {
+        return { ok: false, reason: "invalid-timestamp" };
+      }
+      const sunsetMs = parseStrictIsoUtcMs(sunsetValue);
+      if (sunsetMs === null) {
+        return { ok: false, reason: "invalid-timestamp" };
+      }
+      sunsetAtMs = sunsetMs;
+      if (sunsetAtMs < deprecatedResult.ms) {
+        return { ok: false, reason: "sunset-before-deprecation" };
+      }
+    }
+
+    if (successorValue !== null) {
+      if (typeof successorValue !== "string") {
+        return { ok: false, reason: "invalid-entry" };
+      }
+      if (hasControlCharacter(successorValue)) {
+        return { ok: false, reason: "control-character" };
+      }
+      if (
+        successorValue.length > SUCCESSOR_PATH_MAX_LENGTH ||
+        successorValue.includes("..") ||
+        !SUCCESSOR_PATH_RE.test(successorValue)
+      ) {
+        return { ok: false, reason: "invalid-successor-path" };
+      }
+    }
+
+    match = {
+      routeKey: routeKeyValue,
+      deprecatedAtIso: deprecatedValue as string,
+      sunsetAtIso: sunsetValue as string | null,
+      successorPath: successorValue as string | null,
+    };
+    break;
   }
   if (match === undefined) {
     return { ok: true, headers: {} };

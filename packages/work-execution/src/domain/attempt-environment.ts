@@ -16,7 +16,8 @@
  * keys and extra keys are refused, and every refusal is a typed
  * `{ ok: false, reason }` result. A `Proxy` that lies consistently in every
  * trap is an accepted residual; a `Proxy` detectable through its array target,
- * its reported descriptors or its prototype is refused.
+ * its reported descriptors, its prototype or a throwing
+ * `getPrototypeOf`/`ownKeys`/`getOwnPropertyDescriptor` trap is refused.
  */
 
 export type AttemptEnvironmentStatus = 'none' | 'created' | 'loaded' | 'sealed' | 'destroyed' | 'failed';
@@ -100,29 +101,39 @@ function readExactDataRecord(value: unknown, keys: readonly string[]): Record<st
  * a getter or a setter). The caller checks which allowed keys are present.
  */
 function readPlainDataRecord(value: unknown, allowedKeys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length > MAX_OBJECT_KEYS) {
-    return null;
-  }
-  const out: Record<string, unknown> = {};
-  for (const key of ownKeys) {
-    if (typeof key !== 'string' || POLLUTING_KEYS.has(key) || !allowedKeys.includes(key)) {
+  // The reflective reads below can throw out of a revoked Proxy or a Proxy
+  // with a throwing `getPrototypeOf`/`ownKeys`/`getOwnPropertyDescriptor`
+  // trap. Even `Array.isArray` throws on a revoked Proxy. Any such failure
+  // is a refusal (null -> invalid-input at the callers), never an exception
+  // escaping this function. Cost stays O(1): the key-count bound still runs
+  // before any descriptor read.
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       return null;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
       return null;
     }
-    out[key] = descriptor.value;
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length > MAX_OBJECT_KEYS) {
+      return null;
+    }
+    const out: Record<string, unknown> = {};
+    for (const key of ownKeys) {
+      if (typeof key !== 'string' || POLLUTING_KEYS.has(key) || !allowedKeys.includes(key)) {
+        return null;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+        return null;
+      }
+      out[key] = descriptor.value;
+    }
+    return out;
+  } catch {
+    return null;
   }
-  return out;
 }
 
 /** A non-empty string of at most 128 characters matching the bounded id pattern. */

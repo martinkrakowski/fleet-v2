@@ -242,6 +242,30 @@ describe('decideEnvironmentStep', () => {
       expect(decideEnvironmentStep(createdState(), new Proxy(function proxyTarget() { /* hostile */ }, {}))).toEqual({ ok: false, reason: 'invalid-input' });
     });
 
+    it('refuses a revoked Proxy and a Proxy with throwing reflection traps without throwing', () => {
+      const stateShape = { status: 'none', attemptId: null, environmentId: null, isolation: null, worktreeRef: null };
+      const revokedState = Proxy.revocable(stateShape, {});
+      revokedState.revoke();
+      expect(decideEnvironmentStep(revokedState.proxy, createEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      const revokedEvent = Proxy.revocable(createEvent(), {});
+      revokedEvent.revoke();
+      expect(decideEnvironmentStep(createdState(), revokedEvent.proxy)).toEqual({ ok: false, reason: 'invalid-input' });
+
+      const trap = (): never => {
+        throw new Error('trap must never escape');
+      };
+      const throwingOwnKeysState = new Proxy(stateShape, { ownKeys: trap });
+      expect(decideEnvironmentStep(throwingOwnKeysState, createEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      const throwingPrototypeState = new Proxy(stateShape, { getPrototypeOf: trap });
+      expect(decideEnvironmentStep(throwingPrototypeState, createEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      const throwingDescriptorState = new Proxy(stateShape, { getOwnPropertyDescriptor: trap });
+      expect(decideEnvironmentStep(throwingDescriptorState, createEvent())).toEqual({ ok: false, reason: 'invalid-input' });
+      const throwingOwnKeysEvent = new Proxy(createEvent(), { ownKeys: trap });
+      expect(decideEnvironmentStep(createdState(), throwingOwnKeysEvent)).toEqual({ ok: false, reason: 'invalid-input' });
+      const throwingDescriptorEvent = new Proxy(createEvent(), { getOwnPropertyDescriptor: trap });
+      expect(decideEnvironmentStep(createdState(), throwingDescriptorEvent)).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
     it('refuses prototype-polluting keys and extra keys', () => {
       for (const key of [pollutingKey('proto'), pollutingKey('constructor'), pollutingKey('prototype')]) {
         const pollutedState: Record<string, unknown> = { status: 'none', attemptId: null, environmentId: null, isolation: null, worktreeRef: null };

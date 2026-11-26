@@ -377,8 +377,9 @@ const COVERAGE: ReadonlyMap<string, Coverage> = new Map<string, Coverage>([
   ['packages/work-execution/src/infrastructure/adapters/LanePlanRepositoryAdapter.adapter.ts::PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/RelaunchPlanRepositoryAdapter.adapter.ts::RELAUNCH_PLAN_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/work-execution/src/infrastructure/adapters/SeatObservationRepositoryAdapter.adapter.ts::SEAT_OBSERVATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
   ['packages/operator-coordination/src/infrastructure/adapters/OrchestratorRequestRepositoryAdapter.adapter.ts::ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
-  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; every writer stamped schemaVersion, so no pre-version records ever existed' }],
+  ['packages/tenancy/src/infrastructure/adapters/OrganizationRepositoryAdapter.adapter.ts::ORGANIZATION_STORE_VERSION_POLICY', { exempt: 'adapter introduced after the shared schema-version scheme; no pre-version records ever existed' }],
 ]);
 
 const FIXTURE_DIR = path.join(
@@ -799,13 +800,10 @@ describe('validateSchemaVersionPolicyValue', () => {
       acceptedVersions: proxyFakeSlice,
     });
     expect(proxyResult.ok).toBe(true);
-    if (proxyResult.ok) {
-      expect(proxyResult.policy.acceptedVersions).toEqual([1]);
+    if (!proxyResult.ok) {
+      throw new Error(`expected ok, got ${proxyResult.error}`);
     }
-    // And the copy is validated: a fabricated [999] for writer 1 would have
-    // been an invalid accepted policy (future/invalid version), so a constant
-    // or identity copy path fails this assertion.
-    expect([999].some((version) => version > 1)).toBe(true);
+    expect(proxyResult.policy.acceptedVersions).toEqual([1]);
   });
 
   it('refuses a Proxy over [1, 999] whose get trap reports length 1 while its own length descriptor says 2', () => {

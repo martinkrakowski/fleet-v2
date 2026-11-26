@@ -223,7 +223,7 @@ function makeHarness(input: {
     verification: verificationFake,
     journal: wrapped,
     halt: haltFake,
-    queue: queueFake(input.queueEntries ?? []),
+    queue: queueFake(input.queueEntries ?? [makeQueueEntry()]),
     newUlid: ulid,
     nowIso: () => clock,
   });
@@ -296,6 +296,7 @@ describe('DecideShadowMergeUseCase', () => {
   it('a moved head first journals the original head, then a second row under the new head key, and leaves the first key rows untouched', async () => {
     const harness = makeHarness({
       forge: sequencedForgeRead([greenForge(), { ...greenForge(), liveHeadSha: MOVED_HEAD }]),
+      queueEntries: [makeQueueEntry(), makeQueueEntry({ headOid: MOVED_HEAD })],
     });
 
     const first = await harness.useCase.decideShadowMerge(harness.request);
@@ -460,21 +461,79 @@ describe('DecideShadowMergeUseCase', () => {
     expect(rows[1].reasonCode).toBe('would-merge');
   });
 
-  it('an earlier live entry on the same base holds the queue head: the decision is the not-queue-head wait with zero forge reads and zero journal appends', async () => {
+  it('an earlier live entry on the same base no longer holds the decision: the target entry journals would-merge (owner decision 2026-11-26)', async () => {
     const harness = makeHarness({
       queueEntries: [
         makeQueueEntry({
           pullRequest: 7,
           headOid: 'a'.repeat(40),
-          enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+          enqueuedAtIso: '2026-11-01T10:00:00.000Z',
           baseBranch: 'main',
         }),
+        makeQueueEntry(),
       ],
     });
 
     const result = await harness.useCase.decideShadowMerge(harness.request);
 
-    expect(result).toEqual({ outcome: 'not-ready', reasonCode: 'not-queue-head', journalKey: null });
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+    expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(1);
+  });
+
+  it.each([
+    [
+      'an open PR ahead of it',
+      () => [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), enqueuedAtIso: '2026-11-01T09:00:00.000Z' })],
+    ],
+    [
+      'a closed would-drop entry ahead of it',
+      () => [
+        makeQueueEntry({
+          pullRequest: 8,
+          headOid: 'b'.repeat(40),
+          state: 'dropped',
+          reason: 'closed',
+          enqueuedAtIso: '2026-11-01T09:00:00.000Z',
+        }),
+      ],
+    ],
+    [
+      'the same PR older head ahead of it',
+      () => [makeQueueEntry({ pullRequest: 1, headOid: MOVED_HEAD, enqueuedAtIso: '2026-11-01T09:00:00.000Z' })],
+    ],
+    [
+      'a PR merged since the last tick ahead of it',
+      () => [
+        makeQueueEntry({
+          pullRequest: 9,
+          headOid: 'c'.repeat(40),
+          state: 'merged',
+          mergeCommitOid: 'd'.repeat(40),
+          mergedAtIso: '2026-11-01T09:30:00.000Z',
+          enqueuedAtIso: '2026-11-01T09:00:00.000Z',
+        }),
+      ],
+    ],
+  ])('a target that is not the queue head with %s still records would-merge', async (_label, ahead) => {
+    const harness = makeHarness({ queueEntries: [...ahead(), makeQueueEntry()] });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'journalled', reasonCode: 'would-merge', journalKey: MERGE_KEY });
+    expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(1);
+  });
+
+  it.each([
+    ['a parked entry', [makeQueueEntry({ state: 'parked', reason: 'checks' })]],
+    ['a dropped entry', [makeQueueEntry({ state: 'dropped', reason: 'closed' })]],
+    ['no entry at all', []],
+    ['only an older head queued while the newer head is asked', [makeQueueEntry({ headOid: MOVED_HEAD })]],
+  ])('%s is refused not-queued with zero forge reads and no would-merge row', async (_label, queueEntries) => {
+    const harness = makeHarness({ queueEntries });
+
+    const result = await harness.useCase.decideShadowMerge(harness.request);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'not-queued', journalKey: null });
     expect(harness.forge.calls).toBe(0);
     expect(harness.appends()).toBe(0);
     expect(await mergePrResultCount(harness.journal, MERGE_KEY)).toBe(0);
@@ -484,7 +543,7 @@ describe('DecideShadowMergeUseCase', () => {
     const harness = makeHarness({
       forgeResult: { ...greenForge(), baseRef: 'chain/example' },
       requestOverrides: { baseBranch: 'chain/example' },
-      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), baseBranch: 'main' })],
+      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), baseBranch: 'main' }), makeQueueEntry({ baseBranch: 'chain/example' })],
     });
 
     const result = await harness.useCase.decideShadowMerge(harness.request);
@@ -494,7 +553,7 @@ describe('DecideShadowMergeUseCase', () => {
 
   it('a parked earlier entry on the same base does not block the decision, because the head skips parked entries', async () => {
     const harness = makeHarness({
-      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), state: 'parked', reason: 'checks' })],
+      queueEntries: [makeQueueEntry({ pullRequest: 7, headOid: 'a'.repeat(40), state: 'parked', reason: 'checks' }), makeQueueEntry()],
     });
 
     const result = await harness.useCase.decideShadowMerge(harness.request);

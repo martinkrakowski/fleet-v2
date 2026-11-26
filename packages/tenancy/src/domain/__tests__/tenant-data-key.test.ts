@@ -143,7 +143,13 @@ describe("parseTenantDataKeyRecord refuses hostile and malformed input", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) {
         // The polluting key is named; its value is never echoed.
-        expect(result.reason).toBe(`tenant data key record has the prototype-polluting key ${key}`);
+        // `__proto__` and `constructor` are named; `prototype` is refused as
+        // an undeclared key, which names neither the key nor its value.
+        expect(result.reason).toBe(
+          key === "prototype"
+            ? "tenant data key record has an extra unknown key"
+            : `tenant data key record has the prototype-polluting key ${key}`,
+        );
         expect(result.reason).not.toContain("1");
       }
     }
@@ -414,3 +420,52 @@ function operationFor(status: string): "wrap" | "unwrap" {
   // allow it, so wrap is used for rotated and unwrap for destroyed.
   return status === "rotated" ? "wrap" : "unwrap";
 }
+
+describe("decideKeyUse reads hostile records once and honours the injected Proxy detector", () => {
+  it("refuses a transparent Proxy around a valid record with invalid-request when the detector is supplied, and never runs its traps", () => {
+    let trapRan = false;
+    const transparent = new Proxy(validKey(), {
+      get(target, key, receiver) {
+        trapRan = true;
+        return Reflect.get(target, key, receiver);
+      },
+      ownKeys(target) {
+        trapRan = true;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        trapRan = true;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(decideKeyUse(validKey(), "healthy", "acme", "wrap", isProxy)).toEqual({ allowed: true });
+    expect(decideKeyUse(transparent, "healthy", "acme", "wrap", isProxy)).toEqual({
+      allowed: false,
+      reason: "invalid-request",
+    });
+    expect(trapRan).toBe(false);
+  });
+
+  it("never runs a Proxy get trap: a throwing get trap is a typed refusal and a flip-flopping status is never read through get", () => {
+    let getRan = 0;
+    const throwing = new Proxy(validKey(), {
+      get() {
+        getRan += 1;
+        throw new Error("get trap ran");
+      },
+    });
+    expect(() => parseTenantDataKeyRecord(throwing)).not.toThrow();
+    expect(() => decideKeyUse(throwing, "healthy", "acme", "wrap")).not.toThrow();
+    const flipFlop = new Proxy(validKey(), {
+      get(target, key) {
+        getRan += 1;
+        return key === "status" ? "destroyed" : Reflect.get(target, key);
+      },
+    });
+    const parsed = parseTenantDataKeyRecord(flipFlop);
+    if (parsed.ok) {
+      expect(parsed.record.status).toBe("active");
+    }
+    expect(getRan).toBe(0);
+  });
+});

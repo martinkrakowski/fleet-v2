@@ -407,7 +407,38 @@ const MAX_STATUS_LINES = 1024;
 
 /** Explicit loop cost bound on the session ids collected from status text. */
 const MAX_LISTED_SESSIONS = 1024;
+
+/**
+ * Byte budget on the status text the header search may traverse: the
+ * split and header search themselves are bounded, so 64 MiB of
+ * newline-heavy status output can never allocate millions of entries
+ * before the capped scan.
+ */
+const MAX_STATUS_SCAN_BYTES = 1024 * 1024;
+
+/** Per-line cap so one giant line cannot be materialised whole. */
+const MAX_STATUS_LINE_BYTES = 4096;
 const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
+
+/**
+ * At most `MAX_STATUS_LINES` lines of at most `MAX_STATUS_LINE_BYTES`
+ * each, and never more than `MAX_STATUS_SCAN_BYTES` of output
+ * traversed: the split is bounded up front instead of splitting the
+ * whole stdout first.
+ */
+function boundedStatusLines(stdout: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  // At most the header line plus MAX_STATUS_LINES lines after it.
+  while (lines.length < MAX_STATUS_LINES + 1 && start <= MAX_STATUS_SCAN_BYTES) {
+    const newlineIndex = stdout.indexOf('\n', start);
+    const end = newlineIndex === -1 ? stdout.length : newlineIndex;
+    lines.push(stdout.slice(start, Math.min(end, start + MAX_STATUS_LINE_BYTES)));
+    if (newlineIndex === -1) break;
+    start = newlineIndex + 1;
+  }
+  return lines;
+}
 
 /**
  * Session ids the runner's `--status` output actually lists: only lines
@@ -415,7 +446,7 @@ const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
  * bare session id. A `ses_…` inside the directory path never counts.
  */
 function statusSessionIds(stdout: string): string[] {
-  const lines = stdout.split('\n');
+  const lines = boundedStatusLines(stdout);
   const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
   if (headerIndex === -1) return [];
   const ids = new Set<string>();

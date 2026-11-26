@@ -152,6 +152,43 @@ describe('ExecutionRunnerAdapter.listSessions', () => {
     });
   });
 
+  it('bounds the status split and header search so newline-heavy output neither allocates unboundedly nor reads past the cap', async () => {
+    // Header beyond the bounded line scan: never found, ids never read.
+    const headerBeyondCap = `${'x\n'.repeat(3000)}ocm-run: running in ${runnerWorktreePath}:\nses_late\n`;
+    const beyond = idleAdapter([{ exitCode: 3, stdout: headerBeyondCap, stderr: '' }]);
+    const beyondStatus = await beyond.adapter.listSessions({
+      worktreePath: runnerWorktreePath,
+      runner: runnerRecord,
+    });
+    expect(beyondStatus).toEqual({
+      ok: false,
+      error: 'unreadable',
+      reason: 'status exit 3 listed no valid session ids',
+    });
+
+    // Newline-heavy flood after a header inside the bound: the scan stops
+    // at the cap and completes without materialising the whole split.
+    // 1500 ids stay inside snapshotPlainData's 16 KiB string budget while
+    // exceeding the 1024 post-header line cap.
+    const ids: string[] = [];
+    for (let i = 0; i < 1500; i += 1) ids.push(`ses_i${i}`);
+    const flood = idleAdapter([
+      {
+        exitCode: 3,
+        stdout: `ocm-run: running in ${runnerWorktreePath}:\n${ids.join('\n')}\n`,
+        stderr: '',
+      },
+    ]);
+    const floodStatus = await flood.adapter.listSessions({
+      worktreePath: runnerWorktreePath,
+      runner: runnerRecord,
+    });
+    expect(floodStatus.ok).toBe(true);
+    if (!floodStatus.ok) return;
+    expect(floodStatus.sessions.length).toBeLessThanOrEqual(1024);
+    expect(floodStatus.sessions).toEqual(ids.slice(0, 1024));
+  });
+
   it('malformed JSON stdout returns unreadable', async () => {
     const { adapter } = idleAdapter([
       { exitCode: 0, stdout: '{"sessions": [ses_a}', stderr: '' },

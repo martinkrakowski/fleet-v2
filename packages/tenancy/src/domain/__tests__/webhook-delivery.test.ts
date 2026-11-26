@@ -36,8 +36,15 @@ const baseInput = (overrides: Record<string, unknown> = {}): Input => ({
   ...overrides,
 });
 
+/**
+ * Production passes the trusted `types.isProxy` predicate from
+ * infrastructure; the tests stand in for that with a side-effect-free
+ * detector unless a specific one is being exercised.
+ */
+const TRUSTED_DETECTOR = (): boolean => false;
+
 const accept = (input: unknown, isProxy?: (value: unknown) => boolean): WebhookWakeRecord => {
-  const result = decideWebhookDelivery(input, isProxy);
+  const result = decideWebhookDelivery(input, isProxy ?? TRUSTED_DETECTOR);
   if (result.outcome !== "accepted") {
     throw new Error(`expected accepted, got ${JSON.stringify(result)}`);
   }
@@ -45,7 +52,7 @@ const accept = (input: unknown, isProxy?: (value: unknown) => boolean): WebhookW
 };
 
 const refuseReason = (input: unknown, isProxy?: (value: unknown) => boolean): string => {
-  const result = decideWebhookDelivery(input, isProxy);
+  const result = decideWebhookDelivery(input, isProxy ?? TRUSTED_DETECTOR);
   if (result.outcome !== "refused") {
     throw new Error(`expected refused, got ${JSON.stringify(result)}`);
   }
@@ -205,7 +212,55 @@ describe("decideWebhookDelivery — hostile input and isProxy", () => {
       expect(refuseReason(input)).toBe("invalid-input");
     }
     for (const badDetector of [42, null, {}, "x"]) {
-      expect(refuseReason(baseInput(), badDetector as never)).toBe("invalid-input");
+      const result = decideWebhookDelivery(baseInput(), badDetector as never);
+      expect(result).toEqual({ outcome: "refused", reason: "invalid-input" });
+    }
+  });
+
+  it("refuses an object input when isProxy is omitted, including a calm Proxy wrapping valid input, without running any trap", () => {
+    // No trusted detector, no snapshot: every object input is refused before
+    // snapshotPlainData can touch it, so a Proxy's traps can never run.
+    expect(decideWebhookDelivery(baseInput()).outcome).toBe("refused");
+    const reason = (decideWebhookDelivery(baseInput()) as { reason: string }).reason;
+    expect(reason).toBe("invalid-input");
+
+    // A calm Proxy wrapping valid input is refused, not accepted.
+    const calmProxy = new Proxy(baseInput(), {});
+    expect(decideWebhookDelivery(calmProxy).outcome).toBe("refused");
+    expect((decideWebhookDelivery(calmProxy) as { reason: string }).reason).toBe("invalid-input");
+
+    // A trap with side effects never runs: the trap records any invocation
+    // and would make the test fail even though the result is still a refusal.
+    let trapsRun = 0;
+    const sideEffectProxy = new Proxy(baseInput(), {
+      get() {
+        trapsRun += 1;
+        return undefined;
+      },
+      getOwnPropertyDescriptor() {
+        trapsRun += 1;
+        return undefined;
+      },
+      getPrototypeOf() {
+        trapsRun += 1;
+        return Object.prototype;
+      },
+      ownKeys() {
+        trapsRun += 1;
+        return [];
+      },
+      has() {
+        trapsRun += 1;
+        return false;
+      },
+    });
+    expect(decideWebhookDelivery(sideEffectProxy).outcome).toBe("refused");
+    expect(trapsRun).toBe(0);
+
+    // Primitives and null are not proxiable and keep their existing refusal
+    // without a detector.
+    for (const primitive of [null, 42, "str", true, undefined]) {
+      expect(refuseReason(primitive, undefined)).toBe("invalid-input");
     }
   });
 
@@ -273,6 +328,45 @@ describe("decideWebhookDelivery — freshness window", () => {
     const atBoundary = new Date(Date.parse(RECEIVED) + WEBHOOK_MAX_FUTURE_SKEW_MS).toISOString();
     expect(refuseReason(baseInput({ signedAtIso: oneTooFar }))).toBe("stale");
     expect(accept(baseInput({ signedAtIso: atBoundary })).deliveryId).toBe(DELIVERY_ID);
+  });
+
+  it("refuses sub-millisecond excess beyond the 60-second future-skew limit that Date.parse alone would hide", () => {
+    // 60 s + 1 μs: Date.parse truncates the μs and sees exactly 60 s, but the
+    // real skew exceeds the limit, so this must be `stale`.
+    expect(
+      refuseReason(
+        baseInput({ receivedAtIso: "2026-11-26T12:00:00.000Z", signedAtIso: "2026-11-26T12:01:00.000001Z" }),
+      ),
+    ).toBe("stale");
+    // Exactly 60 s with a truncated zero fraction is accepted.
+    expect(
+      accept(
+        baseInput({ receivedAtIso: "2026-11-26T12:00:00.000Z", signedAtIso: "2026-11-26T12:01:00.000000Z" }),
+      ).deliveryId,
+    ).toBe(DELIVERY_ID);
+    // 1 μs inside the limit (60 s − 1 μs) is accepted.
+    expect(
+      accept(
+        baseInput({ receivedAtIso: "2026-11-26T12:00:00.000Z", signedAtIso: "2026-11-26T12:00:59.999999Z" }),
+      ).deliveryId,
+    ).toBe(DELIVERY_ID);
+  });
+
+  it("refuses sub-millisecond excess beyond the 5-minute age limit that Date.parse alone would hide", () => {
+    // Received fraction pushes the real age past 5 minutes while both parsed
+    // stamps sit exactly on the boundary.
+    expect(
+      refuseReason(
+        baseInput({ receivedAtIso: "2026-11-26T12:00:00.000001Z", signedAtIso: "2026-11-26T11:55:00.000000Z" }),
+      ),
+    ).toBe("stale");
+    // The signed fraction pulling the real age back inside the window is
+    // accepted.
+    expect(
+      accept(
+        baseInput({ receivedAtIso: "2026-11-26T12:00:00.000000Z", signedAtIso: "2026-11-26T11:55:00.000001Z" }),
+      ).deliveryId,
+    ).toBe(DELIVERY_ID);
   });
 });
 
@@ -353,7 +447,7 @@ describe("webhook-delivery constants and types", () => {
   });
 
   it("produces a decision value that typechecks against the union shape", () => {
-    const decision: WebhookDeliveryDecision = decideWebhookDelivery(baseInput());
+    const decision: WebhookDeliveryDecision = decideWebhookDelivery(baseInput(), TRUSTED_DETECTOR);
     expect(decision.outcome).toBe("accepted");
   });
 });

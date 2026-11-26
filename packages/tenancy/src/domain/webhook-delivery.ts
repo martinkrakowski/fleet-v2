@@ -19,6 +19,13 @@
  * `{ outcome: 'refused', reason: 'invalid-input' }`, never a throw and never
  * a pass. Refusals never echo the rejected `deliveryId`, `organizationId`,
  * `eventType` or any other rejected value.
+ *
+ * Zero-trap guarantee and the optional detector: the detector is the trusted,
+ * side-effect-free `types.isProxy` predicate injected by infrastructure. When
+ * it is omitted the domain cannot prove an object input is not a Proxy, and
+ * snapshotting would run that Proxy's traps, so an object input with no
+ * detector is `invalid-input` — it is never snapshotted with a detector that
+ * "detects nothing". Primitive inputs are not proxiable and need no detector.
  */
 
 import { snapshotPlainData, type IsProxy } from "@fleet/shared";
@@ -90,7 +97,15 @@ const ALLOWED_EVENT_TYPE_SET: ReadonlySet<string> = new Set<string>(ALLOWED_WEBH
 
 const MAX_ID_LENGTH = 256;
 const MAX_EVENT_TYPE_LENGTH = 128;
+/** The maximum length of any ISO string this module even looks at. */
 const MAX_ISO_LENGTH = 64;
+
+/**
+ * A detector that detects nothing. Used only for primitive inputs, which are
+ * not proxiable and can never reach a snapshot with an omitted detector —
+ * object inputs are refused above before any snapshot runs.
+ */
+const PRIMITIVE_NO_DETECTOR: IsProxy = () => false;
 
 /**
  * A bounded identifier: non-empty, at most 256 characters, no control
@@ -134,12 +149,57 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+const ISO_FRACTION_RE = /\.(\d{1,9})/;
+
+/**
+ * Whether the real gap `leading - other` exceeds `limit` (all in
+ * milliseconds), given the whole-millisecond `Date.parse` views and the two
+ * timestamps' fractional-seconds digit strings. `Date.parse` keeps the first
+ * three fraction digits (the milliseconds) and truncates the sub-millisecond
+ * tail, so the real gap is `(leadingMs - otherMs)` plus the difference of the
+ * two tails. Each zoned pattern fraction is bounded at nine digits, so both
+ * tails are padded to exactly nine digits and their last six (the
+ * sub-millisecond nanoseconds) compared exactly with BigInt — no
+ * sub-millisecond excess can slip through. Cost: O(1) — bounded digit
+ * strings, no loops over input.
+ */
+function exceedsLimitWithFractions(
+  leadingMs: number,
+  otherMs: number,
+  limitMs: number,
+  leadingIso: string,
+  otherIso: string,
+): boolean {
+  const head = leadingMs - otherMs - limitMs;
+  // A sub-millisecond tail difference is strictly within ±1 ms, so beyond
+  // that the truncated view already decides.
+  if (head >= 1) {
+    return true;
+  }
+  if (head <= -1) {
+    return false;
+  }
+  const scale = 1_000_000n; // one sub-millisecond tail in nanoseconds
+  const a = subMillisecondTail(leadingIso);
+  const b = subMillisecondTail(otherIso);
+  return BigInt(head) * scale > b - a;
+}
+
+/** The sub-millisecond tail of a validated ISO timestamp, in nanoseconds. */
+function subMillisecondTail(iso: string): bigint {
+  const match = ISO_FRACTION_RE.exec(iso);
+  const digits = (match === null ? "" : match[1]).padEnd(9, "0");
+  return BigInt(digits.slice(3));
+}
+
 /**
  * Decide whether a verified forge webhook delivery yields a wake record, in a
  * fixed order:
  *
  * 1. validate `isProxy` and snapshot `input` — any hostile shape, wrong key
- *    set or malformed field is `invalid-input` before anything else;
+ *    set or malformed field is `invalid-input` before anything else; an
+ *    object input with `isProxy` omitted is `invalid-input` (no trusted
+ *    detector, no snapshot, no Proxy trap ever runs);
  * 2. `signatureVerified !== true` is `signature-invalid`;
  * 3. outside the freshness window (`signedAtIso` more than
  *    `WEBHOOK_MAX_AGE_MS` before `receivedAtIso`, or more than
@@ -168,7 +228,18 @@ export function decideWebhookDelivery(input: unknown, isProxy?: IsProxy): Webhoo
   if (isProxy !== undefined && typeof isProxy !== "function") {
     return INVALID;
   }
-  const detector: IsProxy = isProxy ?? (() => false);
+  // An omitted detector must not default to "detects nothing": a Proxy can
+  // then slip past and its traps run during the snapshot (and a calm Proxy
+  // wrapping valid input would even be accepted). Without a trusted detector
+  // the zero-trap guarantee cannot be established, so every object input —
+  // the only proxiable kind — is refused before any snapshot. Primitives
+  // (`undefined`, `boolean`, `number`, `string`, `bigint`, `symbol`) are not
+  // proxiable and are refused by the snapshot itself. `typeof` never invokes
+  // a trap. Cost: O(1).
+  if (isProxy === undefined && input !== null && typeof input === "object") {
+    return INVALID;
+  }
+  const detector: IsProxy = isProxy ?? PRIMITIVE_NO_DETECTOR;
   const snapshot = snapshotPlainData(input, detector, {
     maxDepth: 2,
     maxKeys: 8,
@@ -257,7 +328,19 @@ export function decideWebhookDelivery(input: unknown, isProxy?: IsProxy): Webhoo
   // zoned checks, so Date.parse is exact here. O(1).
   const signedMs = Date.parse(signedAtIso as string);
   const receivedMs = Date.parse(receivedAtIso as string);
-  if (receivedMs - signedMs > WEBHOOK_MAX_AGE_MS || signedMs - receivedMs > WEBHOOK_MAX_FUTURE_SKEW_MS) {
+  // `Date.parse` truncates sub-millisecond digits, so a difference computed
+  // from the parsed values alone can mis-state the real skew: a fraction like
+  // `.000001Z` is dropped entirely, letting a delivery just outside a limit
+  // through (60 s + 1 μs parses as exactly 60 s). The whole-millisecond
+  // difference is therefore corrected with the exact fractional-seconds digit
+  // strings of both stamps, compared with BigInt so any fraction width the
+  // bounded strings allow stays exact. Cost: O(1) — the regex runs over a
+  // string bounded at 64 characters and the digit comparison has the same
+  // bound.
+  if (
+    exceedsLimitWithFractions(receivedMs, signedMs, WEBHOOK_MAX_AGE_MS, receivedAtIso as string, signedAtIso as string) ||
+    exceedsLimitWithFractions(signedMs, receivedMs, WEBHOOK_MAX_FUTURE_SKEW_MS, signedAtIso as string, receivedAtIso as string)
+  ) {
     return { outcome: "refused", reason: "stale" };
   }
 

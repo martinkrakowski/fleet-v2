@@ -148,8 +148,27 @@ describe("@fleet/tenancy scaffold", () => {
     },
   );
 
-  it("@fleet/tenancy src/index.ts exports nothing at runtime", async () => {
-    const mod = await import("../index.js");
-    expect(Object.keys(mod)).toEqual([]);
-  });
+  it(
+    "@fleet/tenancy exports the organization and project domain API at runtime: DEFAULT_ORGANIZATION_ID, ORGANIZATION_ID_PATTERN, isZonedIsoDateTime, validateOrganizationRecord, retireOrganization, acceptsNewWork, validateProjectRecord and decideProjectTransition",
+    async () => {
+      const mod = await import("../index.js");
+      for (const name of [
+        "DEFAULT_ORGANIZATION_ID",
+        "ORGANIZATION_ID_PATTERN",
+        "isZonedIsoDateTime",
+        "validateOrganizationRecord",
+        "retireOrganization",
+        "acceptsNewWork",
+        "validateProjectRecord",
+        "decideProjectTransition",
+      ] as const) {
+        expect(mod, `runtime export ${name} must exist`).toHaveProperty(name);
+      }
+      expect(mod.DEFAULT_ORGANIZATION_ID).toBe("default");
+      expect(mod.ORGANIZATION_ID_PATTERN.test("default")).toBe(true);
+      expect(mod.isZonedIsoDateTime("2026-01-01T00:00:00Z")).toBe(true);
+      expect(mod.validateOrganizationRecord(null).ok).toBe(false);
+      expect(mod.validateProjectRecord(null).ok).toBe(false);
+    },
+  );
 });

@@ -1181,12 +1181,12 @@ bounded_contexts:
     status: active
     description: >-
       Owns organisation, project and membership records for deployments serving
-      more than one organisation. Scaffold-only: no entities, ports or adapters
-      are declared yet.
+      more than one organisation. Pure domain entities only; ports, adapters
+      and I/O belong to later stations.
     depends_on: []
     layers:
       domain:
-        entities: []
+        entities: [Organization, Project]
         value_objects: []
       application:
         use_cases: []

@@ -156,50 +156,114 @@ function snapshotRefusal(
   }
 }
 
+/** Why `readRecord` refused: a typed shape, so callers can map it to their own reason codes. */
+export type RecordRefusal =
+  | { readonly kind: "snapshot"; readonly reason: string; readonly path: string | null }
+  | { readonly kind: "not-object" }
+  | { readonly kind: "too-many-keys" }
+  | { readonly kind: "symbol-key" }
+  | { readonly kind: "forbidden-key"; readonly key: string }
+  | { readonly kind: "unknown-key"; readonly key: string };
+
+/**
+ * Check an already-snapshotted plain record's own keys against
+ * `allowedKeys`. The record is a frozen snapshot copy, so these reads touch
+ * no caller-controlled object. Cost bound: O(1) — one pass over at most
+ * `allowedKeys.size + 1` own keys (the snapshot refuses anything larger),
+ * so a single extra key still reaches the polluting-key and unknown-key
+ * checks.
+ */
+export function checkSnapshotKeys(
+  record: Record<string, unknown>,
+  allowedKeys: ReadonlySet<string>,
+): RecordRefusal | null {
+  const ownKeys = Reflect.ownKeys(record);
+  for (const key of ownKeys) {
+    if (typeof key !== "string") {
+      return { kind: "symbol-key" };
+    }
+    if (key === "__proto__" || key === "constructor") {
+      return { kind: "forbidden-key", key };
+    }
+    if (!allowedKeys.has(key)) {
+      return { kind: "unknown-key", key };
+    }
+  }
+  if (ownKeys.length > allowedKeys.size) {
+    return { kind: "too-many-keys" };
+  }
+  return null;
+}
+
 /**
  * Snapshot unknown input as a plain record whose own keys are all in
- * `allowedKeys`. Cost bound: O(1) — one bounded snapshot pass (at most
- * `allowedKeys.size` keys, depth 1, strings capped at 4096 characters) plus
- * one pass over at most that many own keys, refusing before iterating when
- * the own-key count exceeds the allowed key set.
+ * `allowedKeys`. Every field is read exactly once, through its own data
+ * descriptor, so no getter and no Proxy `get` trap ever runs and a
+ * flip-flopping value cannot change between check and use. Cost bound:
+ * O(1) — one bounded snapshot pass (at most `allowedKeys.size` keys, depth
+ * 1, strings capped at 4096 characters) plus one pass over at most that
+ * many own keys.
  */
+export function readRecord(
+  input: unknown,
+  isProxy: IsProxy | undefined,
+  allowedKeys: ReadonlySet<string>,
+): { readonly ok: true; readonly value: Record<string, unknown> } | { readonly ok: false; readonly refusal: RecordRefusal } {
+  const snapshot = snapshotPlainData(
+    input,
+    isProxy ?? (() => false),
+    { maxDepth: 1, maxKeys: allowedKeys.size + 1, maxStringLength: MAX_STRING_LENGTH },
+  );
+  if (!snapshot.ok) {
+    return { ok: false, refusal: { kind: "snapshot", reason: snapshot.reason, path: snapshot.path } };
+  }
+  const value = snapshot.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, refusal: { kind: "not-object" } };
+  }
+  const record = value as Record<string, unknown>;
+  const keyRefusal = checkSnapshotKeys(record, allowedKeys);
+  if (keyRefusal !== null) {
+    return { ok: false, refusal: keyRefusal };
+  }
+  return { ok: true, value: record };
+}
+
+/** The human-readable refusal text for a `RecordRefusal`; never echoes a value. */
+export function describeRecordRefusal(
+  label: string,
+  refusal: RecordRefusal,
+  allowedKeys: ReadonlySet<string>,
+): string {
+  switch (refusal.kind) {
+    case "snapshot":
+      return snapshotRefusal(label, refusal.reason, refusal.path, allowedKeys);
+    case "not-object":
+      return `${label} record must be a plain object`;
+    case "too-many-keys":
+      return `${label} record has too many own keys`;
+    case "symbol-key":
+      return `${label} record has a symbol own key`;
+    case "forbidden-key":
+      return `${label} record has the prototype-polluting key ${refusal.key}`;
+    case "unknown-key":
+      // The unknown key text is never echoed.
+      return `${label} record has an extra unknown key`;
+  }
+}
+
+/** Snapshot unknown input as a plain record; see `readRecord`. */
 export function snapshotRecord(
   label: string,
   input: unknown,
   isProxy: IsProxy | undefined,
   allowedKeys: ReadonlySet<string>,
 ): ValidationResult<Record<string, unknown>> {
-  const snapshot = snapshotPlainData(
-    input,
-    isProxy ?? (() => false),
-    { maxDepth: 1, maxKeys: allowedKeys.size, maxStringLength: MAX_STRING_LENGTH },
-  );
-  if (!snapshot.ok) {
-    return refused(snapshotRefusal(label, snapshot.reason, snapshot.path, allowedKeys));
+  const read = readRecord(input, isProxy, allowedKeys);
+  if (!read.ok) {
+    return refused(describeRecordRefusal(label, read.refusal, allowedKeys));
   }
-  const value = snapshot.value;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return refused(`${label} record must be a plain object`);
-  }
-  const record = value as Record<string, unknown>;
-  const ownKeys = Reflect.ownKeys(record);
-  // Refuse before iterating when the shape is already wrong.
-  if (ownKeys.length > allowedKeys.size) {
-    return refused(`${label} record has too many own keys`);
-  }
-  for (const key of ownKeys) {
-    if (typeof key !== "string") {
-      return refused(`${label} record has a symbol own key`);
-    }
-    if (key === "__proto__" || key === "constructor") {
-      return refused(`${label} record has the prototype-polluting key ${key}`);
-    }
-    if (!allowedKeys.has(key)) {
-      // The unknown key text is never echoed.
-      return refused(`${label} record has an extra unknown key`);
-    }
-  }
-  return accepted(record);
+  return accepted(read.value);
 }
 
 /** The fields every tenancy record carries besides its own id fields. */

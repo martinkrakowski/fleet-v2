@@ -390,4 +390,50 @@ describe("createTenantCompositionCache", () => {
       expect(calls).toHaveLength(2);
     },
   );
+
+  it(
+    "keeps size within maxEntries when compose re-enters get for another tenant before its own entry is stored",
+    () => {
+      // With maxEntries: 1, composing tenant A synchronously calls get for
+      // tenant B before A is inserted. A's slot is reserved during its
+      // compose, so B must be refused cache-full (without composing) and
+      // the map must never exceed 1 entry once A is stored.
+      const calls: Array<{ readonly principal: string; readonly organizationId: string }> = [];
+      let bResult: unknown;
+      const cache: TenantCompositionCache<Instance> = createTenantCompositionCache(
+        (key) => {
+          calls.push(key);
+          if (key.organizationId === "org-a") {
+            // Re-enter the cache for tenant B before A is inserted.
+            bResult = bGet?.();
+          }
+          return { tag: `composed-${key.organizationId}` };
+        },
+        { maxEntries: 1 },
+      );
+      const bGet: () => unknown = () => cache.get(VALID_PRINCIPAL, "org-b");
+      const a = cache.get(VALID_PRINCIPAL, "org-a");
+      expect(a).toEqual({ ok: true, value: { tag: "composed-org-a" } });
+      // The re-entrant get for B was refused cache-full, without composing B.
+      expect(bResult).toEqual({ ok: false, reason: "cache-full" });
+      expect(calls).toEqual([
+        { principal: VALID_PRINCIPAL, organizationId: "org-a" },
+      ]);
+      // The capacity bound holds despite the re-entrant composition.
+      expect(cache.size()).toBe(1);
+      // A is cached: a repeated get returns the identical reference.
+      const again = cache.get(VALID_PRINCIPAL, "org-a");
+      expect(again.ok && a.ok).toBe(true);
+      if (again.ok && a.ok) {
+        expect(again.value).toBe(a.value);
+      }
+      expect(cache.size()).toBe(1);
+      // Nothing evicted or duplicated by the re-entrant path.
+      expect(cache.get(VALID_PRINCIPAL, "org-b")).toEqual({
+        ok: false,
+        reason: "cache-full",
+      });
+      expect(cache.size()).toBe(1);
+    },
+  );
 });

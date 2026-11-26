@@ -157,6 +157,12 @@ export function createTenantCompositionCache<T>(
 ): TenantCompositionCache<T> {
   const maxEntries = resolveMaxEntries(options, isProxy ?? (() => false));
   const entries = new Map<string, Entry<T>>();
+  // Keys whose `compose` is currently running: their capacity slot is
+  // already reserved, so a re-entrant `get` from inside `compose` cannot
+  // push the map past `maxEntries` by filling the slot meanwhile. The
+  // invariant `entries.size + pending.size <= maxEntries` holds at every
+  // observable point.
+  const pending = new Set<string>();
 
   return {
     get(principal: string, organizationId: string): CacheResult<T> {
@@ -175,18 +181,27 @@ export function createTenantCompositionCache<T>(
         return { ok: true, value: cached.value };
       }
       // Full: refuse without evicting anything and without composing.
-      if (entries.size >= maxEntries) {
+      // Reserved (in-flight) slots count towards the bound, so composing
+      // tenant A cannot admit tenant B re-entrantly and end up exceeding
+      // `maxEntries` once A's own entry is stored.
+      if (entries.size + pending.size >= maxEntries) {
         return { ok: false, reason: "cache-full" };
       }
       if (typeof compose !== "function") {
         return { ok: false, reason: "compose-failed" };
       }
+      // Reserve the slot before composing; a re-entrant get for this same
+      // key during compose then sees the reservation (cache-full) instead
+      // of composing recursively.
+      pending.add(key);
       let value: T;
       try {
         value = compose({ principal, organizationId });
       } catch {
+        pending.delete(key);
         return { ok: false, reason: "compose-failed" };
       }
+      pending.delete(key);
       if (value === null || value === undefined) {
         return { ok: false, reason: "compose-failed" };
       }

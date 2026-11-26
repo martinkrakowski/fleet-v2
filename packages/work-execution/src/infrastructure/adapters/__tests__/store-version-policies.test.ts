@@ -408,7 +408,7 @@ describe('store schema-version policy discovery and coverage', () => {
     expect(discovered).toEqual(EXPECTED_INVENTORY);
   });
 
-  // Cost bound: exactly one dynamic import per discovered adapter file (18),
+  // Cost bound: exactly one dynamic import per discovered adapter file (17),
   // sequential. Adapter modules transitively pull real dependencies, so under
   // a fully loaded host the import phase needs far more than the default
   // 5-second per-test timeout; this is an explicit bound, not an unbounded wait.

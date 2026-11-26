@@ -34,9 +34,26 @@ function validInput(overrides: Partial<EvidenceBundleInput> = {}): EvidenceBundl
       { role: 'implementer', seatId: 's-1' },
     ],
     policyRevision: 'policy-2026-11',
-    authorityEventsJsonl: `{"organizationId":"org-1","event":"dispatch"}\n`,
+    authorityEventsJsonl: authorityLine('org-1'),
     ...overrides,
   };
+}
+
+/** One complete, valid `AuthorityEvent` JSONL line. */
+function authorityLine(
+  organizationId: string | null,
+  overrides: Record<string, unknown> = {},
+): string {
+  return `${JSON.stringify({
+    eventId: 'ev-1',
+    kind: 'dispatch',
+    actor: 'operator@example.com',
+    organizationId,
+    atIso: AT_ISO,
+    beforeRevision: null,
+    afterRevision: null,
+    ...overrides,
+  })}`;
 }
 
 /** Deep-freeze an object graph, so any mutation of `input` throws in strict mode. */
@@ -110,7 +127,7 @@ describe('assembleEvidenceBundle', () => {
     const withoutLineOrg = assembleEvidenceBundle(
       deepFreeze(validInput({
         organizationId: null,
-        authorityEventsJsonl: '{"event":"dispatch"}\n',
+        authorityEventsJsonl: `${authorityLine(null)}\n`,
       })),
     );
     expect(withoutLineOrg.ok).toBe(true);
@@ -118,10 +135,36 @@ describe('assembleEvidenceBundle', () => {
     const withNullLineOrg = assembleEvidenceBundle(
       deepFreeze(validInput({
         organizationId: null,
-        authorityEventsJsonl: '{"organizationId":null,"event":"dispatch"}\n',
+        authorityEventsJsonl: `${authorityLine(null)}\n`,
       })),
     );
     expect(withNullLineOrg.ok).toBe(true);
+  });
+
+  it('refuses a JSONL line that is not a complete AuthorityEvent despite a matching organizationId', () => {
+    // The reviewer-reported case: an object carrying only `organizationId`
+    // used to pass and be archived as audit evidence.
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: '{"organizationId":"org-1"}\n' })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: '{"organizationId":"org-1","event":"dispatch"}\n' })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses a JSONL line with an unknown kind, a bad actor, or an unparseable atIso', () => {
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1', { kind: 'unknown-kind' })}\n` })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1', { actor: 'bad actor!' })}\n` })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1', { atIso: 'not-a-date' })}\n` })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(assembleEvidenceBundle(
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1', { beforeRevision: 5 })}\n` })),
+    )).toEqual({ ok: false, reason: 'invalid-input' });
   });
 
   it('produces byte-identical entries and manifest for reversed key order at root and in nested items', () => {
@@ -230,7 +273,7 @@ describe('assembleEvidenceBundle', () => {
 
   it('refuses malformed non-empty JSONL lines', () => {
     expect(assembleEvidenceBundle(
-      deepFreeze(validInput({ authorityEventsJsonl: '{"organizationId":"org-1","event":"dispatch"}\nnot json\n' })),
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-1')}\nnot json\n` })),
     )).toEqual({ ok: false, reason: 'invalid-input' });
     expect(assembleEvidenceBundle(
       deepFreeze(validInput({ authorityEventsJsonl: '[1,2]\n' })),
@@ -298,7 +341,7 @@ describe('assembleEvidenceBundle', () => {
 
   it('refuses a JSONL line carrying an own prototype-polluting key', () => {
     const result = assembleEvidenceBundle(deepFreeze(validInput({
-      authorityEventsJsonl: '{"organizationId":"org-1","__proto__":{"x":1}}\n',
+      authorityEventsJsonl: `{"organizationId":"org-1","__proto__":{"x":1},"eventId":"ev-1","kind":"dispatch","actor":"operator@example.com","atIso":"${AT_ISO}","beforeRevision":null,"afterRevision":null}\n`,
     })));
     expect(result).toEqual({ ok: false, reason: 'invalid-input' });
   });
@@ -435,15 +478,15 @@ describe('assembleEvidenceBundle', () => {
 
   it('refuses any authorityEventsJsonl line with a different organizationId', () => {
     expect(assembleEvidenceBundle(
-      deepFreeze(validInput({ authorityEventsJsonl: '{"organizationId":"org-2","event":"dispatch"}\n' })),
+      deepFreeze(validInput({ authorityEventsJsonl: `${authorityLine('org-2')}\n` })),
     )).toEqual({ ok: false, reason: 'cross-organization-event' });
     expect(assembleEvidenceBundle(
       deepFreeze(validInput({
-        authorityEventsJsonl: `{"organizationId":"org-1"}\n{"organizationId":"org-2"}\n`,
+        authorityEventsJsonl: `${authorityLine('org-1')}\n${authorityLine('org-2')}\n`,
       })),
     )).toEqual({ ok: false, reason: 'cross-organization-event' });
     expect(assembleEvidenceBundle(
-      deepFreeze(validInput({ organizationId: null, authorityEventsJsonl: '{"organizationId":"org-2"}\n' })),
+      deepFreeze(validInput({ organizationId: null, authorityEventsJsonl: `${authorityLine('org-2')}\n` })),
     )).toEqual({ ok: false, reason: 'cross-organization-event' });
   });
 

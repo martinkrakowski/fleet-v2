@@ -143,6 +143,35 @@ const FINDING_KEYS = ['findingId', 'severity', 'disposition'] as const;
 const GATE_OUTPUT_KEYS = ['command', 'exitCode', 'outputExcerpt'] as const;
 const SEAT_KEYS = ['role', 'seatId'] as const;
 
+/**
+ * The exact own keys a serialised `AuthorityEvent` JSONL line carries, the
+ * kinds it may name and the `actor` shape it must match — the same record
+ * rules as `parseAuthorityEvent` in `@fleet/operator-coordination`, restated
+ * here because no cross-context dependency is declared in that direction.
+ */
+const AUTHORITY_EVENT_KEYS = [
+  'eventId',
+  'kind',
+  'actor',
+  'organizationId',
+  'atIso',
+  'beforeRevision',
+  'afterRevision',
+] as const;
+
+const AUTHORITY_EVENT_KINDS: ReadonlySet<string> = new Set([
+  'dispatch',
+  'stop',
+  'grant',
+  'merge',
+  'policy-change',
+  'key-change',
+  'membership-change',
+  'operator-access',
+]);
+
+const AUTHORITY_ACTOR_PATTERN = /^[A-Za-z0-9._@-]{1,128}$/;
+
 const UNREADABLE = Symbol('unreadable');
 const HOSTILE = Symbol('hostile');
 
@@ -289,6 +318,66 @@ function hasExactKeys(
  */
 function isBoundedString(value: unknown, maxLength: number): value is string {
   return typeof value === 'string' && value.length <= maxLength;
+}
+
+/**
+ * A bounded required text: a non-empty string of at most `maxLength`
+ * characters with no control character, mirroring the authority-event field
+ * rules. O(length), every length cap bounds the scan.
+ */
+function isBoundedAuthorityText(value: unknown, maxLength: number): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A bounded optional text: `null` or a bounded required text. */
+function isBoundedOptionalAuthorityText(value: unknown, maxLength: number): boolean {
+  return value === null || isBoundedAuthorityText(value, maxLength);
+}
+
+/**
+ * One parsed JSONL line, already snapshotted to own enumerable data
+ * properties, is a complete `AuthorityEvent`: exactly the seven keys, every
+ * field present, well-formed and within its bound. O(1) per line beyond the
+ * bounded field scans. Invalid shape reads as `invalid-input`, never a pass —
+ * a bare `{"organizationId":"org-1"}` line carries no evidence.
+ */
+function isAuthorityEventLine(record: Readonly<Record<string, unknown>>): boolean {
+  if (!hasExactKeys(record, AUTHORITY_EVENT_KEYS)) {
+    return false;
+  }
+  if (!isBoundedAuthorityText(record.eventId, MAX_ID_LENGTH)) {
+    return false;
+  }
+  if (typeof record.kind !== 'string' || !AUTHORITY_EVENT_KINDS.has(record.kind)) {
+    return false;
+  }
+  if (typeof record.actor !== 'string' || !AUTHORITY_ACTOR_PATTERN.test(record.actor)) {
+    return false;
+  }
+  if (!isBoundedOptionalAuthorityText(record.organizationId, MAX_ID_LENGTH)) {
+    return false;
+  }
+  const atIso = record.atIso;
+  if (
+    !isBoundedAuthorityText(atIso, MAX_TIMESTAMP_LENGTH)
+    || !AT_ISO_PATTERN.test(atIso)
+    || !Number.isFinite(Date.parse(atIso))
+  ) {
+    return false;
+  }
+  if (!isBoundedOptionalAuthorityText(record.beforeRevision, MAX_ID_LENGTH)) {
+    return false;
+  }
+  return isBoundedOptionalAuthorityText(record.afterRevision, MAX_ID_LENGTH);
 }
 
 /** The JSON text of `value` with no key-order dependence: a leaf only. */
@@ -451,8 +540,9 @@ export function assembleEvidenceBundle(input: unknown): EvidenceBundleResult {
       }
     }
 
-    // The authority-events JSONL: every non-empty line must be a JSON object
-    // with unique keys, whose `organizationId` matches the bundle's.
+    // The authority-events JSONL: every non-empty line must be a complete
+    // `AuthorityEvent` object with unique keys, whose `organizationId`
+    // matches the bundle's.
     for (const line of authorityEventsJsonl.split('\n')) {
       if (line.trim() === '') {
         continue;
@@ -471,6 +561,12 @@ export function assembleEvidenceBundle(input: unknown): EvidenceBundleResult {
       }
       const lineSnapshot = snapshotRecord(parsed);
       if (lineSnapshot.kind !== 'ok') {
+        return { ok: false, reason: 'invalid-input' };
+      }
+      // A line that is not a complete `AuthorityEvent` is malformed data,
+      // refused even when its `organizationId` matches: it must never be
+      // archived as audit evidence.
+      if (!isAuthorityEventLine(lineSnapshot.value)) {
         return { ok: false, reason: 'invalid-input' };
       }
       const lineOrgId = lineSnapshot.value.organizationId;

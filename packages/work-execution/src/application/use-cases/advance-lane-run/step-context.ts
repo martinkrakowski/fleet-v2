@@ -558,12 +558,12 @@ const STAY_PARKED: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'parked'
  * wrong prototype, an accessor or a list longer than the cap, then one
  * descriptor per index. A getter on the list never runs.
  *
- * CE2: the optional `headAdvanced` key is present only when BOTH the
- * inspection's `checkedOutCommit` and the attempt's collected `headCommit`
- * are valid lowercase 40-hex SHAs, and it is their strict inequality. It
- * proves the head differs, not that it advanced (SPLIT_NEXT: the recollect
- * must verify ancestry). A missing, malformed, uppercase or getter-backed
- * `checkedOutCommit` leaves the key absent (unknown, read as `false`).
+ * CE2: `headAdvanced` is the strict inequality of the inspection's
+ * `checkedOutCommit` and the attempt's collected `headCommit`, both of which
+ * must be valid lowercase 40-hex SHAs. It proves the head differs, not that
+ * it advanced (SPLIT_NEXT: the recollect must verify ancestry). FY03F: when
+ * either head is missing, malformed, uppercase or getter-backed the whole
+ * fact is `undefined`, as `ResumeLaneRunUseCase.dirtyWorktreeFactOf` is `null`.
  */
 export async function dirtyWorktreeFactOf(
   ctx: AdvanceStepContext,
@@ -621,9 +621,12 @@ export async function dirtyWorktreeFactOf(
     LANE_HEAD_SHA_PATTERN.test(headCommit)
       ? checkedOutCommit !== headCommit
       : undefined;
-  return headAdvanced === undefined
-    ? { trackedFilesChanged: bounded.length }
-    : { trackedFilesChanged: bounded.length, headAdvanced };
+  // FY03F: an unknown head (either side missing, malformed, uppercase,
+  // getter-backed or a Proxy) fails closed exactly as the resume path does:
+  // no fact at all, so the park stays parked (`missing-dirty-worktree-fact`)
+  // instead of escalating a dirty worktree on a head nobody could verify.
+  // O(1) beyond the reads above.
+  return headAdvanced === undefined ? undefined : { trackedFilesChanged: bounded.length, headAdvanced };
 }
 
 /**

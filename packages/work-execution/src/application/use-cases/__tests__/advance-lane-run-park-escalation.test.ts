@@ -292,8 +292,12 @@ async function appendResult(
 }
 
 /** One dirty tracked path: the fact that justifies an escalation. */
-function dirtyInspection(): { readonly uncommittedPaths: readonly string[]; readonly untrackedPaths: readonly string[] } {
-  return { uncommittedPaths: ['src/a.ts'], untrackedPaths: [] };
+function dirtyInspection(): {
+  readonly uncommittedPaths: readonly string[];
+  readonly untrackedPaths: readonly string[];
+  readonly checkedOutCommit: string;
+} {
+  return { uncommittedPaths: ['src/a.ts'], untrackedPaths: [], checkedOutCommit: COMMIT };
 }
 
 interface WiredInspect {

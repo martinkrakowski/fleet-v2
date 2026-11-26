@@ -10,6 +10,7 @@ export * from "./AttemptArtifactAdapter.adapter.js";
 export * from "./AttemptOwnerDecisionAdapter.adapter.js";
 export * from "./AttemptRepositoryAdapter.adapter.js";
 export * from "./AttemptReviewLocator.helper.js";
+export * from "./AuthorityEventJournalAdapter.adapter.js";
 export * from "./AutoMergeOwnerRoutingAdapter.adapter.js";
 export * from "./BriefAuthoringAdapter.adapter.js";
 export * from "./BriefKnowledgeAdapter.adapter.js";

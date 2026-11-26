@@ -114,7 +114,6 @@ import {
   ReserveExecutionCapacityUseCase,
   RunnerForAttemptAdapter,
   SshExecutor,
-  StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
   composeCutoverShadowEvidence,
@@ -147,8 +146,9 @@ import {
   ReapZombiesUseCase,
   ReaperFindingRepositoryAdapter,
   InMemoryReaperFindingRepositoryAdapter,
-  RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
+  type AuditedRequestLaneRunStopPort,
+  type StopAttemptPort,
   type ProjectProfileReadPort,
   type AttemptRecord,
   type AttemptReviewLocator,
@@ -1072,7 +1072,8 @@ export interface FleetCliRuntime {
     /** AG-5: the edit-only commit step for a recorded agy edit-only attempt. */
     readonly commitEditOnlyAttempt: CommitEditOnlyAttemptUseCase;
     readonly reconcileAttempt: ReconcileAttemptUseCase;
-    readonly stopAttempt: StopAttemptUseCase;
+    /** FC12B: the stop use case wrapped with the authority event emission. */
+    readonly stopAttempt: StopAttemptPort;
     readonly collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
     /** EX-1a: the operator's record-only cancel for a prepared, never-dispatched attempt. */
@@ -1129,7 +1130,8 @@ export interface FleetCliRuntime {
     readonly laneRunJournal: LaneRunJournalAdapter;
     readonly driverLease: ConductorDriverLeaseAdapter;
     readonly halt: ConductorHaltAdapter;
-    readonly requestLaneRunStop: RequestLaneRunStopUseCase;
+    /** FC12B: the audited stop port; its `auditGap` flags a missed sink write. */
+    readonly requestLaneRunStop: AuditedRequestLaneRunStopPort;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
     /** PT1a (SN3): the runs parked past `policy.daemon.stallAfterMinutes`, for `conductor status --stalled`. */
     readonly listStalledRuns: ListStalledRunsUseCase;

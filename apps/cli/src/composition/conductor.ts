@@ -31,6 +31,7 @@ import {
   ReapZombiesUseCase,
   ReaperFindingRepositoryAdapter,
   InMemoryReaperFindingRepositoryAdapter,
+  AuthorityEventJournalAdapter,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   ReviewAssessmentAdapter,
@@ -51,6 +52,7 @@ import {
   type ProjectProfileReadPort,
   type ReconcileAttemptUseCase,
   type RunnerForAttemptPort,
+  withStopAuthorityEvents,
 } from '@fleet/work-execution';
 import type { CoordinationRequestRepositoryAdapter } from '@fleet/operator-coordination';
 
@@ -374,10 +376,19 @@ export function composeConductor(input: ComposeConductorInput) {
     laneRunJournal,
     driverLease: conductorDriverLease,
     halt: conductorHalt,
-    requestLaneRunStop: new RequestLaneRunStopUseCase({
-      runRepo: laneRunRepository,
-      runJournal: laneRunJournal,
-    }),
+    // FC12B fix round 2: the CLI's real stop requests emit their authority
+    // audit event through the state-dir journal sink; the audited wrapper's
+    // `auditGap` flag is surfaced by the stop command's own boundary.
+    requestLaneRunStop: withStopAuthorityEvents(
+      new RequestLaneRunStopUseCase({
+        runRepo: laneRunRepository,
+        runJournal: laneRunJournal,
+      }),
+      new AuthorityEventJournalAdapter(
+        stateDir === undefined ? {} : { stateDir },
+      ),
+      { actor: 'cli', organizationId: null },
+    ),
     inspectLaneRuns: new InspectLaneRunsUseCase({
       runRepo: laneRunRepository,
       runJournal: laneRunJournal,

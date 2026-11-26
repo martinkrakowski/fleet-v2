@@ -20,7 +20,7 @@ workspace:
     the existing Waves service supplies observation and decisions.
 planes:
   core: [work-execution, evidence-and-acceptance]
-  supporting: [brief-knowledge, operator-coordination, merge-coordination]
+  supporting: [brief-knowledge, operator-coordination, merge-coordination, tenancy]
 
 monorepo:
   packageManager: yarn@4.12.0
@@ -1167,6 +1167,27 @@ bounded_contexts:
       domain:
         entities: [TrainRecord, QueueEntryRecord, BatchRecord, CandidateRecord, GateReceiptRecord, PromotionReceiptRecord]
         value_objects: [TrainState, TrainEvent]
+      application:
+        use_cases: []
+        ports:
+          in: []
+          out: []
+      infrastructure:
+        adapters: []
+
+  - name: tenancy
+    type: supporting
+    plane: supporting
+    status: active
+    description: >-
+      Owns organisation, project and membership records for deployments serving
+      more than one organisation. Scaffold-only: no entities, ports or adapters
+      are declared yet.
+    depends_on: []
+    layers:
+      domain:
+        entities: []
+        value_objects: []
       application:
         use_cases: []
         ports:

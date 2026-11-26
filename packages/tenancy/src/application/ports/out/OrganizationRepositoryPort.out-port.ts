@@ -44,3 +44,15 @@ export interface OrganizationRepositoryPort {
    */
   saveOrganization(record: OrganizationRecord, expectedRevision: number): Promise<OrganizationWriteOutcome>;
 }
+
+/**
+ * Thrown by `findOrganization` for an id that is not a non-empty string: a
+ * malformed lookup key is a caller bug, never an answer of "absent". The
+ * message never echoes the offending value.
+ */
+export class UnsafeOrganizationIdError extends Error {
+  constructor() {
+    super('organization id must be a non-empty string');
+    this.name = 'UnsafeOrganizationIdError';
+  }
+}

@@ -21,8 +21,9 @@ import {
   validateOrganizationRecord,
 } from '../../domain/entities/Organization.js';
 import { ORGANIZATION_ID_PATTERN } from '../../domain/entities/record-guards.js';
-import type {
-  OrganizationRepositoryPort,
+import {
+  UnsafeOrganizationIdError,
+  type OrganizationRepositoryPort,
   OrganizationWriteOutcome,
   StoredOrganization,
 } from '../../application/ports/out/OrganizationRepositoryPort.out-port.js';
@@ -74,7 +75,15 @@ function snapshotOrganizationInput(
   input: unknown,
 ): { ok: true; record: OrganizationRecord } | { ok: false } {
   const validated = validateOrganizationRecord(input, isProxy);
-  return validated.ok ? { ok: true, record: validated.value } : { ok: false };
+  if (!validated.ok) {
+    return { ok: false };
+  }
+  // `schemaVersion` is a storage envelope concern: it is stripped here so a
+  // caller-supplied `schemaVersion: 1` is stored and returned identically in
+  // memory and on disk (where the envelope writes its own).
+  const { schemaVersion: _envelope, ...record } = validated.value;
+  void _envelope;
+  return { ok: true, record };
 }
 
 /**
@@ -159,7 +168,7 @@ export class OrganizationRepositoryAdapter implements OrganizationRepositoryPort
 
   async findOrganization(id: string): Promise<StoredOrganization | null> {
     if (typeof id !== 'string' || id.length === 0) {
-      throw new Error('OrganizationRepositoryAdapter refuses an unsafe organization id');
+      throw new UnsafeOrganizationIdError();
     }
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {

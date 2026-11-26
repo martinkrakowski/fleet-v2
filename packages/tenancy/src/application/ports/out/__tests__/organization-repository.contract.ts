@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import type { OrganizationRecord } from '../../../../domain/entities/Organization.js';
-import type {
-  OrganizationRepositoryPort,
-  OrganizationWriteOutcome,
+import {
+  UnsafeOrganizationIdError,
+  type OrganizationRepositoryPort,
+  type OrganizationWriteOutcome,
 } from '../OrganizationRepositoryPort.out-port.js';
 
 /**
@@ -180,13 +181,35 @@ export function describeOrganizationRepositoryContract(
       expect(await port.listOrganizations()).toEqual([]);
     });
 
-    it('refuses a non-string or empty id on findOrganization with a named error instead of answering absence', async () => {
+    it('strips a caller-supplied schemaVersion identically in every mode: create, find, list and save all return the record without it', async () => {
+      const port = createPort();
+      const withVersion = { ...makeOrg(), schemaVersion: 1 } as OrganizationRecord;
+      const created = await port.createOrganization(withVersion);
+      expect(created).toEqual({ status: 'saved', record: makeOrg(), revision: 0 });
+      const found = await port.findOrganization('org-1');
+      expect(found).toEqual({ record: makeOrg(), revision: 0 });
+      expect(Object.hasOwn(found!.record, 'schemaVersion')).toBe(false);
+      const listed = await port.listOrganizations();
+      expect(listed.every((entry) => !Object.hasOwn(entry.record, 'schemaVersion'))).toBe(true);
+      const saved = await port.saveOrganization(
+        { ...makeOrg({ displayName: 'Renamed' }), schemaVersion: 1 } as OrganizationRecord,
+        0,
+      );
+      expect(saved).toEqual({
+        status: 'saved',
+        record: makeOrg({ displayName: 'Renamed' }),
+        revision: 1,
+      });
+      expect(Object.hasOwn((await port.findOrganization('org-1'))!.record, 'schemaVersion')).toBe(false);
+    });
+
+    it('refuses a non-string or empty id on findOrganization with UnsafeOrganizationIdError instead of answering absence', async () => {
       const port = createPort();
       await port.createOrganization(makeOrg());
       for (const bad of [null, undefined, 7, ['org-1'], '']) {
         await expect(
           port.findOrganization(bad as string),
-        ).rejects.toThrow('OrganizationRepositoryAdapter refuses an unsafe organization id');
+        ).rejects.toBeInstanceOf(UnsafeOrganizationIdError);
       }
       expect(await port.findOrganization('org-1')).not.toBeNull();
     });

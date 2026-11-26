@@ -130,8 +130,14 @@ describe('OrganizationRepositoryAdapter (file mode)', () => {
       const adapter = new OrganizationRepositoryAdapter({ stateDir });
       const refused = await adapter.findOrganization('org-1').catch((error: unknown) => error);
       expect(refused, `case ${index}`).toBeInstanceOf(StateFileUnreadableError);
-      const quarantine = await fs.readdir(path.join(stateDir, 'quarantine'));
-      expect(quarantine.length, `case ${index} quarantined the bytes`).toBeGreaterThan(0);
+      // The quarantine directory is emptied after every case (it prunes old
+      // copies, so a running count is unreliable): exactly one copy, holding
+      // exactly this case's bytes, proves THIS case quarantined them.
+      const quarantineDir = path.join(stateDir, 'quarantine');
+      const quarantine = await fs.readdir(quarantineDir);
+      expect(quarantine, `case ${index} quarantined its bytes exactly once`).toHaveLength(1);
+      expect(await fs.readFile(path.join(quarantineDir, quarantine[0]!), 'utf8')).toBe(payload);
+      await fs.rm(quarantineDir, { recursive: true, force: true });
     }
   });
 
@@ -176,22 +182,21 @@ describe('OrganizationRepositoryAdapter (file mode)', () => {
     expect((onDisk[0] as Record<string, unknown>)['displayName']).toBe('Org One');
   });
 
-  it('serializes two adapters over one stateDir: the second save at the same revision is stale', async () => {
-    const first = new OrganizationRepositoryAdapter({ stateDir });
-    const second = new OrganizationRepositoryAdapter({ stateDir });
-    await first.createOrganization(makeOrg());
-    await expect(second.saveOrganization(makeOrg({ displayName: 'Racer' }), 0)).resolves.toEqual({
-      status: 'saved',
-      record: makeOrg({ displayName: 'Racer' }),
-      revision: 1,
-    });
-    await expect(first.saveOrganization(makeOrg({ displayName: 'Loser' }), 0)).resolves.toEqual({
-      status: 'refused',
-      reason: 'stale-revision',
-    });
-    expect(await first.findOrganization('org-1')).toEqual(
-      await second.findOrganization('org-1'),
+  it('serializes concurrent saves over one stateDir: of many saves at the same expected revision exactly one is saved and the rest are stale', async () => {
+    const seed = new OrganizationRepositoryAdapter({ stateDir });
+    await seed.createOrganization(makeOrg());
+    const adapters = Array.from({ length: 6 }, () => new OrganizationRepositoryAdapter({ stateDir }));
+    const outcomes = await Promise.all(
+      adapters.map((adapter, index) =>
+        adapter.saveOrganization(makeOrg({ displayName: `Racer ${index}` }), 0),
+      ),
     );
+    expect(outcomes.filter((outcome) => outcome.status === 'saved')).toHaveLength(1);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'refused' && outcome.reason === 'stale-revision'),
+    ).toHaveLength(5);
+    const stored = await seed.findOrganization('org-1');
+    expect(stored?.revision).toBe(1);
   });
 });
 

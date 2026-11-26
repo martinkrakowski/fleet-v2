@@ -7,6 +7,7 @@ const DAY = '2026-11-10';
 const DIGEST = '0123456789ab';
 const OTHER_DIGEST = 'ffeeddccbbaa';
 const HEAD_A = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
+const HEAD_B = 'b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7';
 const HEAD_C = 'f0e9d8c7b6a5f4e3d2c1b0a99887766554433221';
 
 function inDayIso(minutes: number, second = 0): string {
@@ -399,6 +400,52 @@ describe('evaluateShadowMergeSet (S1)', () => {
       },
     });
     expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+  });
+
+  describe('superseded old-head fleet rows', () => {
+    const supersededInput = (oldRows: { head: string; at: string }[]): Record<string, unknown> => dayInput({
+      shell: { events: [shellEvent({ headOid: HEAD_C })], unknownLines: 0 },
+      fleet: {
+        results: [
+          ...oldRows.map((row) => fleetResult({ key: mergeKey(DIGEST, 7, row.head.slice(0, 12)), recordedAtIso: row.at })),
+          fleetResult({ key: mergeKey(DIGEST, 7, HEAD_C.slice(0, 12)), recordedAtIso: inDayIso(599, 50) }),
+        ],
+        entries: [...new Set([...oldRows.map((row) => row.head), HEAD_C])].map((head) => fleetEntry({ headOid: head })),
+      },
+    });
+
+    it('drops an old-head row when the shell merged the PR at a newer head that has its own fleet row', () => {
+      const input = supersededInput([{ head: HEAD_A, at: inDayIso(599, 30) }]);
+      expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+    });
+
+    it('drops every old-head row of one PR, not just the first', () => {
+      const input = supersededInput([
+        { head: HEAD_A, at: inDayIso(598, 10) },
+        { head: HEAD_B, at: inDayIso(599, 10) },
+      ]);
+      expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+    });
+
+    it('keeps a wrong-head row recorded after the shell merged the PR at the newer head', () => {
+      const input = supersededInput([{ head: HEAD_A, at: inDayIso(600, 1) }]);
+      expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+    });
+
+    it('floors the old-head row to the whole second: 0.9 s into the merge second is dropped, the next whole second is kept', () => {
+      const within = supersededInput([{ head: HEAD_A, at: inDayIso(600).replace('.000Z', '.900Z') }]);
+      expect(evaluateShadowMergeSet(within)).toEqual(PASS_DAY);
+      const after = supersededInput([{ head: HEAD_A, at: inDayIso(600, 1) }]);
+      expect(evaluateShadowMergeSet(after)).toMatchObject({ status: 'fail', divergences: 1 });
+    });
+
+    it('keeps an old-head row when the newer shell-merged head has no fleet row of its own', () => {
+      const input = dayInput({
+        shell: { events: [shellEvent({ headOid: HEAD_C })], unknownLines: 0 },
+        fleet: { results: [fleetResult({ recordedAtIso: inDayIso(599, 30) })], entries: [fleetEntry()] },
+      });
+      expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
+    });
   });
 });
 

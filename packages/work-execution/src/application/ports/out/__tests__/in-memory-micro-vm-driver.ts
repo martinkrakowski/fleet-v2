@@ -180,20 +180,25 @@ export class InMemoryMicroVmDriver implements MicroVmDriverPort {
     if (configured !== null) {
       return this.refuse('create', attemptId, null, configured);
     }
+    // A refused create (duplicate attemptId) must not issue an environmentId:
+    // the duplicate check runs before the counter advances, so a later
+    // successful create is not exposed with a skipped ID.
+    if (this.states.has(attemptId)) {
+      return this.refuse('create', attemptId, null);
+    }
     // The environmentId is issued here, never supplied, so it is well formed by construction.
     const environmentId = this.issueEnvironmentId();
-    const state = this.states.get(attemptId) ?? INITIAL_ATTEMPT_ENVIRONMENT_STATE;
-    const step = decideEnvironmentStep(state, {
+    const step = decideEnvironmentStep(INITIAL_ATTEMPT_ENVIRONMENT_STATE, {
       kind: 'create',
       attemptId,
       environmentId,
-      isolation: isolationValue,
+      isolation: isolationValue as MicroVmIsolation,
     });
     if (!step.ok) {
       return this.refuse('create', attemptId, null);
     }
     this.states.set(attemptId, step.state);
-    const handle: MicroVmHandle = { environmentId, attemptId, isolation: isolationValue };
+    const handle: MicroVmHandle = { environmentId, attemptId, isolation: isolationValue as MicroVmIsolation };
     this.handles.set(environmentId, handle);
     this.record('create', attemptId, environmentId, true, null);
     return { ok: true as const, handle };

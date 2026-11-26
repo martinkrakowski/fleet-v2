@@ -44,8 +44,13 @@ describe('InMemoryMicroVmDriver specifics', () => {
     if (created2.ok) {
       expect(await sealRefused.injectWorktree(created2.handle, { worktreeRef: 'wt/att-1' })).toEqual({ ok: true });
       expect(await sealRefused.seal(created2.handle)).toEqual({ ok: false, reason: 'refused' });
-      // The failed seal left the environment loaded, not sealed.
-      expect(await sealRefused.injectWorktree(created2.handle, { worktreeRef: 'wt/att-1-again' })).toEqual({ ok: true });
+      // The failed seal left the environment loaded, not sealed: a repeat
+      // injectWorktree is refused from `loaded` (not `sealed`), and the seal
+      // retry fails again only through the injected configured failure.
+      expect(await sealRefused.injectWorktree(created2.handle, { worktreeRef: 'wt/att-1-again' }))
+        .toEqual({ ok: false, reason: 'refused' });
+      expect(await sealRefused.seal(created2.handle)).toEqual({ ok: false, reason: 'refused' });
+      expect(await sealRefused.destroy(created2.handle)).toEqual({ ok: true });
     }
 
     const destroyUnavailable = new InMemoryMicroVmDriver({ failOnStep: 'destroy', failureReason: 'unavailable' });
@@ -77,6 +82,22 @@ describe('InMemoryMicroVmDriver specifics', () => {
     const refused = await driver.create({ attemptId: 'att-2', isolation: 'bogus' } as unknown as Parameters<InMemoryMicroVmDriver['create']>[0]);
     expect(refused).toEqual({ ok: false, reason: 'refused' });
     expect(driver.recordedCalls().at(-1)).toMatchObject({ step: 'create', ok: false, reason: 'refused' });
+  });
+
+  it('does not advance the environmentId numbering when a duplicate create is refused', async () => {
+    const driver = new InMemoryMicroVmDriver();
+    const first = await driver.create({ attemptId: 'att-1', isolation: 'microvm' });
+    expect(first.ok).toBe(true);
+    // The duplicate create is refused without issuing an environmentId.
+    expect(await driver.create({ attemptId: 'att-1', isolation: 'microvm' }))
+      .toEqual({ ok: false, reason: 'refused' });
+    // The next successful create carries the immediately following number,
+    // not a skipped one: no ID was burned by the refused create.
+    const second = await driver.create({ attemptId: 'att-2', isolation: 'microvm' });
+    expect(second.ok).toBe(true);
+    if (second.ok && first.ok) {
+      expect(second.handle.environmentId).toBe('env-2');
+    }
   });
 
   it('keeps destroy idempotent for the bound handle while refusing it for foreign handles', async () => {

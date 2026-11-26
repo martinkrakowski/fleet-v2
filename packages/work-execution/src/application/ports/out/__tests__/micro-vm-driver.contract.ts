@@ -153,6 +153,10 @@ export function describeMicroVmDriverContract(
         return;
       }
       const handle = bound.handle;
+      const classInstance = new (class Held {
+        attemptId = 'att-1';
+        isolation = 'microvm';
+      })();
       const hostileRequests: readonly unknown[] = [
         null,
         undefined,
@@ -162,6 +166,11 @@ export function describeMicroVmDriverContract(
         [],
         sparse,
         { length: 2, 0: 'a', 1: 'b' },
+        // Non-plain objects: a foreign prototype (Date, class instance, Map)
+        // is refused by the plain-record guard, never unwrapped.
+        new Date(),
+        classInstance,
+        new Map([['attemptId', 'att-1']]),
         { attemptId: oversizedId, isolation: 'microvm' },
         { attemptId: 'att-1', isolation: oversizedId },
       ];
@@ -217,7 +226,7 @@ export function describeMicroVmDriverContract(
 
       // A handle read through a Proxy is refused the same way.
       const handleTarget: Record<string, unknown> = { environmentId: 'env-1', attemptId: 'att-1', isolation: 'microvm' };
-      const viaHandleProxy = await driver.seal(new Proxy(handleTarget, {}) as MicroVmHandle);
+      const viaHandleProxy = await driver.seal(new Proxy(handleTarget, {}) as unknown as MicroVmHandle);
       expect(viaHandleProxy).toEqual({ ok: false, reason: 'refused' });
     });
 
@@ -225,18 +234,20 @@ export function describeMicroVmDriverContract(
       const driver = createDriver();
       const pollutingKeys = ['__' + 'proto__', 'con' + 'structor', 'proto' + 'type'];
       for (const key of pollutingKeys) {
+        // A plain assignment to '__proto__' mutates the prototype instead of
+        // creating an own key, so define the polluting key as an own property.
         const polluted: Record<string, unknown> = { attemptId: 'att-1', isolation: 'microvm' };
-        polluted[key] = 'x';
+        Object.defineProperty(polluted, key, { value: 'x', enumerable: true, writable: true, configurable: true });
         const created = await driver.create(polluted as { attemptId: string; isolation: 'microvm' });
         expect(created).toEqual({ ok: false, reason: 'refused' });
 
         const pollutedHandle: Record<string, unknown> = { environmentId: 'env-1', attemptId: 'att-1', isolation: 'microvm' };
-        pollutedHandle[key] = 'x';
-        const sealed = await driver.seal(pollutedHandle as MicroVmHandle);
+        Object.defineProperty(pollutedHandle, key, { value: 'x', enumerable: true, writable: true, configurable: true });
+        const sealed = await driver.seal(pollutedHandle as unknown as MicroVmHandle);
         expect(sealed).toEqual({ ok: false, reason: 'refused' });
       }
 
-      const extraKeyRequest = { attemptId: 'att-1', isolation: 'microvm', unexpected: 1 };
+      const extraKeyRequest = { attemptId: 'att-1', isolation: 'microvm' as const, unexpected: 1 };
       expect(await driver.create(extraKeyRequest)).toEqual({ ok: false, reason: 'refused' });
 
       const created = await driver.create({ attemptId: 'att-2', isolation: 'microvm' });
@@ -255,7 +266,11 @@ export function describeMicroVmDriverContract(
       for (const attemptId of invalidIds) {
         const created = await driver.create({ attemptId, isolation: 'microvm' });
         expect(created.ok).toBe(false);
-        expect(JSON.stringify(created)).not.toContain(attemptId);
+        // JSON.stringify always contains the empty string, so the no-echo
+        // check is meaningful only for non-empty values.
+        if (attemptId.length > 0) {
+          expect(JSON.stringify(created)).not.toContain(attemptId);
+        }
       }
       const created = await driver.create({ attemptId: 'att-1', isolation: 'microvm' });
       expect(created.ok).toBe(true);
@@ -266,7 +281,9 @@ export function describeMicroVmDriverContract(
         const mismatched: MicroVmHandle = { environmentId, attemptId: 'att-1', isolation: 'microvm' };
         const sealed = await driver.seal(mismatched);
         expect(sealed).toEqual({ ok: false, reason: 'refused' });
-        expect(JSON.stringify(sealed)).not.toContain(environmentId);
+        if (environmentId.length > 0) {
+          expect(JSON.stringify(sealed)).not.toContain(environmentId);
+        }
       }
     });
 
@@ -289,7 +306,9 @@ export function describeMicroVmDriverContract(
       for (const worktreeRef of invalidRefs) {
         const injected = await driver.injectWorktree(handle, { worktreeRef });
         expect(injected).toEqual({ ok: false, reason: 'refused' });
-        expect(JSON.stringify(injected)).not.toContain(worktreeRef);
+        if (worktreeRef.length > 0) {
+          expect(JSON.stringify(injected)).not.toContain(worktreeRef);
+        }
       }
       // Still in the created state: a legal injection succeeds afterwards.
       expect(await driver.injectWorktree(handle, { worktreeRef: 'wt/att-1' })).toEqual({ ok: true });

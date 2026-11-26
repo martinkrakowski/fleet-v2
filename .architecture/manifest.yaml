@@ -1186,8 +1186,8 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [Organization, Project]
-        value_objects: []
+        entities: [Organization, Project, Membership]
+        value_objects: [Role]
       application:
         use_cases: []
         ports:

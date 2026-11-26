@@ -289,6 +289,7 @@ describe('conductor start incomplete ledger (AD-2)', () => {
     const briefPath = join(dir, BRIEF_FILE);
     writeFileSync(briefPath, JSON.stringify(briefFixture()), 'utf8');
     const runtime = runtimeOf(dir);
+    await seedCrashedStart(runtime, ATTEMPT_ID);
 
     const result = await runStart(runtime, dir, ['--brief-request', briefPath, '--tier', '2'], fakeDriver({
       outcome: 'incomplete',
@@ -315,6 +316,7 @@ describe('conductor start incomplete ledger (AD-2)', () => {
     const briefPath = join(dir, BRIEF_FILE);
     writeFileSync(briefPath, JSON.stringify(briefFixture()), 'utf8');
     const runtime = runtimeOf(dir);
+    await seedCrashedStart(runtime, ATTEMPT_ID);
     const record = runtime.coordination.recordAttentionItem.recordAttentionItem.bind(
       runtime.coordination.recordAttentionItem,
     );
@@ -341,5 +343,144 @@ describe('conductor start incomplete ledger (AD-2)', () => {
     // The wrapper is restored so the runtime stays usable after the test.
     (runtime.coordination.recordAttentionItem as unknown as { recordAttentionItem: unknown }).recordAttentionItem =
       record;
+  });
+
+  const BRIEF_REJECTED_INCOMPLETE: StartLaneRunResult = {
+    outcome: 'incomplete',
+    runId: RUN_ID,
+    attemptId: ATTEMPT_ID,
+    step: 'brief',
+    reason: 'brief-rejected: worktreePath is required',
+  };
+
+  async function incompleteStartWithReservations(
+    reservations: () => unknown,
+  ): Promise<{ code: number; stdout: readonly string[]; summaries: readonly string[] }> {
+    const dir = tempStateDir();
+    const briefPath = join(dir, BRIEF_FILE);
+    writeFileSync(briefPath, JSON.stringify(briefFixture()), 'utf8');
+    const runtime = runtimeOf(dir);
+    (runtime.execution.executionJournal as unknown as { listActiveReservations: unknown }).listActiveReservations =
+      async () => reservations();
+    const result = await runStart(
+      runtime,
+      dir,
+      ["--brief-request", briefPath, "--tier", "2"],
+      fakeDriver(BRIEF_REJECTED_INCOMPLETE),
+    );
+    return { code: result.code, stdout: result.stdout, summaries: await listedCrashedStartSummaries(runtime) };
+  }
+
+  it('a pre-reserve start refusal exits 1 with the refusal JSON and raises no attention item (regression pin)', async () => {
+    const dir = tempStateDir();
+    const briefPath = join(dir, BRIEF_FILE);
+    writeFileSync(briefPath, JSON.stringify(briefFixture()), 'utf8');
+    const runtime = runtimeOf(dir);
+
+    const result = await runStart(
+      runtime,
+      dir,
+      ['--brief-request', briefPath, '--tier', '2'],
+      fakeDriver({ outcome: 'refused', reason: 'halted' } as unknown as StartLaneRunResult),
+    );
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout[0]!)).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(await listedCrashedStartSummaries(runtime)).toEqual([]);
+  });
+
+  it('an incomplete start with no held reservation raises no crashed-start attention item', async () => {
+    const dir = tempStateDir();
+    const briefPath = join(dir, BRIEF_FILE);
+    writeFileSync(briefPath, JSON.stringify(briefFixture()), 'utf8');
+    const runtime = runtimeOf(dir);
+
+    const result = await runStart(
+      runtime,
+      dir,
+      ['--brief-request', briefPath, '--tier', '2'],
+      fakeDriver(BRIEF_REJECTED_INCOMPLETE),
+    );
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout[0]!)).toMatchObject({
+      outcome: 'incomplete',
+      step: 'brief',
+      reason: 'brief-rejected: worktreePath is required',
+    });
+    expect(result.stderr).toEqual([]);
+    expect(await listedCrashedStartSummaries(runtime)).toEqual([]);
+  });
+
+  it('an incomplete start whose only reservations are held for another attempt or released raises no crashed-start item', async () => {
+    const out = await incompleteStartWithReservations(() => [
+      { attemptId: 'attempt-other', held: true, slotIndex: 0 },
+      { attemptId: ATTEMPT_ID, held: false, slotIndex: 1 },
+    ]);
+
+    expect(out.code).toBe(1);
+    expect(out.summaries).toEqual([]);
+  });
+
+  it('an incomplete start still raises crashed-start when active reservations cannot be read', async () => {
+    const out = await incompleteStartWithReservations(() => {
+      throw new Error('example journal failure');
+    });
+
+    expect(out.code).toBe(1);
+    expect(JSON.parse(out.stdout[0]!)).toMatchObject({ outcome: 'incomplete', step: 'brief' });
+    expect(out.summaries).toHaveLength(1);
+    expect(out.summaries[0]).toContain(`for attempt ${ATTEMPT_ID}`);
+    expect(out.summaries[0]).not.toContain('slot 0');
+  });
+
+  it('an incomplete start still raises crashed-start when the reservation list is not an array', async () => {
+    const out = await incompleteStartWithReservations(() => ({ length: 0 }));
+
+    expect(out.code).toBe(1);
+    expect(out.summaries).toHaveLength(1);
+  });
+
+  it('an incomplete start still raises crashed-start for a null, hole, getter or oversized reservation list without running a getter', async () => {
+    let getterRuns = 0;
+    const hostile: unknown[][] = [
+      [null],
+      [undefined],
+      new Array(1) as unknown[],
+      [
+        Object.defineProperty({}, 'attemptId', {
+          enumerable: true,
+          get: () => {
+            getterRuns += 1;
+            return 'attempt-other';
+          },
+        }),
+      ],
+      [{ attemptId: 'attempt-other', held: true }, 'not-an-object'],
+      Array.from({ length: 10_001 }, () => ({ attemptId: 'attempt-other', held: false })),
+    ];
+    for (const list of hostile) {
+      // The pre-start crashed-start scan reads the journal first and is not
+      // under test; the list is hostile only for the call the fallback makes.
+      let calls = 0;
+      const out = await incompleteStartWithReservations(() => {
+        calls += 1;
+        return calls === 1 ? [] : list;
+      });
+      expect(calls).toBe(2);
+      expect(out.code).toBe(1);
+      expect(out.summaries).toHaveLength(1);
+    }
+    expect(getterRuns).toBe(0);
+  });
+
+  it('an incomplete start with a held reservation raises crashed-start naming its slot', async () => {
+    const out = await incompleteStartWithReservations(() => [
+      { attemptId: 'attempt-other', held: true, slotIndex: 3 },
+      { attemptId: ATTEMPT_ID, held: true, slotIndex: 2 },
+    ]);
+
+    expect(out.summaries).toHaveLength(1);
+    expect(out.summaries[0]).toContain('slot 2');
   });
 });

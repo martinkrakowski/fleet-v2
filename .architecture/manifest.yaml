@@ -307,7 +307,8 @@ apps:
     framework: plain-ts
     role: operator-driver-and-composition-root
     description: >-
-      Compose the four contexts and adapters in a local CLI. No inference proxy,
+      Compose the business contexts declared in bounded_contexts and adapters in a
+      local CLI. No inference proxy,
       automatic host administration or live dispatch is implemented.
     depends_on: [work-execution, evidence-and-acceptance, brief-knowledge, operator-coordination]
   - name: web
@@ -321,7 +322,8 @@ apps:
     framework: nitro
     role: http-driver-and-composition-root
     description: >-
-      Nitro HTTP API scaffold and future composition root for the four contexts.
+      Nitro HTTP API scaffold and future composition root for the business
+      contexts declared in bounded_contexts.
       Routes delegate to application ports; execution and credentials stay behind
       the existing infrastructure boundaries.
     depends_on: [work-execution, evidence-and-acceptance, brief-knowledge, operator-coordination]
@@ -340,7 +342,7 @@ bounded_contexts:
     layers:
       domain:
         entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink, MergeRecord]
-        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState]
+        value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState, SpendCap]
       application:
         use_cases:
           - RegisterWorkOrderUseCase
@@ -1178,7 +1180,7 @@ agent_instructions:
   constraints:
     - "Keep domain and application free of Node, filesystem, subprocess, network and vendor imports."
     - "No empty interface or generic generated stub establishes an implemented security or lifecycle guarantee. Refine typed contracts before migrating a station."
-    - "Keep exactly four business contexts. CLI and Nitro API are composition roots; Next.js is a presentation boundary."
+    - "Keep the business contexts declared in bounded_contexts; supporting packages for optional organisation-aware features, if added, are declared there too, and no core package imports them. CLI and Nitro API are composition roots; Next.js is a presentation boundary."
     - "Use explicit allow-listed argument arrays for script adapters; do not execute commands copied from lane notes."
     - "Preserve existing lane fences and host-side credential placement. No automatic host restart or sudo."
     - "No service, credential, live host, production database or deployment is contacted by the generated application."

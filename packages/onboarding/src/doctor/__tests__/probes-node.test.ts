@@ -37,7 +37,10 @@ import type {
 import {
   createNodeDoctorExecutor,
   createNodeDoctorProbes,
+  DISK_QUOTA_FILE,
+  DISK_QUOTA_MAX_CHARS,
   LOGIN_SHELL_CANARY,
+  parseDiskQuotaUsage,
   seatProbeArgv,
 } from '../probes-node.js';
 import { posixQuote } from '../ssh-remote.js';
@@ -1351,5 +1354,107 @@ describe('createNodeDoctorProbes loginShell (SHP1)', () => {
       },
     });
     await expect(probes.loginShell!('lane-host')).resolves.toBe('unknown');
+  });
+});
+
+describe('createNodeDoctorProbes diskQuotaUsage (OPQ1)', () => {
+  it('pins the fixed file path and the parse budget', () => {
+    expect(DISK_QUOTA_FILE).toBe('/etc/fleet/disk-quota-bytes');
+    expect(DISK_QUOTA_MAX_CHARS).toBe(256);
+  });
+
+  it('runs cat on the fixed disk-quota file through sshRemoteArgv with the probe budget', async () => {
+    const fake = fakeExecutor({ stdout: '100 1000\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+    await expect(probes.diskQuotaUsage!('lane-host')).resolves.toEqual({
+      usedBytes: 100,
+      totalBytes: 1000,
+    });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'sh',
+      '-c',
+      posixQuote(['cat', DISK_QUOTA_FILE].map(posixQuote).join(' ')),
+    ]);
+    expect(fake.calls[0]?.options?.timeoutMs).toBe(10_000);
+
+    const local = fakeExecutor({ stdout: '100 1000' });
+    const localProbes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await expect(localProbes.diskQuotaUsage!('local')).resolves.toBeUndefined();
+    expect(local.calls).toHaveLength(0);
+  });
+
+  it('returns undefined without spawning for local, unsafe alias, or exhausted budget', async () => {
+    const fake = fakeExecutor({ stdout: '100 1000\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+    await expect(probes.diskQuotaUsage!('local')).resolves.toBeUndefined();
+    await expect(probes.diskQuotaUsage!('bad host')).resolves.toBeUndefined();
+    await expect(probes.diskQuotaUsage!('-dash-alias')).resolves.toBeUndefined();
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const budgeted = createNodeDoctorProbes({ localExecutor: fake.executor, timeoutMs });
+      await expect(budgeted.diskQuotaUsage!('lane-host')).resolves.toBeUndefined();
+    }
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it('maps a failing, signalled, or erroring diskQuotaUsage run to undefined', async () => {
+    const outcomes: Partial<DoctorCommandRunResult>[] = [
+      // `cat` on a missing file: exit 1, no usable answer.
+      { exitCode: 1, stdout: '' },
+      { exitCode: 1, stdout: 'cat: no such file\n' },
+      { exitCode: 2, stdout: '100 1000\n' },
+      { exitCode: null, signal: 'SIGTERM', stdout: '100 1000\n' },
+      { exitCode: 0, stdout: '100 1000\n', error: 'late failure' },
+      { exitCode: null, signal: null, stdout: '', error: 'spawn ENOENT' },
+      { exitCode: 0, stdout: 42 as unknown as string },
+    ];
+    for (const outcome of outcomes) {
+      const fake = fakeExecutor(outcome);
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.diskQuotaUsage!('lane-host')).resolves.toBeUndefined();
+      expect(fake.calls).toHaveLength(1);
+    }
+  });
+
+  it('returns undefined for malformed, oversized, or out-of-range disk quota output', async () => {
+    for (const stdout of [
+      '',
+      '   ',
+      '\n',
+      '100 1000 extra\n',
+      '100\n',
+      '1000 100\n',
+      '10.5 100\n',
+      '-1 100\n',
+      'NaN 100\n',
+      '１００ 1000\n',
+      '1,000 10000\n',
+      `${'9'.repeat(10_000)} ${'9'.repeat(10_000)}`,
+      `${'7'.repeat(257)} 1000`,
+      '100 0\n',
+      '100 -5\n',
+      `${Number.MAX_SAFE_INTEGER + 1} ${Number.MAX_SAFE_INTEGER + 2}\n`,
+      'abc def\n',
+    ]) {
+      expect(parseDiskQuotaUsage(stdout)).toBeUndefined();
+    }
+    // A 256-character answer at the boundary still parses.
+    const padded = `${' '.repeat(100)}100 1000${' '.repeat(148)}`;
+    expect(padded).toHaveLength(256);
+    expect(parseDiskQuotaUsage(padded)).toEqual({ usedBytes: 100, totalBytes: 1000 });
+    expect(parseDiskQuotaUsage('0 1\n')).toEqual({ usedBytes: 0, totalBytes: 1 });
+    expect(parseDiskQuotaUsage('  100\t1000 \n')).toEqual({
+      usedBytes: 100,
+      totalBytes: 1000,
+    });
+    expect(parseDiskQuotaUsage(undefined as unknown as string)).toBeUndefined();
+    expect(parseDiskQuotaUsage(42 as unknown as string)).toBeUndefined();
   });
 });

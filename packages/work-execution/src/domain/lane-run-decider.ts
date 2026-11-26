@@ -293,6 +293,13 @@ export interface LaneRunReviewFact {
   readonly seatIndex: number | null;
   /** Retries already issued for that seat at this head (0 or 1). */
   readonly retries: number;
+  /**
+   * RM2: counted intents on `seatIndex` at this head (absent: read as
+   * `retries + 1`). Two unparseable verdicts from one seat make it exhausted.
+   */
+  readonly latestSeatIntents?: number;
+  /** RM2: seats that gave two unparseable verdicts at this head; absent: none. */
+  readonly exhaustedSeatIndexes?: readonly number[];
 }
 
 export interface LaneRunFacts {
@@ -333,6 +340,8 @@ export interface LaneRunFacts {
   readonly attempt: LaneRunAttemptFact | null;
   /** Current head of the run's branch (collected head, or the PR head once pushed) (K4/K6). */
   readonly head12: string | null;
+  /** The lane's full head sha when the attempt artifacts carry it; absent or null reads as unknown (the PR head is then not verified and reads as moved). */
+  readonly headSha?: string | null;
   /** Head of the run's last `accepted` acceptance (K1b). */
   readonly acceptedHead12: string | null;
   /** Gate result at `head12`; `unknown` is not a pass (K4, S2b). */
@@ -414,7 +423,13 @@ export interface LaneRunFacts {
   /** GB4: a final `ci` result with reason `ci-failed` is already recorded at this head in this round; absent reads as false. */
   readonly ciFailureRecorded?: boolean;
   /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
+  readonly pr: {
+    readonly state: 'open' | 'merged' | 'closed';
+    readonly head12: string;
+    /** The snapshot's full head sha when the forge read carries it; absent reads as unknown (never a match). */
+    readonly headSha?: string;
+    readonly containsLaneHead: boolean;
+  } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
   /** An unreadable door reads true; `policyGrant` per AM4a (K6). KS7b: the branch and the train belong to the merge queue. */
@@ -568,6 +583,25 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
 }
 
 /**
+ * RM3 fix round 2: whether the PR's head has moved off the lane's head.
+ * `O(1)`: two string compares, no getter, no iteration. At full sha precision
+ * when both shas are known — a move that shares the 12-character prefix is
+ * still a move. When either full sha is unavailable the head is not verified
+ * and reads as moved (fail closed; a 12-character prefix match proves nothing).
+ */
+function laneRunPrHeadMovedOf(facts: LaneRunFacts): boolean {
+  const pr = facts.pr;
+  if (pr === null) {
+    return false;
+  }
+  if (typeof pr.headSha === 'string' && typeof facts.headSha === 'string') {
+    return pr.headSha !== facts.headSha;
+  }
+  // Fail closed: without both full shas the head is not verified, so it reads as moved.
+  return true;
+}
+
+/**
  * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
  * the `premerge` commit status, the merge hold, before the policy-grant /
  * train / merge tail. Returns `null` to fall through to that tail. Total;
@@ -586,6 +620,22 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
     return outcome.kind === 'enter'
       ? { kind: 'enter', to: outcome.to }
       : { kind: 'park', reason: outcome.reason, qualifier: null, parkedFrom: facts.state };
+  }
+  // RM3: a Tier 2 `released` hold never posts success while the PR's head has
+  // moved off the lane's head: the pending post waits until a receipt for the
+  // PR's head exists. A lane head move is G7's re-gating, not this guard.
+  // Fix round 2: the move is detected at full sha precision when both shas
+  // are known — two distinct heads sharing the 12-character prefix are still
+  // a move; without both shas the head is unverified and reads as moved.
+  // Helper round 2: once the merge queue has recorded an outcome for the run
+  // (its `update-branch` may itself have moved the PR head), the queue outcome
+  // (`dropped-fixable`, `held`, `stuck`, `merged`) is handled by the merge
+  // tail, never masked by this guard.
+  if (
+    record.tier === 2 && hold.kind === 'released' && facts.mergeEnqueue === 'none' &&
+    facts.pr !== null && laneRunPrHeadMovedOf(facts)
+  ) {
+    return { kind: 'wait', reason: 'premerge-pending' };
   }
   if (hold.kind === 'released' && facts.premergePost === 'success') {
     return null;
@@ -815,15 +865,34 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         // then parks. A refused or unavailable review never reaches this branch:
         // its journalled `refused` result makes G8 park the run `step-refused`
         // first, which is right for a deterministic refusal. A retry never counts
-        // as a pass, and there is no seat switch — an unread verdict is not a
-        // seat outage.
-        if (review.retries === 0 && review.seatIndex !== null) {
+        // as a pass. RM2: the seat that gave a SECOND unparseable verdict at this
+        // head (and is recorded as exhausted) hands the next review to the next
+        // seat in the plan; a seat's own first unparseable verdict is retried on
+        // that seat, and when no other seat remains the run parks.
+        if (review.seatIndex !== null && (review.latestSeatIntents ?? review.retries + 1) === 1) {
           return act({
             step: kind,
             round: record.round,
             seatIndex: review.seatIndex,
             head12: facts.head12,
             retry: 1,
+            attemptOrdinal: null,
+          });
+        }
+        const exhausted = review.exhaustedSeatIndexes;
+        if (
+          review.seatIndex !== null &&
+          exhausted?.includes(review.seatIndex) === true &&
+          facts.reviewSeat.ok &&
+          facts.reviewSeat.seatIndex !== review.seatIndex &&
+          !exhausted.includes(facts.reviewSeat.seatIndex)
+        ) {
+          return act({
+            step: kind,
+            round: record.round,
+            seatIndex: facts.reviewSeat.seatIndex,
+            head12: facts.head12,
+            retry: null,
             attemptOrdinal: null,
           });
         }

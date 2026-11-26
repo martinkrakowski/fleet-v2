@@ -19,6 +19,7 @@ import {
   isLaneRunReviewUnreachableDetail,
   laneRunReviewFact,
   laneRunReviewIntentIgnored,
+  laneRunReviewSeatUsage,
 } from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -109,6 +110,7 @@ function reviewSeatOf(
   kind: ReviewKind,
   entries: readonly LaneRunJournalEntryRecord[],
   attemptRecords: readonly (AttemptRecord | null)[],
+  head12: string | null = null,
 ): LaneRunSeatFact {
   const plan = latestSeatPlanOf(attemptRecords);
   if (plan === null) {
@@ -117,8 +119,11 @@ function reviewSeatOf(
   if (kind === 'pre-merge') {
     return preMergeSeatOf(ctx, record, entries, attemptRecords, plan);
   }
+  // RM2: seats that gave two unparseable verdicts at this head are skipped, and
+  // a D10 pin on such a seat yields to the next eligible seat.
+  const exhausted = new Set(laneRunReviewSeatUsage(entries, record.runId, kind, head12).exhaustedSeatIndexes);
   const pinned = pinnedReviewSeatIndex(entries, record.runId, kind);
-  if (pinned !== null) {
+  if (pinned !== null && !exhausted.has(pinned)) {
     return pinned < plan.getSeats('review').length ? { ok: true, seatIndex: pinned } : { ok: false };
   }
   const sameFamily = ctx.deps.sameModelFamily;
@@ -130,6 +135,7 @@ function reviewSeatOf(
     round: record.round,
     implementerModels: implementerModelsOf(attemptRecords),
     sameFamily,
+    excludedSeatIndexes: exhausted,
   });
   return selected.ok ? { ok: true, seatIndex: selected.seatIndex } : { ok: false };
 }
@@ -179,6 +185,25 @@ function preMergeSeatOf(
 }
 
 /**
+ * RM2: the fact with the seat-usage fields added, only when some seat is
+ * exhausted at this head; every other fact is returned as read, so the journal
+ * fact's shape is untouched when no seat has given two unparseable verdicts.
+ */
+function withSeatUsage(
+  fact: LaneRunReviewFact,
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  kind: 'brief-check' | 'code-review',
+  head12: string | null,
+): LaneRunReviewFact {
+  const usage = laneRunReviewSeatUsage(entries, runId, kind, head12);
+  if (usage.exhaustedSeatIndexes.length === 0) {
+    return fact;
+  }
+  return { ...fact, latestSeatIntents: usage.latestSeatIntents, exhaustedSeatIndexes: usage.exhaustedSeatIndexes };
+}
+
+/**
  * The review facts of one advance (K5, plan §3.4): the per-kind journal facts
  * (`briefCheck`, `codeReview`) plus the review seat for the kind due. Pure
  * except `ctx.deps.sameModelFamily`; nothing throws.
@@ -191,12 +216,12 @@ export function reviewFactsOf(
   head12: string | null,
   attemptRecords: readonly (AttemptRecord | null)[],
 ): ReviewFacts {
-  const briefCheck = laneRunReviewFact(entries, record.runId, 'brief-check', head12);
-  const codeReview = laneRunReviewFact(entries, record.runId, 'code-review', head12);
+  const briefCheck = withSeatUsage(laneRunReviewFact(entries, record.runId, 'brief-check', head12), entries, record.runId, 'brief-check', head12);
+  const codeReview = withSeatUsage(laneRunReviewFact(entries, record.runId, 'code-review', head12), entries, record.runId, 'code-review', head12);
   const preMergeReview = laneRunReviewFact(entries, record.runId, 'pre-merge', head12);
   const reviewSeat: LaneRunSeatFact =
     state === 'brief-check' || state === 'code-review'
-      ? reviewSeatOf(ctx, record, state, entries, attemptRecords)
+      ? reviewSeatOf(ctx, record, state, entries, attemptRecords, head12)
       : state === 'awaiting-premerge' || state === 'merging'
         ? reviewSeatOf(ctx, record, 'pre-merge', entries, attemptRecords)
         : { ok: false };

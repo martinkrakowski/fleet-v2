@@ -293,6 +293,13 @@ export interface LaneRunReviewFact {
   readonly seatIndex: number | null;
   /** Retries already issued for that seat at this head (0 or 1). */
   readonly retries: number;
+  /**
+   * RM2: counted intents on `seatIndex` at this head (absent: read as
+   * `retries + 1`). Two unparseable verdicts from one seat make it exhausted.
+   */
+  readonly latestSeatIntents?: number;
+  /** RM2: seats that gave two unparseable verdicts at this head; absent: none. */
+  readonly exhaustedSeatIndexes?: readonly number[];
 }
 
 export interface LaneRunFacts {
@@ -858,15 +865,34 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         // then parks. A refused or unavailable review never reaches this branch:
         // its journalled `refused` result makes G8 park the run `step-refused`
         // first, which is right for a deterministic refusal. A retry never counts
-        // as a pass, and there is no seat switch — an unread verdict is not a
-        // seat outage.
-        if (review.retries === 0 && review.seatIndex !== null) {
+        // as a pass. RM2: the seat that gave a SECOND unparseable verdict at this
+        // head (and is recorded as exhausted) hands the next review to the next
+        // seat in the plan; a seat's own first unparseable verdict is retried on
+        // that seat, and when no other seat remains the run parks.
+        if (review.seatIndex !== null && (review.latestSeatIntents ?? review.retries + 1) === 1) {
           return act({
             step: kind,
             round: record.round,
             seatIndex: review.seatIndex,
             head12: facts.head12,
             retry: 1,
+            attemptOrdinal: null,
+          });
+        }
+        const exhausted = review.exhaustedSeatIndexes;
+        if (
+          review.seatIndex !== null &&
+          exhausted?.includes(review.seatIndex) === true &&
+          facts.reviewSeat.ok &&
+          facts.reviewSeat.seatIndex !== review.seatIndex &&
+          !exhausted.includes(facts.reviewSeat.seatIndex)
+        ) {
+          return act({
+            step: kind,
+            round: record.round,
+            seatIndex: facts.reviewSeat.seatIndex,
+            head12: facts.head12,
+            retry: null,
             attemptOrdinal: null,
           });
         }

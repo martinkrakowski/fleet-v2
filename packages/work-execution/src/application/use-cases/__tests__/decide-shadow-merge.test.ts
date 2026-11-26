@@ -87,6 +87,21 @@ function forgeReadFake(result: ReadForgeMergeResult): ForgeMergeReadPort & { cal
   return adapter as ForgeMergeReadPort & { calls: number };
 }
 
+function sequencedForgeRead(results: readonly ReadForgeMergeResult[]): ForgeMergeReadPort & { calls: number } {
+  const adapter = {
+    calls: 0,
+    async readForgeMerge(): Promise<ReadForgeMergeResult> {
+      const result = results[Math.min(adapter.calls, results.length - 1)];
+      adapter.calls += 1;
+      return result;
+    },
+    isConfigured(): boolean {
+      return true;
+    },
+  };
+  return adapter as ForgeMergeReadPort & { calls: number };
+}
+
 function throwingForgeRead(): ForgeMergeReadPort & { calls: number } {
   const adapter = {
     calls: 0,
@@ -227,10 +242,19 @@ describe('DecideShadowMergeUseCase', () => {
     expect(after).toHaveLength(before.length);
   });
 
-  it('a moved head journals a second row under the new head key and leaves the first key rows untouched', async () => {
-    const harness = makeHarness({ forgeResult: { ...greenForge(), liveHeadSha: MOVED_HEAD } });
+  it('a moved head first journals the original head, then a second row under the new head key, and leaves the first key rows untouched', async () => {
+    const harness = makeHarness({
+      forge: sequencedForgeRead([greenForge(), { ...greenForge(), liveHeadSha: MOVED_HEAD }]),
+    });
 
-    const result = await harness.useCase.decideShadowMerge(harness.request);
+    const first = await harness.useCase.decideShadowMerge(harness.request);
+    expect(first.outcome).toBe('journalled');
+    expect(first.reasonCode).toBe('would-merge');
+    const originalRows = await rowsFor(harness.journal, MERGE_KEY);
+    expect(originalRows.map((row) => row.kind)).toEqual(['intent', 'result']);
+    expect(originalRows[1].linkedId).toBe(HEAD);
+
+    const result = await harness.useCase.decideShadowMerge({ ...harness.request, headOid: MOVED_HEAD });
 
     expect(result.outcome).toBe('journalled');
     expect(result.reasonCode).toBe('would-merge');
@@ -238,7 +262,7 @@ describe('DecideShadowMergeUseCase', () => {
     expect(movedRows.map((row) => row.kind)).toEqual(['intent', 'result']);
     expect(movedRows[1].reasonCode).toBe('would-merge');
     expect(movedRows[1].linkedId).toBe(MOVED_HEAD);
-    expect(await rowsFor(harness.journal, MERGE_KEY)).toHaveLength(0);
+    expect(await rowsFor(harness.journal, MERGE_KEY)).toEqual(originalRows);
   });
 
   it.each([

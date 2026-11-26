@@ -187,6 +187,18 @@ async function seedQueueEntry(
   expect(decision.outcome).toBe('created');
 }
 
+/** Rewrite every stored queue entry of the store file to parked with the given reason. */
+async function parkSeededEntries(stateDir: string, reason: string): Promise<void> {
+  const file = path.join(stateDir, 'merge-queue.json');
+  const parsed = JSON.parse(await fs.readFile(file, 'utf8')) as unknown;
+  const entries = Array.isArray(parsed) ? parsed : (parsed as { entries: unknown[] }).entries;
+  for (const entry of entries as Array<Record<string, unknown>>) {
+    entry['state'] = 'parked';
+    entry['reason'] = reason;
+  }
+  await fs.writeFile(file, JSON.stringify(parsed));
+}
+
 /** Every stored run-journal row, read straight from the store file (a bare entry array). */
 async function rawJournalRows(stateDir: string): Promise<readonly LaneRunJournalEntryRecord[]> {
   const parsed: unknown = JSON.parse(await fs.readFile(path.join(stateDir, 'run-journal.json'), 'utf8'));
@@ -283,6 +295,43 @@ describe('merge decide', () => {
     const refused = await runDecide(runtime, decideArgv(9));
     expect(refused.code).toBe(1);
     expect((JSON.parse(refused.out) as Record<string, unknown>)['reasonCode']).toBe('not-queued');
+    expect((await fs.readFile(queueFile)).equals(before)).toBe(true);
+  });
+
+  it.each([
+    ['at the requested head', HEAD],
+    ['at an older head', 'fedcba987654ef0123456789abcdef0123456789'],
+  ])('journals would-merge for a parked checks entry %s and leaves the queue file byte-identical', async (_label, seedHead) => {
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, greenForgeFake().run);
+    await seedQueueEntry(runtime, 7, seedHead);
+    await parkSeededEntries(stateDir, 'checks');
+    const queueFile = path.join(stateDir, 'merge-queue.json');
+    const before = await fs.readFile(queueFile);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(0);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('journalled');
+    expect(printed['reasonCode']).toBe('would-merge');
+    expect((await fs.readFile(queueFile)).equals(before)).toBe(true);
+  });
+
+  it('refuses not-queued (exit 1) for a parked entry whose reason is not checks, with zero forge calls and the queue file byte-identical', async () => {
+    const forge = greenForgeFake();
+    const { runtime, stateDir } = runtimeFor({ [REPOSITORY_ARG]: shadowRepo() }, forge.run);
+    await seedQueueEntry(runtime, 7);
+    await parkSeededEntries(stateDir, 'threads');
+    const queueFile = path.join(stateDir, 'merge-queue.json');
+    const before = await fs.readFile(queueFile);
+
+    const result = await runDecide(runtime, decideArgv(7));
+
+    expect(result.code).toBe(1);
+    const printed = JSON.parse(result.out) as Record<string, unknown>;
+    expect(printed['outcome']).toBe('refused');
+    expect(printed['reasonCode']).toBe('not-queued');
+    expect(forge.calls).toHaveLength(0);
     expect((await fs.readFile(queueFile)).equals(before)).toBe(true);
   });
 

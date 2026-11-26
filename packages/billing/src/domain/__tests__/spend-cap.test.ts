@@ -152,6 +152,27 @@ describe("parseSpendCap", () => {
     expect(parseSpendCap(extra)).toEqual({ ok: false, reason: "invalid-input" });
   });
 
+  it("refuses a huge excess of enumerable keys without reading their values", () => {
+    // The bounded census must refuse an excess of enumerable keys after
+    // inspecting at most expectedKeys.length + 1 of them, so the input is
+    // never snapshotted and no excess property is ever read: every excess
+    // key below is an accessor whose getter records any attempt to read it.
+    const hugeReads = { extra: 0 };
+    const huge: Record<string, unknown> = { ...orgCap() };
+    Object.defineProperty(huge, "extra", {
+      enumerable: true,
+      get() {
+        hugeReads.extra += 1;
+        return 1;
+      },
+    });
+    for (let i = 0; i < 100_000; i += 1) {
+      huge[`pad-${String(i).padStart(6, "0")}`] = i;
+    }
+    expect(parseSpendCap(huge)).toEqual({ ok: false, reason: "invalid-input" });
+    expect(hugeReads.extra).toBe(0);
+  });
+
   it("refuses prototype-polluting, extra, and missing keys", () => {
     const polluted: Record<string, unknown> = { ...orgCap() };
     Object.defineProperty(polluted, "__proto__", { value: {}, enumerable: true });

@@ -18,9 +18,10 @@
  * refused. A hostile Proxy trap surfaces as a typed refusal, never a throw;
  * a Proxy that lies consistently in every trap is an accepted residual.
  * Every refusal is the typed reason `invalid-input`; no input value is ever
- * echoed back. Every check is O(1): fixed key counts (5 and 6), bounded
- * string lengths (63 for identifiers, 7 for a period key, 64 for an ISO
- * timestamp) and single safe-integer comparisons.
+ * echoed back. Every check is O(1): the key census is bounded (see
+ * `readExactRecord`), string lengths are bounded (63 for identifiers, 7 for a
+ * period key, 64 for an ISO timestamp) and the arithmetic rests on single
+ * safe-integer comparisons.
  */
 
 /** The scope a cap applies to. An organization cap carries no project. */
@@ -101,17 +102,31 @@ type ReadResult =
  * Snapshot an unknown value into a frozen plain record with exactly the
  * expected keys, reading every own property through its descriptor.
  *
- * Cost bound: O(1) — `Reflect.ownKeys` runs once and its length is checked
- * against the exact expected key count before any descriptor is read, so a
- * hostile object with an enormous key count is refused without enumeration;
- * the expected-key set is a compile-time constant (5 or 6 entries).
+ * Cost bound: O(1). The key census runs in two bounded phases and never
+ * materializes an unbounded key list before refusing an excess:
+ *
+ * 1. A lazy `for...in` census of the enumerable own string keys (the
+ *    prototype is already pinned to `Object.prototype` or `null`, so nothing
+ *    is inherited) bails out the moment the count exceeds the expected one.
+ *    An input with any excess of enumerable keys is therefore refused after
+ *    at most `expectedKeys.length + 1` iterations, never after enumerating
+ *    all of them.
+ * 2. Only when that bounded count matches exactly does the full own-key
+ *    census (`Reflect.ownKeys`) run, refusing hidden extras (non-enumerable
+ *    or symbol keys). Residual, same class as a Proxy that lies in every
+ *    trap: an input deliberately built with exactly the expected enumerable
+ *    keys plus an enormous number of *hidden* keys cannot be distinguished
+ *    from a clean record without that full enumeration, because the platform
+ *    offers no lazy own-key enumeration for hidden properties; building such
+ *    an input already costs the attacker one write per hidden key, and no
+ *    property of it is ever read beyond the expected keys' descriptors.
  *
  * Refused, never thrown: non-objects, arrays, non-plain prototypes,
- * descriptor-read failures (hostile Proxy traps), key counts other than the
- * exact expected one, unexpected keys (including symbols, non-enumerable
- * keys and prototype-polluting keys), accessors and non-enumerable
- * properties. A Proxy that lies consistently in every trap is an accepted
- * residual.
+ * descriptor-read failures (hostile Proxy traps), excess enumerable keys
+ * (bounded phase 1), key counts other than the exact expected one, unexpected
+ * keys (including symbols, non-enumerable keys and prototype-polluting keys),
+ * accessors and non-enumerable properties. A Proxy that lies consistently in
+ * every trap is an accepted residual.
  */
 function readExactRecord(
   input: unknown,
@@ -125,11 +140,32 @@ function readExactRecord(
     if (prototype !== Object.prototype && prototype !== null) {
       return { ok: false };
     }
+    // Phase 1: lazy census of the enumerable own string keys, bailing out as
+    // soon as the count exceeds the expected one, so excess keys are refused
+    // in O(expectedKeys.length + 1) without materializing them.
+    const expected: ReadonlySet<string> = new Set(expectedKeys);
+    let enumerableCount = 0;
+    for (const key in input) {
+      enumerableCount += 1;
+      if (
+        enumerableCount > expectedKeys.length ||
+        typeof key !== "string" ||
+        !expected.has(key) ||
+        FORBIDDEN_KEYS.has(key)
+      ) {
+        return { ok: false };
+      }
+    }
+    if (enumerableCount !== expectedKeys.length) {
+      return { ok: false };
+    }
+    // Phase 2: full own-key census, reached only when the bounded phase-1
+    // count already matched exactly; it refuses hidden extras (symbols and
+    // non-enumerable keys) and any key outside the expected set.
     const keys = Reflect.ownKeys(input);
     if (keys.length !== expectedKeys.length) {
       return { ok: false };
     }
-    const expected: ReadonlySet<string> = new Set(expectedKeys);
     const snapshot: Record<string, unknown> = {};
     for (const key of keys) {
       if (typeof key !== "string" || !expected.has(key) || FORBIDDEN_KEYS.has(key)) {
@@ -188,8 +224,8 @@ const CAP_KEYS = ["scope", "organizationId", "projectId", "periodKey", "limitUni
 /**
  * Parse an unknown value into a `SpendCap`. Every field is read through its
  * own data-property descriptor (see `readExactRecord`), so getters never run
- * and Proxies are refused or bounded; the key count is checked against the
- * exact expected count of 5 before any descriptor is read.
+ * and Proxies are refused or bounded; excess keys are refused by the bounded
+ * census of `readExactRecord` before any descriptor is read.
  *
  * Cost bound: O(1) per the bounds documented on `readExactRecord`,
  * `isIdentifier`, `isPeriodKey` and `isUnitCount`. Never throws, never

@@ -1,10 +1,17 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { StopAuthorityEvent } from '../../domain/authority-event-mapping.js';
-import { AuthorityEventJournalAdapter } from './AuthorityEventJournalAdapter.adapter.js';
+import {
+  AuthorityEventJournalAdapter,
+  MAX_AUTHORITY_JOURNAL_EVENTS,
+} from './AuthorityEventJournalAdapter.adapter.js';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 let dirs: string[] = [];
 
@@ -158,5 +165,154 @@ describe('AuthorityEventJournalAdapter', () => {
       });
     }
     await expect(fs.readFile(path.join(stateDir, 'authority-events.jsonl'), 'utf8')).rejects.toThrow();
+  });
+
+  it('falls back to MAX_AUTHORITY_JOURNAL_EVENTS for invalid maxEvents options', async () => {
+    const invalid: unknown[] = [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY, '5'];
+    for (const maxEvents of invalid) {
+      const journal = new AuthorityEventJournalAdapter({ maxEvents } as never);
+      expect((journal as unknown as { maxEvents: number }).maxEvents).toBe(
+        MAX_AUTHORITY_JOURNAL_EVENTS,
+      );
+    }
+    // A valid small value is honoured, so the fallback is not a constant.
+    const small = new AuthorityEventJournalAdapter({ maxEvents: 2 });
+    expect((small as unknown as { maxEvents: number }).maxEvents).toBe(2);
+  });
+
+  it('refuses in-memory journal at maxEvents cap with unavailable', async () => {
+    const journal = new AuthorityEventJournalAdapter({ maxEvents: 2 });
+    await expect(journal.record(stopEvent())).resolves.toEqual({ outcome: 'recorded' });
+    await expect(journal.record(stopEvent())).resolves.toEqual({ outcome: 'recorded' });
+    await expect(journal.record(stopEvent())).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+  });
+
+  it('rotates the durable journal at maxEvents cap into <stem>.1.jsonl and starts a fresh live file', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const prior = `${JSON.stringify(stopEvent('first'))}\n`;
+    await fs.writeFile(filePath, prior, 'utf8');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    const next = stopEvent('second');
+    await expect(journal.record(next)).resolves.toEqual({ outcome: 'recorded' });
+    // The archive carries every prior line byte-identical.
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.1.jsonl'), 'utf8')).toBe(prior);
+    // The live file now holds only the new event.
+    const fresh = await fs.readFile(filePath, 'utf8');
+    expect(fresh).toBe(`${JSON.stringify(next)}\n`);
+  });
+
+  it('numbers successive rotations: a second rotation creates <stem>.2.jsonl and leaves <stem>.1.jsonl untouched', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const archive1Path = path.join(stateDir, 'authority-events.1.jsonl');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await fs.writeFile(filePath, `${JSON.stringify(stopEvent('first'))}\n`, 'utf8');
+    await expect(journal.record(stopEvent('second'))).resolves.toEqual({ outcome: 'recorded' });
+    const archive1Before = await fs.readFile(archive1Path, 'utf8');
+    // The live file now holds 'second' only; recording a third rotates again.
+    await expect(journal.record(stopEvent('third'))).resolves.toEqual({ outcome: 'recorded' });
+    expect(await fs.readFile(archive1Path, 'utf8')).toBe(archive1Before);
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.2.jsonl'), 'utf8')).toBe(
+      `${JSON.stringify(stopEvent('second'))}\n`,
+    );
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(stopEvent('third'))}\n`);
+  });
+
+  it('never overwrites pre-existing archives and picks the next unused positive integer', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const archives: Record<string, string> = {
+      'authority-events.1.jsonl': `${JSON.stringify(stopEvent('a1'))}\n`,
+      'authority-events.2.jsonl': `${JSON.stringify(stopEvent('a2'))}\n`,
+      'authority-events.bak.jsonl': 'not an archive\n',
+      'authority-events.0.jsonl': 'zero is not positive\n',
+      // Beyond Number.MAX_SAFE_INTEGER: not a safe integer, ignored.
+      'authority-events.99999999999999999999.jsonl': 'too large\n',
+    };
+    for (const [name, content] of Object.entries(archives)) {
+      await fs.writeFile(path.join(stateDir, name), content, 'utf8');
+    }
+    await fs.writeFile(filePath, `${JSON.stringify(stopEvent('old'))}\n`, 'utf8');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(stopEvent('new'))).resolves.toEqual({ outcome: 'recorded' });
+    for (const [name, content] of Object.entries(archives)) {
+      expect(await fs.readFile(path.join(stateDir, name), 'utf8')).toBe(content);
+    }
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.3.jsonl'), 'utf8')).toBe(
+      `${JSON.stringify(stopEvent('old'))}\n`,
+    );
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(stopEvent('new'))}\n`);
+  });
+
+  it('refuses with unavailable when link fails with EACCES and leaves live file and archives untouched', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const live = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, live, 'utf8');
+    const eacces = Object.assign(new Error('link denied'), { code: 'EACCES' });
+    const link = vi.spyOn(fs, 'link').mockRejectedValue(eacces);
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(stopEvent('fresh'))).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    expect(link).toHaveBeenCalled();
+    expect(await fs.readFile(filePath, 'utf8')).toBe(live);
+    expect(await fs.readdir(stateDir)).toEqual(['authority-events.jsonl']);
+  });
+
+  it('refuses with unavailable when link keeps failing with EEXIST past the bounded retry limit', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const live = `${JSON.stringify(stopEvent('kept'))}\n`;
+    await fs.writeFile(filePath, live, 'utf8');
+    const eexist = Object.assign(new Error('link exists'), { code: 'EEXIST' });
+    const link = vi.spyOn(fs, 'link').mockRejectedValue(eexist);
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(stopEvent('fresh'))).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'unavailable',
+    });
+    // The retry budget is bounded, not an infinite loop.
+    expect(link.mock.calls.length).toBeGreaterThan(1);
+    expect(link.mock.calls.length).toBeLessThanOrEqual(32);
+    expect(await fs.readFile(filePath, 'utf8')).toBe(live);
+    expect(await fs.readdir(stateDir)).toEqual(['authority-events.jsonl']);
+  });
+
+  it('answers recorded without rotating for a retry of an eventId still in the full live file', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const kept = stopEvent('kept');
+    const live = `${JSON.stringify(kept)}\n`;
+    await fs.writeFile(filePath, live, 'utf8');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(kept)).resolves.toEqual({ outcome: 'recorded' });
+    // No rotation happened: the live file is unchanged and no archive exists.
+    expect(await fs.readFile(filePath, 'utf8')).toBe(live);
+    expect(await fs.readdir(stateDir)).toEqual(['authority-events.jsonl']);
+  });
+
+  it('appends a rotated eventId to the fresh live file, since archives are not re-read for idempotency', async () => {
+    const stateDir = await tempStateDir();
+    const filePath = path.join(stateDir, 'authority-events.jsonl');
+    const rotated = stopEvent('rotated');
+    await fs.writeFile(
+      path.join(stateDir, 'authority-events.1.jsonl'),
+      `${JSON.stringify(rotated)}\n`,
+      'utf8',
+    );
+    await fs.writeFile(filePath, `${JSON.stringify(stopEvent('old'))}\n`, 'utf8');
+    const journal = new AuthorityEventJournalAdapter({ stateDir, maxEvents: 1 });
+    await expect(journal.record(rotated)).resolves.toEqual({ outcome: 'recorded' });
+    // The archive is untouched and the event appears once in the fresh live file.
+    expect(await fs.readFile(path.join(stateDir, 'authority-events.1.jsonl'), 'utf8')).toBe(
+      `${JSON.stringify(rotated)}\n`,
+    );
+    expect(await fs.readFile(filePath, 'utf8')).toBe(`${JSON.stringify(rotated)}\n`);
   });
 });

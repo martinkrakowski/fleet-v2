@@ -10,13 +10,27 @@
  * lifetime (an API or CLI run without a durable state directory is
  * disposable, and its audit trail is too).
  *
- * Cost bounds: every `record` is O(n) in the journal's own line count, with
- * `n <= MAX_AUTHORITY_JOURNAL_EVENTS` (an over-full journal refuses as
- * `unavailable` rather than growing without bound); the event's own shape
- * check is O(1) over its seven fixed keys. Hostile-input rule: the event is
- * read only through its own property descriptors — no getter ever runs — a
- * throwing shape reads as `invalid-event`, and no refusal ever echoes a
- * supplied value. Nothing here throws.
+ * When the durable live journal reaches the configured event cap
+ * (`maxEvents`, default `MAX_AUTHORITY_JOURNAL_EVENTS`) the next record
+ * rotates it: the live file is hard-linked to
+ * `<stem>.<next>.jsonl` inside the state directory and the live path is
+ * unlinked, then the new event appends to a fresh live file. Rotation
+ * never rewrites prior lines and never uses `fs.rename` (a rename could
+ * clobber an archive created concurrently); it retries `EEXIST` within a
+ * bounded `MAX_ROTATION_ATTEMPTS` budget. An `eventId` that has rotated
+ * into an archive is **not** re-read from archives for idempotency, so a
+ * same-key retry after rotation may append once more to the fresh live
+ * file; the `eventId` is identical, so downstream consumers de-duplicate.
+ * No event is ever dropped or rewritten.
+ *
+ * Cost bounds: every `record` is O(n) in the live journal's own line
+ * count, with `n <= maxEvents` (a full journal rotates instead of growing
+ * without bound); archive selection is O(m) in the `stateDir` entry count
+ * with a bounded `MAX_ROTATION_ATTEMPTS` retry loop; the event's own shape
+ * check is O(1) over its seven fixed keys. Hostile-input rule: the event
+ * is read only through its own property descriptors — no getter ever
+ * runs — a throwing shape reads as `invalid-event`, and no refusal ever
+ * echoes a supplied value. Nothing here throws.
  */
 
 import { promises as fs } from 'node:fs';
@@ -36,11 +50,14 @@ import {
 export const AUTHORITY_EVENTS_FILE = 'authority-events.jsonl';
 
 /**
- * The most events the journal holds before it refuses as `unavailable`.
- * Matches the FC12A export bound's order; a journal this large means the
- * audit trail needs an export-and-rotate policy, not an unbounded file.
+ * The default event cap of the live journal: the number of events it holds
+ * before the next record rotates it into an archive (FC12E). Also the
+ * fallback for any invalid `maxEvents` option.
  */
 export const MAX_AUTHORITY_JOURNAL_EVENTS = 50_000;
+
+/** The bounded `fs.link` retry budget when an archive name is taken. */
+const MAX_ROTATION_ATTEMPTS = 32;
 
 /** The exactly-seven own keys a stop event carries. */
 const EVENT_KEYS: readonly string[] = [
@@ -58,6 +75,13 @@ export interface AuthorityEventJournalAdapterOptions {
   readonly stateDir?: string;
   /** File name inside the state directory; defaults to `authority-events.jsonl`. */
   readonly fileName?: string;
+  /**
+   * The live journal's event cap before rotation; defaults to
+   * `MAX_AUTHORITY_JOURNAL_EVENTS`. A non-positive-safe-integer value
+   * (`0`, `-1`, `NaN`, `1.5`, `Infinity` or a non-number) falls back to
+   * that default rather than throwing.
+   */
+  readonly maxEvents?: number;
 }
 
 /**
@@ -167,7 +191,9 @@ function serializeEvent(event: StopAuthorityEvent): string {
   });
 }
 
-/** The event id of one stored journal line, or null for an unreadable line. */
+/**
+ * The event id of one stored journal line, or null for an unreadable line.
+ */
 function eventIdOfLine(line: unknown): string | null {
   if (typeof line !== 'string' || line.length === 0) {
     return null;
@@ -184,18 +210,83 @@ function eventIdOfLine(line: unknown): string | null {
   }
 }
 
+/** Escape a literal file-name stem for exact use inside a RegExp. */
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
   private readonly filePath: string | null;
   private readonly lockPath: string | null;
+  private readonly maxEvents: number;
   private readonly memory: string[] = [];
 
   constructor(options?: AuthorityEventJournalAdapterOptions) {
+    this.maxEvents =
+      typeof options?.maxEvents === 'number' &&
+      Number.isSafeInteger(options.maxEvents) &&
+      options.maxEvents > 0
+        ? options.maxEvents
+        : MAX_AUTHORITY_JOURNAL_EVENTS;
     this.filePath =
       options?.stateDir === undefined
         ? null
         : path.join(options.stateDir, options?.fileName ?? AUTHORITY_EVENTS_FILE);
     this.lockPath =
       this.filePath === null ? null : `${this.filePath}.lock`;
+  }
+
+  /**
+   * Rotate the full live journal to `<stem>.<n>.jsonl` inside `stateDir`:
+   * pick the next unused positive integer from existing archive names
+   * (strictly `^<stem>.(\d+).jsonl$`, canonical safe integers), then
+   * hard-link the live file to the archive and unlink the live path —
+   * `fs.link` + `fs.unlink`, never `fs.rename` or a `wx` reservation,
+   * because a rename would clobber an archive another worker created
+   * between the scan and the link. `EEXIST` from `fs.link` increments the
+   * candidate number and retries within `MAX_ROTATION_ATTEMPTS`; any other
+   * failure leaves the live file intact and refuses as `unavailable`.
+   */
+  private async rotate(): Promise<'ok' | 'refused'> {
+    // `this.filePath` is non-null whenever rotation is reachable; the cast
+    // is local and only avoids re-narrowing across closures.
+    const filePath = this.filePath as string;
+    const directory = path.dirname(filePath);
+    const stem = path.basename(filePath).replace(/\.jsonl$/, '');
+    const archivePattern = new RegExp(
+      `^${escapeRegExp(stem)}\\.(\\d+)\\.jsonl$`,
+    );
+    const entries = await fs.readdir(directory);
+    let maxExisting = 0;
+    for (const entry of entries) {
+      const match = archivePattern.exec(entry);
+      if (match === null) {
+        continue;
+      }
+      const n = Number(match[1]);
+      if (!Number.isSafeInteger(n) || n <= 0 || !/^(0|[1-9]\d*)$/.test(match[1])) {
+        continue;
+      }
+      maxExisting = Math.max(maxExisting, n);
+    }
+    for (let n = maxExisting + 1; n <= maxExisting + MAX_ROTATION_ATTEMPTS; n += 1) {
+      const archivePath = path.join(directory, `${stem}.${n}.jsonl`);
+      try {
+        await fs.link(filePath, archivePath);
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code === 'EEXIST') {
+          continue;
+        }
+        return 'refused';
+      }
+      try {
+        await fs.unlink(filePath);
+      } catch {
+        return 'refused';
+      }
+      return 'ok';
+    }
+    return 'refused';
   }
 
   async record(event: StopAuthorityEvent): Promise<AuthorityEventSinkResult> {
@@ -205,7 +296,7 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
     if (this.filePath === null || this.lockPath === null) {
       // In-memory mode: a linear scan over a bounded list is the same
       // idempotency contract as the file's, for a disposable process.
-      if (this.memory.length >= MAX_AUTHORITY_JOURNAL_EVENTS) {
+      if (this.memory.length >= this.maxEvents) {
         return { outcome: 'refused', reason: 'unavailable' };
       }
       const line = serializeEvent(event);
@@ -230,18 +321,28 @@ export class AuthorityEventJournalAdapter implements AuthorityEventSinkPort {
           content = '';
         }
         const lines = content.length === 0 ? [] : content.split('\n').filter((line) => line.length > 0);
-        if (lines.length >= MAX_AUTHORITY_JOURNAL_EVENTS) {
-          return { outcome: 'refused' as const, reason: 'unavailable' as const };
-        }
+        // Idempotency is checked against the live file first: a repeat of an
+        // event still in the live journal answers `recorded` without
+        // rotating. An `eventId` that already rotated into an archive is NOT
+        // re-read from archives, so a same-key retry after rotation appends
+        // once more to the fresh live file; the `eventId` is identical, so
+        // downstream consumers de-duplicate. No event is ever dropped or
+        // rewritten.
         if (lines.some((line) => eventIdOfLine(line) === event.eventId)) {
           return { outcome: 'recorded' as const };
+        }
+        if (lines.length >= this.maxEvents) {
+          const rotated = await this.rotate();
+          if (rotated !== 'ok') {
+            return { outcome: 'refused' as const, reason: 'unavailable' as const };
+          }
         }
         await fs.appendFile(this.filePath as string, `${serializeEvent(event)}\n`, 'utf8');
         return { outcome: 'recorded' as const };
       });
     } catch {
-      // A failed lock, read or append is an unavailable transport, never a
-      // throw and never a partial record.
+      // A failed lock, read, rotation or append is an unavailable transport,
+      // never a throw and never a partial record.
       return { outcome: 'refused', reason: 'unavailable' };
     }
   }

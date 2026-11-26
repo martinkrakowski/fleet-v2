@@ -321,9 +321,20 @@ export function retireOrganization(
 }
 
 /**
- * Whether an organisation still accepts new work. Cost bound: O(1) — two
- * field reads, no iteration.
+ * Whether an organisation still accepts new work. The input is untrusted:
+ * it is validated with the same bounded hostile-input guard as any other
+ * record reader, so `null`, getters (never invoked), Proxies (via the
+ * injected detector) and every other hostile shape return `false` instead
+ * of throwing or executing attacker code.
+ *
+ * Cost bound: O(1) — one bounded validation pass (at most 6 keys, depth 1,
+ * strings capped at 4096 characters) plus two field reads on the validated
+ * snapshot.
  */
-export function acceptsNewWork(org: OrganizationRecord): boolean {
-  return org.status === "active" && org.retiredAtIso === null;
+export function acceptsNewWork(org: unknown, isProxy?: IsProxy): boolean {
+  const validated = validateOrganizationRecord(org, isProxy);
+  if (!validated.ok) {
+    return false;
+  }
+  return validated.value.status === "active" && validated.value.retiredAtIso === null;
 }

@@ -9,7 +9,8 @@
  * Cost bounds under test: each validator performs one bounded snapshot pass
  * (at most 6 keys for an organization record, 7 for a project record) and
  * one pass over at most that key set; `retireOrganization` adds two
- * timestamp parses; `acceptsNewWork` is two field reads; and
+ * timestamp parses; `acceptsNewWork` adds one bounded validation pass plus
+ * two field reads on the validated snapshot; and
  * `decideProjectTransition` is two validations plus three comparisons. All
  * are O(1).
  *
@@ -487,6 +488,38 @@ describe("retireOrganization", () => {
       throw new Error("fixture must validate");
     }
     expect(acceptsNewWork(explicitlyRetired.value)).toBe(false);
+  });
+
+  it("acceptsNewWork returns false for hostile input without throwing, invoking getters, or running Proxy traps", () => {
+    // Hostile shapes read as untrusted input: null, undefined, primitives,
+    // arrays, array-likes and enormous lengths all return false, never throw.
+    for (const hostile of [null, undefined, 42, "str", true, [], { length: 1e9 }]) {
+      expect(acceptsNewWork(hostile)).toBe(false);
+    }
+    // A getter-backed record is refused and the getter is never executed.
+    let getterRan = false;
+    const getterBacked = Object.defineProperty({}, "status", {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return "active";
+      },
+    });
+    expect(acceptsNewWork(getterBacked)).toBe(false);
+    expect(getterRan).toBe(false);
+    // A Proxy is refused when the detector is supplied, and its traps never
+    // run; even without the detector a throwing trap yields a typed refusal,
+    // never a throw.
+    const proxy = new Proxy(validOrganization(), {
+      get() {
+        throw new Error("trap must not run");
+      },
+      ownKeys() {
+        throw new Error("trap must not run");
+      },
+    });
+    expect(acceptsNewWork(proxy, isProxy)).toBe(false);
+    expect(acceptsNewWork(proxy)).toBe(false);
   });
 });
 

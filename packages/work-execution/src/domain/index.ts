@@ -17,6 +17,7 @@ export * from "./cutover-records.js";
 export * from "./daemon-events.js";
 export * from "./daemon-tick.js";
 export * from "./dispatch-stagger.js";
+export * from "./driver-lease.js";
 export * from "./entities/index.js";
 export * from "./execution-record-readers.js";
 export * from "./execution-records.js";

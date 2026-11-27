@@ -96,6 +96,13 @@ function isValidIsoTimestamp(value: string): boolean {
   const hour = Number(value.slice(11, 13));
   const minute = Number(value.slice(14, 16));
   const second = Number(value.slice(17, 19));
+  // The offset (`Z` or `[+-]HH:MM`) must itself be a valid time: an offset
+  // such as `+99:99` is not a valid ISO-8601 timestamp. `O(1)`.
+  const offset = value.slice(19).replace(/^\.\d{1,9}/, '');
+  const offsetMatch = /^[+-](\d{2}):(\d{2})$/.exec(offset);
+  if (offsetMatch !== null && (Number(offsetMatch[1]) > 23 || Number(offsetMatch[2]) > 59)) {
+    return false;
+  }
   if (hour > 23 || minute > 59 || second > 59 || month < 1 || month > 12 || day < 1) {
     return false;
   }
@@ -259,20 +266,21 @@ export function decideMigrationRun(
 
   // Gap check against ALL applied ids: the largest applied id bounds the
   // past. Any unapplied migration sorting before ANY applied id would
-  // retro-insert history and must be refused. The `.some` scan is `O(n)` per
-  // candidate, bounded by `O(n^2)` worst case; short-circuit first.
+  // retro-insert history and must be refused. Comparing each candidate
+  // against the precomputed maximum applied id is an `O(1)` check per
+  // candidate (`O(1)` to compute the maximum itself), so the whole loop is
+  // `O(n)` after the `O(n log n)` sort.
   let maxAppliedId: string | null = null;
   for (const id of appliedById.keys()) {
     if (maxAppliedId === null || id > maxAppliedId) {
       maxAppliedId = id;
     }
   }
-  const appliedIds: readonly string[] = [...appliedById.keys()];
   const toRun: AvailableMigration[] = [];
   for (const entry of sortedAvailable) {
     const id = entry['id'] as string;
     if (!appliedById.has(id)) {
-      if (appliedIds.some((appliedId) => appliedId > id)) {
+      if (maxAppliedId !== null && id < maxAppliedId) {
         return { ok: false, reason: 'gap', id };
       }
       toRun.push({

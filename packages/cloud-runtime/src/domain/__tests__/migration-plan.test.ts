@@ -221,6 +221,15 @@ describe("decideMigrationRun", () => {
         "applied",
       );
     }
+    // The numeric offset itself must be a valid time: an out-of-range offset
+    // hour or minute is not a valid ISO-8601 timestamp even though the local
+    // date and time are valid.
+    for (const badOffset of ["2026-01-01T00:00:00+99:99", "2026-01-01T00:00:00+00:99", "2026-01-01T00:00:00-24:00"]) {
+      expectInvalidInput(
+        decideMigrationRun([{ id: "0001_a", checksum: "c1", appliedAtIso: badOffset }], [available("0001_a", "c1")], isProxy),
+        "applied",
+      );
+    }
     // Every real calendar component round-trips, including a fractional part
     // and a numeric offset.
     const ok = decideMigrationRun(

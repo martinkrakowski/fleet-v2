@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "id": "run-0003",
+  "kind": "work-run",
+  "status": "active",
+  "organizationId": "acme-org",
+  "payload": {
+    "title": "Record from a newer schema",
+    "steps": ["prepare", "apply", "verify"]
+  }
+}

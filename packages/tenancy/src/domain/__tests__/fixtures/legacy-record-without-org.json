@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "run-0001",
+  "kind": "work-run",
+  "status": "active",
+  "payload": {
+    "title": "Legacy hosted record",
+    "steps": ["prepare", "apply", "verify"]
+  }
+}

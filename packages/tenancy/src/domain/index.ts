@@ -2,6 +2,7 @@
 
 export * from "./admission.js";
 export * from "./api-token.js";
+export * from "./default-org-read.js";
 export * from "./entities/index.js";
 export * from "./role-scopes.js";
 export * from "./sign-in-link.js";

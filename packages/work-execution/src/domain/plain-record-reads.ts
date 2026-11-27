@@ -85,7 +85,9 @@ export function readPlainRecordWithOptionalKeys(
  * A fresh copy of `value` when it is a plain object whose own keys are all
  * enumerable string data properties (no getter, no setter, nothing
  * non-enumerable); null otherwise. Stricter than the optional-key reader: an
- * enumerable getter here returns null rather than a copied `undefined`.
+ * enumerable getter here returns null rather than a copied `undefined` —
+ * including a degenerate accessor whose accessors are both `undefined`
+ * (no `value` field), which the accessor checks alone would miss.
  */
 export function snapshotPlainDataRecord(value: unknown): Record<string, unknown> | null {
   if (!isPlainRecordObject(value)) {
@@ -107,7 +109,20 @@ function copyEnumerableDataKey(value: Record<string, unknown>, key: string | sym
     return false;
   }
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (!descriptor || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+  if (
+    !descriptor ||
+    !descriptor.enumerable ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined ||
+    // An accessor whose accessors are both `undefined` (for example
+    // `defineProperty(value, key, { enumerable: true, get: undefined })`)
+    // passes the two accessor checks above yet has no `value` field at all:
+    // without this check it is copied as `descriptor.value` — the literal
+    // `undefined`. An engine-built data descriptor always carries a `value`
+    // field, so this refuses exactly that accessor class.
+    // (`readBoundedDenseArray` applies the same check per index.)
+    !('value' in descriptor)
+  ) {
     return false;
   }
   out[key] = descriptor.value;

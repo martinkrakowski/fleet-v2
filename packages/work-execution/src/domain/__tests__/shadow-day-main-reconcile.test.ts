@@ -101,6 +101,37 @@ describe('evaluateHandLands (SR4 hand-land break count)', () => {
     expect(commitCalls).toBe(0);
   });
 
+  it('refuses an accessor with an undefined getter and no setter on dayStartIso as invalid-input, not invalid-timestamp', () => {
+    // A degenerate accessor (both accessors present but `undefined`, no
+    // `value` field) must be refused at the snapshot, before any timestamp
+    // check sees a copied `undefined` and misclassifies it.
+    const accessorInput: Record<string, unknown> = {};
+    Object.defineProperty(accessorInput, 'dayStartIso', { enumerable: true, get: undefined, configurable: true });
+    accessorInput.dayEndIso = DAY_END;
+    accessorInput.firstParentCommits = [];
+    accessorInput.shellMergedShas = [];
+    expect(evaluateHandLands(accessorInput)).toEqual(REFUSED('invalid-input'));
+
+    // The same degenerate accessor on a commit record's `sha` is also
+    // `invalid-input`, not `invalid-sha`.
+    const accessorCommit: Record<string, unknown> = {};
+    Object.defineProperty(accessorCommit, 'sha', { enumerable: true, get: undefined, configurable: true });
+    accessorCommit.committedAtIso = commitIso(10);
+    expect(evaluateHandLands(dayInput({ firstParentCommits: [accessorCommit] }))).toEqual(REFUSED('invalid-input'));
+
+    // A Proxy descriptor trap reporting the same degenerate accessor is
+    // refused too, and no `get` trap is ever consulted for the value.
+    const proxied = new Proxy(dayInput() as Record<string, unknown>, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'dayEndIso') {
+          return { enumerable: true, configurable: true, get: undefined, set: undefined };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(evaluateHandLands(proxied)).toEqual(REFUSED('invalid-input'));
+  });
+
   it('refuses a revoked Proxy and a throwing-trap Proxy as invalid-input', () => {
     const revoked = Proxy.revocable(dayInput(), {});
     revoked.revoke();

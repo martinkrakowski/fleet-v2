@@ -231,6 +231,44 @@ describe('snapshotPlainDataRecord', () => {
     expect(snapshotPlainDataRecord(input)).toBeNull();
   });
 
+  it('refuses an accessor with an undefined getter and no setter (a descriptor with no value field) instead of copying undefined', () => {
+    // `defineProperty` with a `get: undefined` (and no setter) stores a real
+    // accessor property whose descriptor has `get` and `set` present but
+    // `undefined`, and no `value` field, so `descriptor.value` would be the
+    // literal `undefined` without the `'value' in descriptor` refusal.
+    const direct: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(direct, 'b', { enumerable: true, get: undefined, configurable: true });
+    expect(snapshotPlainDataRecord(direct)).toBeNull();
+
+    const bothUndefined: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(bothUndefined, 'b', {
+      get: undefined,
+      set: undefined,
+      enumerable: true,
+      configurable: true,
+    });
+    expect(snapshotPlainDataRecord(bothUndefined)).toBeNull();
+
+    // The same degenerate accessor descriptor arriving through a Proxy
+    // descriptor trap is refused the same way, and the Proxy `get` trap is
+    // never consulted for the value.
+    let getTrapCalls = 0;
+    const proxied = new Proxy({ a: 1, b: 'plain' } as Record<string, unknown>, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'b') {
+          return { enumerable: true, configurable: true, get: undefined, set: undefined };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      get() {
+        getTrapCalls += 1;
+        return 'leaked';
+      },
+    });
+    expect(snapshotPlainDataRecord(proxied)).toBeNull();
+    expect(getTrapCalls).toBe(0);
+  });
+
   it('refuses a non-plain value with null', () => {
     expect(snapshotPlainDataRecord(null)).toBeNull();
     expect(snapshotPlainDataRecord(42)).toBeNull();

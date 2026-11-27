@@ -365,16 +365,38 @@ describe('option validation refuses hostile input', () => {
     expect(loadForbiddenNames({}, snapshot)).toEqual([]);
   });
 
-  it('parses 5000 distinct names from env and from a file and returns them all in order', () => {
-    delete process.env[ENV_KEY];
+  it('refuses a Proxy snapshot value with reason proxy without running any trap', () => {
+    process.env[ENV_KEY] = FAKE;
+    let trapCalls = 0;
+    const trap = () => {
+      trapCalls += 1;
+      throw new Error('trap ran');
+    };
+    const hostileValue = new Proxy({}, { ownKeys: trap, getPrototypeOf: trap });
+    const snapshot = () => ({ ok: true, value: hostileValue });
+    expect(readForbiddenNameOptions({}, snapshot)).toEqual({ ok: false, reason: 'proxy' });
+    expect(loadForbiddenNames({}, snapshot)).toEqual([]);
+    expect(trapCalls).toBe(0);
+  });
+
+  it('parses 5000 distinct names (plus 100 duplicates) from the process env and from a file, in order', () => {
     const expected = Array.from({ length: 5000 }, (_, index) => `name${index}`);
     const withDuplicates = [...expected, ...expected.slice(0, 100)];
-    expect(loadForbiddenNames({ env: withDuplicates.join(',') })).toEqual(expected);
+    process.env[ENV_KEY] = withDuplicates.join(',');
+    expect(loadForbiddenNames()).toEqual(expected);
+    delete process.env[ENV_KEY];
     withTempDir((dir) => {
       const filePath = join(dir, 'names');
       writeFileSync(filePath, `${withDuplicates.join('\n')}\n`);
       expect(loadForbiddenNames({ filePath })).toEqual(expected);
     });
+  });
+
+  it('yields no names for an env string over the 64 KiB bound, like an oversized file', () => {
+    process.env[ENV_KEY] = `${FAKE},${'a'.repeat(65_536)}`;
+    expect(loadForbiddenNames()).toEqual([]);
+    process.env[ENV_KEY] = `${FAKE},${'a'.repeat(65_536 - FAKE.length - 1)}`;
+    expect(loadForbiddenNames()).toEqual([FAKE, 'a'.repeat(65_536 - FAKE.length - 1)]);
   });
 
   it('passes a well-formed injected snapshot outcome through to the loader', () => {

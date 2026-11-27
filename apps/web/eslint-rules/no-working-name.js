@@ -6,6 +6,7 @@
 // `apps/web/.forbidden-names` (one name per line). Neither source is present in
 // a clean checkout, in which case the rule is a no-op. Matched words are never
 // echoed into a report.
+import { Buffer } from 'node:buffer';
 import { readFileSync, statSync } from 'node:fs';
 import { types } from 'node:util';
 import { snapshotPlainData } from '@fleet/shared';
@@ -84,6 +85,9 @@ function validateSnapshotOutcome(snapshotResult) {
   const snapshotValue = valueRead.value;
   let isArray;
   try {
+    if (types.isProxy(snapshotValue)) {
+      return refuse('proxy');
+    }
     isArray = Array.isArray(snapshotValue);
   } catch {
     return refuse('not-plain');
@@ -145,6 +149,9 @@ function readNamesFile(filePath) {
  * per line) is read. Invalid options, a missing/unreadable file or blank
  * entries yield `[]` (the rule is then a no-op); nothing is ever thrown.
  *
+ * The env string and the file are both bounded to 64 KiB (`MAX_FILE_BYTES`);
+ * an oversized one yields `[]`.
+ *
  * Cost: O(own keys) for the option read, O(1) env/stat check, O(n) bounded
  * (64 KiB) entry parsing.
  *
@@ -162,7 +169,8 @@ export function loadForbiddenNames(options, snapshot = snapshotPlainData) {
       ? process.env.FLEET_WEB_FORBIDDEN_NAMES
       : parsed.value.env;
     if (typeof env === 'string') {
-      return parseNames(env, ',');
+      // The same bound as an oversized file: refuse rather than parse.
+      return Buffer.byteLength(env, 'utf8') > MAX_FILE_BYTES ? [] : parseNames(env, ',');
     }
     const filePath = parsed.value.filePath === undefined
       ? new URL('../.forbidden-names', import.meta.url)

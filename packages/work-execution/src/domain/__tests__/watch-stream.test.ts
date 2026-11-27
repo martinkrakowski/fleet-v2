@@ -715,4 +715,21 @@ describe("watch-stream validation hardening", () => {
     const ok = appendWatchLines(nearLimit, ["x"], 1000, DETECTOR);
     expect(ok.ok && ok.buffer.lastSeq === Number.MAX_SAFE_INTEGER).toBe(true);
   });
+
+  it("re-redacts secret-shaped text already present in a caller-supplied buffer on append", () => {
+    const text = `leak ${GITHUB_TOKEN}`;
+    const poisoned = {
+      entries: [{ seq: 1, text, bytes: new TextEncoder().encode(text).byteLength, atMs: 1000 }],
+      totalBytes: new TextEncoder().encode(text).byteLength,
+      lastSeq: 1,
+    };
+    const appended = appendWatchLines(poisoned, ["ordinary"], 2000, DETECTOR);
+    expect(appended.ok).toBe(true);
+    if (!appended.ok) return;
+    expect(appended.buffer.entries[0]!.text).toBe("leak [REDACTED:github-token]");
+    expect(JSON.stringify(appended.buffer).includes(GITHUB_TOKEN)).toBe(false);
+    expect(appended.buffer.totalBytes).toBe(
+      appended.buffer.entries.reduce((sum, entry) => sum + entry.bytes, 0),
+    );
+  });
 });

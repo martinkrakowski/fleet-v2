@@ -514,10 +514,22 @@ export function appendWatchLines(
   // Evict entries older than maxAgeMs before appending (entries stamped in
   // the future are not older, so they stay until time passes them).
   const oldestAllowed = nowMs - WATCH_BUFFER_LIMITS.maxAgeMs;
-  const kept: WatchEntry[] = bufferRead.buffer.entries.filter((entry) => entry.atMs >= oldestAllowed);
+  // Entries already in a caller-supplied buffer may carry text that never
+  // passed the append-time redaction: re-redact every kept entry (and
+  // re-derive its byte size) so the returned buffer never stores a secret.
+  const kept: WatchEntry[] = [];
   let totalBytes = 0;
-  for (const entry of kept) {
-    totalBytes += entry.bytes;
+  for (const entry of bufferRead.buffer.entries) {
+    if (entry.atMs < oldestAllowed) {
+      continue;
+    }
+    const redaction = redactWatchLine(entry.text);
+    if (!redaction.ok) {
+      return refusal('invalid-buffer');
+    }
+    const bytes = new TextEncoder().encode(redaction.line).byteLength;
+    kept.push(Object.freeze({ seq: entry.seq, text: redaction.line, bytes, atMs: entry.atMs }));
+    totalBytes += bytes;
   }
 
   // A sequence counter that cannot advance exactly by the batch size would

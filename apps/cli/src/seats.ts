@@ -33,6 +33,7 @@ import {
   readInstallationState,
 } from "./hosts.js";
 import { formatDoctorLine, type CliIo } from "./index.js";
+import type { RecordSeatObservationPort } from "@fleet/work-execution";
 
 /** Options the driver and tests inject; every default composes the real thing. */
 export interface SeatsCliOptions {
@@ -46,6 +47,11 @@ export interface SeatsCliOptions {
   readonly confirm?: (question: string) => Promise<boolean>;
   /** Probe implementation for `seats check`; the node probes compose when omitted. */
   readonly probes?: DoctorProbes;
+  /**
+   * SR6: the observation recorder behind `seats observe`; the composed
+   * runtime supplies it, and tests inject their own. Help needs none.
+   */
+  readonly recordSeatObservation?: RecordSeatObservationPort;
 }
 
 const SEATS_HELP = `Usage: fleet-v2 seats free-tier [status|on|off] [--yes]
@@ -80,12 +86,206 @@ type ParsedSeatsArgs =
   | { readonly ok: false; readonly error: string };
 
 const SEATS_GROUP_HELP = `Usage: fleet-v2 seats list | check | free-tier [status|on|off] [--yes]
+                | observe --seat <seatId> --outcome <outcome>
+                          (--attempt <attemptId> | --review-request <reviewRequestId>)
+                          [--observation-id <id>] [--observed-at <iso>] [--dry-run]
 
   list       print every seat declared in the installation file
   check      run the loader and the doctor's seat probes over each seat
   free-tier  show or change policy.useFreeSeats (see 'fleet-v2 seats free-tier --help')
+  observe    record one seat observation from outside the runner (SR6; see
+             'fleet-v2 seats observe --help')
 
-Exit codes: 0 shown or healthy, 1 refused or failing, 2 usage error.`;
+Exit codes: 0 shown, recorded or healthy, 1 refused or failing, 2 usage error.`;
+
+/** The `observe` flags, with whether each takes a value. */
+const OBSERVE_FLAGS: Readonly<Record<string, boolean>> = {
+  seat: true,
+  outcome: true,
+  attempt: true,
+  "review-request": true,
+  "observation-id": true,
+  "observed-at": true,
+  "dry-run": false,
+};
+
+const OBSERVE_HELP = `Usage: fleet-v2 seats observe --seat <seatId> --outcome <outcome>
+                              (--attempt <attemptId> | --review-request <reviewRequestId>)
+                              [--observation-id <id>] [--observed-at <iso>] [--dry-run]
+
+Record one observation of a seat refusal seen outside fleet's runner (plan
+§3.5.5). Exactly one subject is required: --attempt names a running attempt
+whose committed seat is --seat, or --review-request names a brief-check,
+code-review or pre-merge review request whose committed seat is --seat.
+--outcome is one of: rate-limited, payment, timeout, model-missing, no-route,
+empty-response. --observed-at defaults to now; --observation-id defaults to a
+fresh id. A subject that already carries a result or receipt, a seat
+mismatch or an unknown id is refused; nothing is written and no attempt or
+installation health is ever changed. --dry-run validates and writes nothing.
+
+Exit codes: 0 recorded, duplicate or dry run, 1 refused, 2 usage error.`;
+
+type ParsedObserveArgs =
+  | { readonly ok: true; readonly help: true }
+  | {
+      readonly ok: true;
+      readonly help: false;
+      readonly seatId: string;
+      readonly outcome: string;
+      readonly attemptId?: string;
+      readonly reviewRequestId?: string;
+      readonly observationId?: string;
+      readonly observedAt?: string;
+      readonly dryRun: boolean;
+    }
+  | { readonly ok: false; readonly error: string };
+
+/** Parse one `seats observe` invocation; every problem is a usage message. */
+function parseObserveArgs(tokens: readonly string[]): ParsedObserveArgs {
+  const values: {
+    seatId?: string;
+    outcome?: string;
+    attemptId?: string;
+    reviewRequestId?: string;
+    observationId?: string;
+    observedAt?: string;
+    dryRun: boolean;
+  } = { dryRun: false };
+  const set = (flag: string, value: string): string | null => {
+    if (flag === "seat") {
+      if (values.seatId !== undefined) return "seat";
+      values.seatId = value;
+      return null;
+    }
+    if (flag === "outcome") {
+      if (values.outcome !== undefined) return "outcome";
+      values.outcome = value;
+      return null;
+    }
+    if (flag === "attempt") {
+      if (values.attemptId !== undefined) return "attempt";
+      values.attemptId = value;
+      return null;
+    }
+    if (flag === "review-request") {
+      if (values.reviewRequestId !== undefined) return "review-request";
+      values.reviewRequestId = value;
+      return null;
+    }
+    if (flag === "observation-id") {
+      if (values.observationId !== undefined) return "observation-id";
+      values.observationId = value;
+      return null;
+    }
+    if (values.observedAt !== undefined) return "observed-at";
+    values.observedAt = value;
+    return null;
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (isHelpToken(token)) {
+      return { ok: true, help: true };
+    }
+    if (!token.startsWith("--") || token === "--") {
+      return { ok: false, error: `Unexpected argument: ${token}\n${OBSERVE_HELP}` };
+    }
+    const body = token.slice(2);
+    const separator = body.indexOf("=");
+    const flag = separator === -1 ? body : body.slice(0, separator);
+    const inlineValue = separator === -1 ? undefined : body.slice(separator + 1);
+    if (!(flag in OBSERVE_FLAGS)) {
+      return { ok: false, error: `Unknown seats observe option: --${flag}\n${OBSERVE_HELP}` };
+    }
+    if (!OBSERVE_FLAGS[flag]) {
+      if (inlineValue !== undefined) {
+        return { ok: false, error: `--${flag} takes no value\n${OBSERVE_HELP}` };
+      }
+      values.dryRun = true;
+      continue;
+    }
+    let value: string;
+    if (inlineValue !== undefined) {
+      value = inlineValue;
+    } else {
+      index += 1;
+      const next = tokens[index];
+      if (next === undefined || next.startsWith("--")) {
+        return { ok: false, error: `--${flag} requires a value\n${OBSERVE_HELP}` };
+      }
+      value = next;
+    }
+    const repeated = set(flag, value);
+    if (repeated !== null) {
+      return { ok: false, error: `--${repeated} was given twice\n${OBSERVE_HELP}` };
+    }
+  }
+  if (values.seatId === undefined) {
+    return { ok: false, error: `--seat is required\n${OBSERVE_HELP}` };
+  }
+  if (values.outcome === undefined) {
+    return { ok: false, error: `--outcome is required\n${OBSERVE_HELP}` };
+  }
+  if (values.attemptId !== undefined && values.reviewRequestId !== undefined) {
+    return {
+      ok: false,
+      error: `--attempt and --review-request are mutually exclusive\n${OBSERVE_HELP}`,
+    };
+  }
+  if (values.attemptId === undefined && values.reviewRequestId === undefined) {
+    return {
+      ok: false,
+      error: `exactly one of --attempt or --review-request is required\n${OBSERVE_HELP}`,
+    };
+  }
+  return {
+    ok: true,
+    help: false,
+    seatId: values.seatId,
+    outcome: values.outcome,
+    ...(values.attemptId !== undefined ? { attemptId: values.attemptId } : {}),
+    ...(values.reviewRequestId !== undefined ? { reviewRequestId: values.reviewRequestId } : {}),
+    ...(values.observationId !== undefined ? { observationId: values.observationId } : {}),
+    ...(values.observedAt !== undefined ? { observedAt: values.observedAt } : {}),
+    dryRun: values.dryRun,
+  };
+}
+
+/** `seats observe`: record one observation through the execution stack (SR6). */
+async function observeSeat(
+  argv: readonly string[],
+  io: CliIo,
+  options: SeatsCliOptions,
+): Promise<number> {
+  const parsed = parseObserveArgs(argv);
+  if (!parsed.ok) {
+    io.stderr(`${parsed.error}\n`);
+    return 2;
+  }
+  if (parsed.help) {
+    io.stdout(`${OBSERVE_HELP}\n`);
+    return 0;
+  }
+  const recorder = options.recordSeatObservation;
+  if (recorder === undefined) {
+    io.stderr("seat observation recording is not wired; this build composes no runtime\n");
+    return 1;
+  }
+  const result = await recorder.execute(
+    {
+      seatId: parsed.seatId,
+      outcome: parsed.outcome,
+      ...(parsed.attemptId !== undefined
+        ? { subject: { attemptId: parsed.attemptId } }
+        : { subject: { reviewRequestId: parsed.reviewRequestId as string } }),
+      ...(parsed.observationId !== undefined ? { observationId: parsed.observationId } : {}),
+      ...(parsed.observedAt !== undefined ? { observedAtIso: parsed.observedAt } : {}),
+    },
+    "cli",
+    { dryRun: parsed.dryRun },
+  );
+  io.stdout(`${JSON.stringify(result)}\n`);
+  return result.outcome === "refused" ? 1 : 0;
+}
 
 function isHelpToken(token: string): boolean {
   return token === "help" || token === "--help" || token === "-h";
@@ -378,6 +578,9 @@ export async function seatsCommand(
   }
   if (head === "free-tier") {
     return freeTierCommand(argv, io, options);
+  }
+  if (head === "observe") {
+    return observeSeat(rest, io, options);
   }
   if (head !== "list" && head !== "check") {
     io.stderr(`Unknown seats subcommand: ${head}\n${SEATS_GROUP_HELP}\n`);

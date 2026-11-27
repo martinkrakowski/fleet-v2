@@ -106,6 +106,8 @@ import {
   ProbeProjectUseCase,
   PullRequestFindingsReadAdapter,
   ReconcileAttemptUseCase,
+  RecordSeatObservationUseCase,
+  SeatObservationRepositoryAdapter,
   RegisterWorkOrderUseCase,
   RepositoryFactsAdapter,
   RequestAttemptAcceptanceUseCase,
@@ -265,6 +267,7 @@ import {
   parseMergeRepositoryKey,
   requireValidInstallationModel,
   resolveMergePolicy,
+  resolveSeatsPolicy,
   resolveTelemetryPolicy,
   type FleetInstallation,
   type FleetInstallationModel,
@@ -1124,6 +1127,8 @@ export interface FleetCliRuntime {
     readonly applyRelaunch: ApplyRelaunchUseCase;
     /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
     readonly reviewThreadHelper: ReviewThreadHelperPort;
+    /** SR6: `seats observe`; records one seat observation from outside the runner. */
+    readonly recordSeatObservation: RecordSeatObservationUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1639,6 +1644,30 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     runRepo: conductor.laneRunRepository,
     runJournal: conductor.laneRunJournal,
+  });
+
+  // SR6: `seats observe` is built here too, for the same reason as the close:
+  // a review-request subject resolves its committed seat through the
+  // conductor's lane-run stores. The observation store is the append-only
+  // seat-observation file; the cooling policy is the installation's
+  // `policy.seats.observationCooldownMinutes` at composition (0 = off). The
+  // pre-merge chain order is copied once: `pre-merge` has no `SeatPlan` v1
+  // role, so the chain entry at the journal key's seat index is the seat.
+  const seatObservationRepository = new SeatObservationRepositoryAdapter({ stateDir });
+  const highRiskReviewerSeatIds = installationModel?.chains?.['high-risk-reviewer']?.map(
+    (step) => step.seatId,
+  );
+  const recordSeatObservation = new RecordSeatObservationUseCase({
+    observations: seatObservationRepository,
+    attempts: attemptRepository,
+    isProxy: types.isProxy,
+    nowIso: () => new Date().toISOString(),
+    mintObservationId: () => newUlid(),
+    observationCooldownMinutes: resolveSeatsPolicy(installationModel?.policy).observationCooldownMinutes,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+    reviewRequest: conductor.reviewRequest,
+    ...(highRiskReviewerSeatIds !== undefined ? { highRiskReviewerSeatIds } : {}),
   });
 
   // KF-36b-2: the read-only stale listing reads the same stores as the close,
@@ -2254,6 +2283,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       /** RC1: the same read-only lane-run reader `conducted.facts.runs` uses, for record-day's early warning; undefined when conducted is not wired or the composition is not durable. */
       ...(recordShadowDay !== undefined && shadowRunsRead !== undefined ? { shadowRunsRead } : {}),
       reviewThreadHelper,
+      /** SR6: `seats observe`; records one seat observation from outside the runner. */
+      recordSeatObservation,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,
         nowIso: () => new Date().toISOString(),

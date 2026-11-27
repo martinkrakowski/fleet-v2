@@ -1,0 +1,5 @@
+# Hexagen arch-lint layout. The linter only needs the production source
+# program: test files are skipped by its own test-double rules, and keeping
+# them out of the ts-morph program keeps `yarn lint:arch` inside the 30s
+# budget the `hexagen arch validate` wrapper enforces.
+tsconfig: .architecture/tsconfig.arch-lint.json

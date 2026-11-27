@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true
+  },
+  "include": [
+    "../packages/*/src/**/*.ts",
+    "../packages/*/src/**/*.tsx",
+    "../apps/*/src/**/*.ts",
+    "../apps/*/src/**/*.tsx",
+    "../apps/api/server/**/*.ts"
+  ],
+  "exclude": [
+    "../**/__tests__/**",
+    "../**/*.test.ts",
+    "../**/*.test.tsx",
+    "../**/*.spec.ts",
+    "../**/*.spec.tsx"
+  ]
+}

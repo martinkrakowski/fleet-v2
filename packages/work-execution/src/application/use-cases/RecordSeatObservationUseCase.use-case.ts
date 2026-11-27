@@ -383,7 +383,9 @@ export class RecordSeatObservationUseCase implements RecordSeatObservationPort {
   ): Promise<RecordSeatObservationResult> {
     let existing;
     try {
-      existing = await this.deps.observations.listSeatObservations(record.seatId);
+      // The repository deduplicates observation IDs across every seat, so the
+      // pre-read must consider the whole store, not just this seat's slice.
+      existing = await this.deps.observations.listSeatObservations();
     } catch {
       return refusal('store-error', 'the observation store could not be read');
     }

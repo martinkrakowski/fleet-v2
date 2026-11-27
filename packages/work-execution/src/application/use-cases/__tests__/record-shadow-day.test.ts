@@ -2705,6 +2705,119 @@ describe('RecordShadowDayUseCase', () => {
     });
   });
 
+  /**
+   * A fixture whose shell carries one merge the fleet never would-merged
+   * (pr 90): S1 fails with exactly one `missing-in-fleet` divergence.
+   */
+  function divergentFixture(): Fixture {
+    const fixture = conformingFixture();
+    fixture.shellLines.push(shellResultLine(`${DAY}T11:00:00Z`, 90, HEAD_E));
+    return fixture;
+  }
+
+  const S1_DIVERGENCE = {
+    totalCount: 1,
+    items: [{ pr: 90, head12: HEAD_E.slice(0, 12), side: 'shell', code: 'missing-in-fleet' }],
+  };
+
+  it('surfaces S1, S4 and S6 divergenceDiagnostics on RecordShadowDayResult only for evaluated criteria with divergences', async () => {
+    const gateHeads = [
+      ...agreeingGateHeads(0),
+      { headOid: oid(90), conductorVerdict: 'pass' as const, pushedAtIso: `${DAY}T07:30:00Z`, ciGate: 'failure' },
+    ];
+    const harness = wiredHarness(divergentFixture(), {
+      gateHeads,
+      // Run 11 loses its premerge receipt, so S6' fails with one
+      // nonconforming run on D (tier 2 without a pre-merge receipt).
+      conformanceRuns: conformanceRunSpecs().map((spec) => (spec.pr === 11 ? { ...spec, premergeAtIso: null } : spec)),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('fail');
+    expect(result.recorded.S4).toBe('fail');
+    expect(result.recorded.S6).toBe('fail');
+    expect(result.divergenceDiagnostics).toEqual({
+      S1: S1_DIVERGENCE,
+      S4: { totalCount: 1, items: [{ pr: 0, head12: oid(90).slice(0, 12), side: 'fleet', code: 'false-pass' }] },
+      S6: {
+        totalCount: 1,
+        items: [{ pr: 11, head12: conformanceHeadOid(11).slice(0, 12), side: 'fleet', code: 'premerge-not-posted-before-merge' }],
+      },
+    });
+  });
+
+  it('omits S4 and S6 from divergenceDiagnostics when conducted is absent', async () => {
+    const harness = makeHarness(divergentFixture(), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    expect(result.recorded.S6).toBeUndefined();
+    expect(result.divergenceDiagnostics).toEqual({ S1: S1_DIVERGENCE });
+  });
+
+  it('omits divergenceDiagnostics when criteria pass or fail to read sources', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+      // S4' cannot read the forge, so it is unevaluated, never divergent.
+      forgeOutcome: 'unavailable',
+      // S6' cannot read the review receipts, so it is unevaluated too, while
+      // S1 passes with zero divergences on the matched fixture.
+      receiptsThrow: true,
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S4).toBeUndefined();
+    expect(result.recorded.S6).toBeUndefined();
+    expect(result).not.toHaveProperty('divergenceDiagnostics');
+  });
+
+  it('returns ledger-unreadable without divergenceDiagnostics when the evidence ledger cannot be read', async () => {
+    const harness = makeHarness(divergentFixture(), NOW);
+    harness.setLedgerRead({ status: 'unreadable' });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'ledger-unreadable' });
+    expect(result).not.toHaveProperty('divergenceDiagnostics');
+  });
+
+  it('returns deadline-exceeded without divergenceDiagnostics when the deadline is reached', async () => {
+    const harness = makeHarness(divergentFixture(), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ deadlineIso: PAST_DEADLINE }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(result).not.toHaveProperty('divergenceDiagnostics');
+  });
+
+  it('computes identical S1, S4 and S6 verdict digests with and without divergenceDiagnostics', async () => {
+    // The day carries divergences on all three criteria, yet each digest is
+    // byte-identical to the canonical summary recomputed here WITHOUT any
+    // divergence diagnostics: the diagnostics are non-digested observability.
+    const gateHeads = [
+      ...agreeingGateHeads(0),
+      { headOid: oid(90), conductorVerdict: 'pass' as const, pushedAtIso: `${DAY}T07:30:00Z`, ciGate: 'failure' },
+    ];
+    const harness = wiredHarness(divergentFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs().map((spec) => (spec.pr === 11 ? { ...spec, premergeAtIso: null } : spec)),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S1?.digest).toBe(expectedS1Digest(DAY, 'fail', 'merge-set-divergence', {
+      mergesCompared: 6,
+      excludedBatchMerges: 0,
+      compared: 5,
+      divergences: 1,
+    }));
+    expect(dayRecord?.verdicts.S4?.digest).toBe(expectedS4Digest(DAY, 'fail', 'gate-false-pass', {
+      compared: 31,
+      agreeing: 30,
+      falsePasses: 1,
+      stricterFails: 0,
+    }, gateHeads));
+    expect(dayRecord?.verdicts.S6?.digest).toBe(expectedS6Digest(DAY, 'fail', 'premerge-not-posted-before-merge'));
+  });
+
   it('reports S6 unevaluated (shell-events-unavailable) when the shell events read is unavailable', async () => {
     const harness = wiredHarness(conformingFixture(), {
       gateHeads: agreeingGateHeads(0),

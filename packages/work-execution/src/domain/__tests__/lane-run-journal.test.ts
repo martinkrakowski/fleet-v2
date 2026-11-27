@@ -799,3 +799,63 @@ describe('result recovery fields (O2c fix round 1)', () => {
     expect(read.error).toBe('LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere');
   });
 });
+
+describe('premerge carry journal record (U6)', () => {
+  const FROM = 'a'.repeat(40);
+  const TO = 'b'.repeat(40);
+  const carryRecord = (to: string = TO): Record<string, unknown> => ({
+    attemptId: 'attempt-1',
+    fromHeadSha: FROM,
+    toHeadSha: to,
+    mainParentSha: 'c'.repeat(40),
+    mainRangeBaseSha: 'e'.repeat(40),
+    changedPaths: ['src/a.ts'],
+    decidedAtIso: '2026-11-27T12:00:00.000Z',
+    reason: 'base-merge-clean',
+  });
+  const intent = (key: string, carry: unknown): Record<string, unknown> => ({
+    version: 1,
+    entryId: '01JB0000000000000000000001',
+    kind: 'intent',
+    key,
+    runId: 'run-01JB0000000000000000000000',
+    recordedAtIso: '2026-11-27T12:00:00.000Z',
+    mode: null,
+    expectedRevision: null,
+    mintedId: 'forge-1',
+    outcome: null,
+    reasonCode: null,
+    detail: null,
+    grantId: null,
+    state: null,
+    carry,
+  });
+  const premergeKeyAt = (head: string): string => `run-01JB0000000000000000000000/r0/premerge@${head.slice(0, 12)}`;
+
+  it('carry journal record round-trips from-head and to-head', () => {
+    const read = readLaneRunJournalEntry(intent(premergeKeyAt(TO), carryRecord()));
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.entry.carry?.fromHeadSha).toBe(FROM);
+      expect(read.entry.carry?.toHeadSha).toBe(TO);
+    }
+  });
+
+  it('carry journal record with a non-40-hex sha, a foreign key, or on a result is refused', () => {
+    expect(readLaneRunJournalEntry(intent(premergeKeyAt(TO), { ...carryRecord(), toHeadSha: 'abc' })).ok).toBe(false);
+    // The key must be the premerge key at the carried head.
+    expect(readLaneRunJournalEntry(intent(premergeKeyAt(FROM), carryRecord())).ok).toBe(false);
+    expect(readLaneRunJournalEntry(intent('run-01JB0000000000000000000000/r0/accept/0@' + TO.slice(0, 12), carryRecord())).ok).toBe(false);
+    const result = { ...intent(premergeKeyAt(TO), carryRecord()), kind: 'result', mintedId: null, outcome: 'completed', reasonCode: 'premerge-success' };
+    expect(readLaneRunJournalEntry(result).ok).toBe(false);
+  });
+
+  it('a premerge intent without carry still reads as before', () => {
+    const { carry: _carry, ...plain } = intent(premergeKeyAt(TO), null);
+    const read = readLaneRunJournalEntry(plain);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.entry.carry).toBeUndefined();
+    }
+  });
+});

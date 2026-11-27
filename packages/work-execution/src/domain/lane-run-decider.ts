@@ -28,6 +28,7 @@ import {
   afterLaneRunPreMergePass,
   laneRunDrainContinues,
   laneRunHaltLiftExit,
+  laneRunBranchBehindExit,
   laneRunHeadChanged,
   laneRunMergeHold,
   LANE_RUN_DRAIN_STEPS,
@@ -36,6 +37,8 @@ import {
 } from './lane-run-transitions.js';
 import type { LaneRunFailureCause, RunStopMode } from './lane-run-transitions.js';
 import type { LaneRunMergeEnqueueFact } from './lane-run-step-facts.js';
+import { premergeCarryMatches } from './receipt-carry.js';
+import type { PremergeCarry } from './receipt-carry.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import { SEAT_TRIGGER_CLASSES } from './value-objects/StopReason.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
@@ -400,6 +403,15 @@ export interface LaneRunFacts {
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   /** KS7a-2: the latest final `premerge` journal result at `head12` (the merging hold's post). */
   readonly premergePost: 'none' | 'success' | 'failure' | 'refused';
+  /**
+   * U6: the verified base-merge carry from the lane head (`headSha`) to the PR
+   * head, from the journal or a fresh `qualifyBaseMergeCarry`; absent or null
+   * when no head move qualifies. When it matches, `premergePost` is read at the
+   * PR head's key, not the lane head's.
+   */
+  readonly premergeCarry?: PremergeCarry | null;
+  /** U6: the head move was definitively refused by the carry evidence (not merely unanswered); absent reads as false. */
+  readonly premergeCarryRefused?: boolean;
   /** KS7b: what the merge queue made of the run's enqueued head at (round, `head12`), from the journal. */
   readonly mergeEnqueue: LaneRunMergeEnqueueFact;
   /** `AssessHeadAcceptance` at `head12` (K6). */
@@ -602,6 +614,23 @@ function laneRunPrHeadMovedOf(facts: LaneRunFacts): boolean {
 }
 
 /**
+ * U6: a Tier 2 head move the carry evidence definitively refused (a hand-resolved
+ * merge, a lane-authored change, red CI, a non-merge move) parks `branch-behind`
+ * through the strict-path exit of `laneRunBranchBehindExit`, rather than waiting
+ * on a receipt that can never match. An unanswered question (no evidence port,
+ * CI pending, an unreadable mirror) is not a refusal and returns null. Total.
+ */
+function laneRunHeadMoveRefusedPark(facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.premergeCarryRefused !== true) {
+    return null;
+  }
+  const exit = laneRunBranchBehindExit({ mergePath: 'strict', branchBehind: true, overlapOnMain: true });
+  return exit.kind === 'park'
+    ? { kind: 'park', reason: exit.reason, qualifier: null, parkedFrom: facts.state }
+    : null;
+}
+
+/**
  * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
  * the `premerge` commit status, the merge hold, before the policy-grant /
  * train / merge tail. Returns `null` to fall through to that tail. Total;
@@ -631,11 +660,21 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   // (its `update-branch` may itself have moved the PR head), the queue outcome
   // (`dropped-fixable`, `held`, `stuck`, `merged`) is handled by the merge
   // tail, never masked by this guard.
+  // U6: a head move that is only the base branch merged into the reviewed head
+  // (verified by `qualifyBaseMergeCarry`, facts.premergeCarry) carries the
+  // release to the PR head, so the post is made, and read, at the PR head. Any
+  // other move the evidence definitively refuses parks `branch-behind` (the
+  // strict-path exit of `laneRunBranchBehindExit`); an unanswered question
+  // (evidence unavailable, CI not yet green) keeps waiting.
+  let postHead12 = facts.head12;
   if (
     record.tier === 2 && hold.kind === 'released' && facts.mergeEnqueue === 'none' &&
     facts.pr !== null && laneRunPrHeadMovedOf(facts)
   ) {
-    return { kind: 'wait', reason: 'premerge-pending' };
+    if (!premergeCarryMatches(facts.premergeCarry, facts.headSha, facts.pr.headSha)) {
+      return laneRunHeadMoveRefusedPark(facts) ?? { kind: 'wait', reason: 'premerge-pending' };
+    }
+    postHead12 = facts.pr.head12;
   }
   if (hold.kind === 'released' && facts.premergePost === 'success') {
     return null;
@@ -644,14 +683,14 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   if (!post) {
     return { kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: facts.state };
   }
-  if (facts.head12 === null) {
+  if (postHead12 === null) {
     return WAIT_FACTS_INCONSISTENT;
   }
   const attempt = facts.attempt;
   if (attempt === null || attempt.round !== record.round) {
     return WAIT_FACTS_INCONSISTENT;
   }
-  const built = laneRunPremergeKey(record.runId, record.round, facts.head12);
+  const built = laneRunPremergeKey(record.runId, record.round, postHead12);
   if (!built.ok) {
     return WAIT_FACTS_INCONSISTENT;
   }
@@ -661,7 +700,7 @@ function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): La
     key: built.key,
     round: record.round,
     seatIndex: attempt.seatIndex,
-    head12: facts.head12,
+    head12: postHead12,
     retry: null,
   };
 }
@@ -1431,6 +1470,22 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // stop keeps reconciling the premerge hold.
       const forceStopOverPremerge =
         facts.pendingIntent.step === 'premerge' && facts.stopMode === 'force';
+      // U6: a pending `premerge` post whose PR head moved by something the carry
+      // evidence refused parks `branch-behind` instead of reconciling forever.
+      const refusedMove =
+        facts.pendingIntent.step === 'premerge' &&
+        facts.state === 'merging' &&
+        facts.stopMode === null &&
+        record.tier === 2 &&
+        facts.mergeEnqueue === 'none' &&
+        facts.pr !== null &&
+        laneRunPrHeadMovedOf(facts) &&
+        laneRunMergeHold(record.tier, facts.preMerge, record.round).kind === 'released'
+          ? laneRunHeadMoveRefusedPark(facts)
+          : null;
+      if (refusedMove !== null) {
+        return refusedMove;
+      }
       if (!premergeNeedsReview && !forceStopOverPremerge) {
         return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
       }

@@ -15,6 +15,7 @@ import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { ParkEscalationMode } from './park-escalation.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
+import type { PremergeCarry } from './receipt-carry.js';
 import type { SeatFailureOutcome } from './seat-selection.js';
 
 /** The fixed reason code of the result that closes an ambiguous pending intent an operator stop or resume abandoned (F171). */
@@ -79,7 +80,10 @@ export function laneRunConductEntry(
   });
 }
 
-export function laneRunIntentEntry(entryId: string, runId: string, key: string, mintedId: string | null, nowIso: string): LaneRunJournalEntryRecord {
+export function laneRunIntentEntry(
+  entryId: string, runId: string, key: string, mintedId: string | null, nowIso: string,
+  carry?: PremergeCarry,
+): LaneRunJournalEntryRecord {
   return Object.freeze({
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
     entryId,
@@ -95,6 +99,7 @@ export function laneRunIntentEntry(entryId: string, runId: string, key: string, 
     detail: null,
     grantId: null,
     state: null,
+    ...(carry === undefined ? {} : { carry }),
   });
 }
 
@@ -793,6 +798,36 @@ export function laneRunPremergePost(
     }
   }
   return post;
+}
+
+/**
+ * U6: the carry journalled on this run's `premerge` intent at `toHead12` (the
+ * carried head's key), or null. The first matching intent wins, and a key has
+ * at most one intent, so a re-read after a crash returns the same fact and the
+ * carry is recorded once per (run, carried head). Pure; never throws.
+ */
+export function laneRunRecordedPremergeCarry(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  toHead12: string | null,
+): PremergeCarry | null {
+  if (typeof toHead12 !== 'string' || !PREMERGE_HEAD12_PATTERN.test(toHead12)) {
+    return null;
+  }
+  for (const entry of entries) {
+    if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
+      continue;
+    }
+    const carry = entry.carry;
+    if (carry === null || carry === undefined) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed !== null && parsed.kind === 'premerge' && parsed.head12 === toHead12 && carry.toHeadSha.slice(0, 12) === toHead12) {
+      return carry;
+    }
+  }
+  return null;
 }
 
 /** What the merge queue made of the run's enqueued head, read from the journal (KS7b). */

@@ -18,6 +18,8 @@ import {
 } from './record-schema-version.js';
 import { containsSecretShape } from '@fleet/shared';
 import { parseBaseBranch } from './base-branch.js';
+import { readPremergeCarry } from './receipt-carry.js';
+import type { PremergeCarry } from './receipt-carry.js';
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from './lane-run-keys.js';
 import type { ParkEscalationMode } from './park-escalation.js';
@@ -98,6 +100,13 @@ export interface LaneRunJournalEntryRecord {
    * on a result; absent reads as null.
    */
   readonly linkedId?: string | null;
+  /**
+   * A `premerge` intent at a carried head: the auditable fact that the Tier 2
+   * release was carried from the reviewed head to this key's head after a
+   * clean base merge (U6). Only on an intent whose key is a premerge key at the
+   * carry's `toHeadSha`; absent reads as null.
+   */
+  readonly carry?: PremergeCarry | null;
 }
 
 export type LaneRunJournalEntryRead =
@@ -135,6 +144,7 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
     'digest',
     'reasonKind',
     'linkedId',
+    'carry',
   ]);
   if (snapshot === null) {
     return journalEntryBodyError('LaneRunJournal entry must be a record with exactly the entry keys');
@@ -143,6 +153,7 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   const hasDigest = Object.hasOwn(snapshot, 'digest');
   const hasReasonKind = Object.hasOwn(snapshot, 'reasonKind');
   const hasLinkedId = Object.hasOwn(snapshot, 'linkedId');
+  const hasCarry = Object.hasOwn(snapshot, 'carry');
   const headError = entryHeadError(snapshot);
   if (headError !== null) {
     return journalEntryBodyError(headError);
@@ -165,6 +176,10 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   }
   const kind = snapshot.kind as LaneRunJournalEntryKind;
   const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(snapshot.key);
+  const carryError = entryCarryError(snapshot, hasCarry, parsedKey);
+  if (carryError !== null) {
+    return journalEntryBodyError(carryError);
+  }
   const identityError = entryIdentityError(kind, snapshot);
   if (identityError !== null) {
     return journalEntryBodyError(identityError);
@@ -179,6 +194,7 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
     hasDigest,
     hasReasonKind,
     hasLinkedId,
+    hasCarry,
     versionRead.explicit ? versionRead.schemaVersion : null,
   );
   return { ok: true, entry, schemaVersion: versionRead.schemaVersion };
@@ -196,6 +212,7 @@ function buildJournalEntry(
   hasDigest: boolean,
   hasReasonKind: boolean,
   hasLinkedId: boolean,
+  hasCarry: boolean,
   schemaVersion: number | null,
 ): LaneRunJournalEntryRecord {
   return Object.freeze({
@@ -217,6 +234,7 @@ function buildJournalEntry(
     ...(hasDigest ? { digest: snapshot.digest as string | null } : {}),
     ...(hasReasonKind ? { reasonKind: snapshot.reasonKind as string | null } : {}),
     ...(hasLinkedId ? { linkedId: snapshot.linkedId as string | null } : {}),
+    ...(hasCarry ? { carry: snapshot.carry === null ? null : readPremergeCarry(snapshot.carry) } : {}),
   });
 }
 
@@ -510,6 +528,29 @@ function entryReasonKindError(snapshot: Record<string, unknown>, present: boolea
   }
   if (typeof reasonKind !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(reasonKind)) {
     return 'LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere';
+  }
+  return null;
+}
+
+/**
+ * A premerge carry (U6): only on an intent whose key is the premerge key at the
+ * carry's own `toHeadSha`; null or a record `readPremergeCarry` accepts exactly.
+ */
+function entryCarryError(
+  snapshot: Record<string, unknown>,
+  present: boolean,
+  parsedKey: ParsedLaneRunKey | null,
+): string | null {
+  if (!present || snapshot.carry === null) {
+    return null;
+  }
+  const message = 'LaneRunJournal carry must be null or a valid carry record on a premerge intent at the carried head';
+  if (snapshot.kind !== 'intent' || parsedKey === null || parsedKey.kind !== 'premerge') {
+    return message;
+  }
+  const carry = readPremergeCarry(snapshot.carry);
+  if (carry === null || carry.toHeadSha.slice(0, 12) !== parsedKey.head12) {
+    return message;
   }
   return null;
 }

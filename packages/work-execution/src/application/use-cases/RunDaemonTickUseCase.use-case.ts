@@ -63,6 +63,8 @@ import {
 import type { ChainAttentionPort, RaiseChainAttentionResult } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { DaemonJobPort, DaemonJobPassRequest } from '../ports/out/DaemonJobPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import type { KillallHaltMarkerPort } from '../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { DaemonLeasePort } from '../ports/out/DaemonLeasePort.out-port.js';
 import type { DaemonPausePort } from '../ports/out/DaemonPausePort.out-port.js';
@@ -79,6 +81,7 @@ import type {
 import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergePassPort.in-port.js';
 import type { RefreshChainsPort, RefreshChainsResult } from '../ports/in/RefreshChainsPort.in-port.js';
 import type { SweepChainsPort, SweepChainsResult } from '../ports/in/SweepChainsPort.in-port.js';
+import { isKillallHalted, isKillallTrainPaused } from './chain-pass-halt.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -95,6 +98,10 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 export interface RunDaemonTickDependencies {
   readonly pause: Pick<DaemonPausePort, 'read'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** KA3-1: the killall halt marker; absent reads as not halted. */
+  readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+  /** KA3-1: the killall train pause; absent reads as not paused. */
+  readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
   readonly status: Pick<DaemonStatusPort, 'read' | 'write'>;
   readonly lease: Pick<DaemonLeasePort, 'acquire' | 'release' | 'read'>;
   readonly events: Pick<DaemonEventProjectionPort, 'append'>;
@@ -976,7 +983,13 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
   private async readPause(): Promise<DaemonPauseState> {
     try {
-      return normalizePause(await this.deps.pause.read());
+      const state = normalizePause(await this.deps.pause.read());
+      // KA3-1, fail closed: a clear daemon pause still counts as paused when
+      // the killall train pause reads paused or unreadable.
+      if (state.state !== 'unreadable' && (await isKillallTrainPaused(this.deps.killallTrainPause))) {
+        return { state: 'unreadable' };
+      }
+      return state;
     } catch {
       return { state: 'unreadable' };
     }
@@ -984,7 +997,13 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
   private async readHalt(): Promise<ConductorHaltState> {
     try {
-      return normalizeHalt(await this.deps.halt.read());
+      const state = normalizeHalt(await this.deps.halt.read());
+      // KA3-1, fail closed: a clear conductor halt still counts as halted when
+      // the killall halt marker reads halted or unreadable.
+      if (state.state !== 'halted' && state.state !== 'unreadable' && (await isKillallHalted(this.deps.killallHalt))) {
+        return { state: 'unreadable' };
+      }
+      return state;
     } catch {
       return { state: 'unreadable' };
     }

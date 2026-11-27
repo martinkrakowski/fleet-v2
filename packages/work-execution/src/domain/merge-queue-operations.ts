@@ -35,7 +35,8 @@ export type MergeEnqueueRefusal =
   | 'invalid-tier'
   | 'invalid-enqueued-at'
   | 'invalid-deadline'
-  | 'invalid-base';
+  | 'invalid-base'
+  | 'halted';
 
 export interface MergeEnqueueInput {
   readonly repository: MergeQueueRepositoryRef;

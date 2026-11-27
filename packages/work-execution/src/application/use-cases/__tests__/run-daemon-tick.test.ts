@@ -10,6 +10,8 @@ import type { DaemonStatusPort, DaemonStatusFileRead } from '../../ports/out/Dae
 import type { DaemonPausePort } from '../../ports/out/DaemonPausePort.out-port.js';
 import type { DaemonEventProjectionPort } from '../../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
+import type { KillallHaltMarkerPort } from '../../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../../ports/out/KillallTrainPausePort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ForgeMergeReadPort } from '../../ports/out/ForgeMergeReadPort.out-port.js';
 import type { RefreshChainsPort } from '../../ports/in/RefreshChainsPort.in-port.js';
@@ -240,6 +242,8 @@ function makeHarness(overrides: {
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
   readonly chainRefresh?: RefreshChainsPort;
+  readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+  readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
 } = {}): Harness {
   const status = new FakeStatus();
   if (overrides.previousStatus !== undefined) {
@@ -287,6 +291,8 @@ function makeHarness(overrides: {
     ...(overrides.chainRefreshMode !== undefined ? { chainRefreshMode: overrides.chainRefreshMode } : {}),
     ...(overrides.chainAttention !== undefined ? { chainAttention: overrides.chainAttention } : {}),
     ...(overrides.chainRefresh !== undefined ? { chainRefresh: overrides.chainRefresh } : {}),
+    ...(overrides.killallHalt !== undefined ? { killallHalt: overrides.killallHalt } : {}),
+    ...(overrides.killallTrainPause !== undefined ? { killallTrainPause: overrides.killallTrainPause } : {}),
   };
   const useCase = new RunDaemonTickUseCase(deps);
   const run = (requestOverrides: Partial<RunDaemonTickRequest> = {}) =>
@@ -1229,5 +1235,58 @@ describe('RunDaemonTickUseCase chain refresh under an operator halt (OG7b5)', ()
 
     expect(result.exitCode).toBe(1);
     expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-request' });
+  });
+});
+
+describe('RunDaemonTickUseCase killall halt and train-pause guards (KA3-1)', () => {
+  it('treats tick as halted when killallHalt is halted even if conductor halt is clear', async () => {
+    // Guard: `readHalt()` folds `isKillallHalted` into a clear conductor halt
+    // as `{ state: 'unreadable' }` (fail closed), so the plan records the
+    // halt exactly as it does for an unreadable conductor marker.
+    const h = makeHarness({
+      killallHalt: { read: async () => ({ state: 'halted' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
+    });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.status?.halted).toBe(true);
+  });
+
+  it('treats tick as halted when killallHalt is unreadable even if conductor halt is clear', async () => {
+    // Guard: `isKillallHalted` fails closed on an 'unreadable' marker.
+    const h = makeHarness({
+      killallHalt: { read: async () => ({ state: 'unreadable' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
+    });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.status?.halted).toBe(true);
+  });
+
+  it('treats tick as paused when killallTrainPause is paused even if daemon pause is clear', async () => {
+    // Guard: `readPause()` folds `isKillallTrainPaused` into a clear daemon
+    // pause as `{ state: 'unreadable' }` (fail closed), so the tick pauses
+    // and runs no job.
+    const h = makeHarness({
+      killallTrainPause: { read: async () => ({ status: 'paused' }) } as unknown as Pick<KillallTrainPausePort, 'read'>,
+    });
+
+    const result = await h.run();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.status?.paused).toBe(true);
+    expect(h.mergePass.requests).toHaveLength(0);
+  });
+
+  it('treats tick as paused when killallTrainPause is unreadable even if daemon pause is clear', async () => {
+    // Guard: `isKillallTrainPaused` fails closed on an 'unreadable' pause.
+    const h = makeHarness({
+      killallTrainPause: { read: async () => ({ status: 'unreadable' }) } as unknown as Pick<KillallTrainPausePort, 'read'>,
+    });
+
+    const result = await h.run();
+
+    expect(result.status?.paused).toBe(true);
   });
 });

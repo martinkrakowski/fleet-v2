@@ -26,6 +26,8 @@ import {
   WatchTrainHealthUseCase,
   RunMergePassUseCase,
   DecideShadowMergeUseCase,
+  KillallHaltMarkerAdapter,
+  KillallTrainPauseAdapter,
   computeCallBudget,
   isZonedIsoDateTime,
   mergeQueueRepositoryDigest,
@@ -103,6 +105,10 @@ export interface ComposedDaemon {
   readonly status: DaemonStatusFileAdapter;
   /** The status store opened read-only: `daemon status` never quarantines or mutates disk. */
   readonly statusReadOnly: DaemonStatusFileAdapter;
+  /** KA3-1: the killall halt marker, read-only when durable; the daemon never mutates it. */
+  readonly killallHalt: KillallHaltMarkerAdapter;
+  /** KA3-1: the killall train pause, read-only when durable; the daemon never mutates it. */
+  readonly killallTrainPause: KillallTrainPauseAdapter;
   readonly lease: DaemonLeaseAdapter;
   readonly events: DaemonEventProjectionAdapter;
   readonly runMergePass: RunMergePassUseCase;
@@ -261,6 +267,13 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
   const pause = new DaemonPauseAdapter({ stateDir });
   const status = new DaemonStatusFileAdapter({ stateDir });
   const statusReadOnly = durable ? new DaemonStatusFileAdapter({ stateDir, readOnly: true }) : status;
+  // KA3-1: the killall marker stores are read-only whenever they are durable,
+  // mirroring `statusReadOnly`: the daemon reads the markers, never writes or
+  // quarantines them; without a durable state directory they stay in-memory.
+  const killallHalt = durable ? new KillallHaltMarkerAdapter({ stateDir, readOnly: true }) : new KillallHaltMarkerAdapter();
+  const killallTrainPause = durable
+    ? new KillallTrainPauseAdapter({ stateDir, readOnly: true })
+    : new KillallTrainPauseAdapter();
   const lease = new DaemonLeaseAdapter({ stateDir });
   const events = new DaemonEventProjectionAdapter({ stateDir });
   const verification = new MergeVerificationAdapter({
@@ -278,6 +291,8 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     verification,
     journal: input.conductor.laneRunJournal,
     halt: input.conductor.halt,
+    killallHalt,
+    killallTrainPause,
     newUlid: () => newUlid(),
     nowIso: now,
   });
@@ -321,6 +336,8 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
   const runDaemonTick = new RunDaemonTickUseCase({
     pause,
     halt: input.conductor.halt,
+    killallHalt,
+    killallTrainPause,
     status,
     lease,
     events,
@@ -436,6 +453,8 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     pause,
     status,
     statusReadOnly,
+    killallHalt,
+    killallTrainPause,
     lease,
     events,
     runMergePass,

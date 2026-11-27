@@ -250,6 +250,12 @@ export async function premergeAttestCommand(
   if (attemptSnapshot === null) {
     return refuseRecord(io, invalidRecord);
   }
+  // Only a collected attempt has artifacts the conductor accepted: a running
+  // or ended-but-uncollected attempt may carry a stale head, and attesting it
+  // would record a receipt for a head that was never collected.
+  if (fieldOf(attemptSnapshot, 'state') !== 'collected') {
+    return refuseRecord(io, { outcome: 'refused', reason: 'attempt-not-collected', runId });
+  }
   const artifacts = safePlainSnapshot(fieldOf(attemptSnapshot, 'artifacts'));
   if (artifacts === null) {
     return refuseRecord(io, invalidRecord);

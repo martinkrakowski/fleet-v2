@@ -16,7 +16,7 @@ import { assessmentIdForAttempt, type ReviewReceiptRecord } from '@fleet/evidenc
 
 import type { FleetCliRuntime } from '../composition.js';
 import { premergeAttestCommand, readPremergeAttestFlags } from '../conductor-premerge-attest.js';
-import { CONDUCTOR_HELP, type ConductorCliOptions } from '../conductor.js';
+import { CONDUCTOR_HELP, conductorCommand, type ConductorCliOptions } from '../conductor.js';
 import type { CliIo } from '../index.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -131,11 +131,11 @@ function makeRuntime(answers: PortAnswers): { runtime: FleetCliRuntime; calls: S
       },
       reviewRequest: {
         findLatestReceiptOfKind: async () =>
-          answers.review ?? { outcome: 'found', receipt: answers.preMergeReceipt ?? passedReceipt() },
+          'review' in answers ? answers.review : { outcome: 'found', receipt: answers.preMergeReceipt ?? passedReceipt() },
       },
       ciState: {
         readHeadCiState: async (request: { headSha: string }) =>
-          answers.ci ?? { headSha: request.headSha, state: 'passed', reason: 'read' },
+          'ci' in answers ? answers.ci : { headSha: request.headSha, state: 'passed', reason: 'read' },
       },
       newUlid: () => '01JB0000000000000000000001',
     },
@@ -145,7 +145,7 @@ function makeRuntime(answers: PortAnswers): { runtime: FleetCliRuntime; calls: S
       },
       forgeRead: {
         readPullRequest: async () =>
-          answers.pullRequest ?? {
+          'pullRequest' in answers ? answers.pullRequest : {
             outcome: 'found',
             pullRequest: { number: 7, headSha: HEAD, headRef: 'fleet/run-example', state: 'open' },
           },
@@ -222,6 +222,16 @@ describe('conductor premerge attest usage errors (exit 2)', () => {
     expect(code).toBe(2);
     expect(io.outLines).toEqual([]);
     expect(io.errLines.join('')).toContain('durable state directory');
+  });
+});
+
+describe('conductor premerge routing', () => {
+  it.each([['--help'], ['-h']])('answers premerge %s with a usage error (exit 2), not the generic help', async (flag) => {
+    const io = captureIo();
+    const code = await conductorCommand(['premerge', flag], io, makeRuntime({}).runtime, BASE_OPTIONS);
+    expect(code).toBe(2);
+    expect(io.outLines).toEqual([]);
+    expect(io.errLines.join('')).toContain('Unknown conductor premerge subcommand');
   });
 });
 
@@ -383,6 +393,17 @@ describe('conductor premerge attest refusals (exit 1)', () => {
     },
     {
       reason: 'invalid-record',
+      answers: { pullRequest: { outcome: 'found', pullRequest: null } },
+    },
+    {
+      reason: 'invalid-record',
+      answers: { review: { outcome: 'found', receipt: null } },
+    },
+    { reason: 'invalid-record', answers: { ci: null } },
+    { reason: 'attempt-not-collected', answers: { attempt: attemptRecord({ state: 'running' }) } },
+    { reason: 'attempt-not-collected', answers: { attempt: attemptRecord({ state: 'ended' }) } },
+    {
+      reason: 'invalid-record',
       answers: { ci: getterBacked() },
       assert: (calls) => expect(calls.recordedReceipts).toHaveLength(0),
     },
@@ -408,7 +429,7 @@ describe('conductor premerge attest refusals (exit 1)', () => {
     }
   });
 
-  it('never invokes a getter while snapshotting a getter-backed run, attempt or assessment', async () => {
+  it('never invokes a getter while snapshotting a getter-backed run', async () => {
     let getterRuns = 0;
     const hostile = Object.defineProperty({}, 'tier', {
       get() {

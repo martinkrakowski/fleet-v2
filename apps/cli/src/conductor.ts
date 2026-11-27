@@ -2453,6 +2453,11 @@ export async function conductorCommand(
   if (subcommand === 'schedule') {
     return await scheduleCommand(argv.slice(1), io, runtime, options);
   }
+  // Premerge validates its own arguments, so `premerge --help` must reach it
+  // and be refused as a usage error rather than answered by the generic help.
+  if (subcommand === 'premerge') {
+    return await premergeCommand(argv.slice(1), io, runtime, options);
+  }
   if (conductorHelpRequested(subcommand, argv)) {
     io.stdout(`${CONDUCTOR_HELP}\n`);
     return 0;
@@ -2467,9 +2472,6 @@ export async function conductorCommand(
   }
   if (subcommand === 'reap') {
     return await reapCommand(argv.slice(1), io, runtime, options);
-  }
-  if (subcommand === 'premerge') {
-    return await premergeCommand(argv.slice(1), io, runtime, options);
   }
   const parsed = readControlOptions(argv.slice(1), io);
   if (parsed === null) {

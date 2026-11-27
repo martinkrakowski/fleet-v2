@@ -134,7 +134,7 @@ const ENTRY_KEYS: readonly string[] = ['seq', 'text', 'bytes', 'atMs'];
 
 /** Whether the number is a usable non-negative integer timestamp or counter. */
 function isIndex(n: unknown): n is number {
-  return typeof n === 'number' && Number.isInteger(n) && n >= 0;
+  return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
 }
 
 /**
@@ -518,6 +518,12 @@ export function appendWatchLines(
   let totalBytes = 0;
   for (const entry of kept) {
     totalBytes += entry.bytes;
+  }
+
+  // A sequence counter that cannot advance exactly by the batch size would
+  // repeat a seq and let a cursor skip lines: refuse instead of wrapping.
+  if (bufferRead.buffer.lastSeq + linesRead.lines.length > Number.MAX_SAFE_INTEGER) {
+    return refusal('invalid-buffer');
   }
 
   let lastSeq = bufferRead.buffer.lastSeq;

@@ -704,4 +704,15 @@ describe("watch-stream validation hardening", () => {
       reason: "invalid-buffer",
     });
   });
+
+  it("refuses counters beyond the safe-integer range and an append that would overflow lastSeq", () => {
+    const unsafe = { entries: [], totalBytes: 0, lastSeq: Number.MAX_SAFE_INTEGER + 1 };
+    expect(appendWatchLines(unsafe, ["x"], 1000, DETECTOR)).toEqual({ ok: false, reason: "invalid-buffer" });
+    expect(readWatchLinesAfter(unsafe, 0, 1000, DETECTOR)).toEqual({ ok: false, reason: "invalid-buffer" });
+    const atLimit = { entries: [], totalBytes: 0, lastSeq: Number.MAX_SAFE_INTEGER };
+    expect(appendWatchLines(atLimit, ["x"], 1000, DETECTOR)).toEqual({ ok: false, reason: "invalid-buffer" });
+    const nearLimit = { entries: [], totalBytes: 0, lastSeq: Number.MAX_SAFE_INTEGER - 1 };
+    const ok = appendWatchLines(nearLimit, ["x"], 1000, DETECTOR);
+    expect(ok.ok && ok.buffer.lastSeq === Number.MAX_SAFE_INTEGER).toBe(true);
+  });
 });

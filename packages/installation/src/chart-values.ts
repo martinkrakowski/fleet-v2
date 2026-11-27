@@ -28,7 +28,28 @@ export const CHART_VALUES_LIMITS: Readonly<PlainDataLimits> = Object.freeze({
   maxStringLength: 4096,
 });
 
-const ROOT_KEYS: ReadonlySet<string> = new Set([
+/** Truly immutable view over a Set: `Object.freeze(new Set(...))` is NOT
+ * enough, because freezing the Set object does not freeze its internal
+ * slots, so `.add('extra')` would still mutate the exported allow-list and
+ * make the validator accept an undocumented key. This view exposes only the
+ * read operations of `ReadonlySet`, with no `add`/`delete`/`clear` at all. */
+function frozenKeySet(keys: readonly string[]): ReadonlySet<string> {
+  const inner = new Set(keys);
+  const view: ReadonlySet<string> = {
+    get size(): number {
+      return inner.size;
+    },
+    has: (key: string) => inner.has(key),
+    keys: () => inner.keys(),
+    values: () => inner.values(),
+    entries: () => inner.entries(),
+    forEach: (callback, thisArg) => inner.forEach(callback, thisArg),
+    [Symbol.iterator]: () => inner[Symbol.iterator](),
+  };
+  return Object.freeze(view);
+}
+
+const ROOT_KEYS: ReadonlySet<string> = frozenKeySet([
   'replicaCount',
   'image',
   'service',
@@ -40,14 +61,14 @@ const ROOT_KEYS: ReadonlySet<string> = new Set([
   'stateDir',
 ]);
 
-const IMAGE_KEYS: ReadonlySet<string> = new Set(['repository', 'tag', 'pullPolicy']);
-const SERVICE_KEYS: ReadonlySet<string> = new Set(['type', 'port']);
-const API_KEYS: ReadonlySet<string> = new Set(['host', 'port', 'allowRemote']);
-const WEB_KEYS: ReadonlySet<string> = new Set(['apiUrl']);
-const PERSISTENCE_KEYS: ReadonlySet<string> = new Set(['enabled', 'size', 'storageClass']);
-const SERVICE_ACCOUNT_KEYS: ReadonlySet<string> = new Set(['create', 'name']);
-const RESOURCES_KEYS: ReadonlySet<string> = new Set(['requests', 'limits']);
-const RESOURCE_KEYS: ReadonlySet<string> = new Set(['cpu', 'memory']);
+const IMAGE_KEYS: ReadonlySet<string> = frozenKeySet(['repository', 'tag', 'pullPolicy']);
+const SERVICE_KEYS: ReadonlySet<string> = frozenKeySet(['type', 'port']);
+const API_KEYS: ReadonlySet<string> = frozenKeySet(['host', 'port', 'allowRemote']);
+const WEB_KEYS: ReadonlySet<string> = frozenKeySet(['apiUrl']);
+const PERSISTENCE_KEYS: ReadonlySet<string> = frozenKeySet(['enabled', 'size', 'storageClass']);
+const SERVICE_ACCOUNT_KEYS: ReadonlySet<string> = frozenKeySet(['create', 'name']);
+const RESOURCES_KEYS: ReadonlySet<string> = frozenKeySet(['requests', 'limits']);
+const RESOURCE_KEYS: ReadonlySet<string> = frozenKeySet(['cpu', 'memory']);
 
 /** Documented allow-list per object level, keyed by dotted schema path
  * (`root` for the top-level object). Kept in exact parity with
@@ -68,7 +89,7 @@ export const CHART_VALUES_ALLOWED_KEYS: Readonly<
 });
 
 /** Hosted-only package and capability names; never valid in chart values. */
-const HOSTED_KEYS: ReadonlySet<string> = new Set([
+const HOSTED_KEYS: ReadonlySet<string> = frozenKeySet([
   'hosted',
   'cloud',
   'saas',
@@ -82,7 +103,7 @@ const HOSTED_KEYS: ReadonlySet<string> = new Set([
 
 const HOSTED_PREFIXES: readonly string[] = ['@fleet/hosted', 'fleet-hosted'];
 
-const POLLUTING_KEYS: ReadonlySet<string> = new Set([
+const POLLUTING_KEYS: ReadonlySet<string> = frozenKeySet([
   '__proto__',
   'constructor',
   'prototype',

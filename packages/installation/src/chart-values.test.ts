@@ -148,6 +148,33 @@ describe('validateChartValues', () => {
     expect(sortedSchema.size).toBe(10);
   });
 
+  it('exposes frozen allow-list sets so callers cannot mutate validation', () => {
+    for (const keys of Object.values(CHART_VALUES_ALLOWED_KEYS)) {
+      expect(Object.isFrozen(keys)).toBe(true);
+      // The view exposes no mutator at all: `add` must be absent, so any
+      // mutation attempt throws and the key set cannot grow.
+      expect((keys as unknown as Record<string, unknown>).add).toBeUndefined();
+      expect((keys as unknown as Record<string, unknown>).delete).toBeUndefined();
+      expect((keys as unknown as Record<string, unknown>).clear).toBeUndefined();
+      // Even if a caller somehow attempts an add, the validator must still
+      // refuse the key afterwards.
+      try {
+        (keys as unknown as { add: (key: string) => unknown }).add('extra');
+      } catch {
+        // Throwing is expected: mutation is refused.
+      }
+      expect(keys.has('extra')).toBe(false);
+      expectRefused(
+        validateChartValues({ extra: 'sentinel-value' }, types.isProxy),
+        'unknown-key',
+      );
+      expectRefused(
+        validateChartValues({ image: { extra: 'sentinel-value' } }, types.isProxy),
+        'unknown-key',
+      );
+    }
+  });
+
   it('refuses unknown key at root and nested objects without echoing key', () => {
     const root = validateChartValues(
       { SENTINEL_SECRET_ROOT: 'sensitive' },

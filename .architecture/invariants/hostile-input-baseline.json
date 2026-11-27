@@ -3,7 +3,7 @@
   "status": "ratchet-baseline",
   "counts": {
     "getOwnPropertyDescriptor": 255,
-    "Reflect.ownKeys": 85,
+    "Reflect.ownKeys": 86,
     "getPrototypeOf": 96,
     "Proxy": 1,
     "structuredClone": 6,
@@ -108,7 +108,7 @@
     },
     "work-execution": {
       "getOwnPropertyDescriptor": 201,
-      "Reflect.ownKeys": 61,
+      "Reflect.ownKeys": 62,
       "getPrototypeOf": 67,
       "Proxy": 0,
       "structuredClone": 6,

@@ -534,7 +534,7 @@ function isCloneableData(raw: unknown): boolean {
 export interface CutoverStreakDay {
   /** UTC calendar date, `YYYY-MM-DD`. */
   readonly day: string;
-  /** The repository digest the day certified against; non-empty, bounded, secret-free. */
+  /** The release SHA the day certified against; 40 lowercase hex digits. */
   readonly releaseSha: string;
   /** Whether every shadow criterion passed that day. */
   readonly clean: boolean;
@@ -652,8 +652,9 @@ interface ValidatedStreakDay {
 
 /**
  * One day record: exactly the eight keys of `CutoverStreakDay`, `day` a real
- * UTC calendar date, `releaseSha` non-empty, bounded and secret-free, `clean`
- * a boolean, every count a safe integer in `[0, 10_000]`. Cost bound: `O(K)`
+ * UTC calendar date, `releaseSha` a 40-hex lowercase release SHA (which makes
+ * it bounded and secret-free), `clean` a boolean, every count a safe integer
+ * in `[0, 10_000]`. Cost bound: `O(K)`
  * in the record's own-key count via `readExactSnapshot`, plus one
  * `DAY_PATTERN`-bounded date check and one bounded byte count per string —
  * no getter is ever invoked. Never throws.
@@ -671,7 +672,12 @@ function readStreakDay(element: unknown): ValidatedStreakDay | null {
   if (dayNumber === null) {
     return null;
   }
-  if (typeof releaseSha !== 'string' || releaseSha.length === 0 || !isLengthGatedSafeString(releaseSha)) {
+  // The established release identity is a 40-hex lowercase SHA (the same shape
+  // `isMergeHex40` and the shadow ledger's release-SHA pattern enforce); a
+  // nonempty safe string like `"x"` must not pass the streak gate. The pattern
+  // already bounds the length at 40 and confines the text to hex, and the
+  // safe-string check keeps the secret-shape refusal explicit.
+  if (!isMergeHex40(releaseSha) || !isLengthGatedSafeString(releaseSha)) {
     return null;
   }
   if (typeof clean !== 'boolean') {
@@ -749,8 +755,9 @@ function readStreakOptions(options: unknown): { nowIso: string; rolledBackAtIso:
  * primitive/array-like/over-cap or enormous `length`/index getter/extra or
  * symbol key, a revoked or throwing-trap Proxy on the container or an
  * element, a malformed day record (getter, missing/extra key, polluting key,
- * bad `day`, `null` or empty `releaseSha`, non-boolean `clean`, out-of-range
- * count), or a duplicate, unsorted or gapped day are `invalid-days`.
+ * bad `day`, `null` or a non-40-hex `releaseSha`, non-boolean `clean`,
+ * out-of-range count), or a duplicate, unsorted or gapped day are
+ * `invalid-days`.
  *
  * Cost bounds: `readBoundedDenseArray(days, 64)` gates `O(1)` on prototype
  * and `length` descriptor before any key enumeration, then `O(K)` in own-key

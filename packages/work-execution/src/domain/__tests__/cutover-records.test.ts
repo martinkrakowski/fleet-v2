@@ -1766,6 +1766,41 @@ describe('evaluateCutoverStreak', () => {
     });
   });
 
+  it('refuses non-40-hex releaseSha shapes (a short non-hex string, wrong lengths, uppercase, non-hex) as invalid-days', () => {
+    // The reviewer's example: a nonempty safe string is not a release identity.
+    // Only a 40-hex lowercase SHA passes; every other shape is invalid-days.
+    for (const bad of [
+      'x',
+      'd'.repeat(39),
+      'd'.repeat(41),
+      'd'.repeat(64),
+      'D'.repeat(40),
+      'g'.repeat(40),
+      `${'d'.repeat(39)}G`,
+      `${'d'.repeat(40)}\n`,
+      `sk-${'a'.repeat(36)}`,
+      null,
+      7,
+    ]) {
+      expect(evaluateCutoverStreak([streakDay(0, { releaseSha: bad })], streakOptions())).toEqual({
+        certified: false,
+        reason: 'invalid-days',
+      });
+    }
+    // The 40-hex boundary itself still certifies.
+    expect(
+      evaluateCutoverStreak([streakDay(0, { releaseSha: '0123456789abcdef0123456789abcdef01234567' })], streakOptions()),
+    ).toEqual({
+      certified: true,
+      spanStartDay: dayOf(0),
+      spanEndDay: dayOf(0),
+      spanDays: 1,
+      releaseSha: '0123456789abcdef0123456789abcdef01234567',
+      countedRuns: 25,
+      countedTier2: 5,
+    });
+  });
+
   it('refuses duplicate, unsorted, and gapped day entries as invalid-days', () => {
     for (const bad of [
       daysAt([1, 1]), // duplicate day

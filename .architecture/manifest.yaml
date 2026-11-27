@@ -875,6 +875,7 @@ bounded_contexts:
       - { adapter: RelaunchPlanRepositoryAdapter, implements: RelaunchPlanRepositoryPort, integration: local-transactional-store }
       - { adapter: CutoverRecordRepositoryAdapter, implements: CutoverRecordRepositoryPort, integration: local-transactional-store }
       - { adapter: ShadowEvidenceAdapter, implements: ShadowEvidencePort, integration: local-transactional-store }
+      - { adapter: GitMirrorReceiptCarryEvidenceAdapter, implements: ReceiptCarryEvidencePort, integration: read-only-git-mirror }
       - { adapter: ShadowAttestationAdapter, implements: ShadowAttestationPort, integration: local-transactional-store }
       - { adapter: TrainHealthStateReadAdapter, implements: TrainHealthStateReadPort, integration: in-process-composed-ports-read-only }
       - { adapter: SpdSayHostAudibleAlertAdapter, implements: HostAudibleAlertPort, integration: local-speech-client-subprocess-fixed-argv }

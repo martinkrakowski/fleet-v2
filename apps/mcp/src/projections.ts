@@ -1099,3 +1099,90 @@ export function projectBriefPreview(result: unknown): BriefPreviewProjection {
   }
   return { outcome: asString(record?.outcome) ?? "unknown" };
 }
+
+/** One context proposal in the propose result (MX6c; plan §3.7). */
+export interface ContextProposalProjection {
+  readonly proposalId: string | null;
+  readonly knowledgeEntryId: string | null;
+  readonly version: string | null;
+  readonly claimText: string | null;
+  readonly proposedBecause: string | null;
+}
+
+export type ContextProposalsProjection =
+  | {
+      readonly outcome: "proposed";
+      readonly proposals: ContextProposalProjection[];
+      readonly rankingContextRef: string | null;
+    }
+  | { readonly outcome: "rejected"; readonly reason: string | null }
+  | { readonly outcome: string };
+
+/**
+ * Project the context-propose result (MX6c; plan §3.7). Every field not
+ * listed is dropped; a wrong-typed scalar becomes null and a malformed list
+ * entry is omitted. Never throws.
+ */
+export function projectContextProposals(
+  result: unknown,
+): ContextProposalsProjection {
+  const record = asRecord(result);
+  if (record?.outcome === "proposed") {
+    const rawProposals = Array.isArray(record.proposals) ? record.proposals : [];
+    return {
+      outcome: "proposed",
+      proposals: rawProposals.flatMap((raw) => {
+        const proposal = asRecord(raw);
+        if (!proposal) {
+          return [];
+        }
+        return [
+          {
+            proposalId: asString(proposal.proposalId),
+            knowledgeEntryId: asString(proposal.knowledgeEntryId),
+            version: asString(proposal.version),
+            claimText: asString(proposal.claimText),
+            proposedBecause: asString(proposal.proposedBecause),
+          },
+        ];
+      }),
+      rankingContextRef: asString(record.rankingContextRef),
+    };
+  }
+  if (record?.outcome === "rejected") {
+    const reason = asString(record.reason);
+    return {
+      outcome: "rejected",
+      reason: reason !== null ? reason.slice(0, 500) : null,
+    };
+  }
+  return { outcome: asString(record?.outcome) ?? "unknown" };
+}
+
+export type AskOwnerQuestionProjection =
+  | { readonly outcome: "asked"; readonly question: QuestionProjection }
+  | { readonly outcome: "exists"; readonly question: QuestionProjection }
+  | { readonly outcome: "refused"; readonly reason: string | null }
+  | { readonly outcome: string; readonly question: null };
+
+/**
+ * Project the owner-ask result (MX6c; plan §3.4.4, §3.7). The question is the
+ * same allow-list projection the read tools use; a refusal carries only its
+ * reason, capped at 500 characters. Never throws.
+ */
+export function projectAskOwnerQuestion(
+  result: unknown,
+): AskOwnerQuestionProjection {
+  const record = asRecord(result);
+  if (record?.outcome === "asked" || record?.outcome === "exists") {
+    return { outcome: record.outcome, question: projectQuestion(record.question) };
+  }
+  if (record?.outcome === "refused") {
+    const reason = asString(record.reason);
+    return {
+      outcome: "refused",
+      reason: reason !== null ? reason.slice(0, 500) : null,
+    };
+  }
+  return { outcome: asString(record?.outcome) ?? "unknown", question: null };
+}

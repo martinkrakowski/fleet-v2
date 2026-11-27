@@ -158,9 +158,10 @@ export function isCountedFile(file, relParts) {
   return relParts.slice(0, -1).some((s) => s === "domain" || s === "application");
 }
 
+// Returns null only when the package has no readable src directory; a file read error propagates.
 function collectPackage(src) {
   const files = [];
-  walk(src, files);
+  try { walk(src, files); } catch { return null; }
   const total = Object.fromEntries(PATTERNS.map((p) => [p, 0]));
   for (const f of files.sort(compareText)) {
     if (!isCountedFile(f, path.relative(src, f).split(path.sep))) continue;
@@ -174,7 +175,8 @@ export function collect() {
   const pkgs = {};
   for (const pkg of readdirSync(path.join(root, "packages"), { withFileTypes: true })) {
     if (!pkg.isDirectory()) continue;
-    try { pkgs[pkg.name] = collectPackage(path.join(root, "packages", pkg.name, "src")); } catch { continue; }
+    const total = collectPackage(path.join(root, "packages", pkg.name, "src"));
+    if (total) pkgs[pkg.name] = total;
   }
   return pkgs;
 }

@@ -10,6 +10,8 @@ import {
   BOARD_SOURCES,
   DEFAULT_BOARD_POLICY,
   formatLaneRef,
+  isAllowedDeclarationOutcome,
+  isDeclarationStep,
   isPlainText,
   parseTimeMs,
   WORK_BOARD_SCHEMA_VERSION,
@@ -542,7 +544,7 @@ function placementOf(card: Card, reasons: readonly BoardOwnerReason[]): BoardPla
 const CARD_NOT_READ: Record<BoardPlacement, readonly BoardSource[]> = {
   done: [],
   waiting: ['work-orders', 'pr-links', 'merge-records'],
-  'in-flight': ['work-orders', 'pr-links', 'merge-records', 'owner-items', 'questions'],
+  'in-flight': ['work-orders', 'declarations', 'pr-links', 'merge-records', 'owner-items', 'questions'],
   queued: ['plans', 'work-orders', 'attempts', 'runs', 'declarations', 'pr-links', 'merge-records', 'owner-items', 'questions'],
   dropped: ['plans', 'work-orders', 'attempts', 'runs', 'declarations', 'pr-links', 'merge-records', 'owner-items', 'questions'],
   deferred: ['plans', 'work-orders', 'attempts', 'runs', 'declarations', 'pr-links', 'merge-records', 'owner-items', 'questions'],
@@ -580,7 +582,17 @@ function cardNotRead(card: Card, readings: readonly SourceReading[]): SourceRead
 
 function gatherReadings(facts: BoardFacts, forgeRepos: readonly string[] = []): SourceReading[] {
   const readings: SourceReading[] = [];
+  // A declaration fact from a newer writer may name an unknown step or carry
+  // a token its step does not declare; the board surfaces "not read" rather
+  // than guessing what such a declaration means.
+  const declarationsUnreadable = facts.declarations.some(
+    (declaration) => !isDeclarationStep(declaration.step) || !isAllowedDeclarationOutcome(declaration.step, declaration.outcome),
+  );
   for (const source of BOARD_SOURCES) {
+    if (source === 'declarations' && declarationsUnreadable) {
+      readings.push({ source, repository: null, readAtIso: null, status: 'not-read', reason: 'unavailable' });
+      continue;
+    }
     if (source === 'forge-observation') {
       const forge = facts.sources.filter((r) => r.source === source);
       const byRepo = new Map<string, SourceReading>();

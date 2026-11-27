@@ -299,7 +299,7 @@ describe('R1/R2 lane resolution and cards', () => {
 
     const withDeclaration = boardOf({
       workOrders: [crossProjectWo],
-      declarations: [{ lane: woLaneRef, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW }],
+      declarations: [{ lane: woLaneRef, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW, outcome: null }],
     });
     expect(withDeclaration.lanes).toHaveLength(4);
     expect(withDeclaration.lanes.some((l) => l.projectId === 'other-project')).toBe(false);
@@ -324,7 +324,7 @@ describe('R1/R2 lane resolution and cards', () => {
     const declarationLane: LaneRef = { kind: 'work-order', projectId: 'p2', workOrderId: 'wo-x' };
     const board = boardOf({
       links: [link(7, { lane: linkLane })],
-      declarations: [{ lane: declarationLane, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW }],
+      declarations: [{ lane: declarationLane, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: NOW, outcome: null }],
     });
     expect(board.lanes.filter((l) => l.key === 'wo:wo-x')).toHaveLength(1);
     expectNoLaneInTwoColumns(board);
@@ -389,7 +389,7 @@ describe('R3 started', () => {
 
   it('a lapsed declaration alone is in-flight', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: '2026-10-26T10:00:00.000Z' }],
+      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'first-pass', model: 'model-e', declaredAtIso: '2026-10-26T10:00:00.000Z' , outcome: null }],
     });
     expect(board.lanes.find((l) => l.key === A1_KEY)?.placement).toBe('in-flight');
   });
@@ -804,6 +804,7 @@ describe('R7 column precedence', () => {
             seatRole: 'first-pass',
             model: 'model-e',
             declaredAtIso: NOW,
+            outcome: null,
           },
         ],
       },
@@ -993,5 +994,66 @@ describe('purity', () => {
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
     expect(first.board).toEqual(second.board);
+  });
+});
+
+describe('LB4 declarations on the board', () => {
+  it('the board schema version is 2', () => {
+    const board = derive();
+    expect(board.ok).toBe(true);
+    if (!board.ok) return;
+    expect(board.board.schemaVersion).toBe(2);
+  });
+
+  it('a brief declaration with an outcome is declared, not observed, and clears no guard', () => {
+    const board = derive({
+      declarations: [{ lane: A1, step: 'brief', seatRole: 'builder', model: 'model-b', declaredAtIso: NOW, outcome: 'in-review' }],
+    });
+    expect(board.ok).toBe(true);
+    if (!board.ok) return;
+    const a1 = board.board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.placement).toBe('in-flight');
+    expect(a1?.step).toEqual({
+      kind: 'declared',
+      step: 'brief',
+      seatRole: 'builder',
+      model: 'model-b',
+      declaredAtIso: NOW,
+      outcome: 'in-review',
+    });
+    expect(a1?.stepText).toBe('declared, not observed: brief (in-review) as of ' + NOW);
+    expect(a1?.waitsOn).toEqual([]);
+  });
+
+  it('an unknown declaration step or disallowed outcome marks the declarations source not-read and an in-flight card lists it', () => {
+    for (const declaration of [
+      { lane: A1, step: 'merge' as never, seatRole: 'builder', model: 'model-b', declaredAtIso: NOW, outcome: null },
+      { lane: A1, step: 'gate' as never, seatRole: 'builder', model: 'model-b', declaredAtIso: NOW, outcome: 'reviewed' },
+    ]) {
+      const board = derive({ declarations: [declaration] });
+      expect(board.ok).toBe(true);
+      if (!board.ok) return;
+      const declarationsReading = board.board.sources.find((r) => r.source === 'declarations');
+      expect(declarationsReading).toEqual({ source: 'declarations', repository: null, readAtIso: null, status: 'not-read', reason: 'unavailable' });
+      const a1 = board.board.lanes.find((l) => l.key === A1_KEY);
+      expect(a1?.placement).toBe('in-flight');
+      expect(a1?.step).toBeNull();
+      expect(a1?.notRead).toContainEqual({ source: 'declarations', repository: null, readAtIso: null, status: 'not-read', reason: 'unavailable' });
+      expect(board.board.columns.inFlight.notRead).toContainEqual({ source: 'declarations', repository: null, readAtIso: null, status: 'not-read', reason: 'unavailable' });
+      expect(a1?.waitsOn).toEqual([]);
+    }
+  });
+
+  it('valid declarations keep the declarations source read', () => {
+    const board = derive({
+      declarations: [
+        { lane: A1, step: 'train', seatRole: 'builder', model: 'model-b', declaredAtIso: NOW, outcome: 'parked' },
+        { lane: A2, step: 'pr', seatRole: 'builder', model: 'model-b', declaredAtIso: NOW, outcome: 'opened' },
+      ],
+    });
+    expect(board.ok).toBe(true);
+    if (!board.ok) return;
+    const declarationsReading = board.board.sources.find((r) => r.source === 'declarations');
+    expect(declarationsReading?.status).toBe('read');
   });
 });

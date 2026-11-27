@@ -12,6 +12,7 @@
  */
 
 import * as path from "node:path";
+import { types } from "node:util";
 
 import type { LaneDeclarationRecord } from "../../domain/lane-activity-records.js";
 import { isLaneDeclarationRecord } from "../../domain/lane-activity-records.js";
@@ -34,7 +35,7 @@ export const LANE_DECLARATIONS_FILE = "lane-declarations.json";
 export function parseLaneDeclarationStateRecord(
   raw: unknown,
 ): LaneDeclarationRecord | undefined {
-  return isLaneDeclarationRecord(raw) ? raw : undefined;
+  return isLaneDeclarationRecord(raw, types.isProxy) ? raw : undefined;
 }
 
 function refusal(reason: string): AppendDeclarationResult {

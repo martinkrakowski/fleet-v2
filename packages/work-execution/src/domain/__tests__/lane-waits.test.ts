@@ -194,7 +194,7 @@ function allReadSources(): SourceReading[] {
 }
 
 interface BoardLike {
-  schemaVersion: 1;
+  schemaVersion: 2;
   readAtIso: string;
   policy: typeof DEFAULT_BOARD_POLICY;
   doneCutoffIso: string;
@@ -207,7 +207,7 @@ interface BoardLike {
 
 function board(cards: BoardLaneCard[], overrides: Partial<BoardLike> = {}): BoardLike {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     readAtIso: NOW,
     policy: DEFAULT_BOARD_POLICY,
     doneCutoffIso: NOW,
@@ -299,7 +299,7 @@ describe('WB2c deriveLaneWaits', () => {
     it('refuses boards with missing or wrong-typed fields', () => {
       const ok = board([card(REF_A, 'queued', { waitsOn: [seatRow()] })]);
       expect(deriveLaneWaits({}, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });
-      expect(deriveLaneWaits({ ...ok, schemaVersion: 2 }, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });
+      expect(deriveLaneWaits({ ...ok, schemaVersion: 3 }, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });
       expect(deriveLaneWaits({ ...ok, readAtIso: 'not-a-time' }, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });
       expect(deriveLaneWaits({ ...ok, lanes: 'nope' }, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });
       expect(deriveLaneWaits({ ...ok, sources: 'nope' }, REF_A)).toEqual({ ok: false, reason: 'invalid-board' });

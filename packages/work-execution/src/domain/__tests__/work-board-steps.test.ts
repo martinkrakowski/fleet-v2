@@ -477,7 +477,7 @@ describe('S3.3 linked PR step', () => {
 describe('S3.4 declaration step', () => {
   it('a live declaration is declared, not observed', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' , outcome: null }],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
     expect(a1?.step).toEqual({
@@ -486,13 +486,14 @@ describe('S3.4 declaration step', () => {
       seatRole: 'review',
       model: 'model-r',
       declaredAtIso: '2026-10-27T09:30:00.000Z',
+      outcome: null,
     });
     expect(a1?.stepText).toBe('declared, not observed: code-review as of 2026-10-27T09:30:00.000Z');
   });
 
   it('a lapsed declaration shows state unknown and stays in-flight', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T08:29:00.000Z' }],
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T08:29:00.000Z' , outcome: null }],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
     expect(a1?.placement).toBe('in-flight');
@@ -541,7 +542,8 @@ describe('S4 step text', () => {
       kind: 'pr-merge-not-observed',
       pr: { repository: REPO, number: 7, state: 'not-read', source: 'none', asOfIso: null, ciState: null, title: null, stale: false },
     })).toBe('linked PR #7: merge not yet observed');
-    expect(boardStepText({ kind: 'declared', step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' })).toBe('declared, not observed: code-review as of 2026-10-27T09:30:00.000Z');
+    expect(boardStepText({ kind: 'declared', step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: null })).toBe('declared, not observed: code-review as of 2026-10-27T09:30:00.000Z');
+    expect(boardStepText({ kind: 'declared', step: 'brief', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: 'reviewed' })).toBe('declared, not observed: brief (reviewed) as of 2026-10-27T09:30:00.000Z');
     expect(boardStepText({ kind: 'declaration-lapsed', declaredAtIso: '2026-10-27T08:29:00.000Z' })).toBe('state unknown (declaration lapsed)');
     expect(boardStepText({
       kind: 'dropped-after-start',
@@ -578,7 +580,7 @@ describe('S5/S6 seat, round, PR list and review counts', () => {
 
   it('seat comes from a declaration and round is null', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' , outcome: null }],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
     expect(a1?.seat).toEqual({ role: 'review', model: 'model-r', source: 'declaration' });
@@ -737,7 +739,7 @@ describe('S7 badges', () => {
       workOrders: [wo('wo-example-1')],
       attempts: [attempt('attempt-example-1', { createdAtIso: '2026-10-27T08:00:00.000Z' })],
       links: [link(7)],
-      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+      declarations: [{ lane: A1, step: 'first-pass', seatRole: 'review', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' , outcome: null }],
       forgeObservations: [forgeObs([openPr(7)])],
       ownerItems: [item('item-example-1', { kind: 'backup', subject: 'backup', refs: [refLane('A1')] })],
       linkConflicts: [conflict(7)],
@@ -795,7 +797,7 @@ describe('S4 rendered times (WB2a-2 fix 1)', () => {
 
   it('a parseable non-ISO declaredAtIso renders from its parsed milliseconds', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: BIDI_AS_OF }],
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: BIDI_AS_OF, outcome: null }],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
     expect(a1?.stepText).toBe('declared, not observed: code-review as of 2026-10-27T09:30:00.000Z');
@@ -803,7 +805,7 @@ describe('S4 rendered times (WB2a-2 fix 1)', () => {
   });
 
   it('an unparseable declaredAtIso renders "an unreadable time"', () => {
-    expect(boardStepText({ kind: 'declared', step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: 'not a time' }))
+    expect(boardStepText({ kind: 'declared', step: 'code-review', seatRole: 'review', model: 'model-r', declaredAtIso: 'not a time', outcome: null }))
       .toBe('declared, not observed: code-review as of an unreadable time');
   });
 });
@@ -831,7 +833,7 @@ describe('S5 seat plain text (WB2a-2 fix 1)', () => {
     expect(b1?.badges.find((b) => b.kind === 'attempt-running')).toMatchObject({ attemptId: 'attempt-example-1', seatRole: 'first-pass', model: 'Unnamed seat' });
 
     const declaredBoard = boardOf({
-      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: BIDI_MODEL, declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review', model: BIDI_MODEL, declaredAtIso: '2026-10-27T09:30:00.000Z' , outcome: null }],
     });
     const d1 = declaredBoard.lanes.find((l) => l.key === A1_KEY);
     expect(d1?.step).toMatchObject({ kind: 'declared', model: 'Unnamed seat' });
@@ -840,7 +842,7 @@ describe('S5 seat plain text (WB2a-2 fix 1)', () => {
 
   it('a role that is not plain text becomes unknown role, never null', () => {
     const board = boardOf({
-      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review\u202E', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' }],
+      declarations: [{ lane: A1, step: 'code-review', seatRole: 'review\u202E', model: 'model-r', declaredAtIso: '2026-10-27T09:30:00.000Z' , outcome: null }],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
     expect(a1?.step).toMatchObject({ kind: 'declared', seatRole: 'unknown role' });
@@ -897,5 +899,66 @@ describe('no guess', () => {
     expect(card?.step).toBeNull();
     expect(card?.stepText).toBeNull();
     expect(card?.pullRequests).toEqual([]);
+  });
+});
+
+describe('LB4 declaration steps and outcomes', () => {
+  it('a brief declaration with an outcome renders the token and keeps the outcome on the step', () => {
+    const board = boardOf({
+      declarations: [{ lane: A1, step: 'brief', seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: 'in-review' }],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.step).toEqual({
+      kind: 'declared',
+      step: 'brief',
+      seatRole: 'builder',
+      model: 'model-b',
+      declaredAtIso: '2026-10-27T09:30:00.000Z',
+      outcome: 'in-review',
+    });
+    expect(a1?.stepText).toBe('declared, not observed: brief (in-review) as of 2026-10-27T09:30:00.000Z');
+  });
+
+  it('train and pr declarations carry their own outcome tokens', () => {
+    for (const [step, outcome] of [['train', 'retrying'], ['pr', 'opened']] as const) {
+      const board = boardOf({
+        declarations: [{ lane: A1, step, seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome }],
+      });
+      const a1 = board.lanes.find((l) => l.key === A1_KEY);
+      expect(a1?.step).toMatchObject({ kind: 'declared', step, outcome });
+    }
+  });
+
+  it('a declaration badge carries the outcome when the step comes from an attempt', () => {
+    const board = boardOf({
+      workOrders: [wo('wo-example-1')],
+      attempts: [attempt('att-1', { state: 'running' })],
+      declarations: [
+        { lane: A1, step: 'brief', seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:00:00.000Z', outcome: 'written' },
+      ],
+    });
+    const badge = board.lanes.find((l) => l.key === A1_KEY)?.badges.find((b) => b.kind === 'declaration');
+    expect(badge).toEqual({
+      kind: 'declaration',
+      step: 'brief',
+      declaredAtIso: '2026-10-27T09:00:00.000Z',
+      outcome: 'written',
+      lapsed: false,
+    });
+  });
+
+  it('an unknown declaration step or a disallowed outcome gives no step, no badge and no guessed text', () => {
+    for (const declaration of [
+      { lane: A1, step: 'merge' as never, seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: null },
+      { lane: A1, step: 'gate' as never, seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: 'reviewed' },
+      { lane: A1, step: 'brief' as never, seatRole: 'builder', model: 'model-b', declaredAtIso: '2026-10-27T09:30:00.000Z', outcome: 'shipped' },
+    ]) {
+      const board = boardOf({ declarations: [declaration] });
+      const a1 = board.lanes.find((l) => l.key === A1_KEY);
+      expect(a1?.placement).toBe('in-flight');
+      expect(a1?.step).toBeNull();
+      expect(a1?.stepText).toBeNull();
+      expect(a1?.badges.filter((b) => b.kind === 'declaration')).toEqual([]);
+    }
   });
 });

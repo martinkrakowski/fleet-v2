@@ -7,6 +7,8 @@
  * lapse and clears no guard.
  */
 
+import type { IsProxy } from '@fleet/shared';
+
 import type { LaneDeclarationRecord } from '../../domain/lane-activity-records.js';
 import { parseLaneDeclarationBody } from '../../domain/lane-activity-records.js';
 import { CANONICAL_ISO_PATTERN } from '../../domain/lane-plan-records.js';
@@ -24,6 +26,8 @@ export interface DeclareLaneActivityDependencies {
   readonly nowIso: () => string;
   /** Defaults to the board policy's declaration TTL (90 minutes). */
   readonly ttlMinutes?: number;
+  /** The trusted Proxy detector the untrusted body is snapshotted through. */
+  readonly isProxy: IsProxy;
 }
 
 function refusal(code: DeclareLaneActivityRefusalCode, reason: string): DeclareLaneActivityResult {
@@ -46,9 +50,9 @@ export class DeclareLaneActivityUseCase implements DeclareLaneActivityPort {
       return refusal('clock', 'the clock returned a non-canonical time');
     }
     const ttlMinutes = this.deps.ttlMinutes ?? DEFAULT_BOARD_POLICY.declarationTtlMinutes;
-    const parsed = parseLaneDeclarationBody(body, nowIso, ttlMinutes);
+    const parsed = parseLaneDeclarationBody(body, nowIso, ttlMinutes, this.deps.isProxy);
     if (!parsed.ok) {
-      return refusal('refused', parsed.error);
+      return refusal(parsed.code, parsed.error);
     }
     return this.append(parsed.record);
   }

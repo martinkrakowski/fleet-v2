@@ -7,8 +7,15 @@
  * (`isDeclarationLapsed`); a record carries the deadline, nothing more.
  */
 
+import { snapshotPlainData } from '@fleet/shared';
+import type { IsProxy, PlainDataLimits } from '@fleet/shared';
+
 import type { LaneRef } from './work-board-facts.js';
-import { BOARD_DECLARATION_STEPS, type BoardDeclarationStep } from './work-board-facts.js';
+import {
+  type BoardDeclarationStep,
+  isAllowedDeclarationOutcome,
+  isDeclarationStep,
+} from './work-board-facts.js';
 import {
   CANONICAL_ISO_PATTERN,
   PLAN_ID_PATTERN,
@@ -19,6 +26,20 @@ import {
 
 export const LANE_DECLARATION_RECORD_VERSION = 1 as const;
 export const LANE_BRIEF_READ_RECORD_VERSION = 1 as const;
+
+/**
+ * The snapshot bounds every declaration body and record is read through: a
+ * body carries at most the five declared keys plus one nested lane object,
+ * all strings, so these bounds refuse any larger or deeper input without
+ * walking it.
+ */
+export const LANE_DECLARATION_SNAPSHOT_LIMITS: PlainDataLimits = Object.freeze({
+  maxDepth: 2,
+  maxKeys: 8,
+  maxArrayLength: 0,
+  maxNodes: 32,
+  maxStringLength: 512,
+});
 
 /** seatRole and model are single-line plain text, 1–120 code points; all single-line fields refuse C0, DEL, C1, U+2028 and U+2029. */
 export const LANE_DECLARATION_TEXT_LIMIT = 120;
@@ -34,6 +55,8 @@ export interface LaneDeclarationRecord {
   readonly model: string;
   readonly declaredAtIso: string;
   readonly lapsesAtIso: string;
+  /** A typed outcome token, or null; absent reads as null (pre-LB4 records). */
+  readonly outcome?: string | null;
 }
 
 /** One `plan brief-check` record; mirrors `BoardBriefReadFact`. */
@@ -49,13 +72,22 @@ export interface BriefReadRecord {
 
 export type LaneDeclarationParseResult =
   | { readonly ok: true; readonly record: LaneDeclarationRecord }
-  | { readonly ok: false; readonly error: string };
+  | {
+      readonly ok: false;
+      readonly code: 'refused' | 'unknown-step' | 'unknown-outcome';
+      readonly error: string;
+    };
 
 export type BriefReadParseResult =
   | { readonly ok: true; readonly record: BriefReadRecord }
   | { readonly ok: false; readonly error: string };
 
-const DECLARATION_KEYS = ['lane', 'step', 'seatRole', 'model'] as const;
+const DECLARATION_KEYS = ['lane', 'step', 'seatRole', 'model', 'outcome'] as const;
+const REQUIRED_DECLARATION_KEYS = ['lane', 'step', 'seatRole', 'model'] as const;
+const DECLARATION_RECORD_KEYS = [
+  'version', 'lane', 'step', 'seatRole', 'model', 'declaredAtIso', 'lapsesAtIso', 'outcome',
+] as const;
+const POLLUTING_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
 const BRIEF_READ_KEYS = ['lane', 'path', 'outcome', 'sha256', 'bytes'] as const;
 
 /** Refuses C0, DEL, C1, U+2028 and U+2029: single-line plain text or refused. */
@@ -160,10 +192,6 @@ function laneRefOf(record: Record<string, unknown>): LaneRef {
   };
 }
 
-function isDeclarationStep(value: unknown): value is BoardDeclarationStep {
-  return (BOARD_DECLARATION_STEPS as readonly string[]).includes(value as string);
-}
-
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
@@ -189,40 +217,94 @@ function isoAfter(iso: string, milliseconds: number): string | null {
 }
 
 /**
- * Validate one declaration body against the fresh clock read. The declared
- * and lapse times are always clock values, never body fields; every refusal
- * is a fixed string that names the field only.
+ * Snapshot one untrusted input through the declaration limits. Returns the
+ * frozen plain snapshot, or null for any hostile input (a Proxy, a getter or
+ * accessor, a non-plain prototype, a symbol or non-enumerable key, an array,
+ * an over-long string or any over-limit shape) — never running a getter or
+ * trap. Cost is O(own keys), one enumeration, inside `snapshotPlainData`.
+ */
+function snapDeclarationInput(
+  value: unknown,
+  isProxy: IsProxy,
+): Record<string, unknown> | null {
+  const snapped = snapshotPlainData(value, isProxy, LANE_DECLARATION_SNAPSHOT_LIMITS);
+  if (!snapped.ok) {
+    return null;
+  }
+  if (typeof snapped.value !== 'object' || snapped.value === null || Array.isArray(snapped.value)) {
+    return null;
+  }
+  const record = snapped.value as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(record)) {
+    if (typeof key !== 'string') return null;
+    if ((POLLUTING_KEYS as readonly string[]).includes(key)) return null;
+  }
+  return record;
+}
+
+function hasKeysSubsetOf(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set<string>(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function hasRequiredKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+/**
+ * Validate one declaration body against the fresh clock read. The body is
+ * untrusted: it is read through `snapshotPlainData` under this unit's own
+ * limits, and every refusal is a typed `{ ok: false, code, error }` that
+ * names the field only. The declared and lapse times are always clock
+ * values, never body fields.
  */
 export function parseLaneDeclarationBody(
   body: unknown,
   nowIso: string,
   ttlMinutes: number,
+  isProxy: IsProxy,
 ): LaneDeclarationParseResult {
   if (!isCanonicalIso(nowIso)) {
-    return { ok: false, error: 'invalid nowIso' };
+    return { ok: false, code: 'refused', error: 'invalid nowIso' };
   }
   if (!isTtlMinutes(ttlMinutes)) {
-    return { ok: false, error: 'invalid ttlMinutes' };
+    return { ok: false, code: 'refused', error: 'invalid ttlMinutes' };
   }
-  if (!hasExactlyKeys(body, DECLARATION_KEYS)) {
-    return { ok: false, error: 'body must have exactly the keys lane, step, seatRole and model' };
+  const record = snapDeclarationInput(body, isProxy);
+  if (record === null) {
+    return { ok: false, code: 'refused', error: 'body must be plain data' };
   }
-  const record = body as Record<string, unknown>;
+  if (
+    !hasKeysSubsetOf(record, DECLARATION_KEYS) ||
+    !hasRequiredKeys(record, REQUIRED_DECLARATION_KEYS)
+  ) {
+    return {
+      ok: false,
+      code: 'refused',
+      error: 'body must have the keys lane, step, seatRole and model, with an optional outcome',
+    };
+  }
   if (!isLaneRef(record.lane)) {
-    return { ok: false, error: 'invalid lane' };
+    return { ok: false, code: 'refused', error: 'invalid lane' };
   }
   if (!isDeclarationStep(record.step)) {
-    return { ok: false, error: 'invalid step' };
+    return { ok: false, code: 'unknown-step', error: 'unknown declaration step' };
+  }
+  // `snapshotPlainData` already refused an `undefined` value, so an omitted
+  // key and an explicit `null` both normalize to `null` here.
+  const outcome = record.outcome ?? null;
+  if (!isAllowedDeclarationOutcome(record.step, outcome)) {
+    return { ok: false, code: 'unknown-outcome', error: 'unknown or disallowed declaration outcome' };
   }
   if (!isBoundedPlain(record.seatRole, LANE_DECLARATION_TEXT_LIMIT)) {
-    return { ok: false, error: 'invalid seatRole' };
+    return { ok: false, code: 'refused', error: 'invalid seatRole' };
   }
   if (!isBoundedPlain(record.model, LANE_DECLARATION_TEXT_LIMIT)) {
-    return { ok: false, error: 'invalid model' };
+    return { ok: false, code: 'refused', error: 'invalid model' };
   }
   const lapsesAtIso = isoAfter(nowIso, ttlMinutes * 60_000);
   if (lapsesAtIso === null) {
-    return { ok: false, error: 'invalid ttlMinutes' };
+    return { ok: false, code: 'refused', error: 'invalid ttlMinutes' };
   }
   return {
     ok: true,
@@ -234,6 +316,7 @@ export function parseLaneDeclarationBody(
       model: record.model,
       declaredAtIso: nowIso,
       lapsesAtIso,
+      outcome,
     },
   };
 }
@@ -294,19 +377,46 @@ export function parseBriefReadBody(body: unknown, nowIso: string): BriefReadPars
   };
 }
 
-/** The structural check the declaration store's reader applies to each record. */
-export function isLaneDeclarationRecord(value: unknown): value is LaneDeclarationRecord {
-  if (!isRecordObject(value) || value.version !== LANE_DECLARATION_RECORD_VERSION) {
+/**
+ * The structural check the declaration store's reader applies to each record.
+ * The value is untrusted: it is read through `snapshotPlainData` under this
+ * unit's own limits, so a Proxy, a getter, an array hole, a polluting key or
+ * any over-limit shape is refused without running a getter or trap. A
+ * pre-LB4 record without an `outcome` key stays valid; a present `outcome`
+ * must be an allowed token for the step (`undefined` is refused).
+ */
+export function isLaneDeclarationRecord(
+  value: unknown,
+  isProxy: IsProxy,
+): value is LaneDeclarationRecord {
+  const snapped = snapDeclarationInput(value, isProxy);
+  if (snapped === null) {
     return false;
   }
-  return (
-    isLaneRef(value.lane) &&
-    isDeclarationStep(value.step) &&
-    isBoundedPlain(value.seatRole, LANE_DECLARATION_TEXT_LIMIT) &&
-    isBoundedPlain(value.model, LANE_DECLARATION_TEXT_LIMIT) &&
-    isCanonicalIso(value.declaredAtIso) &&
-    isCanonicalIso(value.lapsesAtIso)
-  );
+  if (snapped.version !== LANE_DECLARATION_RECORD_VERSION) {
+    return false;
+  }
+  if (!hasKeysSubsetOf(snapped, DECLARATION_RECORD_KEYS)) {
+    return false;
+  }
+  if (!hasRequiredKeys(snapped, REQUIRED_DECLARATION_KEYS) ||
+    !hasRequiredKeys(snapped, ['version', 'declaredAtIso', 'lapsesAtIso'])) {
+    return false;
+  }
+  if (!isLaneRef(snapped.lane) || !isDeclarationStep(snapped.step)) {
+    return false;
+  }
+  if (!isBoundedPlain(snapped.seatRole, LANE_DECLARATION_TEXT_LIMIT) ||
+    !isBoundedPlain(snapped.model, LANE_DECLARATION_TEXT_LIMIT) ||
+    !isCanonicalIso(snapped.declaredAtIso) ||
+    !isCanonicalIso(snapped.lapsesAtIso)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(snapped, 'outcome')) {
+    if (snapped.outcome === undefined) return false;
+    return isAllowedDeclarationOutcome(snapped.step, snapped.outcome);
+  }
+  return true;
 }
 
 /** The structural check the brief-read store's reader applies to each record. */

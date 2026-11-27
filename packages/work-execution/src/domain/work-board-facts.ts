@@ -16,7 +16,7 @@ import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunParkReason } from './lane-run-records.js';
 import { planTextError } from './lane-plan-sidecar.js';
 
-export const WORK_BOARD_SCHEMA_VERSION = 1 as const;
+export const WORK_BOARD_SCHEMA_VERSION = 2 as const;
 
 /** Every store or read the board depends on (plan §3.7), in the one order used everywhere. */
 export const BOARD_SOURCES = [
@@ -123,8 +123,46 @@ export interface BoardRunFact {
 
 export const BOARD_DECLARATION_STEPS = [
   'first-pass', 'gate', 'brief-check', 'code-review', 'fix-round', 'pre-merge', 'ci', 'other',
+  'brief', 'train', 'pr',
 ] as const;
 export type BoardDeclarationStep = (typeof BOARD_DECLARATION_STEPS)[number];
+
+/**
+ * The outcome tokens a declaration step may carry (LB4); only `brief`, `train`
+ * and `pr` declare outcomes, every other step allows only `null`.
+ */
+export const BOARD_DECLARATION_OUTCOMES_BY_STEP: Readonly<
+  Record<BoardDeclarationStep, readonly string[]>
+> = Object.freeze({
+  'first-pass': [],
+  gate: [],
+  'brief-check': [],
+  'code-review': [],
+  'fix-round': [],
+  'pre-merge': [],
+  ci: [],
+  other: [],
+  brief: ['writing', 'written', 'in-review', 'changes-requested', 'reviewed', 'failed'],
+  train: ['queued', 'at-head', 'retrying', 'parked', 'merged'],
+  pr: ['opened', 'merged', 'closed'],
+} as Record<BoardDeclarationStep, readonly string[]>);
+export type BoardDeclarationOutcome = {
+  [S in BoardDeclarationStep]: (typeof BOARD_DECLARATION_OUTCOMES_BY_STEP)[S][number];
+}[BoardDeclarationStep];
+
+export function isDeclarationStep(value: unknown): value is BoardDeclarationStep {
+  return (BOARD_DECLARATION_STEPS as readonly string[]).includes(value as string);
+}
+
+/** True for `null` on any step, or for a token the step declares; false otherwise. */
+export function isAllowedDeclarationOutcome(
+  step: BoardDeclarationStep,
+  outcome: unknown,
+): outcome is BoardDeclarationOutcome | null {
+  if (outcome === null) return true;
+  if (typeof outcome !== 'string') return false;
+  return (BOARD_DECLARATION_OUTCOMES_BY_STEP[step] as readonly string[]).includes(outcome);
+}
 
 /** `plan declare` (D3): declared, not observed. */
 export interface BoardDeclarationFact {
@@ -133,6 +171,8 @@ export interface BoardDeclarationFact {
   readonly seatRole: string;
   readonly model: string;
   readonly declaredAtIso: string;
+  /** A typed outcome token, or null when the step declares none. Display only. */
+  readonly outcome: string | null;
 }
 
 export interface BoardPullRequestLinkFact {

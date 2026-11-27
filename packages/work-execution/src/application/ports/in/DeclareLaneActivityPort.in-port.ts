@@ -7,7 +7,7 @@
  */
 import type { LaneDeclarationRecord } from '../../../domain/lane-activity-records.js';
 
-export type DeclareLaneActivityRefusalCode = 'refused' | 'store' | 'clock';
+export type DeclareLaneActivityRefusalCode = 'refused' | 'unknown-step' | 'unknown-outcome' | 'store' | 'clock';
 
 export type DeclareLaneActivityResult =
   | {

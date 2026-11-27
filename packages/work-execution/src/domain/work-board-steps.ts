@@ -5,7 +5,7 @@
 
 import { resolveLaneRunBaseBranch } from './base-branch.js';
 import type { BaseBranchValue } from './base-branch.js';
-import { isPlainText, parseTimeMs } from './work-board-facts.js';
+import { isAllowedDeclarationOutcome, isDeclarationStep, isPlainText, parseTimeMs } from './work-board-facts.js';
 import type {
   BoardAttemptFact,
   BoardDeclarationFact,
@@ -80,7 +80,7 @@ export type BoardStep =
   | { readonly kind: 'pr-merged-unrecorded'; readonly pr: BoardPrStatus }
   | { readonly kind: 'pr-merge-not-observed'; readonly pr: BoardPrStatus }
   | { readonly kind: 'declared'; readonly step: BoardDeclarationStep; readonly seatRole: string; readonly model: string;
-      readonly declaredAtIso: string }
+      readonly declaredAtIso: string; readonly outcome: string | null }
   | { readonly kind: 'declaration-lapsed'; readonly declaredAtIso: string }
   | { readonly kind: 'dropped-after-start'; readonly underlying: Exclude<BoardStep, { kind: 'dropped-after-start' }> };
 
@@ -107,7 +107,8 @@ export type BoardBadge =
   | { readonly kind: 'link-conflict'; readonly repository: string; readonly number: number;
       readonly linkedLane: string; readonly refusedLane: string; readonly recordedAtIso: string }
   | { readonly kind: 'merge-integrity'; readonly repository: string; readonly number: number; readonly readAtIso: string }
-  | { readonly kind: 'declaration'; readonly step: BoardDeclarationStep; readonly declaredAtIso: string; readonly lapsed: boolean }
+  | { readonly kind: 'declaration'; readonly step: BoardDeclarationStep; readonly declaredAtIso: string;
+      readonly outcome: string | null; readonly lapsed: boolean }
   | { readonly kind: 'plan-lane-not-imported' };
 
 export interface BoardReviewCounts {
@@ -303,7 +304,16 @@ function stepFromLinks(pullRequests: readonly BoardPrStatus[]): RawBoardStep | n
   return null;
 }
 
-function stepFromDeclaration(declaration: BoardDeclarationFact, nowIso: string, policy: BoardPolicy): RawBoardStep {
+function stepFromDeclaration(
+  declaration: BoardDeclarationFact,
+  nowIso: string,
+  policy: BoardPolicy,
+): RawBoardStep | null {
+  // A fact from a newer writer may name an unknown step or carry a token the
+  // step does not declare; the board never guesses, so there is no step.
+  if (!isDeclarationStep(declaration.step) || !isAllowedDeclarationOutcome(declaration.step, declaration.outcome)) {
+    return null;
+  }
   if (isDeclarationLapsed(declaration.declaredAtIso, nowIso, policy)) {
     return { kind: 'declaration-lapsed', declaredAtIso: declaration.declaredAtIso };
   }
@@ -313,6 +323,7 @@ function stepFromDeclaration(declaration: BoardDeclarationFact, nowIso: string, 
     seatRole: renderedSeatRole(declaration.seatRole) ?? UNKNOWN_ROLE,
     model: renderedSeatModel(declaration.model) ?? UNNAMED_SEAT,
     declaredAtIso: declaration.declaredAtIso,
+    outcome: declaration.outcome,
   };
 }
 
@@ -386,7 +397,9 @@ export function boardStepText(step: BoardStep): string {
       return text;
     }
     case 'declared':
-      return 'declared, not observed: ' + step.step + ' as of ' + renderTime(step.declaredAtIso);
+      return 'declared, not observed: ' + step.step +
+        (step.outcome === null ? '' : ' (' + step.outcome + ')') +
+        ' as of ' + renderTime(step.declaredAtIso);
     case 'declaration-lapsed':
       return 'state unknown (declaration lapsed)';
     case 'dropped-after-start':
@@ -656,6 +669,10 @@ function pushMergeIntegrity(out: BoardBadge[], input: BoardLaneBadgeInput): void
 function pushDeclaration(out: BoardBadge[], input: BoardLaneBadgeInput): void {
   const declaration = latestDeclaration(input.declarations);
   if (declaration === null) return;
+  // An unknown step or disallowed outcome (from a newer writer) renders no badge.
+  if (!isDeclarationStep(declaration.step) || !isAllowedDeclarationOutcome(declaration.step, declaration.outcome)) {
+    return;
+  }
   if (
     input.step !== null &&
     (input.step.kind === 'declared' || input.step.kind === 'declaration-lapsed') &&
@@ -667,6 +684,7 @@ function pushDeclaration(out: BoardBadge[], input: BoardLaneBadgeInput): void {
     kind: 'declaration',
     step: declaration.step,
     declaredAtIso: declaration.declaredAtIso,
+    outcome: declaration.outcome,
     lapsed: isDeclarationLapsed(declaration.declaredAtIso, input.nowIso, input.policy),
   });
 }

@@ -267,9 +267,10 @@ describe("owner item create route", () => {
     }
   });
 
-  it("returns 400 BAD_REQUEST for array or invalid JSON body", async () => {
+  it("returns 400 BAD_REQUEST for array, null, or invalid JSON body", async () => {
     const invalid: Array<string | undefined> = [
       JSON.stringify([otherBody()]),
+      "null",
       "{not json",
       JSON.stringify("a string"),
       JSON.stringify(7),

@@ -125,10 +125,12 @@ export async function readBoundedRawBody(event: H3Event, limit: number): Promise
 
 /**
  * Read the request body as a JSON object. An absent body resolves to `{}` so a
- * configured runtime answers the use case's own validation; a non-object body
- * (primitive or array) or a body that is not valid JSON is a client error (400),
- * never a silent empty request. A body
- * over `MAX_JSON_BODY_BYTES` is refused with 413 before it is parsed. `nowIso` is stripped unless
+ * configured runtime answers the use case's own validation; a body
+ * over `MAX_JSON_BODY_BYTES` is refused with 413 before it is parsed.
+ * A body that is present but is not a JSON object (a primitive or an array),
+ * or a body that is not valid JSON, is a client error (400), never a silent
+ * empty request; a closed body contract (`options.keepNowIso`) also refuses a
+ * present JSON `null` body the same way. `nowIso` is stripped unless
  * `options.keepNowIso` is set.
  */
 export async function readObjectBody(
@@ -147,7 +149,11 @@ export async function readObjectBody(
   } catch {
     throw createError({ statusCode: 400, statusMessage: "Invalid JSON body" });
   }
-  if (body === undefined || body === null || body === "") {
+  // An absent body stays the empty object so an open contract answers with the
+  // use case's own validation. A JSON `null` body is present, so a closed body
+  // contract (`keepNowIso`) treats it as the non-object client error below,
+  // never a silent empty request (owner decision 2026-10-27).
+  if (body === undefined || body === "" || (body === null && options.keepNowIso !== true)) {
     return {};
   }
   if (isPlainObject(body)) {

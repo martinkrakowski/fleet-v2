@@ -12,7 +12,9 @@
  *   contract against a factory of org-bound repositories: it seeds one record
  *   in a second organisation and asserts that `get`, `list` and (when
  *   present) `delete` never answer it, never leak it and never hand back a
- *   record payload across the organisation boundary.
+ *   record payload across the organisation boundary. A `delete` that claims
+ *   refusal must also leave the seeded record in place, so the contract
+ *   re-reads it through a repository bound to the seeded organisation.
  *
  * Hostile-input posture: every untrusted input is screened exactly once
  * through `snapshotPlainData` (data) or `Object.getOwnPropertyDescriptor`
@@ -718,7 +720,12 @@ export async function runCrossOrgRefusalContract(
       }
     }
 
-    // `delete`: only checked when the repo supplies one.
+    // `delete`: only checked when the repo supplies one. A refused delete
+    // must also leave the seeded record in place, so a "safe" result is
+    // followed by a persistence re-read through a repo bound to the seeded
+    // organisation: a delete that actually removes the record and then
+    // claims refusal (for example returning `false` or a refusal marker)
+    // would otherwise pass every marker check while destroying the data.
     if (hasDelete && remove !== undefined) {
       if (!takeOperation()) {
         return { ok: false, reason: "exhausted-budget" };
@@ -730,9 +737,12 @@ export async function runCrossOrgRefusalContract(
       if (removed.kind === "timeout") {
         return { ok: false, reason: "timeout" };
       }
+      let deleteProvedSafe = false;
       if (removed.kind === "threw") {
         violations.push("delete");
-      } else if (removed.value !== false) {
+      } else if (removed.value === false) {
+        deleteProvedSafe = true;
+      } else {
         const snapshot = snapshotResult(removed.value, isProxy);
         if (!snapshot.ok) {
           if (snapshot.reason === "hostile-input") {
@@ -744,6 +754,74 @@ export async function runCrossOrgRefusalContract(
           !isRefusalMarker(snapshot.value)
         ) {
           violations.push("delete");
+        } else {
+          deleteProvedSafe = true;
+        }
+      }
+      if (deleteProvedSafe) {
+        if (!takeOperation()) {
+          return { ok: false, reason: "exhausted-budget" };
+        }
+        const verifyRepo = await runOperation(
+          () => createForOrg(ORG_SEEDED),
+          isProxy,
+          waitTimeout,
+          timeoutMs,
+        );
+        if (verifyRepo.kind === "hostile") {
+          return { ok: false, reason: "hostile-input" };
+        }
+        if (verifyRepo.kind === "timeout") {
+          return { ok: false, reason: "timeout" };
+        }
+        const screenedSecond = screenPlainObject(
+          verifyRepo.value,
+          isProxy,
+          REPO_ALLOWED_KEYS,
+          "invalid-factory",
+        );
+        const secondGet = screenedSecond.ok
+          ? screenedSecond.record.get
+          : undefined;
+        if (!screenedSecond.ok || !isPlainFunction(secondGet, isProxy)) {
+          // The record's persistence cannot be proven, so the refused
+          // delete stays a violation.
+          violations.push("delete");
+        } else {
+          if (!takeOperation()) {
+            return { ok: false, reason: "exhausted-budget" };
+          }
+          const persisted = await runOperation(
+            () => (secondGet as (id: string) => unknown)(SEED_ID),
+            isProxy,
+            waitTimeout,
+            timeoutMs,
+          );
+          if (persisted.kind === "hostile") {
+            return { ok: false, reason: "hostile-input" };
+          }
+          if (persisted.kind === "timeout") {
+            return { ok: false, reason: "timeout" };
+          }
+          if (persisted.kind === "threw") {
+            violations.push("delete");
+          } else {
+            const snapshot = snapshotResult(persisted.value, isProxy);
+            if (!snapshot.ok) {
+              if (snapshot.reason === "hostile-input") {
+                return { ok: false, reason: "hostile-input" };
+              }
+              violations.push("delete");
+            } else if (
+              snapshot.value === null ||
+              snapshot.value === undefined ||
+              isRefusalMarker(snapshot.value)
+            ) {
+              // The seeded record the refused delete had to leave alone is
+              // gone: the delete was carried out despite the refusal.
+              violations.push("delete");
+            }
+          }
         }
       }
     }

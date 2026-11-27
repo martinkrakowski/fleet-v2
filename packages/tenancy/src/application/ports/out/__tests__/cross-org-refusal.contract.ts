@@ -226,8 +226,11 @@ function isCleanNativePromise(value: unknown): boolean {
 /**
  * Resolve an untrusted return value without ever reading `.then` on it.
  *
- * 1. `null` or a non-object non-function returns synchronously.
- * 2. A Proxy is refused through the injected detector inside `try/catch`.
+ * 1. The injected detector runs first, inside `try/catch`, on every value
+ *    (a missing or throwing detector is a hostile-input refusal, even for
+ *    `null` or a primitive).
+ * 2. A Proxy is refused; `null` or a non-object non-function then returns
+ *    synchronously.
  * 3. A non-`Promise` object or function returns synchronously, so caller
  *    validation inspects it without touching `.then`.
  * 4. A `Promise` is awaited only when its prototype is `Promise.prototype`
@@ -245,9 +248,6 @@ export async function resolveSafely(
   waitTimeout?: CrossOrgWaitTimeout,
   timeoutMs?: number,
 ): Promise<SafeResolution> {
-  if (raw === null || (typeof raw !== "object" && typeof raw !== "function")) {
-    return { ok: true, value: raw };
-  }
   let rawIsProxy: boolean;
   try {
     rawIsProxy = isProxy(raw) === true;
@@ -256,6 +256,9 @@ export async function resolveSafely(
   }
   if (rawIsProxy) {
     return HOSTILE;
+  }
+  if (raw === null || (typeof raw !== "object" && typeof raw !== "function")) {
+    return { ok: true, value: raw };
   }
   if (!(raw instanceof Promise)) {
     // Not a native promise: return it untouched so the caller's own

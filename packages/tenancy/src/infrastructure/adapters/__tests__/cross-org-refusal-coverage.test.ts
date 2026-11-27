@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   REGISTERED_CROSS_ORG_REFUSAL_TESTS,
   findPortsWithoutRefusalTest,
+  resolveSafely,
   runCrossOrgRefusalContract,
   type CrossOrgRefusalContractResult,
   type PortCoverageResult,
@@ -532,5 +533,17 @@ describe('cross-org refusal coverage enumeration', () => {
       reason: 'cross-org-leak',
       violations: ['get', 'list', 'delete'],
     });
+  });
+  it('resolveSafely guards null and primitives with the injected proxy detector first', async () => {
+    const notADetector = undefined as never;
+    for (const raw of [null, undefined, 0, 'x', true]) {
+      const refused = await resolveSafely(raw, notADetector);
+      expect(refused.ok).toBe(false);
+      const throwing = await resolveSafely(raw, (() => {
+        throw new Error('detector boom');
+      }) as never);
+      expect(throwing.ok).toBe(false);
+      expect(await resolveSafely(raw, types.isProxy)).toEqual({ ok: true, value: raw });
+    }
   });
 });

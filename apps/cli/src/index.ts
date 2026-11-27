@@ -73,7 +73,7 @@ import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { laneCommand } from './commands/lane.js';
-import { tuiCommand } from './tui/command.js';
+import { tuiCommand, type TuiCommandOptions } from './tui/command.js';
 
 export { resolveRunnerSettings };
 
@@ -740,7 +740,7 @@ it reports what the stored plan would do and mutates nothing; --apply
 --grant <id> applies one wave, with --save-inputs and --adopt-inputs as JSON
 arrays of per-lane facts and --now / --deadline as ISO instants.
 
-The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+The tui group opens the shared terminal shell: Runs is read in-process from the local state stores; Questions and Permissions read and, after an explicit confirmation, answer two-way questions and give permission verdicts over /v1 when FLEET_API_URL is set. Run 'fleet-v2 tui --help'.
 
 The lane group runs the lane diff check over one worktree (read-only, findings
 carry path, line and rule name only): lane diff-check <worktree>
@@ -776,7 +776,7 @@ Commands:
   cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex> [--now-iso <iso>] [--deadline-iso <iso>]
   cutover retire --expected-revision <n> --operation-id <id> [--now-iso <iso>] [--deadline-iso <iso>]
   lane diff-check <worktree> --allowed-path-prefixes '<json array>' [--base <value>]
-  tui
+  tui [--thread-id <id>]
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
@@ -852,6 +852,7 @@ export async function runCli(
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
   daemonOptions?: DaemonCliOptions,
+  tuiOptions?: TuiCommandOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -986,7 +987,20 @@ export async function runCli(
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
     }
     if (group === 'tui') {
-      return await tuiCommand(restArgv.slice(1), io, activeRuntime);
+      return await tuiCommand(restArgv.slice(1), io, activeRuntime, {
+        apiUrl: tuiOptions?.apiUrl ?? process.env.FLEET_API_URL,
+        // The token, session secret and thread id come from the host's own wiring (`tuiOptions`) and
+        // `--thread-id`; reading them from the environment needs `scripts/check-turbo-env.mjs` to
+        // allow-list the names first (a follow-up the lane cannot make: scripts/ is protected).
+        ...(tuiOptions?.token !== undefined ? { token: tuiOptions.token } : {}),
+        ...(tuiOptions?.sessionSecret !== undefined ? { sessionSecret: tuiOptions.sessionSecret } : {}),
+        ...(tuiOptions?.threadId !== undefined ? { threadId: tuiOptions.threadId } : {}),
+        ...(tuiOptions?.interactive !== undefined ? { interactive: tuiOptions.interactive } : {}),
+        ...(tuiOptions?.render !== undefined ? { render: tuiOptions.render } : {}),
+        ...(tuiOptions?.nowIso !== undefined ? { nowIso: tuiOptions.nowIso } : {}),
+        ...(tuiOptions?.fetchImpl !== undefined ? { fetchImpl: tuiOptions.fetchImpl } : {}),
+        ...(tuiOptions?.timeoutMs !== undefined ? { timeoutMs: tuiOptions.timeoutMs } : {}),
+      });
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

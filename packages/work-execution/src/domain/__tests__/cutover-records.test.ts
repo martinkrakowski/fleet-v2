@@ -3,6 +3,13 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CUTOVER_STREAK_MAX_DAYS,
+  CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS,
+  CUTOVER_STREAK_MIN_COUNTED_RUNS,
+  CUTOVER_STREAK_MIN_S4_HEADS,
+  CUTOVER_STREAK_MIN_S6_TIER1,
+  CUTOVER_STREAK_MIN_S6_TIER2,
+  CUTOVER_STREAK_MIN_TIER2_RUNS,
   CUTOVER_RETIREMENT_SCRIPTS,
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_RECORD_SCHEMA_VERSION,
@@ -20,6 +27,7 @@ import {
   checkCutoverJournalReplayCapacity,
   cutoverJournalKey,
   cutoverShadowParkKey,
+  evaluateCutoverStreak,
   isWithinCutoverRollbackWindow,
   readCutoverRecord,
   readCutoverShadowEvidence,
@@ -1547,5 +1555,431 @@ describe('checkCutoverJournalReplayCapacity', () => {
     // An identity echo (returning the inputs) fails the shaped-success assertions.
     expect(checkCutoverJournalReplayCapacity(0, pending, [])).toEqual({ ok: true, parkCount: 1 });
     expect(checkCutoverJournalReplayCapacity(0, pending, pending)).toEqual({ ok: true, parkCount: 0 });
+  });
+});
+
+// SR1: the cutover certification streak evaluator (owner decision 2026-11-27,
+// cutover-plan §3.2). `NOW` at the top of this file is `2026-11-05T12:00:00.000Z`,
+// so its UTC day is 2026-11-05 and `dayOf(offset)` names that many UTC days before it.
+describe('evaluateCutoverStreak', () => {
+  const STREAK_RELEASE = 'd'.repeat(40);
+  const OTHER_STREAK_RELEASE = 'e'.repeat(40);
+
+  /** The UTC `YYYY-MM-DD` date `offset` days before `NOW`'s UTC day. */
+  function dayOf(offset: number): string {
+    return new Date(Date.parse(NOW) - offset * DAY_MS).toISOString().slice(0, 10);
+  }
+
+  /** A valid, clean, floor-meeting day record `offset` UTC days before `NOW`. */
+  function streakDay(offset: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      day: dayOf(offset),
+      releaseSha: STREAK_RELEASE,
+      clean: true,
+      countedRuns: 25,
+      countedTier2: 5,
+      s4AgreeingHeads: 35,
+      s6Tier1Runs: 4,
+      s6Tier2Runs: 3,
+      ...overrides,
+    };
+  }
+
+  /** Valid options: `nowIso` = `NOW`, no rollback. */
+  function streakOptions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { nowIso: NOW, rolledBackAtIso: null, ...overrides };
+  }
+
+  /** The days `offsets` names, newest last (ascending, consecutive). */
+  function daysAt(offsets: readonly number[]): readonly unknown[] {
+    return offsets.map((offset) => streakDay(offset));
+  }
+
+  it('refuses hostile options (null, undefined, wrong primitive, array, getter, prototype-polluting keys, revoked/throwing Proxy, bad nowIso/rolledBackAtIso) as invalid-options', () => {
+    const good = streakOptions();
+    for (const bad of [
+      null,
+      undefined,
+      7,
+      'x',
+      true,
+      [],
+      [streakDay(0)],
+      { length: 1, 0: good },
+      { ...good, extra: 1 },
+    ]) {
+      expect(evaluateCutoverStreak([streakDay(0)], bad)).toEqual({ certified: false, reason: 'invalid-options' });
+    }
+    // A getter on an option is refused from its own descriptor and is never run.
+    const withNowIsoGetter = withCountingGetter(good, 'nowIso');
+    expect(evaluateCutoverStreak([streakDay(0)], withNowIsoGetter.value)).toEqual({
+      certified: false,
+      reason: 'invalid-options',
+    });
+    expect(withNowIsoGetter.calls()).toBe(0);
+    expect(evaluateCutoverStreak([streakDay(0)], withPollutingKeys(good))).toEqual({
+      certified: false,
+      reason: 'invalid-options',
+    });
+    expect(evaluateCutoverStreak([streakDay(0)], revokedProxy(good))).toEqual({
+      certified: false,
+      reason: 'invalid-options',
+    });
+    expect(evaluateCutoverStreak([streakDay(0)], throwingTrapsProxy(good))).toEqual({
+      certified: false,
+      reason: 'invalid-options',
+    });
+    // `nowIso` must be a bounded, secret-free, zoned, calendar-valid ISO time.
+    for (const badNowIso of [
+      'junk',
+      '2026-11-05',
+      '2026-11-05T12:00:00',
+      '2026-13-05T12:00:00.000Z',
+      '2026-11-31T12:00:00.000Z',
+      7,
+      null,
+      'x'.repeat(65),
+      `sk-${'a'.repeat(20)}`,
+    ]) {
+      expect(evaluateCutoverStreak([streakDay(0)], streakOptions({ nowIso: badNowIso }))).toEqual({
+        certified: false,
+        reason: 'invalid-options',
+      });
+    }
+    // `rolledBackAtIso` must be `null` or a bounded zoned ISO time.
+    for (const badRollback of ['junk', '2026-11-04', '2026-11-04T12:00:00', 7, 'x'.repeat(65)]) {
+      expect(evaluateCutoverStreak([streakDay(0)], streakOptions({ rolledBackAtIso: badRollback }))).toEqual({
+        certified: false,
+        reason: 'invalid-options',
+      });
+    }
+  });
+
+  it('refuses hostile days containers (null, undefined, non-iterable, hole, array-like, length > 64, enormous length, index getter, revoked/throwing Proxy) as invalid-days', () => {
+    const good = daysAt([0]) as unknown as Record<string, unknown>;
+    // The shared hostile shapes: primitives, a sparse array (a hole), an array-like and enormous lengths.
+    for (const bad of hostileShapes()) {
+      expect(evaluateCutoverStreak(bad, streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    }
+    // One day over the 64-day cap.
+    const overCap = Array.from({ length: 65 }, (_, i) => streakDay(64 - i));
+    expect(evaluateCutoverStreak(overCap, streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    // A symbol own key on the container.
+    const withSymbol = [streakDay(0)];
+    Object.defineProperty(withSymbol, Symbol('extra'), { value: 1, enumerable: true });
+    expect(evaluateCutoverStreak(withSymbol, streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    // An index getter is refused from its own descriptor and is never run.
+    const withIndexGetter = [streakDay(0)];
+    let indexGetterCalls = 0;
+    Object.defineProperty(withIndexGetter, 0, {
+      enumerable: true,
+      get() {
+        indexGetterCalls += 1;
+        return streakDay(0);
+      },
+    });
+    expect(evaluateCutoverStreak(withIndexGetter, streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+    expect(indexGetterCalls).toBe(0);
+    // Revoked and throwing-trap Proxies on the container and on one element.
+    expect(evaluateCutoverStreak(revokedProxy(good), streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+    expect(evaluateCutoverStreak(throwingTrapsProxy(good), streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+    expect(evaluateCutoverStreak([revokedProxy(streakDay(0))], streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+    expect(evaluateCutoverStreak([throwingTrapsProxy(streakDay(0))], streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+  });
+
+  it('refuses malformed day records (getter, prototype-polluting keys, null releaseSha, bad day, negative/non-integer/over-10000 counts) as invalid-days', () => {
+    const withCleanGetter = withCountingGetter(streakDay(0), 'clean');
+    for (const bad of [
+      withCleanGetter.value,
+      withPollutingKeys(streakDay(0)),
+      streakDay(0, { releaseSha: null }),
+      streakDay(0, { releaseSha: '' }),
+      streakDay(0, { releaseSha: 7 }),
+      streakDay(0, { releaseSha: 'x'.repeat(65) }),
+      streakDay(0, { releaseSha: `sk-${'a'.repeat(20)}` }),
+      streakDay(0, { day: '2026-11-31' }),
+      streakDay(0, { day: '20261305' }),
+      streakDay(0, { day: '2026-13-05' }),
+      streakDay(0, { day: 7 }),
+      streakDay(0, { clean: 'yes' }),
+      streakDay(0, { clean: null }),
+      streakDay(0, { countedRuns: -1 }),
+      streakDay(0, { countedRuns: 1.5 }),
+      streakDay(0, { countedRuns: Number.NaN }),
+      streakDay(0, { countedRuns: Number.POSITIVE_INFINITY }),
+      streakDay(0, { countedRuns: 10_001 }),
+      streakDay(0, { countedRuns: '25' }),
+      streakDay(0, { countedTier2: -1 }),
+      streakDay(0, { s4AgreeingHeads: -1 }),
+      streakDay(0, { s6Tier1Runs: -1 }),
+      streakDay(0, { s6Tier2Runs: -1 }),
+    ]) {
+      expect(evaluateCutoverStreak([bad], streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    }
+    // A missing key and an extra key are refused.
+    const missing = streakDay(0);
+    delete missing.clean;
+    expect(evaluateCutoverStreak([missing], streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    expect(evaluateCutoverStreak([{ ...streakDay(0), extra: 1 }], streakOptions())).toEqual({
+      certified: false,
+      reason: 'invalid-days',
+    });
+    // The getter was refused from its own descriptor and never ran.
+    expect(withCleanGetter.calls()).toBe(0);
+    // The count boundaries inside the accepted range are not refused.
+    expect(
+      evaluateCutoverStreak(
+        [
+          streakDay(0, {
+            countedRuns: 10_000,
+            countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS,
+            s4AgreeingHeads: CUTOVER_STREAK_MIN_S4_HEADS,
+            s6Tier1Runs: CUTOVER_STREAK_MIN_S6_TIER1,
+            s6Tier2Runs: CUTOVER_STREAK_MIN_S6_TIER2,
+          }),
+        ],
+        streakOptions(),
+      ),
+    ).toEqual({
+      certified: true,
+      spanStartDay: dayOf(0),
+      spanEndDay: dayOf(0),
+      spanDays: 1,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: 10_000,
+      countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS,
+    });
+  });
+
+  it('refuses duplicate, unsorted, and gapped day entries as invalid-days', () => {
+    for (const bad of [
+      daysAt([1, 1]), // duplicate day
+      daysAt([0, 1]), // unsorted (newest first)
+      daysAt([3, 1, 0]), // gap between the first two days
+      daysAt([2, 0]), // unsorted with a gap
+    ]) {
+      expect(evaluateCutoverStreak(bad, streakOptions())).toEqual({ certified: false, reason: 'invalid-days' });
+    }
+  });
+
+  it('refuses empty days and days all at or before rolledBackAtIso as no-days', () => {
+    expect(evaluateCutoverStreak([], streakOptions())).toEqual({ certified: false, reason: 'no-days' });
+    // Every day at or before the rollback's UTC day is dropped, so a streak
+    // ending exactly on the rollback day is empty.
+    const rollbackDay = '2026-11-03T00:00:00.000Z';
+    expect(evaluateCutoverStreak([streakDay(2)], streakOptions({ rolledBackAtIso: rollbackDay }))).toEqual({
+      certified: false,
+      reason: 'no-days',
+    });
+    // Later in the same UTC day changes nothing: the day is still dropped whole.
+    const lateRollback = '2026-11-03T23:59:59.999Z';
+    expect(evaluateCutoverStreak(daysAt([3, 2]), streakOptions({ rolledBackAtIso: lateRollback }))).toEqual({
+      certified: false,
+      reason: 'no-days',
+    });
+  });
+
+  it('refuses when the newest remaining day is not clean as newest-day-not-clean', () => {
+    expect(evaluateCutoverStreak([streakDay(1), streakDay(0, { clean: false })], streakOptions())).toEqual({
+      certified: false,
+      reason: 'newest-day-not-clean',
+    });
+    // A single unclean day is refused the same way, whatever its counts.
+    expect(evaluateCutoverStreak([streakDay(0, { clean: false, countedRuns: 100 })], streakOptions())).toEqual({
+      certified: false,
+      reason: 'newest-day-not-clean',
+    });
+  });
+
+  it('refuses when the newest day is older than 1 day or in the future as newest-day-stale', () => {
+    // Two UTC days before `NOW`: one past the age cap.
+    expect(evaluateCutoverStreak([streakDay(2)], streakOptions())).toEqual({
+      certified: false,
+      reason: 'newest-day-stale',
+    });
+    // One UTC day in the future: a negative age is stale, not certified.
+    expect(evaluateCutoverStreak([streakDay(-1)], streakOptions())).toEqual({
+      certified: false,
+      reason: 'newest-day-stale',
+    });
+    // Age exactly CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS (yesterday UTC) is not stale.
+    expect(
+      evaluateCutoverStreak([streakDay(CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS)], streakOptions()).certified,
+    ).toBe(true);
+  });
+
+  it('refuses as release-changed when counted runs are below floor and an older clean day had a different releaseSha', () => {
+    // The span is cut to the newest day (5 + 10 = 15 counted runs over what the
+    // span actually covers), and the cut was a clean day with another release.
+    const days = [streakDay(1, { releaseSha: OTHER_STREAK_RELEASE, countedRuns: 5 }), streakDay(0, { countedRuns: 10 })];
+    expect(evaluateCutoverStreak(days, streakOptions())).toEqual({ certified: false, reason: 'release-changed' });
+  });
+
+  it('refuses as counted-runs-below-floor when counted runs are below floor without a release change', () => {
+    // A single day under the floor: no cut at all.
+    expect(evaluateCutoverStreak([streakDay(0, { countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS - 1 })], streakOptions()))
+      .toEqual({ certified: false, reason: 'counted-runs-below-floor' });
+    // An unclean older day cuts the span too, but a release change it is not.
+    expect(
+      evaluateCutoverStreak([streakDay(1, { clean: false }), streakDay(0, { countedRuns: 10 })], streakOptions()),
+    ).toEqual({ certified: false, reason: 'counted-runs-below-floor' });
+  });
+
+  it('certifies when counted runs meet the floor even if an older clean day had a different releaseSha', () => {
+    // The older clean day with a different release simply ends the span: the
+    // newest day's own 25 runs meet the floor.
+    const days = [
+      streakDay(1, { releaseSha: OTHER_STREAK_RELEASE, countedRuns: 100 }),
+      streakDay(0, { countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS }),
+    ];
+    expect(evaluateCutoverStreak(days, streakOptions())).toEqual({
+      certified: true,
+      spanStartDay: dayOf(0),
+      spanEndDay: dayOf(0),
+      spanDays: 1,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS,
+      countedTier2: 5,
+    });
+  });
+
+  it('refuses as tier2-runs-below-floor when span countedTier2 is below 4', () => {
+    expect(evaluateCutoverStreak([streakDay(0, { countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS - 1 })], streakOptions()))
+      .toEqual({ certified: false, reason: 'tier2-runs-below-floor' });
+    // The floor is summed over the whole span: 2 + 1 misses it, 2 + 2 meets it.
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1, { countedTier2: 2 }), streakDay(0, { countedTier2: 1 })],
+        streakOptions(),
+      ),
+    ).toEqual({ certified: false, reason: 'tier2-runs-below-floor' });
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1, { countedTier2: 2 }), streakDay(0, { countedTier2: 2 })],
+        streakOptions(),
+      ).certified,
+    ).toBe(true);
+  });
+
+  it('checks S4 heads floor on the newest span day only', () => {
+    // Newest one below the floor refuses even though the older day was above it.
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1, { s4AgreeingHeads: 40 }), streakDay(0, { s4AgreeingHeads: CUTOVER_STREAK_MIN_S4_HEADS - 1 })],
+        streakOptions(),
+      ),
+    ).toEqual({ certified: false, reason: 's4-heads-below-floor' });
+    // An older span day below the floor does not refuse when the newest meets it.
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1, { s4AgreeingHeads: 0 }), streakDay(0, { s4AgreeingHeads: CUTOVER_STREAK_MIN_S4_HEADS })],
+        streakOptions(),
+      ).certified,
+    ).toBe(true);
+  });
+
+  it('checks S6 Tier 1 and Tier 2 floors on the newest span day only', () => {
+    // Newest one below either floor refuses.
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1), streakDay(0, { s6Tier1Runs: CUTOVER_STREAK_MIN_S6_TIER1 - 1 })],
+        streakOptions(),
+      ),
+    ).toEqual({ certified: false, reason: 's6-runs-below-floor' });
+    expect(
+      evaluateCutoverStreak(
+        [streakDay(1), streakDay(0, { s6Tier2Runs: CUTOVER_STREAK_MIN_S6_TIER2 - 1 })],
+        streakOptions(),
+      ),
+    ).toEqual({ certified: false, reason: 's6-runs-below-floor' });
+    // An older span day below both floors does not refuse when the newest meets both.
+    expect(
+      evaluateCutoverStreak(
+        [
+          streakDay(1, { s6Tier1Runs: 0, s6Tier2Runs: 0 }),
+          streakDay(0, { s6Tier1Runs: CUTOVER_STREAK_MIN_S6_TIER1, s6Tier2Runs: CUTOVER_STREAK_MIN_S6_TIER2 }),
+        ],
+        streakOptions(),
+      ).certified,
+    ).toBe(true);
+  });
+
+  it('certifies a 1-day to 7-day clean streak, caps span at 7 newest days, and excludes rollback day', () => {
+    // A 1-day streak exactly at every floor certifies with the exact shape an
+    // identity echo or a constant `certified: true` would not produce.
+    expect(
+      evaluateCutoverStreak(
+        [
+          streakDay(0, {
+            countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS,
+            countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS,
+            s4AgreeingHeads: CUTOVER_STREAK_MIN_S4_HEADS,
+            s6Tier1Runs: CUTOVER_STREAK_MIN_S6_TIER1,
+            s6Tier2Runs: CUTOVER_STREAK_MIN_S6_TIER2,
+          }),
+        ],
+        streakOptions(),
+      ),
+    ).toEqual({
+      certified: true,
+      spanStartDay: dayOf(0),
+      spanEndDay: dayOf(0),
+      spanDays: 1,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS,
+      countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS,
+    });
+    // A 7-day streak of 5 runs a day certifies across the whole span.
+    const seven = Array.from({ length: 7 }, (_, i) => streakDay(6 - i, { countedRuns: 5, countedTier2: 1 }));
+    expect(evaluateCutoverStreak(seven, streakOptions())).toEqual({
+      certified: true,
+      spanStartDay: dayOf(6),
+      spanEndDay: dayOf(0),
+      spanDays: CUTOVER_STREAK_MAX_DAYS,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: 35,
+      countedTier2: 7,
+    });
+    // Nine clean days: the span caps at the 7 newest days (8 and 9 are outside).
+    const nine = Array.from({ length: 9 }, (_, i) => streakDay(8 - i, { countedRuns: 5, countedTier2: 1 }));
+    expect(evaluateCutoverStreak(nine, streakOptions())).toEqual({
+      certified: true,
+      spanStartDay: dayOf(6),
+      spanEndDay: dayOf(0),
+      spanDays: CUTOVER_STREAK_MAX_DAYS,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: 35,
+      countedTier2: 7,
+    });
+    // The rollback day is excluded and only later days remain: with 10 runs
+    // and 2 tier-2 runs a day, the surviving 2-day span sums exactly to the
+    // floors — including the dropped days would change spanStartDay and the sums.
+    const four = Array.from({ length: 4 }, (_, i) => streakDay(3 - i, { countedRuns: 10, countedTier2: 2 }));
+    expect(
+      evaluateCutoverStreak(four, streakOptions({ rolledBackAtIso: '2026-11-03T00:00:00.000Z' })),
+    ).toEqual({
+      certified: true,
+      spanStartDay: dayOf(1),
+      spanEndDay: dayOf(0),
+      spanDays: 2,
+      releaseSha: STREAK_RELEASE,
+      countedRuns: CUTOVER_STREAK_MIN_COUNTED_RUNS,
+      countedTier2: CUTOVER_STREAK_MIN_TIER2_RUNS,
+    });
   });
 });

@@ -455,6 +455,8 @@ describe('plan command group', () => {
     expect(planHelpOnly(['import', '--help'], io)).toBe(0);
     expect(stdout.join('')).toContain('Usage: fleet-v2 plan');
     expect(planHelpOnly(['list'], io)).toBeUndefined();
+    // A flag value that happens to read `help` is a value, not a help request.
+    expect(planHelpOnly(['list', '--project', 'help'], io)).toBeUndefined();
   });
 
   it('reports a duplicate lane row, rows outside a Lane/Tier/After table and malformed after refs', () => {

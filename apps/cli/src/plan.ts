@@ -549,7 +549,7 @@ export function planHelpOnly(argv: readonly string[], io: CliIo): number | undef
   const subcommand = argv[0] ?? '';
   if (
     isHelpToken(subcommand) ||
-    argv.slice(1).some((token) => token === '--help' || token === '-h' || token === 'help')
+    argv.slice(1).some((token) => token === '--help' || token === '-h')
   ) {
     io.stdout(`${PLAN_HELP}\n`);
     return 0;

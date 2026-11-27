@@ -9,7 +9,7 @@ import {
   SNAPSHOT_PUBLISHER_PLAIN_DATA_LIMITS,
 } from '../../domain/snapshot-publishers.js';
 import type { PublisherSection, SnapshotBuildResult } from '../../domain/snapshot-publishers.js';
-import { MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
+import { MERGE_QUEUE_ENTRY_STATES, MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
 import { readBoundedDenseArray } from '../../domain/plain-record-reads.js';
 import type { SectionSnapshotPush } from '../../domain/snapshot-sections.js';
 import type {
@@ -100,6 +100,18 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
   }
 
   private readRequest(request: unknown): ParsedRequest | null {
+    try {
+      if (
+        typeof request !== 'object' ||
+        request === null ||
+        this.deps.isProxy(request) !== false ||
+        Reflect.ownKeys(request).some((key) => key === 'constructor' || key === 'prototype' || key === '__proto__')
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
     const section = this.field(request, 'section');
     const revision = this.field(request, 'revision');
     const pushedAtIso = this.field(request, 'pushedAtIso');
@@ -252,7 +264,12 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
     }
     const parkedEntries: unknown[] = [];
     for (const entry of entries) {
-      if (this.field(entry, 'state') !== 'parked') {
+      const state = this.field(entry, 'state');
+      // A missing, non-string or unknown state is a malformed record: never read as "not parked".
+      if (typeof state !== 'string' || !(MERGE_QUEUE_ENTRY_STATES as readonly string[]).includes(state)) {
+        return UNREADABLE_SOURCE;
+      }
+      if (state !== 'parked') {
         continue;
       }
       parkedEntries.push({
@@ -290,6 +307,10 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
     const outcome = ownData(snapshot.value, 'outcome');
     const reason = ownData(snapshot.value, 'reason');
     if (outcome === 'pushed') {
+      // `pushed` carries no other field: a reason or any extra key is a contradictory answer.
+      if (Reflect.ownKeys(snapshot.value).length !== 1) {
+        return refusedResult('invalid');
+      }
       return {
         outcome: 'published',
         section: push.section as PublisherSection,

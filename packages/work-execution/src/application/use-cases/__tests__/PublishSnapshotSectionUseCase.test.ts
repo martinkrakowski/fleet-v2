@@ -293,6 +293,9 @@ describe('PublishSnapshotSectionUseCase refusal and unavailable paths', () => {
       ['parks', { runs: async () => [{ runId: '01HX0000000000000000000001' }] }],
       ['parks', { runs: async () => [run('01HX0000000000000000000001', 'bogus')] }],
       ['parks', { entries: async () => [entry(13, 'parked', null)] }],
+      ['parks', { entries: async () => [{ repository: { ...REPO }, pullRequest: 13, reason: null }] }],
+      ['parks', { entries: async () => [entry(13, 'not-a-state')] }],
+      ['parks', { entries: async () => [entry(14, 'queued'), { ...entry(15, 'x'), state: 7 }] }],
     ];
     for (const [section, sources] of malformedRecords) {
       const { useCase, calls } = harness(sources);
@@ -356,6 +359,36 @@ describe('PublishSnapshotSectionUseCase refusal and unavailable paths', () => {
     });
     expect(await tooMany.useCase.publish(request())).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
     expect(tooMany.calls.pushes).toEqual([]);
+  });
+
+  it('refuses a pushed answer that carries a contradictory reason or an extra key, and publishes a bare pushed', async () => {
+    for (const answer of [
+      { outcome: 'pushed', reason: 'timeout' },
+      { outcome: 'pushed', extra: 1 },
+    ]) {
+      const { useCase, calls } = harness({ sessions: OK_SESSIONS, push: async () => answer });
+      expect(await useCase.publish(request())).toEqual({ outcome: 'refused', reason: 'invalid' });
+      expect(calls.pushes).toHaveLength(1);
+    }
+    const bare = harness({ sessions: OK_SESSIONS, push: async () => ({ outcome: 'pushed' }) });
+    expect(await bare.useCase.publish(request())).toMatchObject({ outcome: 'published' });
+  });
+
+  it('refuses a request with an own constructor, prototype or __proto__ key without pushing', async () => {
+    const hostile: unknown[] = [
+      { ...request(), constructor: 'x' },
+      { ...request(), prototype: 'x' },
+      JSON.parse(`{"section":"running","revision":1,"pushedAtIso":"${AT}","__proto__":{}}`),
+    ];
+    for (const bad of hostile) {
+      const { useCase, calls } = harness({ sessions: OK_SESSIONS });
+      expect(await useCase.publish(bad as PublishSnapshotSectionRequest)).toEqual({
+        outcome: 'refused',
+        reason: 'invalid-input',
+      });
+      expect(calls.sessions).toBe(0);
+      expect(calls.pushes).toEqual([]);
+    }
   });
 
   it('propagates push transport timeout and unavailable outcomes', async () => {

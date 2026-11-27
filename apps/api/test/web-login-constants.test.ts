@@ -99,11 +99,13 @@ describe("isWebLoginPath refusals", () => {
 });
 
 describe("web-login constants", () => {
-  it("WEB_LOGIN_SCOPES equals [\"read\", \"message\"] with length 2 and no mutating scopes", () => {
-    expect([...WEB_LOGIN_SCOPES]).toEqual(["read", "message"]);
-    expect(WEB_LOGIN_SCOPES).toHaveLength(2);
+  it("WEB_LOGIN_SCOPES equals [\"read\", \"message\", \"operate\", \"tail\"] with length 4 and no mutating or orchestration scopes", () => {
+    expect([...WEB_LOGIN_SCOPES]).toEqual(["read", "message", "operate", "tail"]);
+    expect(WEB_LOGIN_SCOPES).toHaveLength(4);
     expect(WEB_LOGIN_SCOPES).not.toContain("write");
     expect(WEB_LOGIN_SCOPES).not.toContain("admin");
+    expect(WEB_LOGIN_SCOPES).not.toContain("orchestrate");
+    expect(WEB_LOGIN_SCOPES).not.toContain("dispatch");
   });
 
   it("WEB_LOGIN_ACTOR is pinned to \"owner\"", () => {

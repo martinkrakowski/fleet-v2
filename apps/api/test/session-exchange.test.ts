@@ -26,6 +26,13 @@ import {
   TOKENS_PER_SESSION_LIMIT,
   validateActor,
 } from "../server/wiring/session-exchange.js";
+import {
+  issueWebLoginCode,
+  resetWebLogin,
+  WEB_LOGIN_HEADER,
+  WEB_LOGIN_PATH,
+  WEB_LOGIN_SCOPES,
+} from "../server/wiring/web-login.js";
 
 // Nitro auto-imports h3 utilities into the global scope at build time;
 // vitest does not, so stub them globally before loading route modules.
@@ -56,6 +63,7 @@ describe("T3b session exchange", () => {
   let stopHandlerInvoked: boolean;
   let exchangePostHandler: EventHandler;
   let healthGetHandler: EventHandler;
+  let loginPostHandler: EventHandler;
 
   beforeAll(async () => {
     for (const [key, value] of Object.entries(h3)) {
@@ -78,6 +86,7 @@ describe("T3b session exchange", () => {
 
     exchangePostHandler = (await import("../server/routes/sessions/exchange.post.js")).default;
     healthGetHandler = (await import("../server/routes/health.get.js")).default;
+    loginPostHandler = (await import("../server/routes/sessions/login.post.js")).default;
   });
 
   beforeEach(async () => {
@@ -87,6 +96,7 @@ describe("T3b session exchange", () => {
     setActiveApiToken(null);
     configurePresentedTokenResolver(null);
     configureSessionExchange();
+    resetWebLogin();
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -95,6 +105,7 @@ describe("T3b session exchange", () => {
     app.use(securityMiddleware);
     const router = createRouter();
     router.post(SESSION_EXCHANGE_PATH, exchangePostHandler);
+    router.post(WEB_LOGIN_PATH, loginPostHandler);
     router.post("/v1/decisions", eventHandler((event) => ({ presented: presentedToken(event) })));
     router.get("/v1/questions", eventHandler((event) => ({ presented: presentedToken(event) })));
     router.post(
@@ -123,6 +134,7 @@ describe("T3b session exchange", () => {
     setActiveApiToken(null);
     configurePresentedTokenResolver(null);
     configureSessionExchange();
+    resetWebLogin();
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -662,5 +674,200 @@ describe("T3b session exchange", () => {
     });
     expect(res.status).toBe(403);
     expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  describe("UI-T6c web-login scopes", () => {
+    async function loginWithCode(code: string): Promise<{ status: number; body: any; text: string }> {
+      const res = await fetch(`${baseUrl}${WEB_LOGIN_PATH}`, {
+        method: "POST",
+        headers: { [WEB_LOGIN_HEADER]: code, "content-type": "application/json" },
+        body: "{}",
+      });
+      const text = await res.text();
+      let body: any = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        // non-JSON body stays null
+      }
+      return { status: res.status, body, text };
+    }
+
+    async function establishSession(): Promise<{ sessionId: string; secret: string; scopes: string[] }> {
+      configuredApi();
+      const code = issueWebLoginCode(tempDir);
+      expect(code).not.toBeNull();
+      const login = await loginWithCode(code as string);
+      expect(login.status).toBe(200);
+      return login.body;
+    }
+
+    it("scopes the web login to read, message, operate and tail only", () => {
+      expect([...WEB_LOGIN_SCOPES]).toEqual(["read", "message", "operate", "tail"]);
+      expect(WEB_LOGIN_SCOPES).not.toContain("orchestrate");
+      expect(WEB_LOGIN_SCOPES).not.toContain("dispatch");
+      expect(WEB_LOGIN_SCOPES).not.toContain("verdict");
+      expect(WEB_LOGIN_SCOPES).not.toContain("hook");
+    });
+
+    it("lets a web-login session mint operate and tail tokens that act on /v1", async () => {
+      const session = await establishSession();
+
+      const operate = await mint(session.secret, ["operate"]);
+      expect(operate.tokenId.length).toBeGreaterThan(0);
+      const tail = await mint(session.secret, ["tail"]);
+      expect(tail.tokenId.length).toBeGreaterThan(0);
+
+      const stopRes = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${operate.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(stopRes.status).toBe(200);
+      expect(stopHandlerInvoked).toBe(true);
+
+      // A read-minted token from the same session carries the owner actor and
+      // the session id; the operate-only token itself is scope-refused there.
+      const read = await mint(session.secret, ["read"]);
+      const res = await fetch(`${baseUrl}/v1/questions`, {
+        headers: { authorization: `Bearer ${read.token}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.presented.actor).toBe("owner");
+      expect(body.presented.sessionId).toBe(session.sessionId);
+
+      const operateRes = await fetch(`${baseUrl}/v1/questions`, {
+        headers: { authorization: `Bearer ${operate.token}` },
+      });
+      expect(operateRes.status).toBe(403);
+      expect(await operateRes.json()).toEqual({ error: "Forbidden: scope required" });
+    });
+
+    it("refuses the shared bearer on exchange and never grants it operate or tail scopes", async () => {
+      configuredApi();
+
+      for (const scopes of [["operate"], ["tail"]]) {
+        const res = await fetch(exchangeUrl(), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${VALID_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ scopes }),
+        });
+        expect(res.status).toBe(403);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+      }
+
+      const res = await fetch(`${baseUrl}/v1/questions`, {
+        headers: { authorization: `Bearer ${VALID_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.presented.scopes).toEqual(["orchestrate"]);
+      expect(body.presented.scopes).not.toContain("operate");
+      expect(body.presented.scopes).not.toContain("tail");
+    });
+
+    it("refuses unknown, dispatch, orchestrate, verdict, and hook scopes for a web-login session", async () => {
+      const session = await establishSession();
+
+      for (const scopes of [["not-a-scope"], ["dispatch"], ["orchestrate"], ["verdict"], ["hook"]]) {
+        const res = await fetch(exchangeUrl(), {
+          method: "POST",
+          headers: { [SESSION_EXCHANGE_HEADER]: session.secret, "content-type": "application/json" },
+          body: JSON.stringify({ scopes }),
+        });
+        expect(res.status).toBe(403);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ error: "Forbidden: scope requested is not mintable" });
+        for (const scope of scopes) {
+          expect(text).not.toContain(scope);
+        }
+      }
+    });
+
+    it("enforces TOKENS_PER_SESSION_LIMIT for web-login sessions minting operate and tail", async () => {
+      const session = await establishSession();
+      const tokens: string[] = [];
+
+      for (let i = 0; i < TOKENS_PER_SESSION_LIMIT; i++) {
+        const minted = await mint(session.secret, i % 2 === 0 ? ["operate"] : ["tail"]);
+        tokens.push(minted.token);
+      }
+
+      const over = await fetch(exchangeUrl(), {
+        method: "POST",
+        headers: { [SESSION_EXCHANGE_HEADER]: session.secret, "content-type": "application/json" },
+        body: JSON.stringify({ scopes: ["operate"] }),
+      });
+      expect(over.status).toBe(403);
+      expect(await over.json()).toEqual({ error: "Forbidden: scope requested is not mintable" });
+
+      // Earlier tokens still authenticate: the first (operate) token still
+      // reaches the stop route.
+      stopHandlerInvoked = false;
+      const res = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tokens[0]}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      expect(stopHandlerInvoked).toBe(true);
+    });
+
+    it("refuses a web-login operate or tail token on routes requiring other scopes", async () => {
+      const session = await establishSession();
+      const operateOnly = await mint(session.secret, ["operate"]);
+      const tailOnly = await mint(session.secret, ["tail"]);
+
+      for (const token of [operateOnly.token, tailOnly.token]) {
+        const res = await fetch(`${baseUrl}/v1/orchestrators`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({}),
+        });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: "Forbidden: scope required" });
+      }
+    });
+
+    it("refuses missing, wrong, or reused web login codes with 403", async () => {
+      configuredApi();
+      const code = issueWebLoginCode(tempDir) as string;
+      expect(code).toBeTruthy();
+
+      const missing = await fetch(`${baseUrl}${WEB_LOGIN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(missing.status).toBe(403);
+      expect(await missing.json()).toEqual({ error: "Forbidden: the web login code was refused" });
+
+      const wrong = "wrong-code-value";
+      const wrongRes = await loginWithCode(wrong);
+      expect(wrongRes.status).toBe(403);
+      expect(wrongRes.body).toEqual({ error: "Forbidden: the web login code was refused" });
+      expect(wrongRes.text).not.toContain(wrong);
+
+      const first = await loginWithCode(code);
+      expect(first.status).toBe(200);
+      const reused = await loginWithCode(code);
+      expect(reused.status).toBe(403);
+      expect(reused.body).toEqual({ error: "Forbidden: the web login code was refused" });
+      expect(reused.text).not.toContain(code);
+    });
   });
 });

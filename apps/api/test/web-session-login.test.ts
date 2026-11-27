@@ -224,25 +224,23 @@ describe("T6a web session login", () => {
     return { status: res.status, body, text };
   }
 
-  it("a login with the issued code establishes an interactive session that mints read and message only", async () => {
+  it("a login with the issued code establishes an interactive session that mints read, message, operate, and tail only", async () => {
     const code = issueWebLoginCode(tempDir) as string;
     expect(code).toBeTruthy();
 
     const login = await loginWithCode(code);
     expect(login.status).toBe(200);
     expect(login.body.actor).toBe("owner");
-    expect(login.body.scopes).toEqual(["read", "message"]);
+    expect(login.body.scopes).toEqual(["read", "message", "operate", "tail"]);
     expect(typeof login.body.sessionId).toBe("string");
     expect(typeof login.body.secret).toBe("string");
 
-    const minted = await exchange(login.body.secret, ["read", "message"]);
+    const minted = await exchange(login.body.secret, ["read", "message", "operate", "tail"]);
     expect(minted.status).toBe(200);
-    expect(minted.body.scopes).toEqual(["read", "message"]);
+    expect(minted.body.scopes).toEqual(["read", "message", "operate", "tail"]);
     expect(minted.body.scopes).not.toContain("verdict");
     expect(minted.body.scopes).not.toContain("hook");
-    expect(minted.body.scopes).not.toContain("operate");
     expect(minted.body.scopes).not.toContain("orchestrate");
-    expect(minted.body.scopes).not.toContain("tail");
   });
 
   it("a web session token reaches a message route and is refused on the verdict, operate and orchestrate routes", async () => {

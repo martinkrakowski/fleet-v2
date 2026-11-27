@@ -19,6 +19,7 @@ export * from "./dispatch-stagger.js";
 export * from "./entities/index.js";
 export * from "./execution-record-readers.js";
 export * from "./execution-records.js";
+export * from "./expand-contract-check.js";
 export * from "./forge-credential.js";
 export * from "./gate-receipt-key.js";
 export * from "./held-work-order.js";

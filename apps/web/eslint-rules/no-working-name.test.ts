@@ -106,14 +106,21 @@ describe('forbidden-name loading', () => {
   it('no-op when neither env nor file is present', () => {
     delete process.env[ENV_KEY];
     withTempDir((dir) => {
-      expect(loadForbiddenNames({ filePath: join(dir, 'missing') })).toEqual([]);
+      const missing = join(dir, 'missing');
+      expect(loadForbiddenNames({ filePath: missing })).toEqual([]);
+      const linter = new Linter();
+      const code = `const label = "${FAKE}";`;
+      // explicit missing file path, env left to the (deleted) environment variable
+      expect(linter.verify(code, {
+        plugins: { local: plugin },
+        rules: { 'local/no-working-name': ['error', { filePath: missing }] },
+      })).toEqual([]);
+      // explicit empty env and explicit missing file path
+      expect(linter.verify(code, {
+        plugins: { local: plugin },
+        rules: { 'local/no-working-name': ['error', { env: '', filePath: missing }] },
+      })).toEqual([]);
     });
-    const linter = new Linter();
-    const messages = linter.verify(`const label = "${FAKE}";`, {
-      plugins: { local: plugin },
-      rules: { 'local/no-working-name': 'error' },
-    });
-    expect(messages).toEqual([]);
   });
 
   it('returns empty list when forbidden-names file is unreadable or a directory', () => {
@@ -302,6 +309,72 @@ describe('option validation refuses hostile input', () => {
       const badSnapshot = () => outcome;
       expect(loadForbiddenNames({}, badSnapshot)).toEqual([]);
     }
+  });
+
+  it('refuses an outcome with a throwing ok getter without invoking it or throwing', () => {
+    process.env[ENV_KEY] = FAKE;
+    let getterCalls = 0;
+    const outcome = {
+      get ok(): boolean {
+        getterCalls += 1;
+        throw new Error('ok getter ran');
+      },
+      value: { env: FAKE },
+    };
+    const snapshot = () => outcome;
+    expect(() => readForbiddenNameOptions({}, snapshot)).not.toThrow();
+    expect(readForbiddenNameOptions({}, snapshot)).toEqual({ ok: false, reason: 'invalid-outcome' });
+    expect(() => loadForbiddenNames({}, snapshot)).not.toThrow();
+    expect(loadForbiddenNames({}, snapshot)).toEqual([]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses an outcome with a throwing value getter without invoking it or throwing', () => {
+    process.env[ENV_KEY] = FAKE;
+    let getterCalls = 0;
+    const outcome = {
+      ok: true,
+      get value(): unknown {
+        getterCalls += 1;
+        throw new Error('value getter ran');
+      },
+    };
+    const snapshot = () => outcome;
+    expect(() => readForbiddenNameOptions({}, snapshot)).not.toThrow();
+    expect(readForbiddenNameOptions({}, snapshot)).toEqual({ ok: false, reason: 'invalid-outcome' });
+    expect(() => loadForbiddenNames({}, snapshot)).not.toThrow();
+    expect(loadForbiddenNames({}, snapshot)).toEqual([]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses a Proxy outcome whose traps throw without throwing', () => {
+    process.env[ENV_KEY] = FAKE;
+    const trap = () => {
+      throw new Error('trap ran');
+    };
+    const outcome = new Proxy({}, {
+      get: trap,
+      has: trap,
+      ownKeys: trap,
+      getPrototypeOf: trap,
+      getOwnPropertyDescriptor: trap,
+    });
+    const snapshot = () => outcome;
+    expect(() => readForbiddenNameOptions({}, snapshot)).not.toThrow();
+    expect(readForbiddenNameOptions({}, snapshot)).toEqual({ ok: false, reason: 'invalid-outcome' });
+    expect(loadForbiddenNames({}, snapshot)).toEqual([]);
+  });
+
+  it('parses 5000 distinct names from env and from a file and returns them all in order', () => {
+    delete process.env[ENV_KEY];
+    const expected = Array.from({ length: 5000 }, (_, index) => `name${index}`);
+    const withDuplicates = [...expected, ...expected.slice(0, 100)];
+    expect(loadForbiddenNames({ env: withDuplicates.join(',') })).toEqual(expected);
+    withTempDir((dir) => {
+      const filePath = join(dir, 'names');
+      writeFileSync(filePath, `${withDuplicates.join('\n')}\n`);
+      expect(loadForbiddenNames({ filePath })).toEqual(expected);
+    });
   });
 
   it('passes a well-formed injected snapshot outcome through to the loader', () => {

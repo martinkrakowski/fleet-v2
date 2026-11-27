@@ -44,20 +44,44 @@ export function readForbiddenNameOptions(options, snapshot = snapshotPlainData) 
   } catch {
     return refuse('invalid-outcome');
   }
+  try {
+    return validateSnapshotOutcome(snapshotResult);
+  } catch {
+    return refuse('invalid-outcome');
+  }
+}
+
+// Reads one own data property of the outcome without ever invoking a getter.
+function readOwnData(target, key) {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor === undefined || !('value' in descriptor)) {
+    return { present: false, value: undefined };
+  }
+  return { present: true, value: descriptor.value };
+}
+
+// May throw on hostile input; the caller turns any throw into a refusal.
+function validateSnapshotOutcome(snapshotResult) {
   if (snapshotResult === null
     || typeof snapshotResult !== 'object'
-    || typeof snapshotResult.ok !== 'boolean') {
+    || types.isProxy(snapshotResult)) {
     return refuse('invalid-outcome');
   }
-  if (!snapshotResult.ok) {
-    return typeof snapshotResult.reason === 'string'
-      ? refuse(snapshotResult.reason)
+  const okRead = readOwnData(snapshotResult, 'ok');
+  if (!okRead.present || typeof okRead.value !== 'boolean') {
+    return refuse('invalid-outcome');
+  }
+  if (!okRead.value) {
+    const reasonRead = readOwnData(snapshotResult, 'reason');
+    return reasonRead.present && typeof reasonRead.value === 'string'
+      ? refuse(reasonRead.value)
       : refuse('invalid-outcome');
   }
-  if (!('value' in snapshotResult)) {
+  const valueRead = readOwnData(snapshotResult, 'value');
+  if (!valueRead.present) {
     return refuse('invalid-outcome');
   }
-  const snapshotValue = snapshotResult.value;
+  const snapshotValue = valueRead.value;
   let isArray;
   try {
     isArray = Array.isArray(snapshotValue);
@@ -91,9 +115,11 @@ export function readForbiddenNameOptions(options, snapshot = snapshotPlainData) 
 
 function parseNames(text, separator) {
   const names = [];
+  const seen = new Set();
   for (const raw of text.split(separator)) {
     const name = raw.trim().toLowerCase();
-    if (name !== '' && !names.includes(name)) {
+    if (name !== '' && !seen.has(name)) {
+      seen.add(name);
       names.push(name);
     }
   }
@@ -127,32 +153,42 @@ function readNamesFile(filePath) {
  * @returns {string[]}
  */
 export function loadForbiddenNames(options, snapshot = snapshotPlainData) {
-  const parsed = readForbiddenNameOptions(options, snapshot);
-  if (parsed === null || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean' || !parsed.ok) {
+  try {
+    const parsed = readForbiddenNameOptions(options, snapshot);
+    if (parsed === null || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean' || !parsed.ok) {
+      return [];
+    }
+    const env = parsed.value.env === undefined
+      ? process.env.FLEET_WEB_FORBIDDEN_NAMES
+      : parsed.value.env;
+    if (typeof env === 'string') {
+      return parseNames(env, ',');
+    }
+    const filePath = parsed.value.filePath === undefined
+      ? new URL('../.forbidden-names', import.meta.url)
+      : parsed.value.filePath;
+    return readNamesFile(filePath);
+  } catch {
     return [];
   }
-  const env = parsed.value.env === undefined
-    ? process.env.FLEET_WEB_FORBIDDEN_NAMES
-    : parsed.value.env;
-  if (typeof env === 'string') {
-    return parseNames(env, ',');
-  }
-  const filePath = parsed.value.filePath === undefined
-    ? new URL('../.forbidden-names', import.meta.url)
-    : parsed.value.filePath;
-  return readNamesFile(filePath);
 }
 
 export const noWorkingName = {
   meta: {
     type: 'problem',
-    schema: [],
+    schema: [
+      {
+        type: 'object',
+        properties: { env: { type: 'string' }, filePath: { type: 'string' } },
+        additionalProperties: false,
+      },
+    ],
     messages: {
       forbiddenWorkingName: 'Keep copy neutral: this text contains a configured forbidden name.',
     },
   },
   create(context) {
-    const names = loadForbiddenNames();
+    const names = loadForbiddenNames(context.options[0]);
     if (names.length === 0) {
       return {};
     }

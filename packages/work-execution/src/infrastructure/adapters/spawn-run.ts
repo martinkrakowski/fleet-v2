@@ -17,6 +17,8 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 
+import type { CommandRunErrorCode } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+
 /** Default captured-output cap, matching the runner's reviewed 64 MiB. */
 export const DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
@@ -67,6 +69,8 @@ export interface SpawnRunOutcome {
   readonly stderr: string;
   /** Spawn failure, a timeout, or a max-buffer overrun; absent on a clean run. */
   readonly error?: string;
+  /** Typed classification of the failure above; absent on a clean run. */
+  readonly errorCode?: CommandRunErrorCode;
 }
 
 export interface SpawnRunOptions {
@@ -124,6 +128,7 @@ export function runSpawnOutcome(
     let stderr = '';
     let killed: string | null = null;
     let error: string | undefined;
+    let errorCode: CommandRunErrorCode | undefined;
     let killGrace: ReturnType<typeof setTimeout> | undefined;
 
     const maxBufferBytes = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
@@ -165,6 +170,7 @@ export function runSpawnOutcome(
     const timer = setTimeout(() => {
       if (killed === null) {
         killed = 'SIGTERM';
+        errorCode = 'timeout';
         error = killTree
           ? `command exceeded its ${String(timeoutMs)}ms timeout and its process tree was killed`
           : `command exceeded its ${String(timeoutMs)}ms timeout and was killed`;
@@ -198,6 +204,7 @@ export function runSpawnOutcome(
       buffered += Buffer.byteLength(chunk, 'utf8');
       if (buffered > maxBufferBytes && !overran) {
         overran = true;
+        errorCode = 'max-buffer';
         terminate(
           'SIGKILL',
           `output exceeded maxBufferBytes (${String(maxBufferBytes)}); the process tree was killed`,
@@ -227,7 +234,15 @@ export function runSpawnOutcome(
     child.on('error', (failure: NodeJS.ErrnoException) => {
       // Spawn failure (for example ENOENT): reported, never guessed.
       error = failure.message ?? String(failure);
-      settle({ exitCode: null, signal: null, stdout, stderr, error });
+      errorCode = 'spawn-error';
+      settle({
+        exitCode: null,
+        signal: null,
+        stdout,
+        stderr,
+        ...(error !== undefined ? { error } : {}),
+        ...(errorCode !== undefined ? { errorCode } : {}),
+      });
     });
 
     // Without a tree kill, a surviving grandchild may hold the inherited
@@ -245,6 +260,7 @@ export function runSpawnOutcome(
           stdout,
           stderr,
           ...(error !== undefined ? { error } : {}),
+          ...(errorCode !== undefined ? { errorCode } : {}),
         });
       }, KILL_GRACE_MS).unref();
     });
@@ -260,6 +276,7 @@ export function runSpawnOutcome(
         stdout,
         stderr,
         ...(error !== undefined ? { error } : {}),
+        ...(errorCode !== undefined ? { errorCode } : {}),
       });
     });
 

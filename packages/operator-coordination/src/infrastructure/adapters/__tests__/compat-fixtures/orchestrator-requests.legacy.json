@@ -1,0 +1,20 @@
+[
+  {
+    "requestId": "01JB0000000000000000000000",
+    "revision": 1,
+    "kind": "dispatch-attempt",
+    "projectId": "example-project",
+    "target": { "attemptId": "attempt-example-1" },
+    "requestedBy": { "via": "web", "sessionId": "session-example-1" },
+    "createdAtIso": "2026-10-27T10:00:00.000Z",
+    "expiresAtIso": "2026-10-27T10:30:00.000Z",
+    "updatedAtIso": "2026-10-27T10:00:00.000Z",
+    "state": "queued",
+    "fence": 0,
+    "claimCount": 0,
+    "claim": null,
+    "deferredUntilIso": null,
+    "reason": null,
+    "linked": null
+  }
+]

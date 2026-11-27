@@ -20,6 +20,7 @@
     "sync:dry": "hexagen sync --dry-run",
     "sync:check": "hexagen sync --check --allow-dirty",
     "lint:arch": "hexagen arch validate",
+    "check:hostile-input": "node scripts/check-hostile-input-ratchet.mjs",
     "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\""
   },
   "devDependencies": {

@@ -78,6 +78,16 @@ const PASS_30 = verdict('pass', 'gate-verdicts-agree', {
   agreeing: SHADOW_GATE_MIN_AGREEING_HEADS,
 });
 
+/** One S4 divergence diagnostic: `ValidHead` carries no pull request, so `pr` is always 0. */
+function gateItem(n: number, side: 'fleet' | 'shell', code: string): { pr: number; head12: string; side: 'fleet' | 'shell'; code: string } {
+  return { pr: 0, head12: oid(n).slice(0, 12), side, code };
+}
+
+/** The non-digested payload an S4 evaluation carries when its divergence total is positive. */
+function details(totalCount: number, items: ReturnType<typeof gateItem>[]): { totalCount: number; items: ReturnType<typeof gateItem>[] } {
+  return { totalCount, items };
+}
+
 describe('evaluateShadowGateAgreement (S4 prime)', () => {
   it('30 agreeing pass/success heads spread over D-2..D pass with agreeing 30', () => {
     const result = evaluateShadowGateAgreement(gateInput(agreeing(SHADOW_GATE_MIN_AGREEING_HEADS)));
@@ -102,6 +112,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         compared: SHADOW_GATE_MIN_AGREEING_HEADS + 1,
         agreeing: SHADOW_GATE_MIN_AGREEING_HEADS,
         falsePasses: 1,
+        divergenceDetails: details(1, [gateItem(100, 'fleet', 'false-pass')]),
       }),
     );
   });
@@ -117,6 +128,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         compared: agreeingCount + 1,
         agreeing: agreeingCount,
         falsePasses: 1,
+        divergenceDetails: details(1, [gateItem(100, 'fleet', 'false-pass')]),
       }),
     );
   });
@@ -131,6 +143,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         compared: SHADOW_GATE_MIN_AGREEING_HEADS + 1,
         agreeing: SHADOW_GATE_MIN_AGREEING_HEADS,
         stricterFails: 1,
+        divergenceDetails: details(1, [gateItem(100, 'shell', 'stricter-fail')]),
       }),
     );
   });
@@ -241,6 +254,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         compared: SHADOW_GATE_MIN_AGREEING_HEADS,
         agreeing: SHADOW_GATE_MIN_AGREEING_HEADS - 1,
         falsePasses: 1,
+        divergenceDetails: details(1, [gateItem(100, 'fleet', 'false-pass')]),
       }),
     );
   });
@@ -253,6 +267,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
       compared: SHADOW_GATE_MIN_AGREEING_HEADS + 2,
       agreeing: SHADOW_GATE_MIN_AGREEING_HEADS + 1,
       falsePasses: 1,
+      divergenceDetails: details(1, [gateItem(1, 'fleet', 'false-pass')]),
     });
     // Opposite orders: keeping the first copy, or the last, would fail one of these.
     expect(evaluateShadowGateAgreement(gateInput([later, early, ...rest]))).toEqual(expected);
@@ -273,6 +288,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
         truncated: true,
+        divergenceDetails: details(SHADOW_DIVERGENCE_MAX, Array.from({ length: 20 }, (_, index) => gateItem(index + 1, 'fleet', 'false-pass'))),
       }),
     );
   });
@@ -284,22 +300,16 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
       );
     const fewer = evaluateShadowGateAgreement(gateInput(falsePasses(SHADOW_DIVERGENCE_MAX + 1)));
     const more = evaluateShadowGateAgreement(gateInput(falsePasses(SHADOW_DIVERGENCE_MAX + 2)));
-    expect(fewer).toEqual(
+    const truncatedExpectation = (compared: number) =>
       verdict('unknown', 'gate-comparison-incomplete', {
-        compared: SHADOW_DIVERGENCE_MAX + 1,
+        compared,
         agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
         truncated: true,
-      }),
-    );
-    expect(more).toEqual(
-      verdict('unknown', 'gate-comparison-incomplete', {
-        compared: SHADOW_DIVERGENCE_MAX + 2,
-        agreeing: 0,
-        falsePasses: SHADOW_DIVERGENCE_MAX,
-        truncated: true,
-      }),
-    );
+        divergenceDetails: details(SHADOW_DIVERGENCE_MAX, Array.from({ length: 20 }, (_, index) => gateItem(index + 1, 'fleet', 'false-pass'))),
+      });
+    expect(fewer).toEqual(truncatedExpectation(SHADOW_DIVERGENCE_MAX + 1));
+    expect(more).toEqual(truncatedExpectation(SHADOW_DIVERGENCE_MAX + 2));
     expect(fewer).not.toEqual(more);
   });
 
@@ -317,6 +327,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
         agreeing: 0,
         falsePasses: SHADOW_DIVERGENCE_MAX,
         truncated: true,
+        divergenceDetails: details(SHADOW_DIVERGENCE_MAX, Array.from({ length: 20 }, (_, index) => gateItem(index + 1, 'fleet', 'false-pass'))),
       }),
     );
   });
@@ -335,6 +346,44 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
       verdict('unknown', 'no-settled-heads'),
     );
+  });
+
+  it('records S4 divergenceDetails with pr 0, head12 prefix, side from divergence kind, and code', () => {
+    // One false pass (fleet passed where the shell CI did not) and one
+    // stricter fail (the shell CI passed where the fleet failed) on D, among
+    // enough agreeing heads to stay evaluat­ed.
+    const heads = [
+      ...agreeing(SHADOW_GATE_MIN_AGREEING_HEADS),
+      head(100, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
+      head(101, { conductorVerdict: 'fail', ciGate: 'success' }),
+    ];
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
+      verdict('fail', 'gate-false-pass', {
+        compared: SHADOW_GATE_MIN_AGREEING_HEADS + 2,
+        agreeing: SHADOW_GATE_MIN_AGREEING_HEADS,
+        falsePasses: 1,
+        stricterFails: 1,
+        divergenceDetails: details(2, [
+          gateItem(100, 'fleet', 'false-pass'),
+          gateItem(101, 'shell', 'stricter-fail'),
+        ]),
+      }),
+    );
+  });
+
+  it('caps S4 divergenceDetails at 20 sorted items while preserving totalCount', () => {
+    const heads = Array.from({ length: 30 }, (_, index) =>
+      head(index + 1, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
+    );
+    const result = evaluateShadowGateAgreement(gateInput(heads));
+    expect(result.status).toBe('fail');
+    expect(result.falsePasses).toBe(30);
+    expect(result.divergenceDetails?.totalCount).toBe(30);
+    expect(result.divergenceDetails?.items).toHaveLength(20);
+    expect(result.divergenceDetails?.items).toEqual(
+      Array.from({ length: 20 }, (_, index) => gateItem(index + 1, 'fleet', 'false-pass')),
+    );
+    expect(result.divergenceDetails?.items.every((item) => item.pr === 0)).toBe(true);
   });
 
   it('a malformed head is unknown/invalid-input', () => {
@@ -359,6 +408,35 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
 
   it('null is unknown/invalid-input', () => {
     expect(evaluateShadowGateAgreement(null)).toEqual(INVALID);
+  });
+
+  it('returns invalid-input without divergenceDetails on a malformed S4 record', () => {
+    const result = evaluateShadowGateAgreement(gateInput([{ ...head(1), conductorVerdict: 'unknown' }]));
+    expect(result).toEqual(INVALID);
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('refuses a non-array heads value with invalid-input and no divergenceDetails', () => {
+    const result = evaluateShadowGateAgreement(gateInput('heads'));
+    expect(result).toEqual(INVALID);
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('never invokes a throwing getter on S4 heads and returns invalid-input without divergenceDetails', () => {
+    let indexCalls = 0;
+    const heads: unknown[] = [];
+    Object.defineProperty(heads, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        indexCalls += 1;
+        return head(1);
+      },
+    });
+    const result = evaluateShadowGateAgreement(gateInput(heads));
+    expect(result).toEqual(INVALID);
+    expect(indexCalls).toBe(0);
+    expect(result).not.toHaveProperty('divergenceDetails');
   });
 
   it('undefined is unknown/invalid-input', () => {

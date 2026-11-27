@@ -29,6 +29,13 @@ export interface CommandRunOptions {
   readonly killProcessTree?: boolean;
 }
 
+/**
+ * Typed reason a command run never reported its own exit code: a wall-clock
+ * timeout, a captured-output overrun, or a spawn failure. Free-text `error`
+ * descriptions are never classified; only this code is machine-readable.
+ */
+export type CommandRunErrorCode = 'timeout' | 'max-buffer' | 'spawn-error';
+
 /** Completed outcome of one command run, as far as this port needs it. */
 export interface CommandRunResult {
   /** Exit code, or null when the command never reported one. */
@@ -39,6 +46,13 @@ export interface CommandRunResult {
   readonly stderr: string;
   /** Spawn failure description; absent for a command that ran. */
   readonly error?: string;
+  /**
+   * Typed classification of a run that never reported its own verdict
+   * (`exitCode: null` with an executor error), set by the concrete executor
+   * when it knows the reason. Optional: legacy or scripted executors may omit
+   * it, and a typed classification is never guessed from `error` text.
+   */
+  readonly errorCode?: CommandRunErrorCode;
 }
 
 /** Run one argv array and return its completed outcome, fail closed. */

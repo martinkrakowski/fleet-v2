@@ -43,6 +43,7 @@ export class LocalExecutor implements CommandExecutorPort {
       stdout: outcome.stdout,
       stderr: outcome.stderr,
       ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+      ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
     };
   }
 }

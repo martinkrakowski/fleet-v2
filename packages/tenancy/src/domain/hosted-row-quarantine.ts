@@ -69,17 +69,25 @@ export type ClassifyHostedRowsResult<T> =
 const CANONICAL_INDEX = /^(0|[1-9][0-9]*)$/;
 
 /**
+ * Upper bound on how many characters of a parser-provided reason are ever
+ * examined, so a reason made only of control characters (which never grows
+ * the output) cannot make the scan walk an arbitrarily long input.
+ */
+const MAX_REASON_SCAN_LENGTH = MAX_QUARANTINE_REASON_LENGTH * 8;
+
+/**
  * Sanitize a parser-provided reason: non-strings and empty strings fall back
  * to `invalid-row`; control characters are stripped and the text is capped
  * at `MAX_QUARANTINE_REASON_LENGTH`. Cost bound: O(1) — one pass over at
- * most the first `MAX_QUARANTINE_REASON_LENGTH` characters.
+ * most the first `MAX_REASON_SCAN_LENGTH` characters, whatever the input.
  */
 function sanitizeReason(reason: unknown): string {
   if (typeof reason !== "string") {
     return "invalid-row";
   }
   let out = "";
-  for (let i = 0; i < reason.length && out.length < MAX_QUARANTINE_REASON_LENGTH; i += 1) {
+  const scanEnd = Math.min(reason.length, MAX_REASON_SCAN_LENGTH);
+  for (let i = 0; i < scanEnd && out.length < MAX_QUARANTINE_REASON_LENGTH; i += 1) {
     const code = reason.charCodeAt(i);
     if (code > 0x1f && code !== 0x7f) {
       out += reason[i];

@@ -411,6 +411,26 @@ describe("classifyHostedRows quarantines corrupt rows", () => {
       "r".repeat(MAX_QUARANTINE_REASON_LENGTH),
     );
 
+    // A reason that is only control characters for far longer than the scan
+    // window never reaches the printable tail: the scan stops at its cap.
+    const controlOnlyThenText = "\u0007".repeat(MAX_QUARANTINE_REASON_LENGTH * 8) + "tail";
+    const scanCapped = classifyHostedRows<ParsedRow>(
+      [{ id: "x" }],
+      () => ({ ok: false, reason: controlOnlyThenText }),
+      1,
+      isProxy,
+    );
+    expect((scanCapped as { quarantined: readonly { reason: string }[] }).quarantined[0]?.reason).toBe("invalid-row");
+
+    // Printable text inside the window is still kept after leading controls.
+    const insideWindow = classifyHostedRows<ParsedRow>(
+      [{ id: "x" }],
+      () => ({ ok: false, reason: "\u0007".repeat(100) + "tail" }),
+      1,
+      isProxy,
+    );
+    expect((insideWindow as { quarantined: readonly { reason: string }[] }).quarantined[0]?.reason).toBe("tail");
+
     for (const bad of [undefined, null, 42, "", {}]) {
       const result = classifyHostedRows<ParsedRow>(
         [{ id: "x" }],

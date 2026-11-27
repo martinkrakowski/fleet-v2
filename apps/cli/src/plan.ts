@@ -165,7 +165,7 @@ function parseRepositoryNumberToken(token: string, subcommand: string): {
   const hash = token.indexOf('#');
   const repository = hash === -1 ? '' : token.slice(0, hash);
   const numberText = hash === -1 ? '' : token.slice(hash + 1);
-  if (hash <= 0 || hash === token.length - 1 || repository.split('/').length !== 2 || !/^\d+$/.test(numberText)) {
+  if (hash <= 0 || hash === token.length - 1 || !/^[^/\s#]+\/[^/\s#]+$/.test(repository) || !/^\d+$/.test(numberText)) {
     throw new CliUsageError(`plan ${subcommand} requires <repository>#<number>, not '${token}'`);
   }
   const number = Number(numberText);
@@ -540,6 +540,23 @@ async function planList(tokens: readonly string[], io: CliIo, rt: FleetCliRuntim
   return 0;
 }
 
+/**
+ * Print the plan help and return 0 when the line asks for help (`help`,
+ * `--help`, `-h`, as the subcommand or anywhere after it); otherwise
+ * undefined. Needs no runtime, so `runCli` can answer it before composing one.
+ */
+export function planHelpOnly(argv: readonly string[], io: CliIo): number | undefined {
+  const subcommand = argv[0] ?? '';
+  if (
+    isHelpToken(subcommand) ||
+    argv.slice(1).some((token) => token === '--help' || token === '-h' || token === 'help')
+  ) {
+    io.stdout(`${PLAN_HELP}\n`);
+    return 0;
+  }
+  return undefined;
+}
+
 /** `fleet-v2 plan <subcommand>` dispatch. */
 export async function planCommand(
   argv: readonly string[],
@@ -547,18 +564,12 @@ export async function planCommand(
   rt: FleetCliRuntime,
   options: PlanCliOptions = {},
 ): Promise<number> {
+  const helpExit = planHelpOnly(argv, io);
+  if (helpExit !== undefined) {
+    return helpExit;
+  }
   const subcommand = argv[0] ?? '';
-  if (isHelpToken(subcommand)) {
-    io.stdout(`${PLAN_HELP}\n`);
-    return 0;
-  }
   const rest = argv.slice(1);
-  // Help anywhere in the token line prints the block; a subcommand's `--help`
-  // never reaches the flag parser.
-  if (rest.some((token) => token === '--help' || token === '-h' || token === 'help')) {
-    io.stdout(`${PLAN_HELP}\n`);
-    return 0;
-  }
   try {
     switch (subcommand) {
       case 'import':

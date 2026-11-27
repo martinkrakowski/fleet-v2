@@ -36,7 +36,12 @@ function normalizeAfterToken(token: string, projectId: string, planId: string): 
   if (cleaned === '' || cleaned === '—' || cleaned === '-' || cleaned.toLowerCase() === 'none') {
     return null;
   }
-  const parts = cleaned.split('/').filter((part) => part !== '');
+  const parts = cleaned.split('/');
+  if (parts.some((part) => part === '')) {
+    // An empty segment is a malformed reference: keep it raw so it never
+    // matches a sidecar reference.
+    return `malformed:${cleaned}`;
+  }
   if (parts.length === 1) {
     return fullRef(projectId, planId, parts[0]);
   }
@@ -79,6 +84,9 @@ export function parsePlanMarkdownLanes(
   planId: string,
 ): readonly MarkdownLane[] {
   const lanes: MarkdownLane[] = [];
+  // Lane rows count only under a Lane / Tier / After header row, so a stray
+  // lane-shaped line outside the workbook table cannot pass for the table.
+  let inTable = false;
   for (const line of markdown.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('|') || !trimmed.endsWith('|') || trimmed.length < 2) {
@@ -91,7 +99,13 @@ export function parsePlanMarkdownLanes(
     const laneId = (cells[0] ?? '').replace(/[`*]/g, '');
     // The header row names its columns; a section row carries no tier cell.
     // Neither is a lane row, and neither is ever a finding.
-    if (laneId.toLowerCase() === 'lane' || cells.slice(1).every((cell) => cell === '')) {
+    if (laneId.toLowerCase() === 'lane') {
+      inTable =
+        (cells[1] ?? '').replace(/[`*_]/g, '').toLowerCase() === 'tier' &&
+        (cells[2] ?? '').replace(/[`*_]/g, '').toLowerCase() === 'after';
+      continue;
+    }
+    if (!inTable || cells.slice(1).every((cell) => cell === '')) {
       continue;
     }
     if (!PLANNED_LANE_ID_PATTERN.test(laneId)) {
@@ -121,10 +135,20 @@ export function comparePlanMarkdownToSidecar(
   const drifts: PlanDrift[] = [];
   const rows = parsePlanMarkdownLanes(markdown, sidecar.projectId, sidecar.planId);
   const byLaneId = new Map<string, MarkdownLane>();
+  const duplicateIds = new Set<string>();
   for (const row of rows) {
-    if (!byLaneId.has(row.laneId)) {
+    if (byLaneId.has(row.laneId)) {
+      duplicateIds.add(row.laneId);
+    } else {
       byLaneId.set(row.laneId, row);
     }
+  }
+  for (const laneId of duplicateIds) {
+    drifts.push({
+      kind: 'extra-in-markdown',
+      laneId,
+      detail: 'the markdown table has more than one row for this lane',
+    });
   }
   const sidecarIds = new Set<string>();
   for (const lane of sidecar.lanes) {

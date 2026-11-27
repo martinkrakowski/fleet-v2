@@ -43,7 +43,7 @@ import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { policyCommand, type PolicyCliOptions } from './policy.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
-import { planCommand, type PlanCliOptions } from './plan.js';
+import { planCommand, planHelpOnly, type PlanCliOptions } from './plan.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
@@ -960,6 +960,14 @@ export async function runCli(
     // key generation works before any installation file exists.
     if (group === 'coordination' && restArgv[1] === 'owner-key') {
       return await ownerKeyCommand(restArgv.slice(2), io, stateDir);
+    }
+    // `plan --help` needs no runtime: answer it before composing one, so a bad
+    // installation cannot turn a help request into a usage error.
+    if (group === 'plan') {
+      const planHelpExit = planHelpOnly(restArgv.slice(1), io);
+      if (planHelpExit !== undefined) {
+        return planHelpExit;
+      }
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.

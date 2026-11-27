@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from './composition.js';
-import { planCommand, type PlanCliOptions } from './plan.js';
+import { planCommand, planHelpOnly, type PlanCliOptions } from './plan.js';
 import { comparePlanMarkdownToSidecar, parsePlanMarkdownLanes } from './plan-check.js';
 import type { CliIo } from './index.js';
 import { parseLanePlanSidecar } from '@fleet/work-execution';
@@ -122,6 +122,13 @@ describe('plan command group', () => {
       runtime,
     );
     expect(badRepo.exitCode).toBe(2);
+    for (const token of ['/#1', 'owner/#1', '/repo#1', 'a/b/c#1']) {
+      const malformedRepo = await runPlan(
+        ['link-pr', '2026-10-27_example/A1', token, '--project', 'p'],
+        runtime,
+      );
+      expect(malformedRepo.exitCode).toBe(2);
+    }
     const unknownFlag = await runPlan(
       ['import', sidecarFile(), '--project', 'p', '--forge', 'x'],
       runtime,
@@ -440,5 +447,39 @@ describe('plan command group', () => {
     expect(rows[1].after).toEqual(['proj/plan/A1', 'x/y/Z9']);
     const malformed = parsePlanMarkdownLanes('no table', 'proj', 'plan');
     expect(malformed).toEqual([]);
+  });
+
+  it('answers plan help without a runtime', () => {
+    const { io, stdout } = createMockIo();
+    expect(planHelpOnly(['--help'], io)).toBe(0);
+    expect(planHelpOnly(['import', '--help'], io)).toBe(0);
+    expect(stdout.join('')).toContain('Usage: fleet-v2 plan');
+    expect(planHelpOnly(['list'], io)).toBeUndefined();
+  });
+
+  it('reports a duplicate lane row, rows outside a Lane/Tier/After table and malformed after refs', () => {
+    const parsed = parseLanePlanSidecar(SIDECAR);
+    if (!parsed.ok) {
+      throw new Error('fixture sidecar must parse');
+    }
+    const header = '| Lane | Tier | After |\n| --- | --- | --- |\n';
+    const rowA2 = '| A2 | 2 | A1 other-plan/B1 other-project/third-plan/C1 |';
+    const duplicate = comparePlanMarkdownToSidecar(
+      parsed.sidecar,
+      `${header}| A1 | 2 | — |\n${rowA2}\n| A1 | 0 | — |`,
+    );
+    expect(duplicate.outcome).toBe('drift');
+    const bare = comparePlanMarkdownToSidecar(parsed.sidecar, `| A1 | 2 | — |\n${rowA2}`);
+    expect(bare.outcome).toBe('drift');
+    if (bare.outcome === 'drift') {
+      expect(bare.drifts.every((drift) => drift.kind === 'missing-in-markdown')).toBe(true);
+    }
+    const good = comparePlanMarkdownToSidecar(parsed.sidecar, `${header}| A1 | 2 | — |\n${rowA2}`);
+    expect(good.outcome).toBe('in-sync');
+    const malformed = comparePlanMarkdownToSidecar(
+      parsed.sidecar,
+      `${header}| A1 | 2 | — |\n| A2 | 2 | A1 other-plan//B1 other-project/third-plan/C1 |`,
+    );
+    expect(malformed.outcome).toBe('drift');
   });
 });

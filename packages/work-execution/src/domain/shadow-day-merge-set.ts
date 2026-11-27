@@ -987,7 +987,21 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
 
   const shellItems = shellSet(shellEvents, day, start, end, true);
   if (hasLiveActionInShadow(fleetResults, repoDigest, day)) return { ok: false, reason: 'live-action-in-shadow' };
-  const fleetSet = resolveFleetSet(fleetResults, fleetEntries, repoDigest, day, start, end);
+  // Batches neither count nor break: drop the fleet rows of every
+  // batch-excluded pull request (by number, since update-branch can move a
+  // head) before the fleet resolution runs, so an unresolved or ambiguous
+  // head on an excluded batch merge cannot refuse the day.
+  const excludedPullRequests = shellItems.excludedPullRequests;
+  const keptFleetResults = excludedPullRequests.size === 0
+    ? fleetResults
+    : fleetResults.filter((result) => {
+        const parsed = parseLaneRunKey(result.key as string);
+        return parsed === null || parsed.kind !== 'merge' || !excludedPullRequests.has(parsed.pullRequest);
+      });
+  const keptFleetEntries = excludedPullRequests.size === 0
+    ? fleetEntries
+    : fleetEntries.filter((entry) => !excludedPullRequests.has(entry.pullRequest));
+  const fleetSet = resolveFleetSet(keptFleetResults, keptFleetEntries, repoDigest, day, start, end);
   if ('refusal' in fleetSet) {
     const reason = fleetSet.refusal.reason;
     if (reason !== 'fleet-head-unresolved' && reason !== 'fleet-head-ambiguous') return INVALID;
@@ -1035,6 +1049,11 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     }
   }
   const matched: { readonly run: ShadowConformanceRun; readonly merge: ShadowShellMerge }[] = [];
+  // A conducted run counts at most once: if several same-day shell merges
+  // name the same pull request (and therefore the same single run), only the
+  // first pairing is evaluated, so one conforming run can never be counted
+  // twice and inflate the certification streak total.
+  const matchedRunIds = new Set<string>();
   for (const item of shellItems.items) {
     if (!inDay(item.atIso, day)) continue;
     const ids = runIdsByPullRequest.get(item.pullRequest);
@@ -1043,6 +1062,8 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     const [only] = ids;
     const run = runsByRunId.get(only);
     if (run === undefined) return { ok: false, reason: 'unpaired-log' };
+    if (matchedRunIds.has(run.runId)) continue;
+    matchedRunIds.add(run.runId);
     matched.push({ run, merge: item });
   }
 

@@ -769,6 +769,36 @@ describe('countedRunsForDay (cut-over certification streak)', () => {
     expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
   });
 
+  it('a batch-excluded PR with an unresolved fleet head neither counts nor breaks the day', () => {
+    // Batches neither count nor break: the excluded batch merge's fleet
+    // would-merge row must be dropped before fleet resolution, so its
+    // unresolvable head cannot refuse the day for the non-batch run.
+    const batch = streakPair(9, 1, 2, 12);
+    const openedEvent = shellEvent({ line: 1, atIso: inDayIso(9 * 60), kind: 'batch', outcome: 'opened', pullRequest: batch.pullRequest, headOid: streakHead(9), detailCode: 'none' });
+    const batchedShell = { ...batch.shellEvent, detailCode: 'batch-member' };
+    const nonBatch = streakPair(1, 1, 3, 10);
+    const unresolvedBatchRow = fleetResult({ key: mergeKey(DIGEST, batch.pullRequest, '999999999999') });
+    const input = countedInputFor([nonBatch], {
+      shell: { events: [openedEvent, batchedShell, nonBatch.shellEvent], unknownLines: 0 },
+      fleet: {
+        results: [batch.fleetResult, unresolvedBatchRow, nonBatch.fleetResult],
+        entries: [batch.fleetEntry, nonBatch.fleetEntry],
+      },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a conducted run matched by two same-day shell merges is counted once, not twice', () => {
+    const pair = streakPair(1, 1, 2, 10);
+    const secondMerge = shellEvent({ line: 3, atIso: inDayIso(15 * 60), pullRequest: pair.pullRequest, headOid: streakHead(1) });
+    const secondFleetRow = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(1).slice(0, 12)), recordedAtIso: inDayIso(14 * 60, 50) });
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, secondMerge], unknownLines: 0 },
+      fleet: { results: [pair.fleetResult, secondFleetRow], entries: [pair.fleetEntry] },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
   it('a nonconforming S6 run (no gate result) is not counted', () => {
     const broken = streakPair(1, 1, 1, 10, { journal: [] });
     expect(countedRunsForDay(countedInputFor([broken]))).toEqual({ ok: true, countedRuns: 0, countedTier2: 0 });

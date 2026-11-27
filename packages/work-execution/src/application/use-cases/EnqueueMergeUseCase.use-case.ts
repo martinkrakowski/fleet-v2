@@ -5,6 +5,7 @@ import type { EnqueueMergePort } from '../ports/in/EnqueueMergePort.in-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { KillallHaltMarkerPort } from '../ports/out/KillallHaltMarkerPort.out-port.js';
 import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
+import type { IsProxy } from '@fleet/shared';
 import { isTrainStepBlocked } from './chain-pass-halt.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -20,6 +21,10 @@ export class EnqueueMergeUseCase implements EnqueueMergePort {
       readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
       /** KA3-1: the killall train pause; absent reads as not paused. */
       readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
+      /** Fix round 2: the trusted Proxy detector (`types.isProxy`, bound in
+       * infrastructure), so a Proxy port is refused before its traps run.
+       * Absent, the neutral detector keeps the prior behaviour. */
+      readonly isProxy?: IsProxy;
     },
   ) {}
 
@@ -29,7 +34,7 @@ export class EnqueueMergeUseCase implements EnqueueMergePort {
     }
     // KA3-1, fail closed: a halted conductor, a halted killall marker or a
     // paused merge train refuses the enqueue before the queue is touched.
-    if (await isTrainStepBlocked(this.deps, false)) {
+    if (await isTrainStepBlocked(this.deps, false, this.deps.isProxy)) {
       return { outcome: 'refused', reason: 'halted' };
     }
     return this.deps.queue.enqueueMergeEntry(request);

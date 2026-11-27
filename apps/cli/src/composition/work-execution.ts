@@ -4,6 +4,7 @@
  * composition root.
  */
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 import { join } from 'node:path';
 
 import { withFileLock, writeJsonAtomically } from '../file-store.js';
@@ -610,6 +611,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     halt: conductorHalt,
     killallHalt,
     killallTrainPause,
+    isProxy: types.isProxy,
   });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
   const legacyTrainState = new LegacyTrainStateReadAdapter();

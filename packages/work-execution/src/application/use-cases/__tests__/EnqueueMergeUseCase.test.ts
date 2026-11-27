@@ -1,6 +1,7 @@
 // KA3-1: the enqueue guard — a halted conductor, a halted killall marker or a
 // paused killall train refuses before the queue is touched; a clear trio
 // delegates; an invalid request refuses before any halt or pause read.
+import { types } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 
 import { EnqueueMergeUseCase } from '../EnqueueMergeUseCase.use-case.js';
@@ -47,6 +48,33 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
       halt: clearHalt,
       killallHalt: { read: async () => ({ state: 'halted' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
       killallTrainPause: clearPause,
+    });
+    await expect(useCase.enqueue(command)).resolves.toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(queue.calls).toBe(0);
+  });
+
+  it('enqueue refuses with halted without calling queue for a Proxy killallHalt whose traps hide the read method', async () => {
+    // Guard: fix round 2, item 1 — the use case threads the trusted detector
+    // (`types.isProxy`) into the halt read, so a Proxy port that hides `read`
+    // and reports a null prototype is refused fail-closed (halted) instead of
+    // reading as an absent method (not halted, guard bypassed).
+    const queue = makeQueue();
+    const useCase = new EnqueueMergeUseCase({
+      queue,
+      halt: clearHalt,
+      killallHalt: new Proxy(
+        { read: async () => ({ state: 'clear' }) },
+        {
+          getOwnPropertyDescriptor(): undefined {
+            return undefined;
+          },
+          getPrototypeOf(): null {
+            return null;
+          },
+        },
+      ) as unknown as Pick<KillallHaltMarkerPort, 'read'>,
+      killallTrainPause: clearPause,
+      isProxy: types.isProxy,
     });
     await expect(useCase.enqueue(command)).resolves.toEqual({ outcome: 'refused', reason: 'halted' });
     expect(queue.calls).toBe(0);

@@ -7,6 +7,7 @@
  * array without a shell).
  */
 import { newUlid } from '../ulid.js';
+import { types } from 'node:util';
 
 import {
   DaemonEventProjectionAdapter,
@@ -293,6 +294,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     halt: input.conductor.halt,
     killallHalt,
     killallTrainPause,
+    isProxy: types.isProxy,
     newUlid: () => newUlid(),
     nowIso: now,
   });
@@ -305,6 +307,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     verification,
     journal: input.conductor.laneRunJournal,
     halt: input.conductor.halt,
+    isProxy: types.isProxy,
     newUlid: () => newUlid(),
     nowIso: now,
   });
@@ -345,6 +348,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     forge: input.mergeForgeRead,
     journal: input.conductor.laneRunJournal,
     mergePass: runMergePass,
+    isProxy: types.isProxy,
     ...(chainRefreshMode === 'invalid'
       ? { chainRefreshMode: 'invalid' as const, chainAttention }
       : { chainRefresh }),

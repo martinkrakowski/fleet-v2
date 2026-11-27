@@ -1,4 +1,5 @@
 import { snapshotPlainData } from '@fleet/shared';
+import type { IsProxy } from '@fleet/shared';
 import { readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
@@ -70,17 +71,36 @@ const PORT_METHOD_KEY = 'read';
  * its method within one or two hops; more is a lying reflection, refused. */
 const PORT_METHOD_MAX_HOPS = 8;
 
+/** The neutral detector used when a caller passes none: it refuses nothing, so
+ * the Proxy refusal below falls back to the walk's own throw/refusal bounds.
+ * Production callers bind `types.isProxy` once in infrastructure and thread it
+ * through the use cases (fix round 2, item 1). */
+const NEUTRAL_IS_PROXY: IsProxy = () => false;
+
 /**
- * One bounded, getter-free read of a port's `read` method: the walk touches
- * only `getOwnPropertyDescriptor` and `getPrototypeOf` along the prototype
- * chain — reflection that never fires a getter or a `get` trap — and returns
- * the data-descriptor value. An accessor descriptor is refused without being
- * invoked; a throwing reflection (a revoked or hostile Proxy) and a chain
- * deeper than `PORT_METHOD_MAX_HOPS` (a lying or cyclic trap) are refused
- * fail-closed. Cost: at most `PORT_METHOD_MAX_HOPS` descriptor reads and as
- * many prototype reads, all O(1) per hop, no unbounded work.
+ * One bounded, getter-free read of a port's `read` method. The port object is
+ * untrusted, so the FIRST operation on it is the injected `isProxy` detector
+ * (`node:util` `types.isProxy` in production, threaded from the composition):
+ * a Proxy — including one whose descriptor and prototype traps hide `read` and
+ * report a null prototype, which the descriptor walk alone would misread as a
+ * genuinely absent method — is refused fail-closed before any trap can run.
+ * The walk then touches only `getOwnPropertyDescriptor` and `getPrototypeOf`
+ * along the prototype chain — reflection that never fires a getter or a `get`
+ * trap — and returns the data-descriptor value. An accessor descriptor
+ * (`get`/`set`) is refused without being invoked; a throwing reflection (a
+ * revoked or hostile Proxy) and a chain deeper than `PORT_METHOD_MAX_HOPS` (a
+ * lying or cyclic trap) are refused fail-closed. Cost: one detector call plus
+ * at most `PORT_METHOD_MAX_HOPS` descriptor reads and as many prototype
+ * reads, all O(1) per hop, no unbounded work.
  */
-function readPortMethod(port: object): PortMethodRead {
+function readPortMethod(port: object, isProxy: IsProxy): PortMethodRead {
+  try {
+    if (isProxy(port) === true) {
+      return { ok: false };
+    }
+  } catch {
+    return { ok: false };
+  }
   let cursor: object | null = port;
   for (let hops = 0; hops < PORT_METHOD_MAX_HOPS; hops += 1) {
     if (cursor === null) {
@@ -121,15 +141,17 @@ function readPortMethod(port: object): PortMethodRead {
  */
 export async function isChainPassHalted(
   halt?: Pick<ConductorHaltPort, 'read'> | null,
+  isProxy: IsProxy = NEUTRAL_IS_PROXY,
 ): Promise<boolean> {
   if (halt === undefined || halt === null) {
     // An absent dependency keeps today's behaviour: not halted, never thrown on.
     return false;
   }
-  // The port object itself is untrusted: the `read` method is read through
-  // property descriptors (never a getter or a Proxy get trap) and a refused
-  // read fails closed.
-  const method = readPortMethod(halt);
+  // The port object itself is untrusted: a Proxy is refused by the detector
+  // before any reflection; the `read` method is then read through property
+  // descriptors (never a getter or a Proxy get trap) and a refused read
+  // fails closed.
+  const method = readPortMethod(halt, isProxy);
   if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
@@ -164,12 +186,13 @@ export async function isChainPassHalted(
  */
 export async function isRequiredPassHalted(
   halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
+  isProxy: IsProxy = NEUTRAL_IS_PROXY,
 ): Promise<boolean> {
   if (halt === undefined || halt === null) {
     return true;
   }
   try {
-    return await isChainPassHalted(halt);
+    return await isChainPassHalted(halt, isProxy);
   } catch {
     return true;
   }
@@ -184,6 +207,7 @@ export async function isRequiredPassHalted(
  */
 export async function isKillallHalted(
   killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null,
+  isProxy: IsProxy = NEUTRAL_IS_PROXY,
 ): Promise<boolean> {
   if (killallHalt === undefined) {
     return false;
@@ -191,10 +215,12 @@ export async function isKillallHalted(
   if (killallHalt === null) {
     return true;
   }
-  // The port object itself is untrusted: an absent `read` (none anywhere on
-  // the prototype chain) keeps the not-halted behaviour; a refused walk, a
-  // non-callable value and a throw fail closed.
-  const method = readPortMethod(killallHalt);
+  // The port object itself is untrusted: a Proxy is refused by the detector
+  // before any reflection (a lying trap that hides `read` and reports a null
+  // prototype must never read as an absent method); an absent `read` (none
+  // anywhere on the prototype chain) keeps the not-halted behaviour; a
+  // refused walk, a non-callable value and a throw fail closed.
+  const method = readPortMethod(killallHalt, isProxy);
   if (!method.ok) {
     return true;
   }
@@ -221,6 +247,7 @@ export async function isKillallHalted(
  */
 export async function isKillallTrainPaused(
   killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null,
+  isProxy: IsProxy = NEUTRAL_IS_PROXY,
 ): Promise<boolean> {
   if (killallTrainPause === undefined) {
     return false;
@@ -228,9 +255,10 @@ export async function isKillallTrainPaused(
   if (killallTrainPause === null) {
     return true;
   }
-  // The port object itself is untrusted: mirror the halt read's descriptor
-  // walk; a refused walk, an absent or non-callable `read` all fail closed.
-  const method = readPortMethod(killallTrainPause);
+  // The port object itself is untrusted: mirror the halt read's detector and
+  // descriptor walk; a refused walk, an absent or non-callable `read` all
+  // fail closed.
+  const method = readPortMethod(killallTrainPause, isProxy);
   if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
@@ -256,12 +284,13 @@ export async function isTrainStepBlocked(
     readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
   },
   requireConductorHalt: boolean,
+  isProxy: IsProxy = NEUTRAL_IS_PROXY,
 ): Promise<boolean> {
   return (
     (requireConductorHalt
-      ? await isRequiredPassHalted(deps.halt)
-      : await isChainPassHalted(deps.halt)) ||
-    (await isKillallHalted(deps.killallHalt)) ||
-    (await isKillallTrainPaused(deps.killallTrainPause))
+      ? await isRequiredPassHalted(deps.halt, isProxy)
+      : await isChainPassHalted(deps.halt, isProxy)) ||
+    (await isKillallHalted(deps.killallHalt, isProxy)) ||
+    (await isKillallTrainPaused(deps.killallTrainPause, isProxy))
   );
 }

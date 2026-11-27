@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import {
   isChainPassHalted,
@@ -572,5 +573,56 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // must not break ordinary ports while refusing accessors.
     const proto = { read: async () => ({ state: 'clear' }) };
     await expect(isKillallHalted(Object.create(proto) as never)).resolves.toBe(false);
+  });
+
+  it('isKillallHalted returns true for a Proxy port whose traps hide the read method, without running a trap', async () => {
+    // Guard: fix round 2, item 1. A Proxy can hide its own `read` descriptor
+    // and report a null prototype, which the descriptor walk alone would
+    // misread as a genuinely absent method — and an absent read is the
+    // NOT-halted case, so the halt guard was bypassed. The trusted detector
+    // (`types.isProxy`, threaded from the composition) refuses the port
+    // before any reflection, so the verdict fails closed to halted and no
+    // descriptor or prototype trap ever runs.
+    let descriptorTraps = 0;
+    let prototypeTraps = 0;
+    const hiding = new Proxy(
+      { read: async () => ({ state: 'halted' }) },
+      {
+        getOwnPropertyDescriptor(): undefined {
+          descriptorTraps += 1;
+          return undefined;
+        },
+        getPrototypeOf(): null {
+          prototypeTraps += 1;
+          return null;
+        },
+      },
+    );
+    await expect(isKillallHalted(hiding as never, types.isProxy)).resolves.toBe(true);
+    expect(descriptorTraps).toBe(0);
+    expect(prototypeTraps).toBe(0);
+
+    // The same hiding shape on the other two reads, fail closed as well.
+    await expect(isChainPassHalted(hiding as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(hiding as never, types.isProxy)).resolves.toBe(true);
+
+    // A lying descriptor trap that reports a fake `read` data property is
+    // refused the same way, and the trap still never runs.
+    const lying = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor(): PropertyDescriptor {
+          descriptorTraps += 1;
+          return { value: async () => ({ state: 'clear' }), writable: true, enumerable: true, configurable: true };
+        },
+      },
+    );
+    await expect(isKillallHalted(lying as never, types.isProxy)).resolves.toBe(true);
+    expect(descriptorTraps).toBe(0);
+
+    // And the whole train-step guard blocks on a hiding Proxy port.
+    await expect(
+      isTrainStepBlocked({ killallHalt: hiding as never }, false, types.isProxy),
+    ).resolves.toBe(true);
   });
 });

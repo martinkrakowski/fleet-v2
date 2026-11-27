@@ -14,6 +14,7 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
+import type { IsProxy } from '@fleet/shared';
 import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import type { ConductorHaltState } from '../../domain/conductor-halt.js';
 import {
@@ -102,6 +103,9 @@ export interface RunDaemonTickDependencies {
   readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
   /** KA3-1: the killall train pause; absent reads as not paused. */
   readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
+  /** Fix round 2: the trusted Proxy detector (`types.isProxy`, bound in
+   * infrastructure); a Proxy port is refused before its traps run. */
+  readonly isProxy?: IsProxy;
   readonly status: Pick<DaemonStatusPort, 'read' | 'write'>;
   readonly lease: Pick<DaemonLeasePort, 'acquire' | 'release' | 'read'>;
   readonly events: Pick<DaemonEventProjectionPort, 'append'>;
@@ -986,7 +990,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       const state = normalizePause(await this.deps.pause.read());
       // KA3-1, fail closed: a clear daemon pause still counts as paused when
       // the killall train pause reads paused or unreadable.
-      if (state.state !== 'unreadable' && (await isKillallTrainPaused(this.deps.killallTrainPause))) {
+      if (state.state !== 'unreadable' && (await isKillallTrainPaused(this.deps.killallTrainPause, this.deps.isProxy))) {
         return { state: 'unreadable' };
       }
       return state;
@@ -1000,7 +1004,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       const state = normalizeHalt(await this.deps.halt.read());
       // KA3-1, fail closed: a clear conductor halt still counts as halted when
       // the killall halt marker reads halted or unreadable.
-      if (state.state !== 'halted' && state.state !== 'unreadable' && (await isKillallHalted(this.deps.killallHalt))) {
+      if (state.state !== 'halted' && state.state !== 'unreadable' && (await isKillallHalted(this.deps.killallHalt, this.deps.isProxy))) {
         return { state: 'unreadable' };
       }
       return state;

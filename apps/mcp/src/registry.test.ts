@@ -235,7 +235,7 @@ const OWNER_ASK_BODY = {
   ],
   recommendation: { optionId: "o1", because: "The change is small." },
   doorKind: "one-way" as const,
-  idempotencyKey: "idem-owner-ask-1",
+  idempotencyKey: "ask-one",
 };
 
 /** The exact request body the tool builds from OWNER_ASK_BODY. */

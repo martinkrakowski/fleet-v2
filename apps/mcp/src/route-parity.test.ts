@@ -83,7 +83,7 @@ const OWNER_ASK_TOOL_BODY = {
   ],
   recommendation: { optionId: "o1", because: "The change is small." },
   doorKind: "one-way",
-  idempotencyKey: "idem-owner-ask-1",
+  idempotencyKey: "ask-one",
 } as const;
 
 /** The exact request body the tool posts: the tool input plus `askedBy: "mcp"`. */

@@ -195,7 +195,9 @@ interface Route {
 }
 
 function defaultRoutes(overrides?: {
-  register?: ApiClientResult | ((call: FakeCall) => ApiClientResult);
+  register?:
+    | ApiClientResult
+    | ((call: FakeCall) => ApiClientResult | Promise<ApiClientResult>);
   heartbeat?: ApiClientResult | (() => ApiClientResult);
   retire?: ApiClientResult | (() => ApiClientResult);
 }): Route[] {
@@ -205,7 +207,7 @@ function defaultRoutes(overrides?: {
       reply: (call) =>
         overrides?.register !== undefined
           ? typeof overrides.register === "function"
-            ? (overrides.register as (c: FakeCall) => ApiClientResult)(call)
+            ? (overrides.register as (c: FakeCall) => ApiClientResult | Promise<ApiClientResult>)(call)
             : overrides.register
           : envelope({
               outcome: "registered",
@@ -404,6 +406,42 @@ describe("createOrchestratorLifecycle", () => {
     await Promise.all([lifecycle.stop(), lifecycle.stop(), lifecycle.stop()]);
     await lifecycle.stop();
     expect(calls.filter((call) => call.path.endsWith("/retire"))).toHaveLength(1);
+  });
+
+  it("retires a session whose registration settles after stop() was called", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { lifecycle, calls } = makeLifecycle({
+      register: () => gate.then(() => envelope({ outcome: "registered" })),
+    }, { orchestratorId: "mcp-late" });
+    const started = lifecycle.start();
+    // Shutdown fires while registration is still pending.
+    const stopped = lifecycle.stop();
+    release();
+    await Promise.all([started, stopped]);
+    const retireCalls = calls.filter((call) => call.path.endsWith("/retire"));
+    expect(retireCalls).toHaveLength(1);
+    // No heartbeat ever ran for a session retired at birth.
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * 2);
+    expect(calls.filter((call) => call.path.endsWith("/heartbeat"))).toHaveLength(0);
+    await lifecycle.stop();
+    expect(retireCalls).toHaveLength(1);
+    expect(calls.filter((call) => call.path.endsWith("/retire"))).toHaveLength(1);
+  });
+
+  it("retires when stop() precedes start() and registration later succeeds", async () => {
+    const { lifecycle, calls } = makeLifecycle(
+      {},
+      { orchestratorId: "mcp-prestop" },
+    );
+    const stopped = lifecycle.stop();
+    const started = lifecycle.start();
+    await Promise.all([started, stopped]);
+    expect(calls.filter((call) => call.path.endsWith("/retire"))).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+    expect(calls.filter((call) => call.path.endsWith("/heartbeat"))).toHaveLength(0);
   });
 
   it("never sends retire when registration was skipped (not-configured)", async () => {

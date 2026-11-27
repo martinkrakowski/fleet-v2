@@ -206,8 +206,10 @@ export function createOrchestratorLifecycle(
 
   let registered = false;
   let retired = false;
+  let stopRequested = false;
   let timer: LifecycleTimer | null = null;
   let inFlight = false;
+  let registerPromise: Promise<StartLifecycleResult> | null = null;
   let stopPromise: Promise<void> | null = null;
 
   function clearTimer(): void {
@@ -215,6 +217,22 @@ export function createOrchestratorLifecycle(
       clearIntervalFn(timer);
       timer = null;
     }
+  }
+
+  function retireOnce(): Promise<void> {
+    if (retired || !registered) {
+      // Not registered (yet): nothing to retire. If registration is still
+      // pending, the `stopRequested` branch in register() retires it when it
+      // settles, so no session is left unretired.
+      return Promise.resolve();
+    }
+    retired = true;
+    return deps.client
+      .post(`/v1/orchestrators/${encodeURIComponent(orchestratorId)}/retire`, {})
+      .then(
+        () => undefined,
+        () => undefined,
+      );
   }
 
   async function register(): Promise<StartLifecycleResult> {
@@ -250,6 +268,12 @@ export function createOrchestratorLifecycle(
     }
     if (response.result !== null && envelopeOutcome(response) === "registered") {
       registered = true;
+      if (stopRequested) {
+        // Shutdown fired while registration was still pending: the session
+        // exists server-side, so retire it instead of starting a heartbeat.
+        void retireOnce();
+        return { status: "registered" };
+      }
       timer = setIntervalFn(() => {
         void heartbeatTick();
       }, HEARTBEAT_INTERVAL_MS);
@@ -299,23 +323,27 @@ export function createOrchestratorLifecycle(
   }
 
   function doStop(): Promise<void> {
+    stopRequested = true;
     clearTimer();
-    if (!registered || retired) {
-      retired = true;
-      return Promise.resolve();
+    if (registerPromise === null) {
+      return retireOnce();
     }
-    retired = true;
-    return deps.client
-      .post(`/v1/orchestrators/${encodeURIComponent(orchestratorId)}/retire`, {})
-      .then(
-        () => undefined,
-        () => undefined,
-      );
+    // Registration is still pending: wait for it to settle so a session that
+    // registers after shutdown began is still retired exactly once.
+    return registerPromise.then(
+      () => retireOnce(),
+      () => retireOnce(),
+    );
   }
 
   return {
     orchestratorId,
-    start: register,
+    start(): Promise<StartLifecycleResult> {
+      if (registerPromise === null) {
+        registerPromise = register();
+      }
+      return registerPromise;
+    },
     heartbeatTick,
     stop(): Promise<void> {
       if (stopPromise === null) {

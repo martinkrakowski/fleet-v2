@@ -89,7 +89,7 @@ function isNonEmptyString(value: unknown): value is string {
 /**
  * The record's own enumerable keys must be exactly `required` plus any of
  * `optional`; a forbidden key, a foreign key or a missing required key is null.
- * One `Reflect.ownKeys` over a record whose key count `snapshotPlainData`
+ * One `Object.keys` over a record whose key count `snapshotPlainData`
  * already bounded by `maxKeys`; the values are plain data, never getters.
  */
 function readKeyed(
@@ -100,8 +100,8 @@ function readKeyed(
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return null;
   }
-  for (const key of Reflect.ownKeys(value)) {
-    if (typeof key !== 'string' || FORBIDDEN_KEYS.includes(key)) {
+  for (const key of Object.keys(value)) {
+    if (FORBIDDEN_KEYS.includes(key)) {
       return null;
     }
     if (!required.includes(key) && !optional.includes(key)) {

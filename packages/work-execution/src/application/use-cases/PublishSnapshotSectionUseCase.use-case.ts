@@ -86,14 +86,11 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
     }
   }
 
-  /** One own data property by descriptor: no getter runs, no Proxy is read, anything else is `undefined`. */
+  /** One own data property of a plain-data snapshot: a Proxy, an accessor or anything else is `undefined`. */
   private field(source: unknown, key: string): unknown {
     try {
-      if (typeof source !== 'object' || source === null || this.deps.isProxy(source) !== false) {
-        return undefined;
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(source, key);
-      return descriptor !== undefined && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+      const snapshot = snapshotPlainData(source, this.deps.isProxy, SNAPSHOT_PUBLISHER_PLAIN_DATA_LIMITS);
+      return snapshot.ok ? ownData(snapshot.value, key) : undefined;
     } catch {
       return undefined;
     }
@@ -101,14 +98,15 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
 
   private readRequest(request: unknown): ParsedRequest | null {
     try {
+      const snapshot = snapshotPlainData(request, this.deps.isProxy, SNAPSHOT_PUBLISHER_PLAIN_DATA_LIMITS);
       if (
-        typeof request !== 'object' ||
-        request === null ||
-        this.deps.isProxy(request) !== false ||
-        Reflect.ownKeys(request).some((key) => key === 'constructor' || key === 'prototype' || key === '__proto__')
+        !snapshot.ok ||
+        !isRecordValue(snapshot.value) ||
+        ['constructor', 'prototype', '__proto__'].some((key) => Object.hasOwn(snapshot.value as object, key))
       ) {
         return null;
       }
+      request = snapshot.value;
     } catch {
       return null;
     }
@@ -308,7 +306,7 @@ export class PublishSnapshotSectionUseCase implements PublishSnapshotSectionPort
     const reason = ownData(snapshot.value, 'reason');
     if (outcome === 'pushed') {
       // `pushed` carries no other field: a reason or any extra key is a contradictory answer.
-      if (Reflect.ownKeys(snapshot.value).length !== 1) {
+      if (Object.keys(snapshot.value).length !== 1) {
         return refusedResult('invalid');
       }
       return {

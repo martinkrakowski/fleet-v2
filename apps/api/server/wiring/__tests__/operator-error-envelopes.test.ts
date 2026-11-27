@@ -252,6 +252,22 @@ describe("hostile inputs", () => {
     expectInternalError("op-proto", polluted);
   });
 
+  it("ignores a polluted Object.prototype.value when deciding on an own statusCode accessor", () => {
+    const accessorDescriptor = Object.create(null);
+    accessorDescriptor.get = () => 400;
+    const accessor = Object.defineProperty({}, "statusCode", accessorDescriptor);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    (Object.prototype as { value?: unknown }).value = 400;
+    let envelope: ReturnType<typeof errorEnvelope>;
+    try {
+      envelope = errorEnvelope("op-polluted", accessor);
+    } finally {
+      delete (Object.prototype as { value?: unknown }).value;
+    }
+    expect(envelope).toEqual(internalError("op-polluted"));
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
   it("handles Proxy errors without running get/has traps or throwing", () => {
     const trapProxy = new Proxy(
       {},

@@ -45,7 +45,9 @@ function readOwnDataDescriptor(target: object, key: string): unknown {
   } catch {
     return undefined;
   }
-  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+  return descriptor !== undefined && Object.prototype.hasOwnProperty.call(descriptor, "value")
+    ? descriptor.value
+    : undefined;
 }
 
 function readOwnString(target: object, key: string): string | null {

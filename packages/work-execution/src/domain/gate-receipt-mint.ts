@@ -136,11 +136,22 @@ export type MintGateReceiptRefusalReason =
   | 'vm-not-sealed'
   | 'stale-vm'
   | 'vm-identity-mismatch'
-  | 'digest-mismatch';
+  | 'digest-mismatch'
+  | 'consumed-list-full';
 
 /** Typed outcome: a minted receipt, or a fixed refusal reason that echoes no input. */
 export type MintGateReceiptResult =
-  | { readonly ok: true; readonly receipt: MintedVmGateReceipt }
+  | {
+    readonly ok: true;
+    readonly receipt: MintedVmGateReceipt;
+    /**
+     * The host's consumed-VM list with this VM appended. Minting is pure and
+     * consumes nothing itself, so the caller MUST persist this list as the
+     * next `consumedVmIds`; presenting the same VM against it again is
+     * refused as `stale-vm`.
+     */
+    readonly consumedVmIds: readonly string[];
+  }
   | { readonly ok: false; readonly reason: MintGateReceiptRefusalReason };
 
 /** The record kinds an append may name. `receipt` covers
@@ -527,9 +538,17 @@ export function mintGateReceiptFromVmExit(
       return refusedMint('digest-mismatch');
     }
 
+    // 5. The updated consumed list must itself stay a valid source: a full
+    //    list fails closed rather than minting a receipt that cannot be
+    //    recorded as consumed.
+    if (consumedVmIds.length >= MAX_CONSUMED_VM_IDS) {
+      return refusedMint('consumed-list-full');
+    }
+
     const result: MintedGateReceiptResultValue = gateExit === 0 ? 'pass' : 'fail';
     return Object.freeze({
       ok: true as const,
+      consumedVmIds: Object.freeze([...(consumedVmIds as readonly string[]), vmId]),
       receipt: Object.freeze({
         attemptId,
         vmId,

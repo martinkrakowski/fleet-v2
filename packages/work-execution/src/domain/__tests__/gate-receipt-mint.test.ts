@@ -110,6 +110,7 @@ describe('mintGateReceiptFromVmExit', () => {
         source: 'fresh-vm-exit',
         authoritative: true,
       },
+      consumedVmIds: [VM_ID],
     });
   });
 
@@ -126,6 +127,7 @@ describe('mintGateReceiptFromVmExit', () => {
           source: 'fresh-vm-exit',
           authoritative: true,
         },
+        consumedVmIds: [VM_ID],
       });
     }
   });
@@ -228,6 +230,32 @@ describe('mintGateReceiptFromVmExit', () => {
     expect(
       mintGateReceiptFromVmExit(observation(), freshnessSource({ consumedVmIds: ['vm-other', VM_ID] }), isProxy),
     ).toEqual({ ok: false, reason: 'stale-vm' });
+  });
+
+  it('returns the consumed list with the minted VM appended so feeding it back refuses the same VM as stale-vm', () => {
+    const first = mintGateReceiptFromVmExit(observation(), freshnessSource({ consumedVmIds: ['vm-other'] }), isProxy);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.consumedVmIds).toEqual(['vm-other', VM_ID]);
+    // The input list is never mutated, and the returned list is frozen.
+    expect(Object.isFrozen(first.consumedVmIds)).toBe(true);
+    const replay = mintGateReceiptFromVmExit(
+      observation(),
+      freshnessSource({ consumedVmIds: first.consumedVmIds }),
+      isProxy,
+    );
+    expect(replay).toEqual({ ok: false, reason: 'stale-vm' });
+  });
+
+  it('refuses minting with consumed-list-full when the consumed list is already at its 64-entry cap', () => {
+    const full = Array.from({ length: 64 }, (_, index) => `vm-${index}`);
+    expect(mintGateReceiptFromVmExit(observation(), freshnessSource({ consumedVmIds: full }), isProxy)).toEqual({
+      ok: false,
+      reason: 'consumed-list-full',
+    });
+    expect(
+      mintGateReceiptFromVmExit(observation(), freshnessSource({ consumedVmIds: full.slice(1) }), isProxy).ok,
+    ).toBe(true);
   });
 
   it('refuses a mismatched sealNonce against the host expectedSealNonce with stale-vm', () => {

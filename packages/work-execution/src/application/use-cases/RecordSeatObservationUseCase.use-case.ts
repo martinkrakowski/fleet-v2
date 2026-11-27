@@ -416,9 +416,30 @@ export class RecordSeatObservationUseCase implements RecordSeatObservationPort {
       return refusal('store-error', 'the observation store refused the write');
     }
     if (appended === 'duplicate') {
+      if (duplicateRecord === undefined) {
+        // A concurrent append won between the pre-read and this append. The
+        // store holds the winning record, so re-read rather than reporting the
+        // losing local copy as the stored observation.
+        let stored;
+        try {
+          stored = await this.deps.observations.listSeatObservations();
+        } catch {
+          return refusal('store-error', 'the observation store could not be read');
+        }
+        const winner = stored.find((entry) => entry.observationId === record.observationId);
+        if (winner === undefined) {
+          return refusal('store-error', 'the observation store reported a duplicate it no longer holds');
+        }
+        return {
+          outcome: 'duplicate',
+          observation: winner,
+          cooling: false,
+          reason: 'duplicate-observation-id',
+        };
+      }
       return {
         outcome: 'duplicate',
-        observation: duplicateRecord ?? record,
+        observation: duplicateRecord,
         cooling: false,
         reason: 'duplicate-observation-id',
       };

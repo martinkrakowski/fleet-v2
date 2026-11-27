@@ -505,6 +505,53 @@ describe('RecordSeatObservationUseCase (dry run, windows and duplicates)', () =>
     }
     expect(await store.listSeatObservations('seat-a')).toHaveLength(1);
   });
+
+  it('a concurrent append winning the race returns the stored record, not the losing copy', async () => {
+    // The pre-read misses the record (a concurrent writer appended it after the
+    // read), so the use case must re-read the store instead of answering with
+    // its own losing record.
+    const storedRecord = {
+      version: 1 as const,
+      observationId: 'obs-1',
+      seatId: 'seat-a',
+      outcome: 'rate-limited' as const,
+      observedAtIso: NOW,
+      subject: { attemptId: 'att-1' },
+      via: 'cli' as const,
+    };
+    const store = new SeatObservationRepositoryAdapter();
+    await store.appendSeatObservation(storedRecord);
+    let listCalls = 0;
+    const observations: RecordSeatObservationDependencies['observations'] = {
+      listSeatObservations: async (seatId?: string) => {
+        listCalls += 1;
+        // First call is the stale pre-read; the record only shows up later.
+        if (listCalls === 1) {
+          return [];
+        }
+        return store.listSeatObservations(seatId);
+      },
+      appendSeatObservation: (record) => store.appendSeatObservation(record),
+    };
+    const useCase = new RecordSeatObservationUseCase({
+      observations,
+      attempts: attemptRepo([attemptRecord()]),
+      isProxy: types.isProxy,
+      nowIso: () => NOW,
+      mintObservationId: () => 'obs-1',
+      observationCooldownMinutes: 0,
+    });
+    const repeat = await useCase.execute({ ...attemptInput, observationId: 'obs-1' }, 'cli');
+    expect(repeat).toMatchObject({
+      outcome: 'duplicate',
+      cooling: false,
+      reason: 'duplicate-observation-id',
+    });
+    if (repeat.outcome === 'duplicate') {
+      expect(repeat.observation).toEqual(storedRecord);
+    }
+    expect(await store.listSeatObservations('seat-a')).toHaveLength(1);
+  });
 });
 
 describe('RecordSeatObservationUseCase (hostile input and failures)', () => {

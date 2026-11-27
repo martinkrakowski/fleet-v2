@@ -491,4 +491,86 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     });
     await expect(isKillallTrainPaused({ read: async () => accessor } as never)).resolves.toBe(true);
   });
+
+  it('isKillallHalted returns true without invoking a read accessor on the port itself', async () => {
+    // Guard: the port-shape check reads `read` through property descriptors
+    // (readPortMethod), refusing an accessor without firing it; an
+    // implementation that touches `killallHalt.read` directly runs the
+    // getter and fails the never-invoked assertion.
+    let fired = false;
+    const port: Record<string, unknown> = {};
+    Object.defineProperty(port, 'read', {
+      get() {
+        fired = true;
+        return async () => ({ state: 'clear' });
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    await expect(isKillallHalted(port as never)).resolves.toBe(true);
+    await expect(isChainPassHalted(port as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(port as never)).resolves.toBe(true);
+    expect(fired).toBe(false);
+  });
+
+  it('isKillallHalted returns true for a port whose read accessor throws, without throwing', async () => {
+    // Guard: a throwing read accessor on the port is refused by the
+    // descriptor walk (fail closed) before any invocation is attempted.
+    const port: Record<string, unknown> = {};
+    Object.defineProperty(port, 'read', {
+      get(): never {
+        throw new Error('port read accessor threw');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    await expect(isKillallHalted(port as never)).resolves.toBe(true);
+    await expect(isChainPassHalted(port as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(port as never)).resolves.toBe(true);
+  });
+
+  it('isKillallHalted returns true for a revoked Proxy port without throwing', async () => {
+    // Guard: a revoked Proxy port throws on the descriptor walk's first
+    // reflection operation; the refusal is caught and read fail-closed
+    // instead of rejecting the promise.
+    const { proxy, revoke } = Proxy.revocable<{ read?: unknown }>({ read: async () => ({ state: 'clear' }) }, {});
+    revoke();
+    await expect(isKillallHalted(proxy as never)).resolves.toBe(true);
+    await expect(isChainPassHalted(proxy as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(proxy as never)).resolves.toBe(true);
+  });
+
+  it('isKillallHalted returns true when the port reflection exhausts its trap budget', async () => {
+    // Guard: a Proxy port whose getOwnPropertyDescriptor trap throws after a
+    // small budget is refused fail-closed, never answered as not halted.
+    let descriptors = 0;
+    const portRef: { current?: object } = {};
+    const port: object = new Proxy(
+      {},
+      {
+        // A cyclic lying prototype chain keeps every hop on the Proxy, so the
+        // descriptor trap is hit again and its budget exhausts.
+        getOwnPropertyDescriptor(target: object, key: PropertyKey): PropertyDescriptor | undefined {
+          descriptors += 1;
+          if (descriptors > 1) {
+            throw new Error('trap budget exhausted');
+          }
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+        getPrototypeOf(): object {
+          return portRef.current as object;
+        },
+      },
+    );
+    portRef.current = port;
+    await expect(isKillallHalted(port as never)).resolves.toBe(true);
+  });
+
+  it('isKillallHalted reads an inherited read method through the descriptor walk', async () => {
+    // Guard: the descriptor walk follows the prototype chain, so a normal
+    // adapter whose `read` lives on its prototype still answers — the walk
+    // must not break ordinary ports while refusing accessors.
+    const proto = { read: async () => ({ state: 'clear' }) };
+    await expect(isKillallHalted(Object.create(proto) as never)).resolves.toBe(false);
+  });
 });

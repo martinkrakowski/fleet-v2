@@ -54,6 +54,65 @@ function readExactPortSnapshot(raw: unknown, keys: readonly string[]): Record<st
 }
 
 /**
+ * The result of reading a port's `read` method: `ok: true` carries the method
+ * (possibly `undefined` when the port has none); `ok: false` is a refused,
+ * hostile port (a throwing reflection, an accessor, or a prototype chain too
+ * deep to trust), which every caller maps to its fail-closed verdict.
+ */
+type PortMethodRead =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false };
+
+/** The `read` key every halt/pause port exposes. */
+const PORT_METHOD_KEY = 'read';
+
+/** The prototype hops one method lookup may traverse. A real adapter reaches
+ * its method within one or two hops; more is a lying reflection, refused. */
+const PORT_METHOD_MAX_HOPS = 8;
+
+/**
+ * One bounded, getter-free read of a port's `read` method: the walk touches
+ * only `getOwnPropertyDescriptor` and `getPrototypeOf` along the prototype
+ * chain — reflection that never fires a getter or a `get` trap — and returns
+ * the data-descriptor value. An accessor descriptor is refused without being
+ * invoked; a throwing reflection (a revoked or hostile Proxy) and a chain
+ * deeper than `PORT_METHOD_MAX_HOPS` (a lying or cyclic trap) are refused
+ * fail-closed. Cost: at most `PORT_METHOD_MAX_HOPS` descriptor reads and as
+ * many prototype reads, all O(1) per hop, no unbounded work.
+ */
+function readPortMethod(port: object): PortMethodRead {
+  let cursor: object | null = port;
+  for (let hops = 0; hops < PORT_METHOD_MAX_HOPS; hops += 1) {
+    if (cursor === null) {
+      // The chain ended without a descriptor: the method is genuinely absent.
+      return { ok: true, value: undefined };
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(cursor, PORT_METHOD_KEY);
+    } catch {
+      return { ok: false };
+    }
+    if (descriptor !== undefined) {
+      // An accessor (`get`/`set`) is refused, never invoked: running it would
+      // be exactly the side effect the hostile-input rule forbids.
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return { ok: false };
+      }
+      return { ok: true, value: descriptor.value };
+    }
+    try {
+      cursor = Reflect.getPrototypeOf(cursor);
+    } catch {
+      return { ok: false };
+    }
+  }
+  // Still no end in sight after the hop bound: a lying or cyclic prototype
+  // chain.
+  return { ok: false };
+}
+
+/**
  * The fail-closed halt read shared by the chain passes (plan §3.7): an absent
  * or null dependency is not halted (and never throws on `null`); a provided
  * port without `read`, a throw, and any answer that is not a plain record
@@ -67,11 +126,17 @@ export async function isChainPassHalted(
     // An absent dependency keeps today's behaviour: not halted, never thrown on.
     return false;
   }
-  if (typeof halt.read !== 'function') {
+  // The port object itself is untrusted: the `read` method is read through
+  // property descriptors (never a getter or a Proxy get trap) and a refused
+  // read fails closed.
+  const method = readPortMethod(halt);
+  if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
   try {
-    const state = await halt.read();
+    // `read` is a prototype method: call it against the port so `this` is the
+    // adapter, never an undefined receiver.
+    const state = await (method.value as (this: object) => unknown).call(halt);
     const exact = readExactPortSnapshot(state, ['state', 'record']);
     if (exact === null || exact.state !== 'clear') {
       return true;
@@ -126,14 +191,21 @@ export async function isKillallHalted(
   if (killallHalt === null) {
     return true;
   }
-  if (killallHalt.read === undefined) {
+  // The port object itself is untrusted: an absent `read` (none anywhere on
+  // the prototype chain) keeps the not-halted behaviour; a refused walk, a
+  // non-callable value and a throw fail closed.
+  const method = readPortMethod(killallHalt);
+  if (!method.ok) {
+    return true;
+  }
+  if (method.value === undefined) {
     return false;
   }
-  if (typeof killallHalt.read !== 'function') {
+  if (typeof method.value !== 'function') {
     return true;
   }
   try {
-    const answer = await killallHalt.read();
+    const answer = await (method.value as (this: object) => unknown).call(killallHalt);
     const exact = readExactPortSnapshot(answer, ['state']);
     return !(exact !== null && exact.state === 'clear');
   } catch {
@@ -153,11 +225,17 @@ export async function isKillallTrainPaused(
   if (killallTrainPause === undefined) {
     return false;
   }
-  if (killallTrainPause === null || typeof killallTrainPause.read !== 'function') {
+  if (killallTrainPause === null) {
+    return true;
+  }
+  // The port object itself is untrusted: mirror the halt read's descriptor
+  // walk; a refused walk, an absent or non-callable `read` all fail closed.
+  const method = readPortMethod(killallTrainPause);
+  if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
   try {
-    const answer = await killallTrainPause.read();
+    const answer = await (method.value as (this: object) => unknown).call(killallTrainPause);
     const exact = readExactPortSnapshot(answer, ['status']);
     return !(exact !== null && exact.status === 'clear');
   } catch {

@@ -371,6 +371,21 @@ describe('conductor premerge attest refusals (exit 1)', () => {
       answers: { inspection: { outcome: 'found', assessment: throwingProxy() } },
       assert: (calls) => expect(calls.recordedReceipts).toHaveLength(0),
     },
+    {
+      reason: 'invalid-record',
+      answers: { pullRequest: getterBacked() },
+      assert: (calls) => expect(calls.recordedReceipts).toHaveLength(0),
+    },
+    {
+      reason: 'invalid-record',
+      answers: { review: getterBacked() },
+      assert: (calls) => expect(calls.recordedReceipts).toHaveLength(0),
+    },
+    {
+      reason: 'invalid-record',
+      answers: { ci: getterBacked() },
+      assert: (calls) => expect(calls.recordedReceipts).toHaveLength(0),
+    },
   ];
 
   it.each(cases)('refuses with reason $reason and exit 1 without recording a receipt', async (testCase) => {

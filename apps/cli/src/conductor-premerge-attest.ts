@@ -137,6 +137,23 @@ function safePlainSnapshot(value: unknown): Record<string, unknown> | null {
   }
 }
 
+/**
+ * The plain snapshot of one own key of a snapshotted record: `absent` when
+ * the key is missing (a legitimate not-found shape), `invalid` when the key
+ * is present but not a plain data record, `plain` with its snapshot
+ * otherwise.
+ */
+function fieldSnapshot(
+  record: Record<string, unknown>,
+  key: string,
+): { kind: 'absent' } | { kind: 'invalid' } | { kind: 'plain'; value: Record<string, unknown> } {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    return { kind: 'absent' };
+  }
+  const snapshot = safePlainSnapshot(record[key]);
+  return snapshot === null ? { kind: 'invalid' } : { kind: 'plain', value: snapshot };
+}
+
 /** One typed refusal document on stdout, mapped to exit 1. */
 function refuseRecord(io: CliIo, body: Record<string, unknown>): number {
   io.stdout(`${JSON.stringify(body)}\n`);
@@ -262,12 +279,20 @@ export async function premergeAttestCommand(
     pullRequestRead = undefined;
   }
   const readSnapshot = safePlainSnapshot(pullRequestRead);
-  const pullRequest = readSnapshot === null ? null : safePlainSnapshot(fieldOf(readSnapshot, 'pullRequest'));
+  // A null snapshot (getter, Proxy, non-plain) is an invalid record, not a
+  // head answer; only a valid, genuinely-not-found or head-differing record
+  // is a head mismatch.
+  if (readSnapshot === null) {
+    return refuseRecord(io, invalidRecord);
+  }
+  const pullRequestField = fieldSnapshot(readSnapshot, 'pullRequest');
+  if (pullRequestField.kind === 'invalid') {
+    return refuseRecord(io, invalidRecord);
+  }
   if (
-    readSnapshot === null ||
-    pullRequest === null ||
     fieldOf(readSnapshot, 'outcome') !== 'found' ||
-    fieldOf(pullRequest, 'headSha') !== headSha
+    pullRequestField.kind === 'absent' ||
+    fieldOf(pullRequestField.value, 'headSha') !== headSha
   ) {
     return refuseRecord(io, { outcome: 'refused', reason: 'head-mismatch', runId });
   }
@@ -284,12 +309,18 @@ export async function premergeAttestCommand(
     reviewRead = undefined;
   }
   const reviewSnapshot = safePlainSnapshot(reviewRead);
-  const preMergeReceipt = reviewSnapshot === null ? null : safePlainSnapshot(fieldOf(reviewSnapshot, 'receipt'));
+  // A null snapshot is an invalid record, not a review verdict.
+  if (reviewSnapshot === null) {
+    return refuseRecord(io, invalidRecord);
+  }
+  const receiptField = fieldSnapshot(reviewSnapshot, 'receipt');
+  if (receiptField.kind === 'invalid') {
+    return refuseRecord(io, invalidRecord);
+  }
   if (
-    reviewSnapshot === null ||
-    preMergeReceipt === null ||
     fieldOf(reviewSnapshot, 'outcome') !== 'found' ||
-    decideConductorReviewOutcome(preMergeReceipt).outcome !== 'passed'
+    receiptField.kind === 'absent' ||
+    decideConductorReviewOutcome(receiptField.value).outcome !== 'passed'
   ) {
     return refuseRecord(io, { outcome: 'refused', reason: 'review-not-passed', runId });
   }
@@ -302,7 +333,11 @@ export async function premergeAttestCommand(
     ciRead = undefined;
   }
   const ciSnapshot = safePlainSnapshot(ciRead);
-  if (ciSnapshot === null || fieldOf(ciSnapshot, 'headSha') !== headSha || fieldOf(ciSnapshot, 'state') !== 'passed') {
+  // A null snapshot is an invalid record, not a CI verdict.
+  if (ciSnapshot === null) {
+    return refuseRecord(io, invalidRecord);
+  }
+  if (fieldOf(ciSnapshot, 'headSha') !== headSha || fieldOf(ciSnapshot, 'state') !== 'passed') {
     return refuseRecord(io, { outcome: 'refused', reason: 'ci-not-green', runId });
   }
 
@@ -344,7 +379,7 @@ export async function premergeAttestCommand(
     }
     reviewerModel = requestedReviewerModel.trim();
   } else {
-    const preMergeReviewer = fieldOf(preMergeReceipt, 'reviewerModel');
+    const preMergeReviewer = fieldOf(receiptField.value, 'reviewerModel');
     if (
       typeof preMergeReviewer !== 'string' ||
       preMergeReviewer.trim() === '' ||

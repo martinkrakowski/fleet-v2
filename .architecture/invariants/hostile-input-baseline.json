@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "status": "ratchet-baseline",
   "counts": {
-    "getOwnPropertyDescriptor": 247,
-    "Reflect.ownKeys": 82,
-    "getPrototypeOf": 92,
+    "getOwnPropertyDescriptor": 255,
+    "Reflect.ownKeys": 85,
+    "getPrototypeOf": 96,
     "Proxy": 1,
     "structuredClone": 6,
     "JSON.parse": 18
@@ -83,9 +83,9 @@
       "JSON.parse": 0
     },
     "tenancy": {
-      "getOwnPropertyDescriptor": 3,
-      "Reflect.ownKeys": 4,
-      "getPrototypeOf": 2,
+      "getOwnPropertyDescriptor": 11,
+      "Reflect.ownKeys": 7,
+      "getPrototypeOf": 6,
       "Proxy": 1,
       "structuredClone": 0,
       "JSON.parse": 0

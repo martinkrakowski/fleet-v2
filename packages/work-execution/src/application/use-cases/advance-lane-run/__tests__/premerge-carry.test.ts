@@ -596,33 +596,33 @@ describe('premerge carry (U6): the Tier 2 release across a base-merge head move'
 
   it('refuses a conflict-resolved merge', async () => {
     const rig = await carryRig({ evidence: cleanEvidence({ newHeadTreeSha: 'f'.repeat(40) }) });
-    expect(await rig.run()).toMatchObject({ outcome: 'entered', state: 'parked' });
+    expect(await rig.run()).toMatchObject({ outcome: 'parked', reason: 'branch-behind' });
     expect(successStatuses(rig.harness)).toHaveLength(0);
     expect(rig.harness.forgeRequests).toHaveLength(0);
   });
 
   it('refuses a lane-authored change', async () => {
     const rig = await carryRig({ evidence: cleanEvidence({ prChangedPaths: ['src/example.ts', 'src/lane-authored.ts'] }) });
-    expect(await rig.run()).toMatchObject({ outcome: 'entered', state: 'parked' });
+    expect(await rig.run()).toMatchObject({ outcome: 'parked', reason: 'branch-behind' });
     expect(successStatuses(rig.harness)).toHaveLength(0);
     expect(rig.harness.forgeRequests).toHaveLength(0);
   });
 
   it('refuses a non-merge head move', async () => {
     const rig = await carryRig({ evidence: cleanEvidence({ newHeadParents: [COMMIT] }) });
-    expect(await rig.run()).toMatchObject({ outcome: 'entered', state: 'parked' });
+    expect(await rig.run()).toMatchObject({ outcome: 'parked', reason: 'branch-behind' });
     expect(rig.harness.forgeRequests).toHaveLength(0);
   });
 
   it("refuses when the first parent isn't the reviewed head", async () => {
     const rig = await carryRig({ evidence: cleanEvidence({ newHeadParents: [MAIN_PARENT, COMMIT] }) });
-    expect(await rig.run()).toMatchObject({ outcome: 'entered', state: 'parked' });
+    expect(await rig.run()).toMatchObject({ outcome: 'parked', reason: 'branch-behind' });
     expect(rig.harness.forgeRequests).toHaveLength(0);
   });
 
   it('refuses with red CI', async () => {
     const rig = await carryRig({ ci: 'failed' });
-    expect(await rig.run()).toMatchObject({ outcome: 'entered', state: 'parked' });
+    expect(await rig.run()).toMatchObject({ outcome: 'parked', reason: 'branch-behind' });
     expect(rig.harness.forgeRequests).toHaveLength(0);
   });
 

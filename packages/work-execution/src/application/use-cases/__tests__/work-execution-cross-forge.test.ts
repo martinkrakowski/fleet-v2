@@ -1302,6 +1302,80 @@ baseRef: "main",
     expect(forgePort.requests).toHaveLength(0);
   });
 
+  describe("U6: a post-status carried across a verified base merge", () => {
+    const status = {
+      context: "premerge" as const,
+      state: "success" as const,
+      description: "pre-merge receipt recorded",
+    };
+    const carried = (overrides: Partial<ExecuteAuthorizedForgeActionRequest> = {}) =>
+      forgeRequest({
+        kind: "post-status",
+        pullRequestNumber: undefined,
+        branchName: `feat/${LANE_ID}`,
+        status,
+        expectedHeadSha: OTHER_SHA,
+        carriedFromHeadSha: HEAD_SHA,
+        ...overrides,
+      });
+
+    it("posts at the carried head while the attempt still sits at the reviewed head it names", async () => {
+      const authorization = new FakeActionAuthorization();
+      const { useCase, forgePort } = makeDeps({ authorization });
+
+      const result = await useCase.executeAuthorizedForgeAction(carried());
+
+      expect(result).toMatchObject({ outcome: "executed" });
+      expect(forgePort.requests).toHaveLength(1);
+      expect(forgePort.requests[0]).toMatchObject({ kind: "post-status", expectedHeadSha: OTHER_SHA });
+      expect(authorization.consumeRequests[0]).toMatchObject({ expectedHeadSha: OTHER_SHA });
+    });
+
+    it("refuses when the attempt is not at the reviewed head it names, before consuming any grant", async () => {
+      const authorization = new FakeActionAuthorization();
+      const { useCase, forgePort } = makeDeps({ authorization });
+
+      const result = await useCase.executeAuthorizedForgeAction(
+        carried({ carriedFromHeadSha: "1".repeat(40) }),
+      );
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "Moved head: attempt headCommit does not match expectedHeadSha",
+      });
+      expect(authorization.consumeRequests).toHaveLength(0);
+      expect(forgePort.requests).toHaveLength(0);
+    });
+
+    it("refuses a carriedFromHeadSha on any other kind, equal to the head, or malformed", async () => {
+      for (const request of [
+        carried({ kind: "merge-pr", pullRequestNumber: 7, status: undefined }),
+        carried({ carriedFromHeadSha: OTHER_SHA }),
+        carried({ carriedFromHeadSha: "not-a-sha" }),
+      ]) {
+        const authorization = new FakeActionAuthorization();
+        const { useCase, forgePort } = makeDeps({ authorization });
+        const result = await useCase.executeAuthorizedForgeAction(request);
+        expect(result).toMatchObject({ outcome: "refused" });
+        expect(authorization.consumeRequests).toHaveLength(0);
+        expect(forgePort.requests).toHaveLength(0);
+      }
+    });
+
+    it("drops carriedFromHeadSha from an HTTP body so a caller cannot move the moved-head check", async () => {
+      const authorization = new FakeActionAuthorization();
+      const { useCase, forgePort } = makeDeps({ authorization });
+
+      const result = await useCase.execute(carried());
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "Moved head: attempt headCommit does not match expectedHeadSha",
+      });
+      expect(forgePort.requests).toHaveLength(0);
+    });
+  });
+
   it("refuses a merge when the acceptance assessment is for another head", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort } = makeDeps({

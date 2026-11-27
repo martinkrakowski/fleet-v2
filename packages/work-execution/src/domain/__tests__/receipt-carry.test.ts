@@ -107,7 +107,7 @@ describe('qualifyBaseMergeCarry', () => {
       [],
       getter,
       polluted,
-      new Proxy(clean(), {}),
+      new Proxy(clean(), { ownKeys: () => { throw new Error('trap'); } }),
       hole,
       clean({ prChangedPaths: { length: 1, 0: 'a' } }),
       clean({ prChangedPaths: new Array(1_000_000).fill('a') }),

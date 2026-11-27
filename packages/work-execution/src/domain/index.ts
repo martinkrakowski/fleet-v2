@@ -88,6 +88,7 @@ export * from "./shadow-evidence-ledger.js";
 export * from "./shell-train-events.js";
 export * from "./slo-calculators.js";
 export * from "./slo-report.js";
+export * from "./snapshot-publishers.js";
 export * from "./snapshot-sections.js";
 export * from "./stall-attention.js";
 export * from "./stall-rules.js";

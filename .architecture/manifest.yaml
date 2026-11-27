@@ -362,6 +362,7 @@ bounded_contexts:
           - ListAttemptsUseCase
           - ListAttemptJournalUseCase
           - ProbeProjectUseCase
+          - PublishSnapshotSectionUseCase
           - ListUnregisteredProjectsUseCase
           - ExportRunTelemetryUseCase
           - CloseWorkOrderUseCase
@@ -422,6 +423,7 @@ bounded_contexts:
             - ListAttemptsPort
             - ListAttemptJournalPort
             - ProbeProjectPort
+            - PublishSnapshotSectionPort
             - ListUnregisteredProjectsPort
             - ExportRunTelemetryPort
             - CloseWorkOrderPort
@@ -559,6 +561,8 @@ bounded_contexts:
             - MicroVmDriverPort
             - AuthorityEventSinkPort
             - CloudProviderPort
+            - LaneServerSessionReadPort
+            - SnapshotPushPort
       infrastructure:
         adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, SandboxRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GhReviewThreadHelperAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter, SeatTicketRepositoryAdapter, SeatObservationRepositoryAdapter, SeatCatalogAdapter, ReaperFindingRepositoryAdapter, InMemoryReaperFindingRepositoryAdapter, MergePolicyAdapter, ReleaseStoreAdapter, ChainAttentionAdapter, LaneScorecardFileAdapter, LaneUsageLogFileAdapter, PullRequestFindingsReadAdapter, LaneEditSaveAdapter, CutoverJournalAdapter, RelaunchPlanRepositoryAdapter, CutoverRecordRepositoryAdapter, ShadowEvidenceAdapter, ShadowAttestationAdapter, MergeRecordRepositoryAdapter, GhMergeVetoStateAdapter, TrainHealthStateReadAdapter, SpdSayHostAudibleAlertAdapter, TrainHealthAttentionAdapter, AuthorityEventJournalAdapter]
     contracts:
@@ -579,6 +583,9 @@ bounded_contexts:
       ListAttemptJournalPort: "Return one attempt's action journal entries in recorded order, or a known absence for an unknown attempt; read-only, never contacts the runner, and carries no legality or next-action block."
       ListLaneRunsPort: "Return, read-only, the conductor schedule: every non-terminal lane run in creation order with its projected state, round, pending step, park, package keys and held slot, the held reservations by host, the admission count of active and in-flight runs, the halt marker and whether the driver lease has lapsed; the active-run cap is reported only from a recorded pass trace, never assumed; no lease holder, ssh alias, port, transport or worktree path crosses the port."
       ListConductorPassesPort: "Return, read-only, the most recent recorded conductor passes newest first, at most a bounded limit, each with its time, halt and progress flags, the recorded caps and each run's report in worker-take order; an unreadable or unknown-version trace store is reported unreadable, never an error and never guessed; no holder id crosses the port."
+      PublishSnapshotSectionPort: "Publish one token-only snapshot section (running, train or parks) of the lanes board: read the owning state only, build the section's tokens through the pure builders, and push them through the snapshot push port; running comes only from lane-server session lists, never from lane-run records; it never writes any lane, run, queue or park state, and an unreadable source, an unknown port answer or a refused push is a typed refusal or unavailable result, never a published one; ids and codes only."
+      LaneServerSessionReadPort: "Read, read-only, the sessions each lane server reports as running (session id, project id and the optional seat role and model); an unconfigured, unreachable, slow or unreadable server is a named unavailable result, never an empty list; no path, URL, credential or transport detail crosses the port."
+      SnapshotPushPort: "Push one token-only section snapshot (section, increasing revision, tokens, pushed-at time) to the snapshot receiver; pushed, refused (non-increasing revision, invalid, unauthorized) and unavailable (transport error, timeout, not configured) are named results, never guesses; no credential or endpoint crosses the port."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."

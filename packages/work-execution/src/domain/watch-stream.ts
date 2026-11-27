@@ -323,12 +323,12 @@ export function readWatchBuffer(buffer: unknown, isProxy: IsProxy): ReadWatchBuf
   }
   // One enumeration: exactly the 3 required keys, no extras, no symbol key
   // (the snapshot already refused symbols and non-enumerables).
-  const keys = Reflect.ownKeys(value);
+  const keys = Object.keys(value);
   if (keys.length !== BUFFER_KEYS.length) {
     return refusal('invalid-buffer');
   }
   for (const key of keys) {
-    if (typeof key !== 'string' || !BUFFER_KEYS.includes(key)) {
+    if (!BUFFER_KEYS.includes(key)) {
       return refusal('invalid-buffer');
     }
   }
@@ -343,12 +343,12 @@ export function readWatchBuffer(buffer: unknown, isProxy: IsProxy): ReadWatchBuf
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
       return refusal('invalid-buffer');
     }
-    const entryKeys = Reflect.ownKeys(entry);
+    const entryKeys = Object.keys(entry);
     if (entryKeys.length !== ENTRY_KEYS.length) {
       return refusal('invalid-buffer');
     }
     for (const key of entryKeys) {
-      if (typeof key !== 'string' || !ENTRY_KEYS.includes(key)) {
+      if (!ENTRY_KEYS.includes(key)) {
         return refusal('invalid-buffer');
       }
     }

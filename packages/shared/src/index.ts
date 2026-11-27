@@ -76,3 +76,12 @@ export type {
   PlainDataRefusalReason,
   PlainDataSnapshot,
 } from './plain-data-snapshot.js';
+
+export { ADVERSARIAL_CORPUS, runAdversarialCorpus } from './adversarial-corpus.js';
+export type {
+  AdversarialCorpusCategory,
+  AdversarialCorpusEntry,
+  Codec,
+  CodecEnv,
+  DecodeResult,
+} from './adversarial-corpus.js';

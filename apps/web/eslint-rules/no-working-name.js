@@ -7,7 +7,7 @@
 // a clean checkout, in which case the rule is a no-op. Matched words are never
 // echoed into a report.
 import { Buffer } from 'node:buffer';
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { types } from 'node:util';
 import { snapshotPlainData } from '@fleet/shared';
 
@@ -131,14 +131,42 @@ function parseNames(text, separator) {
 }
 
 function readNamesFile(filePath) {
+  let fd;
   try {
-    const stats = statSync(filePath);
-    if (!stats.isFile() || stats.size > MAX_FILE_BYTES) {
+    // A FIFO or device is refused by path before it is opened (an open would block on
+    // a FIFO), and again on the descriptor; O_NONBLOCK keeps the open itself from waiting.
+    if (!statSync(filePath).isFile()) {
       return [];
     }
-    return parseNames(readFileSync(filePath, 'utf8'), /\r?\n/);
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) {
+      return [];
+    }
+    // Read at most one byte past the bound from the opened descriptor, so a file
+    // that grows between a size check and the read can never be read whole.
+    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const read = readSync(fd, buffer, total, buffer.length - total, null);
+      if (read === 0) {
+        break;
+      }
+      total += read;
+    }
+    if (total > MAX_FILE_BYTES) {
+      return [];
+    }
+    return parseNames(buffer.toString('utf8', 0, total), /\r?\n/);
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // nothing to do: the descriptor is gone either way
+      }
+    }
   }
 }
 
@@ -184,19 +212,14 @@ export function loadForbiddenNames(options, snapshot = snapshotPlainData) {
 export const noWorkingName = {
   meta: {
     type: 'problem',
-    schema: [
-      {
-        type: 'object',
-        properties: { env: { type: 'string' }, filePath: { type: 'string' } },
-        additionalProperties: false,
-      },
-    ],
+    // No options: the forbidden names come only from the operator's environment or ignored file.
+    schema: [],
     messages: {
       forbiddenWorkingName: 'Keep copy neutral: this text contains a configured forbidden name.',
     },
   },
   create(context) {
-    const names = loadForbiddenNames(context.options[0]);
+    const names = loadForbiddenNames();
     if (names.length === 0) {
       return {};
     }

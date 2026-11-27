@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -110,15 +111,11 @@ describe('forbidden-name loading', () => {
       expect(loadForbiddenNames({ filePath: missing })).toEqual([]);
       const linter = new Linter();
       const code = `const label = "${FAKE}";`;
-      // explicit missing file path, env left to the (deleted) environment variable
+      // an explicitly empty environment value is a no-op for the rule itself
+      process.env[ENV_KEY] = '';
       expect(linter.verify(code, {
         plugins: { local: plugin },
-        rules: { 'local/no-working-name': ['error', { filePath: missing }] },
-      })).toEqual([]);
-      // explicit empty env and explicit missing file path
-      expect(linter.verify(code, {
-        plugins: { local: plugin },
-        rules: { 'local/no-working-name': ['error', { env: '', filePath: missing }] },
+        rules: { 'local/no-working-name': 'error' },
       })).toEqual([]);
     });
   });
@@ -397,6 +394,39 @@ describe('option validation refuses hostile input', () => {
     expect(loadForbiddenNames()).toEqual([]);
     process.env[ENV_KEY] = `${FAKE},${'a'.repeat(65_536 - FAKE.length - 1)}`;
     expect(loadForbiddenNames()).toEqual([FAKE, 'a'.repeat(65_536 - FAKE.length - 1)]);
+  });
+
+  it('refuses an oversized names file and accepts one exactly at the 64 KiB bound', () => {
+    delete process.env[ENV_KEY];
+    withTempDir((dir) => {
+      const over = join(dir, 'over');
+      writeFileSync(over, `${FAKE}\n${'a'.repeat(65_536 - FAKE.length)}`);
+      expect(loadForbiddenNames({ filePath: over })).toEqual([]);
+      const exact = join(dir, 'exact');
+      const longName = 'a'.repeat(65_536 - FAKE.length - 1);
+      writeFileSync(exact, `${FAKE}\n${longName}`);
+      expect(loadForbiddenNames({ filePath: exact })).toEqual([FAKE, longName]);
+    });
+  });
+
+  it('returns no names for a FIFO at the names-file path without blocking', () => {
+    delete process.env[ENV_KEY];
+    withTempDir((dir) => {
+      const fifo = join(dir, 'fifo');
+      execFileSync('mkfifo', [fifo]);
+      expect(loadForbiddenNames({ filePath: fifo })).toEqual([]);
+    });
+  });
+
+  it('declares an empty options schema and rejects { env: "" } as an option', () => {
+    expect(noWorkingName.meta.schema).toEqual([]);
+    const linter = new Linter();
+    expect(() =>
+      linter.verify('const a = 1;', {
+        plugins: { local: plugin },
+        rules: { 'local/no-working-name': ['error', { env: '' }] },
+      }),
+    ).toThrow(/no-working-name/);
   });
 
   it('passes a well-formed injected snapshot outcome through to the loader', () => {

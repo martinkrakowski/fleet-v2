@@ -105,10 +105,23 @@ describe("registry metadata (MX1; plan §3.3, §3.7, D10, D16)", () => {
     expect(Object.isFrozen(mutating)).toBe(true);
   });
 
-  it("ships only read tools until T3a (D10; MX6a changes this test)", () => {
+  it("the mutating tools are exactly the owner-ask and context-propose tools; every other tool is read", () => {
     for (const tool of registry.tools) {
-      expect(tool.kind).toBe("read");
+      if (
+        tool.name === "fleet_owner_ask" ||
+        tool.name === "fleet_context_propose"
+      ) {
+        expect(tool.kind).toBe("mutating");
+        expect(tool.scope).toBe("message");
+      } else {
+        expect(tool.kind).toBe("read");
+      }
     }
+    expect(
+      registry.tools
+        .filter((tool) => tool.kind === "mutating")
+        .map((tool) => tool.name),
+    ).toEqual(["fleet_owner_ask", "fleet_context_propose"]);
   });
 
   it("every input schema is a strict object that refuses an extra key", () => {

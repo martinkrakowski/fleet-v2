@@ -255,6 +255,19 @@ function isCongestionCause(value: unknown): value is GatePredicateCause {
   );
 }
 
+/**
+ * Every `GatePredicateCause` a stored predicate result may carry, including
+ * the TP5A1 typed host-side causes (`missing-generated-types`,
+ * `lint-arch-timeout`). Unlike `isCongestionCause` this does not route to the
+ * retry path — it only lets a stored result round-trip without being
+ * discarded as malformed.
+ */
+function isGatePredicateCause(value: unknown): value is GatePredicateCause {
+  return (
+    isCongestionCause(value) || value === 'missing-generated-types' || value === 'lint-arch-timeout'
+  );
+}
+
 export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
   // PT1a hostile-record guard: a null/undefined record, a non-object or a
   // record whose `detail` accessor throws is ignored as null — a stored
@@ -295,7 +308,7 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     (record.exitCode !== null && typeof record.exitCode !== 'number') ||
     typeof record.durationMs !== 'number' ||
     typeof record.detail !== 'string' ||
-    (record.cause !== undefined && !isCongestionCause(record.cause))
+    (record.cause !== undefined && !isGatePredicateCause(record.cause))
   ) {
     return null;
   }

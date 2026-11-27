@@ -4,8 +4,10 @@
 // entries and never throw.
 import { describe, expect, it } from "vitest";
 import {
+  projectAskOwnerQuestion,
   projectBriefPreview,
   projectConductorStatus,
+  projectContextProposals,
   projectLaneRunList,
   projectProjectList,
   projectQuestion,
@@ -486,5 +488,116 @@ describe("projectBriefPreview", () => {
     expect(projectBriefPreview(null)).toEqual({ outcome: "unknown" });
     expect(projectBriefPreview("text")).toEqual({ outcome: "unknown" });
     expect(projectBriefPreview({})).toEqual({ outcome: "unknown" });
+  });
+});
+
+describe("projectAskOwnerQuestion", () => {
+  it("projects an asked outcome through the question allow-list", () => {
+    const projected = projectAskOwnerQuestion({
+      outcome: "asked",
+      question: FULL_QUESTION,
+      extra: "dropped",
+    });
+    expect(projected).toEqual({ outcome: "asked", question: FULL_QUESTION_PROJECTION });
+  });
+
+  it("projects an exists outcome the same way", () => {
+    const projected = projectAskOwnerQuestion({
+      outcome: "exists",
+      question: FULL_QUESTION,
+    });
+    expect(projected).toEqual({ outcome: "exists", question: FULL_QUESTION_PROJECTION });
+  });
+
+  it("caps a refused reason at 500 characters and drops other fields", () => {
+    const projected = projectAskOwnerQuestion({
+      outcome: "refused",
+      reason: "r".repeat(600),
+      question: FULL_QUESTION,
+    });
+    expect(projected).toEqual({ outcome: "refused", reason: "r".repeat(500) });
+    expect(projectAskOwnerQuestion({ outcome: "refused" })).toEqual({
+      outcome: "refused",
+      reason: null,
+    });
+    expect(projectAskOwnerQuestion({ outcome: "refused", reason: 7 })).toEqual({
+      outcome: "refused",
+      reason: null,
+    });
+  });
+
+  it.each([null, [], "x", {}, 5])("does not throw on %p", (input) => {
+    expect(projectAskOwnerQuestion(input)).toEqual({
+      outcome: "unknown",
+      question: null,
+    });
+  });
+});
+
+describe("projectContextProposals", () => {
+  it("projects a proposed outcome with the allow-list per proposal", () => {
+    const projected = projectContextProposals({
+      outcome: "proposed",
+      proposals: [
+        {
+          proposalId: "pr-1",
+          knowledgeEntryId: "ke-1",
+          version: "2",
+          claimText: "Claim",
+          proposedBecause: "Matched",
+          dropped: "field",
+        },
+        null,
+        "x",
+        { proposalId: 7, version: true, claimText: {} },
+      ],
+      rankingContextRef: "rc-1",
+      extra: "dropped",
+    });
+    expect(projected).toEqual({
+      outcome: "proposed",
+      proposals: [
+        {
+          proposalId: "pr-1",
+          knowledgeEntryId: "ke-1",
+          version: "2",
+          claimText: "Claim",
+          proposedBecause: "Matched",
+        },
+        {
+          proposalId: null,
+          knowledgeEntryId: null,
+          version: null,
+          claimText: null,
+          proposedBecause: null,
+        },
+      ],
+      rankingContextRef: "rc-1",
+    });
+  });
+
+  it("caps a rejected reason at 500 characters", () => {
+    const projected = projectContextProposals({
+      outcome: "rejected",
+      reason: "r".repeat(600),
+    });
+    expect(projected).toEqual({ outcome: "rejected", reason: "r".repeat(500) });
+  });
+
+  it("maps a non-string rankingContextRef and a missing proposals list to safe values", () => {
+    const projected = projectContextProposals({
+      outcome: "proposed",
+      proposals: "nope",
+      rankingContextRef: 9,
+    });
+    expect(projected).toEqual({
+      outcome: "proposed",
+      proposals: [],
+      rankingContextRef: null,
+    });
+  });
+
+  it.each([null, [], "x", {}, 5])("does not throw on %p", (input) => {
+    expect(projectContextProposals(input)).toEqual({ outcome: "unknown" });
   });
 });

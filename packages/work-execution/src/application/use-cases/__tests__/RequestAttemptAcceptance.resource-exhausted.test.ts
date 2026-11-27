@@ -416,6 +416,23 @@ describe('resource-exhausted gate classification', () => {
     expect(parseStoredPredicateResult(entry)).toBeNull();
   });
 
+  it('parseStoredPredicateResult round-trips the typed TP5A1 causes that are not congestion', () => {
+    for (const cause of ['missing-generated-types', 'lint-arch-timeout'] as const) {
+      const entry = journalEntry(`attempt-1:accept:${HEAD_SHA}:2`, {
+        predicate: 'command 1: corepack yarn lint:arch',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: null,
+        durationMs: 1,
+        detail: 'exit',
+        cause,
+      });
+      const parsed = parseStoredPredicateResult(entry);
+      expect(parsed).not.toBeNull();
+      expect(parsed?.cause).toBe(cause);
+    }
+  });
+
   it('firstNonPassingGatePredicateOf returns null when no gate run is stored for the head', () => {
     expect(firstNonPassingGatePredicateOf([], 'attempt-1', HEAD_SHA)).toBeNull();
     const otherAttempt = journalEntry(`attempt-2:accept:${HEAD_SHA}:2`, {

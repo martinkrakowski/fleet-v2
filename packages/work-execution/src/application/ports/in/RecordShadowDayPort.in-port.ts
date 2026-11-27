@@ -4,6 +4,7 @@
 // shadow-evidence ledger by compare-and-set, and reports every other
 // criterion as unevaluated — never as a pass, never as a silent fail.
 import type { CutoverShadowCriterion } from '../../../domain/cutover-records.js';
+import type { ShadowDivergenceDetails } from '../../../domain/shadow-day-merge-set.js';
 
 export interface RecordShadowDayRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
@@ -75,6 +76,19 @@ export type RecordShadowDayResult =
       readonly premergeCarry?: {
         readonly unresolvedCount: number;
         readonly unresolvedIds: readonly string[];
+      };
+      /**
+       * Present only when at least one evaluated criterion (S1, S4' or S6')
+       * diverged: the criteria's non-digested divergence diagnostics — the
+       * full per-criterion divergence count plus at most
+       * `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX` bounded, deterministically
+       * sorted items each. Never a criterion with no divergences, never an
+       * empty object, never part of any verdict digest.
+       */
+      readonly divergenceDiagnostics?: {
+        readonly S1?: ShadowDivergenceDetails;
+        readonly S4?: ShadowDivergenceDetails;
+        readonly S6?: ShadowDivergenceDetails;
       };
     }
   | { readonly outcome: 'refused'; readonly reason: RecordShadowDayRefusalReason }

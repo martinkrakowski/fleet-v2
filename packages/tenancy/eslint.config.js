@@ -14,6 +14,23 @@ export default tseslint.config(
     },
   },
   {
+    // Hostile input is handled once, at the boundary (docs/planning/2026-11-27_hostile-input-at-boundary-plan.md,
+    // D-HIB4). Warn-only until HIB13; scripts/check-hostile-input-ratchet.mjs fails CI on any increase.
+    files: ['**/domain/**/*.ts', '**/application/**/*.ts'],
+    ignores: ['**/__tests__/**', '**/*.test.ts', '**/*.test.tsx'],
+    rules: {
+      'no-restricted-syntax': [
+        'warn',
+        { selector: "CallExpression[callee.property.name='getOwnPropertyDescriptor']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+        { selector: "CallExpression[callee.object.name='Reflect'][callee.property.name='ownKeys']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+        { selector: "CallExpression[callee.property.name='getPrototypeOf']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+        { selector: "NewExpression[callee.name='Proxy']", message: 'Hostile input is decoded once at the boundary; no Proxy in domain or application code.' },
+        { selector: "CallExpression[callee.name='structuredClone']", message: 'Hostile input is decoded once at the boundary; use the snapshot kernel in @fleet/shared.' },
+        { selector: "CallExpression[callee.object.name='JSON'][callee.property.name='parse']", message: 'JSON is parsed once at the boundary by the bounded reader, never in domain or application code.' },
+      ],
+    },
+  },
+  {
     files: ['**/*.in-port.ts', '**/*.out-port.ts'],
     rules: {
       '@typescript-eslint/no-empty-object-type': ['error', { allowInterfaces: 'always' }],

@@ -59,6 +59,8 @@ jobs:
         run: sh scripts/check-model-family-fixtures.sh
       - name: turbo env declarations (every env read is declared or reviewed)
         run: node scripts/check-turbo-env.mjs
+      - name: hostile-input ratchet (no new hand-rolled reflection or JSON.parse in domain/application)
+        run: node scripts/check-hostile-input-ratchet.mjs
       - name: yarn build
         run: yarn build
       - name: yarn typecheck

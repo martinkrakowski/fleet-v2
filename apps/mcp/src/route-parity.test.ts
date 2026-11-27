@@ -22,6 +22,7 @@ import {
   type ParsedRouteRule,
   type RouteKey,
 } from "./parity-exclusions.js";
+import { previewDigest } from "./dry-run.js";
 
 /** Resolve the API wiring file as text; no cross-app import, no export reuse. */
 const ROUTE_SCOPES_PATH = path.resolve(
@@ -72,6 +73,28 @@ function toolNamed(registry: FleetRegistry, name: string) {
 const TEST_SHA = "0".repeat(40);
 
 /** Minimal valid input per tool, matching each strict Zod schema. */
+const OWNER_ASK_TOOL_BODY = {
+  questionId: "q-new",
+  title: "Pick a lane model",
+  body: "Which lane model should this work order use?",
+  options: [
+    { id: "o1", label: "Model A", consequence: "Faster, less thorough." },
+    { id: "o2", label: "Model B", consequence: "Slower, more thorough." },
+  ],
+  recommendation: { optionId: "o1", because: "The change is small." },
+  doorKind: "one-way",
+  idempotencyKey: "idem-owner-ask-1",
+} as const;
+
+/** The exact request body the tool posts: the tool input plus `askedBy: "mcp"`. */
+const OWNER_ASK_REQUEST_BODY = { ...OWNER_ASK_TOOL_BODY, askedBy: "mcp" };
+
+const CONTEXT_PROPOSE_REQUEST_BODY = {
+  projectId: "proj-1",
+  laneId: "lane-1",
+  taskSummary: "Summarize the lane's task for context selection.",
+} as const;
+
 const TOOL_INPUTS: Record<string, unknown> = {
   fleet_coordination: {},
   fleet_attempt: { attemptId: "att-1" },
@@ -116,6 +139,17 @@ const TOOL_INPUTS: Record<string, unknown> = {
     contextDecisions: [],
   },
   fleet_telemetry_status: {},
+  fleet_owner_ask: {
+    ...OWNER_ASK_TOOL_BODY,
+    dry_run: false,
+    preview_digest: previewDigest(OWNER_ASK_REQUEST_BODY),
+  },
+  fleet_owner_answer_wait: { questionId: "q-1" },
+  fleet_context_propose: {
+    ...CONTEXT_PROPOSE_REQUEST_BODY,
+    dry_run: false,
+    preview_digest: previewDigest(CONTEXT_PROPOSE_REQUEST_BODY),
+  },
 };
 
 /** The exact route each registered tool must call, in `:param` form. */
@@ -133,6 +167,9 @@ const EXPECTED_ROUTES: Record<string, { method: string; path: string }> = {
   fleet_conductor_status: { method: "GET", path: "/v1/runs" },
   fleet_brief_preview: { method: "POST", path: "/v1/briefs/preview" },
   fleet_telemetry_status: { method: "GET", path: "/v1/telemetry/status" },
+  fleet_owner_ask: { method: "POST", path: "/v1/questions" },
+  fleet_owner_answer_wait: { method: "GET", path: "/v1/questions/:param" },
+  fleet_context_propose: { method: "POST", path: "/v1/knowledge/proposals" },
 };
 
 /** Concrete id segments used by the minimal tool inputs, for normalization. */

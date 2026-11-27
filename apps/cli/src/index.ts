@@ -43,6 +43,7 @@ import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { policyCommand, type PolicyCliOptions } from './policy.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
+import { planCommand, type PlanCliOptions } from './plan.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
@@ -67,7 +68,7 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { ownerKeyCommand } from './commands/owner-key.js';
 import { questionsCommands } from './commands/questions.js';
-import { ownerItemsCommands } from './commands/owner-items.js';
+import { ownerItemsCommands, withdrawOwnerItem, type OwnerItemsCliOptions } from './commands/owner-items.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
@@ -789,7 +790,8 @@ Commands:
     (sign-decision --pre-sign --action-scope merge:import-shadow --repository <owner/repo> --project <id> --expires-at <iso> --key <path> --yes pre-signs the standing grant before request-decision)
     (owner-key init --out <path> generates a 0600 Ed25519 owner key file; owner-key public --key <path> derives the public key)
   questions ask|list|show|answer|sync|expire|acknowledge|wait
-  owner-items add|list|resolve
+  owner-items add|list|resolve|withdraw
+  plan import|check|link-pr|declare|brief-check|list
   help | --help
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
@@ -852,6 +854,8 @@ export async function runCli(
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
   daemonOptions?: DaemonCliOptions,
+  planOptions?: PlanCliOptions,
+  ownerItemsOptions?: OwnerItemsCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -973,6 +977,11 @@ export async function runCli(
     if (group === 'projects') {
       return await projectsCommand(restArgv.slice(1), io, activeRuntime, projectsOptions ?? {});
     }
+    // The plan group manages imported lane plans through the composed runtime
+    // (the state-backed pattern); its writes are confirmed like projects'.
+    if (group === 'plan') {
+      return await planCommand(restArgv.slice(1), io, activeRuntime, planOptions ?? {});
+    }
     if (group === 'conductor') {
       return await conductorCommand(restArgv.slice(1), io, activeRuntime, {
         ...conductorOptions,
@@ -1021,13 +1030,20 @@ export async function runCli(
       (group === 'knowledge' && subcommand === 'candidates') ||
       (group === 'cutover' && subcommand === 'shadow') ||
       (group === 'forge' && subcommand === 'threads') ||
-      (group === 'owner-items' && subcommand === 'resolve');
+      (group === 'owner-items' && (subcommand === 'resolve' || subcommand === 'withdraw'));
     const payload = parseFlags(rest, {
       allowPositional,
       ...(group === 'owner-items' && subcommand === 'add'
         ? { repeatableKeys: new Set(['ref']) }
         : {}),
     });
+    // `owner-items withdraw` is intercepted before the table handler so it
+    // can receive the `CliIo` and the injected confirm gate directly.
+    if (group === 'owner-items' && subcommand === 'withdraw') {
+      const result = await withdrawOwnerItem(payload, activeRuntime, io, ownerItemsOptions ?? {});
+      io.stdout(`${JSON.stringify(result)}\n`);
+      return exitCodeForResult(result, group, subcommand);
+    }
     const result = await handler(payload, activeRuntime, io);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)
     // print one line per record instead of one JSON document; a refusal

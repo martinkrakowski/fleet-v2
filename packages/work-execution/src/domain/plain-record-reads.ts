@@ -249,3 +249,34 @@ export function isCalendarDateTime(iso: string): boolean {
   const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
   return day >= 1 && day <= daysInMonth;
 }
+
+/** The own property descriptor of `name` and the object that holds it, found on `target` or up its prototype chain. */
+export interface InheritedPropertyDescriptor {
+  readonly holder: object;
+  readonly descriptor: PropertyDescriptor;
+}
+
+/**
+ * Finds `name` on `target` or up its prototype chain (at most `maxDepth` objects) through own
+ * property descriptors only, so no getter or Proxy `get` trap runs. A non-object target or a
+ * property that is absent within the bound reads as undefined. May throw on a hostile Proxy:
+ * callers catch.
+ */
+export function findInheritedPropertyDescriptor(
+  target: unknown,
+  name: string,
+  maxDepth: number,
+): InheritedPropertyDescriptor | undefined {
+  if ((typeof target !== 'object' && typeof target !== 'function') || target === null) {
+    return undefined;
+  }
+  let current: object | null = target;
+  for (let depth = 0; current !== null && depth < maxDepth; depth += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor !== undefined) {
+      return { holder: current, descriptor };
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return undefined;
+}

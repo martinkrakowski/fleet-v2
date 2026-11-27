@@ -15,7 +15,7 @@ import type {
   RecordSeatCallResult,
 } from '../ports/in/RecordSeatCallPort.in-port.js';
 import type { RunTelemetryPort, RunTelemetrySendDeadline } from '../ports/out/RunTelemetryPort.out-port.js';
-import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { findInheritedPropertyDescriptor, readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { isTelemetryZonedInstant, type TelemetrySpan } from '../../domain/run-telemetry.js';
 import { TELEMETRY_PLAN_SEAT_TOOLS, TELEMETRY_SEAT_CALL_OUTCOMES } from '../../domain/run-telemetry-attributes.js';
 import {
@@ -75,18 +75,11 @@ function hasExactKeys(snapshot: Record<string, unknown>, expected: readonly stri
  * target reads as `undefined`. May throw on a hostile Proxy: callers catch.
  */
 function dataPropertyOf(target: unknown, name: string): unknown {
-  if ((typeof target !== 'object' && typeof target !== 'function') || target === null) {
+  const found = findInheritedPropertyDescriptor(target, name, MAX_PROTOTYPE_DEPTH);
+  if (found === undefined || found.holder === Object.prototype) {
     return undefined;
   }
-  let current: object | null = target;
-  for (let depth = 0; depth < MAX_PROTOTYPE_DEPTH && current !== null && current !== Object.prototype; depth += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, name);
-    if (descriptor !== undefined) {
-      return Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
-    }
-    current = Object.getPrototypeOf(current) as object | null;
-  }
-  return undefined;
+  return Object.hasOwn(found.descriptor, 'value') ? found.descriptor.value : undefined;
 }
 
 interface ResolvedDependencies {
@@ -190,22 +183,8 @@ function mintId(mintCallId: () => string): string | null {
 
 /** A dense array of exactly one own enumerable data element and nothing else; its element, or undefined. */
 function onlyElementOf(dispositions: unknown): unknown {
-  if (!Array.isArray(dispositions) || Object.getPrototypeOf(dispositions) !== Array.prototype) {
-    return undefined;
-  }
-  const length = Object.getOwnPropertyDescriptor(dispositions, 'length');
-  if (length === undefined || !Object.hasOwn(length, 'value') || length.value !== 1) {
-    return undefined;
-  }
-  const keys = Reflect.ownKeys(dispositions);
-  if (keys.length !== 2 || keys[0] !== '0' || keys[1] !== 'length') {
-    return undefined;
-  }
-  const element = Object.getOwnPropertyDescriptor(dispositions, '0');
-  if (element === undefined || !element.enumerable || !Object.hasOwn(element, 'value')) {
-    return undefined;
-  }
-  return element.value;
+  const read = readBoundedDenseArray(dispositions, 1);
+  return read !== null && read.length === 1 ? read.array[0] : undefined;
 }
 
 /** True when the one disposition entry is for `span` and is exactly `exported@<route>`. */

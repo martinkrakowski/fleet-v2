@@ -16,3 +16,8 @@ global_whitelist:
 
 test_double_rules:
   allowed_cross_package_imports: true
+
+# Hostile-input freeze (HIB plan D-HIB4). arch-linter has no rule for this; it is enforced by
+# the manifest-generated ESLint no-restricted-syntax ban (warn until HIB13) and by the CI count
+# ratchet scripts/check-hostile-input-ratchet.mjs against hostile-input-baseline.json (fails on
+# any increase). The `lint:arch` rule forbidding `unknown` on inbound ports lands with HIB13.

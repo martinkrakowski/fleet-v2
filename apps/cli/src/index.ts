@@ -753,7 +753,7 @@ Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove|rename|daemon|show
-  seats list|check|free-tier [status|on|off] [--yes]
+  seats list|check|free-tier [status|on|off] [--yes] | observe --seat <seatId> --outcome <outcome> (--attempt <id> | --review-request <id>) [--dry-run]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
@@ -877,8 +877,17 @@ export async function runCli(
     if (group === 'init') {
       return await initCommand(restArgv.slice(1), io, initOptions ?? {});
     }
-    // The seats group manages the free-tier flag on the shared onboarding engine.
-    if (group === 'seats') {
+    // The seats group manages the free-tier flag on the shared onboarding
+    // engine; `seats observe` (SR6) alone records through the composed
+    // runtime's execution stack. A help request for it, and an
+    // already-provided recorder (tests), compose nothing.
+    if (
+      group === "seats" &&
+      (restArgv[1] !== "observe" ||
+        restArgv.length === 2 ||
+        restArgv.slice(2).some(isHelpToken) ||
+        seatsOptions?.recordSeatObservation !== undefined)
+    ) {
       return await seatsCommand(restArgv.slice(1), io, seatsOptions ?? {});
     }
     // The policy group manages the auto-merge policy on the shared onboarding engine.
@@ -972,6 +981,14 @@ export async function runCli(
     // (the state-backed pattern), not the installation file itself.
     if (group === 'projects') {
       return await projectsCommand(restArgv.slice(1), io, activeRuntime, projectsOptions ?? {});
+    }
+    // `seats observe` (SR6): the only seats subcommand that records through
+    // the execution stack.
+    if (group === 'seats') {
+      return await seatsCommand(restArgv.slice(1), io, {
+        ...seatsOptions,
+        recordSeatObservation: activeRuntime.execution.recordSeatObservation,
+      });
     }
     if (group === 'conductor') {
       return await conductorCommand(restArgv.slice(1), io, activeRuntime, {

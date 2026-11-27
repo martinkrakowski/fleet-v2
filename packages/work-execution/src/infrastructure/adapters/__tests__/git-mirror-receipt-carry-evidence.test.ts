@@ -16,7 +16,7 @@ const roots: string[] = [];
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
-    cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
   }).trim();
 }
 
@@ -96,7 +96,10 @@ describe('GitMirrorReceiptCarryEvidenceAdapter', () => {
     expect(evidence.automaticMergeTreeSha).toBe(evidence.newHeadTreeSha);
     const verdict = qualifyBaseMergeCarry({
       attemptId: 'attempt-1', reviewedHeadSha: f.lane, newHeadSha: f.mergeHead,
-      ...evidence, laneChangedPaths: ['src/a.ts'], ci: 'passed', decidedAtIso: '2026-11-27T12:00:00.000Z',
+      newHeadParents: evidence.newHeadParents, secondParentOnBase: evidence.secondParentOnBase,
+      mainRangeBaseSha: evidence.mainRangeBaseSha, automaticMergeTreeSha: evidence.automaticMergeTreeSha,
+      newHeadTreeSha: evidence.newHeadTreeSha, prChangedPaths: evidence.prChangedPaths,
+      laneChangedPaths: ['src/a.ts'], ci: 'passed', decidedAtIso: '2026-11-27T12:00:00.000Z',
     });
     expect(verdict.carry).toBe(true);
   });

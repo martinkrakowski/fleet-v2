@@ -881,7 +881,11 @@ export function buildRegistry(
                 });
               }
               last = result;
-              await sleep(waitPollIntervalMs);
+              // Never sleep past the deadline: the last sleep is clamped to the
+              // budget that remains (always positive here, checked after the GET).
+              await sleep(
+                Math.min(waitPollIntervalMs, waitMaxMs - (now() - startMs)),
+              );
             }
           } finally {
             waitInFlight = false;

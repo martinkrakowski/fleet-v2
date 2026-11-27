@@ -721,6 +721,40 @@ describe("fleet_owner_answer_wait tool", () => {
     });
   });
 
+  it("clamps each sleep to the remaining budget so the wait never overshoots the deadline", async () => {
+    const openResponse: ApiClientResult = {
+      operationId: "op-wait",
+      code: "OK",
+      result: {
+        outcome: "found",
+        question: { questionId: "q-1", state: "open" },
+      },
+    };
+    const client = queueClient([openResponse, openResponse, openResponse, openResponse]);
+    let clock = 0;
+    const sleeps: number[] = [];
+    const registry = buildRegistry(client, {
+      waitPollIntervalMs: 10,
+      waitMaxMs: 25,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      now: () => clock,
+    });
+    const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
+      questionId: "q-1",
+    });
+    // 25 ms of budget with 10 ms polls: two full sleeps, then the 5 ms that remain.
+    expect(sleeps).toEqual([10, 10, 5]);
+    expect(clock).toBe(25);
+    expect(client.gets).toHaveLength(3);
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "")).toMatchObject({
+      result: { outcome: "still-open" },
+    });
+  });
+
   it("returns still-open after bounded polls, never answered", async () => {
     const openResponse: ApiClientResult = {
       operationId: "op-wait",

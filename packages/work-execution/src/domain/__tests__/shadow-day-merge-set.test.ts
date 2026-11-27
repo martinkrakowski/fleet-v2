@@ -295,6 +295,60 @@ describe('evaluateShadowMergeSet (S1)', () => {
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
   });
 
+  it('surfaces S1 divergenceDetails with parsed pr, head12, side and code for every divergence kind, sorted by pr', () => {
+    const input = dayInput({
+      shell: {
+        events: [
+          // pr 7 matches the fleet pair, but the fleet row is recorded 1 s
+          // after the shell merge: an ordering divergence on the fleet side.
+          shellEvent(),
+          // pr 9 is merged on the shell and never on the fleet:
+          // `missing-in-fleet`, so the divergence sits on the shell side.
+          shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C }),
+        ],
+        unknownLines: 0,
+      },
+      fleet: {
+        results: [
+          fleetResult({ recordedAtIso: inDayIso(600, 1) }),
+          // pr 8 has a fleet would-merge the shell never merged:
+          // `missing-in-shell`, so the divergence sits on the fleet side.
+          fleetResult({ key: mergeKey(DIGEST, 8, HEAD_B.slice(0, 12)) }),
+        ],
+        entries: [fleetEntry(), fleetEntry({ pullRequest: 8, headOid: HEAD_B })],
+      },
+    });
+    const result = evaluateShadowMergeSet(input);
+    expect(result.status).toBe('fail');
+    expect(result.divergences).toBe(3);
+    expect(result.divergenceDetails).toEqual({
+      totalCount: 3,
+      items: [
+        { pr: 7, head12: HEAD_A.slice(0, 12), side: 'fleet', code: 'fleet-recorded-after-merge' },
+        { pr: 8, head12: HEAD_B.slice(0, 12), side: 'fleet', code: 'missing-in-shell' },
+        { pr: 9, head12: HEAD_C.slice(0, 12), side: 'shell', code: 'missing-in-fleet' },
+      ],
+    });
+  });
+
+  it('caps S1 divergenceDetails at 20 sorted items while preserving totalCount', () => {
+    const head = (pullRequest: number): string => pullRequest.toString(16).padStart(8, '0').repeat(5);
+    const events = Array.from({ length: 25 }, (_, index) => shellEvent({
+      line: index + 1,
+      pullRequest: 100 + index,
+      headOid: head(100 + index),
+      atIso: inDayIso(600 + index),
+    }));
+    const input = dayInput({ shell: { events, unknownLines: 0 }, fleet: { results: [], entries: [] } });
+    const result = evaluateShadowMergeSet(input);
+    expect(result.status).toBe('fail');
+    expect(result.divergences).toBe(25);
+    expect(result.divergenceDetails?.totalCount).toBe(25);
+    expect(result.divergenceDetails?.items).toHaveLength(20);
+    expect(result.divergenceDetails?.items.map((item) => item.pr)).toEqual(Array.from({ length: 20 }, (_, index) => 100 + index));
+    expect(result.divergenceDetails?.items.every((item) => item.side === 'shell' && item.code === 'missing-in-fleet')).toBe(true);
+  });
+
   it('passes with merge-set-equal when the same pair has the fleet row recorded 1 s BEFORE the shell merge', () => {
     const input = dayInput({ fleet: { results: [fleetResult({ recordedAtIso: inDayIso(599, 59) })], entries: [fleetEntry()] } });
     expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
@@ -454,6 +508,47 @@ describe('evaluateShadowMergeSet hostile input', () => {
 
   it('null is refused as invalid-input', () => {
     expect(evaluateShadowMergeSet(null)).toEqual(INVALID);
+  });
+
+  it('refuses null input with invalid-input and no divergenceDetails', () => {
+    const result = evaluateShadowMergeSet(null);
+    expect(result).toEqual(INVALID);
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('returns invalid-input without divergenceDetails on a malformed S1 record', () => {
+    const result = evaluateShadowMergeSet(dayInput({ day: 20261110 }));
+    expect(result).toEqual(INVALID);
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('never invokes a throwing getter on S1 input and returns invalid-input without divergenceDetails', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = dayInput();
+    Object.defineProperty(input, 'shell', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return { events: [], unknownLines: 0 };
+      },
+    });
+    const result = evaluateShadowMergeSet(input);
+    expect(result).toEqual(INVALID);
+    expect(calls).toBe(0);
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('omits malformed divergence keys from S1 divergenceDetails items while still counting them in totalCount and divergences', () => {
+    // Two shell merges for the same pair duplicate one comparator key, so the
+    // comparator emits one `invalid-item` divergence: it always counts toward
+    // `divergences` and `totalCount`, but its key is not a parseable
+    // `<pr>@<head>` divergence and carries no side, so `items` omits it.
+    const input = dayInput({ shell: { events: [shellEvent(), shellEvent({ line: 2, atIso: inDayIso(601) })], unknownLines: 0 } });
+    const result = evaluateShadowMergeSet(input);
+    expect(result.status).toBe('fail');
+    expect(result.reason).toBe('merge-set-divergence');
+    expect(result.divergences).toBe(1);
+    expect(result.divergenceDetails).toEqual({ totalCount: 1, items: [] });
   });
 
   it('undefined is refused as invalid-input', () => {

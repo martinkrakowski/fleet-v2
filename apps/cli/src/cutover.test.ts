@@ -473,7 +473,12 @@ describe('fleet-v2 cutover status and rollback', () => {
 });
 
 describe('cutover shadow record-day merge-queue digest (RD1)', () => {
-  it('records S1 pass when the live fleet/v2 entry shares the journal digest 7c155c1db6b3', async () => {
+  /**
+   * Seeds one matched shadow merge pair (shell merge pr 101 ↔ live fleet
+   * entry + journaled would-merge), optionally plus one extra shell merge
+   * the fleet never would-merged, then runs `record-day` for 2026-11-16.
+   */
+  async function recordDayWith(extraUnmatchedShellMerge: boolean) {
     // enqueue and listMergeEntries judge deadlines against Date.now(), while
     // record-day's list deadline is daemonNow plus 60s. Pin both clocks to the
     // same instant so the brief's deadline stays in the future.
@@ -485,17 +490,27 @@ describe('cutover shadow record-day merge-queue digest (RD1)', () => {
       const headOid = 'a'.repeat(40);
       // Shell events reject a fractional second (`AT_PATTERN` is seconds and
       // `Z` only). This is the same instant as 2026-11-16T10:00:00.000Z.
-      writeFileSync(
-        join(legacyDir, 'events.jsonl'),
-        `${JSON.stringify({
+      const lines = [
+        JSON.stringify({
           at: '2026-11-16T10:00:00Z',
           kind: 'result',
           outcome: 'merged',
           pr: 101,
           headOid,
           detail: '',
-        })}\n`,
-      );
+        }),
+      ];
+      if (extraUnmatchedShellMerge) {
+        lines.push(JSON.stringify({
+          at: '2026-11-16T11:00:00Z',
+          kind: 'result',
+          outcome: 'merged',
+          pr: 102,
+          headOid: 'b'.repeat(40),
+          detail: '',
+        }));
+      }
+      writeFileSync(join(legacyDir, 'events.jsonl'), `${lines.join('\n')}\n`);
 
       const runtime = createFleetCliRuntime({
         stateDir,
@@ -565,7 +580,7 @@ describe('cutover shadow record-day merge-queue digest (RD1)', () => {
       });
       expect(resultEntry.outcome).toBe('appended');
 
-      const result = await run(runtime, [
+      return await run(runtime, [
         'cutover',
         'shadow',
         'record-day',
@@ -576,14 +591,36 @@ describe('cutover shadow record-day merge-queue digest (RD1)', () => {
         '--day',
         '2026-11-16',
       ]);
-      expect(result.code).toBe(0);
-      expect(result.json).toMatchObject({
-        outcome: 'recorded',
-        recorded: { S1: 'pass' },
-      });
     } finally {
       vi.useRealTimers();
     }
+  }
+
+  it('records S1 pass when the live fleet/v2 entry shares the journal digest 7c155c1db6b3', async () => {
+    const result = await recordDayWith(false);
+    expect(result.code).toBe(0);
+    expect(result.json).toMatchObject({
+      outcome: 'recorded',
+      recorded: { S1: 'pass' },
+    });
+  });
+
+  it('cutover shadow record-day prints divergenceDiagnostics alongside recorded verdicts in JSON output', async () => {
+    // One shell merge (pr 102) with no fleet would-merge: S1 fails with one
+    // `missing-in-fleet` divergence, and the non-digested diagnostics ride on
+    // the CLI JSON output next to `recorded`.
+    const result = await recordDayWith(true);
+    expect(result.code).toBe(0);
+    expect(result.json).toMatchObject({
+      outcome: 'recorded',
+      recorded: { S1: 'fail' },
+      divergenceDiagnostics: {
+        S1: {
+          totalCount: 1,
+          items: [{ pr: 102, head12: 'b'.repeat(12), side: 'shell', code: 'missing-in-fleet' }],
+        },
+      },
+    });
   });
 });
 

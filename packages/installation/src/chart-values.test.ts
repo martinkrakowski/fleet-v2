@@ -175,6 +175,25 @@ describe('validateChartValues', () => {
     }
   });
 
+  it('forEach callback never receives a Set with mutators', () => {
+    for (const keys of Object.values(CHART_VALUES_ALLOWED_KEYS)) {
+      let leaked: unknown;
+      keys.forEach((_value, _value2, set) => {
+        leaked = set;
+      });
+      // The third argument must not be the private mutable Set: it must
+      // expose no add/delete/clear, so a callback cannot grow the
+      // allow-list.
+      expect(leaked).toBeDefined();
+      const mutators = leaked as Record<string, unknown>;
+      expect(mutators.add).toBeUndefined();
+      expect(mutators.delete).toBeUndefined();
+      expect(mutators.clear).toBeUndefined();
+      // And the allow-list must still refuse an undocumented key.
+      expect(keys.has('extra')).toBe(false);
+    }
+  });
+
   it('refuses unknown key at root and nested objects without echoing key', () => {
     const root = validateChartValues(
       { SENTINEL_SECRET_ROOT: 'sensitive' },

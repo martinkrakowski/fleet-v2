@@ -43,7 +43,8 @@ function frozenKeySet(keys: readonly string[]): ReadonlySet<string> {
     keys: () => inner.keys(),
     values: () => inner.values(),
     entries: () => inner.entries(),
-    forEach: (callback, thisArg) => inner.forEach(callback, thisArg),
+    forEach: (callback, thisArg) =>
+      inner.forEach((value, value2) => callback(value, value2, view), thisArg),
     [Symbol.iterator]: () => inner[Symbol.iterator](),
   };
   return Object.freeze(view);

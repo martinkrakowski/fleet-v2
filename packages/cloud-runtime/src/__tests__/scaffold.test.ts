@@ -64,4 +64,17 @@ describe("@fleet/cloud-runtime scaffold", () => {
     const mod = await import("../index.js");
     expect(Object.keys(mod)).toEqual([]);
   });
+
+  it("the domain barrel exports exactly decideMigrationRun, checksumOfMigration, MIGRATION_ID_PATTERN, MAX_MIGRATIONS and MAX_SQL_LENGTH", async () => {
+    const mod = await import("../domain/index.js");
+    expect(Object.keys(mod).sort()).toEqual(
+      [
+        "checksumOfMigration",
+        "decideMigrationRun",
+        "MIGRATION_ID_PATTERN",
+        "MAX_MIGRATIONS",
+        "MAX_SQL_LENGTH",
+      ].sort(),
+    );
+  });
 });

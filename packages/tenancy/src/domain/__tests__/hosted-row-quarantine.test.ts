@@ -509,4 +509,37 @@ describe("describeQuarantine", () => {
   it("omitting isProxy still summarizes a plain result", () => {
     expect(describeQuarantine({ ok: true, rows: [1], quarantined: [] })).toBe("quarantine: 0 quarantined, 1 valid");
   });
+
+  it("performs O(1) work: at most 16 entry reads on a huge quarantined array", () => {
+    // A counting proxy stands in for a 10_000-entry quarantined array. With
+    // the required O(1) bound the summary is computed from the `length`
+    // descriptor plus at most `MAX_DESCRIBE_INDEXES = 16` entry reads; an
+    // implementation that scans every index (one descriptor read per entry)
+    // fires ~10_001 traps and fails this assertion.
+    let descriptorReads = 0;
+    const huge: unknown[] = Array.from({ length: 10_000 }, (_, i) => ({ index: i }));
+    const counted = new Proxy(huge, {
+      getOwnPropertyDescriptor(target, key) {
+        descriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = { ok: true, rows: [], quarantined: counted, quarantinedCount: 10_000 };
+    // The proxy is behind the caller's own result object, so the detector on
+    // `result` itself stays false; the entry detector is never used on the
+    // summary array by the caller (plain-text-only read path), so pass a
+    // never-true detector to reach the array through descriptors.
+    const summary = describeQuarantine(result, () => false);
+    expect(summary).toBe(
+      `quarantine: 10000 quarantined (indexes: ${[...Array(MAX_DESCRIBE_INDEXES).keys()].join(", ")} ... (+${
+        10000 - MAX_DESCRIBE_INDEXES
+      } more)), 0 valid`,
+    );
+    // Bounded: 1 `length` descriptor + up to 16 prefix checks in
+    // `readSummaryArray` + up to 16 entry reads in the summary loop = at
+    // most 33 descriptor reads regardless of the 10_000 entries. An
+    // O(length) implementation (one `Reflect.ownKeys` pass plus one
+    // descriptor read per entry) fires ~10_001 traps and fails this.
+    expect(descriptorReads).toBeLessThanOrEqual(2 * MAX_DESCRIBE_INDEXES + 1);
+  });
 });

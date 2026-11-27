@@ -375,7 +375,9 @@ export function describeQuarantine(result: unknown, isProxy?: IsProxy): string {
     }
 
     const indexes: string[] = [];
-    for (let i = 0; i < quarantined.length && indexes.length < MAX_DESCRIBE_INDEXES; i += 1) {
+    // O(1): read at most `MAX_DESCRIBE_INDEXES` entries — a hole inside the
+    // prefix is malformed, and a hostile sparse tail beyond it is never read.
+    for (let i = 0; i < quarantined.length && i < MAX_DESCRIBE_INDEXES; i += 1) {
       const entryDescriptor = Object.getOwnPropertyDescriptor(quarantined, String(i));
       if (entryDescriptor === undefined || entryDescriptor.get !== undefined || !("value" in entryDescriptor)) {
         return "quarantine: invalid result";
@@ -411,11 +413,13 @@ export function describeQuarantine(result: unknown, isProxy?: IsProxy): string {
  * Read a summary-side array through descriptors only: a genuine `Array` with
  * `Array.prototype`, not a Proxy per `detector`, with a plain data `length`
  * descriptor holding a non-negative safe integer, and every canonical index
- * `0..length-1` present as an own enumerable data property (no holes, no
- * sparse arrays, no accessors, no extra or `__proto__`/symbol keys).
+ * `0..min(length-1, MAX_DESCRIBE_INDEXES-1)` present as an own enumerable
+ * data property (no holes, no accessors) in the prefix the summary may ever
+ * read. Indices beyond that prefix are never touched, so a sparse or hostile
+ * tail cannot force unbounded descriptor reads.
  * Null on any mismatch.
- * Cost bound: O(length) — one `Reflect.ownKeys` pass plus one descriptor
- * read per canonical index, bounded by the summary array length.
+ * Cost bound: O(1) — fixed descriptor reads and at most
+ * `MAX_DESCRIBE_INDEXES = 16` entry reads per array, regardless of length.
  */
 function readSummaryArray(value: unknown, detector: IsProxy): readonly unknown[] | null {
   try {
@@ -438,11 +442,10 @@ function readSummaryArray(value: unknown, detector: IsProxy): readonly unknown[]
       return null;
     }
     const length = lengthDescriptor.value;
-    const ownKeys = Reflect.ownKeys(value as object);
-    if (ownKeys.length !== length + 1) {
-      return null;
-    }
-    for (let i = 0; i < length; i += 1) {
+    // O(1): only the first `MAX_DESCRIBE_INDEXES` entries are ever read —
+    // `describeQuarantine` never reads beyond them, so probing deeper would
+    // materialize unbounded synchronous work on hostile summary arrays.
+    for (let i = 0; i < length && i < MAX_DESCRIBE_INDEXES; i += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
       if (
         descriptor === undefined ||

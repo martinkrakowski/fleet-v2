@@ -497,7 +497,7 @@ describe('RecordSeatCallUseCase refusals', () => {
       (spanId: string) => ({ spanId }),
       (spanId: string) => entryFor(spanId, { state: 'pending' }),
       (spanId: string) => entryFor(spanId, { state: 'rejected', reason: 'invalid' }),
-      (spanId: string) => ({ spanId: 7, disposition: exportedDisposition() }) as unknown as Record<string, unknown> & { spanId: string },
+      () => ({ spanId: 7, disposition: exportedDisposition() }) as unknown as Record<string, unknown> & { spanId: string },
       (spanId: string) => entryFor(spanId, 'exported@collector'),
     ]) {
       const { result } = await runSent((spanId) => ({ dispositions: [entry(spanId)], errorKind: null }));

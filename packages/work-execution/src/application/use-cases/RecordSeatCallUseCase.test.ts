@@ -547,4 +547,28 @@ describe('RecordSeatCallUseCase refusals', () => {
     const valid = await runSent((spanId) => ({ dispositions: [entryFor(spanId, { state: 'exported', route: 'phoenix' })], errorKind: null }));
     expect(valid.result.outcome).toBe('exported');
   });
+
+  it('returns not-configured without running a getter when the instance deps property is replaced by an accessor', async () => {
+    let getterRuns = 0;
+    let sends = 0;
+    const telemetry = {
+      send: async (): Promise<unknown> => {
+        sends += 1;
+        return sentFor('example-span');
+      },
+    } as unknown as RunTelemetryPort;
+    const dependencies: RecordSeatCallDependencies = { hmac, mintCallId: () => 'example-call-id', telemetry };
+    const useCase = new RecordSeatCallUseCase(dependencies);
+    Object.defineProperty(useCase, 'deps', {
+      get() {
+        getterRuns += 1;
+        throw new Error('getter must not run');
+      },
+      configurable: true,
+    });
+    const result = await useCase.execute(validRequest());
+    expect(result).toEqual(REFUSED_NOT_CONFIGURED);
+    expect(getterRuns).toBe(0);
+    expect(sends).toBe(0);
+  });
 });

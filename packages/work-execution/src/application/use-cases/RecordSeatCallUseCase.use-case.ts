@@ -291,7 +291,7 @@ export class RecordSeatCallUseCase implements RecordSeatCallPort {
   }
 
   private async record(request: unknown): Promise<RecordSeatCallResult> {
-    const deps = resolveDependencies(this.deps);
+    const deps = resolveDependencies(dataPropertyOf(this, 'deps'));
     if (deps === null) {
       return refused('not-configured');
     }

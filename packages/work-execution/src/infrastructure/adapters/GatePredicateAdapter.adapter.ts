@@ -402,21 +402,27 @@ function missingGeneratedTypesResult(
 }
 
 /**
- * Package-runner tokens whose immediately following argv element is a package
- * script name (`yarn lint:arch`, `npm run lint:arch`, ...). A script name
- * anywhere else in an argv — an argument to `node ./scripts/check.js`, say —
- * does not make the command that script.
+ * Package-runner tokens that may be followed by a package script name
+ * (`yarn lint:arch`, `npm run lint:arch`, ...). A script name anywhere else in
+ * an argv — an argument to `node ./scripts/check.js`, say — does not make the
+ * command that script. The bare subcommand token `run` alone is not a runner:
+ * only a `run` directly after one of these tokens may introduce the script.
  */
-const PACKAGE_RUNNER_TOKENS = new Set(['yarn', 'npm', 'pnpm', 'bun', 'npx', 'turbo', 'corepack', 'run']);
+const PACKAGE_RUNNER_TOKENS = new Set(['yarn', 'npm', 'pnpm', 'bun', 'npx', 'turbo', 'corepack']);
 
-/** Whether one gate command's argv invokes the named package script at the script position (the last element, right after a package-runner token). */
+/** Whether one gate command's argv invokes the named package script at the script position (immediately after a package-runner token, optionally through `run`), with any trailing script arguments allowed. */
 function invokesScript(command: GateCommand, script: string): boolean {
   const argv = command.argv;
-  return (
-    argv.length >= 2 &&
-    argv[argv.length - 1] === script &&
-    PACKAGE_RUNNER_TOKENS.has(argv[argv.length - 2])
-  );
+  for (let i = 0; i < argv.length; i++) {
+    if (!PACKAGE_RUNNER_TOKENS.has(argv[i] as string)) {
+      continue;
+    }
+    const scriptIndex = argv[i + 1] === 'run' ? i + 2 : i + 1;
+    if (argv[scriptIndex] === script) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Whether one gate command's argv invokes `lint:arch` at the package-script position. */

@@ -1283,6 +1283,44 @@ describe('GatePredicateAdapter typed gate causes (TP5A1)', () => {
     expect(realResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', cause: 'lint-arch-timeout' });
   });
 
+  it('does not treat the bare run token as a package runner while still matching lint:arch with trailing arguments', async () => {
+    const timedOut = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+
+    // `node ./scripts/check.js run lint:arch` carries a bare `run` token, not a
+    // package runner: the typed timeout of that command is an ordinary unknown
+    // result, never the lint-arch-timeout cause.
+    const bareRunResults = evaluatedResults(
+      await timedOut.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'run', 'lint:arch']),
+      ),
+    );
+    expect(bareRunResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(bareRunResults[2]).not.toHaveProperty('cause');
+
+    // The same typed timeout on `yarn lint:arch --fix` — the script followed by
+    // trailing script arguments — DOES emit the cause, so the guard above is
+    // not a constant.
+    const trailingArgsResults = evaluatedResults(
+      await timedOut.adapter.evaluateGatePredicates(commandRequest(['yarn', 'lint:arch', '--fix'])),
+    );
+    expect(trailingArgsResults[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'fail',
+      cause: 'lint-arch-timeout',
+    });
+  });
+
   it('emits lint-arch-timeout only when the run never reported an exit code with an executor error', async () => {
     // A run claiming exitCode 0 alongside the typed timeout code violates the
     // port contract (an executor error never yields an exit code): it is never

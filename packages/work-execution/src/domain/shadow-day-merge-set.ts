@@ -13,7 +13,18 @@ import { compareShadowMergeSets } from './shadow-comparators.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { SHELL_DETAIL_CODES, SHELL_TRAIN_EVENT_KINDS } from './shell-train-events.js';
 import type { ShellTrainEvent } from './shell-train-events.js';
-import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord, snapshotPlainDataRecord } from './plain-record-reads.js';
+import {
+  SHADOW_CONFORMANCE_MAX_RUNS,
+  SHADOW_CONFORMANCE_MAX_SHELL_FACTS,
+  createShadowRunConformanceContext,
+  dedupeRunsByRunId,
+  evaluateRunS6WithContext,
+  readPullRequest,
+  readShadowConformanceRunDetailed,
+  readShadowHeadMove,
+} from './shadow-day-conformance.js';
+import type { ShadowConformanceRun, ShadowShellHeadMove, ShadowShellMerge } from './shadow-day-conformance.js';
 
 /**
  * How far past either midnight boundary a shell merge or fleet would-merge
@@ -834,4 +845,222 @@ function survivingDivergences(
     }
   }
   return surviving;
+}
+
+// SR3 cut-over support: how many of the day's conducted runs count toward
+// the certification streak. Reuses the S1 evaluation's own readers and set
+// logic verbatim plus the per-run S6 evaluator; no existing verdict changes.
+
+/** Every reason `countedRunsForDay` can refuse with. */
+export type CountedRunsRefusalReason =
+  | 'invalid-input'
+  | 'invalid-tier'
+  | 'unreadable-journal'
+  | 'missing-review-receipts'
+  | 'duplicate-run-conflict'
+  | 'pull-request-has-several-runs'
+  | 'unpaired-log'
+  | 'unmatched-record'
+  | 'tier2-batch-merge'
+  | 'shell-events-incomplete'
+  | 'live-action-in-shadow'
+  | 'fleet-head-unresolved'
+  | 'fleet-head-ambiguous'
+  | 'head-moves-incomplete';
+
+/** How many of the day's conducted runs count toward the streak, or a typed refusal. */
+export type CountedRunsForDayResult =
+  | { readonly ok: true; readonly countedRuns: number; readonly countedTier2: number }
+  | { readonly ok: false; readonly reason: CountedRunsRefusalReason };
+
+const COUNTED_RUNS_INPUT_KEYS: readonly string[] = ['day', 'repoDigest', 'shell', 'fleet', 'runs', 'headMoves', 'headMovesIncompleteFor'];
+
+/** True when the snapshot carried an own enumerable `constructor` or `prototype` key. Cost: constant. */
+function hasPollutingOwnKey(record: Record<string, unknown>): boolean {
+  return Object.hasOwn(record, 'constructor') || Object.hasOwn(record, 'prototype');
+}
+
+/** True when the snapshot's own keys are exactly `keys`, each once. Cost: O(K) in the snapshot's own key count. */
+function hasExactOwnKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Object.keys(record);
+  if (own.length !== keys.length) return false;
+  for (const key of own) {
+    if (!keys.includes(key)) return false;
+  }
+  return true;
+}
+
+/**
+ * Counts the day's conducted runs that would count toward the cut-over
+ * certification streak: every non-batch shell merge on day D whose fleet
+ * `would-merge` row matches and whose conducted run conforms on every S6
+ * rule, judged per run with NO aggregate floor. Tier 2 runs count both in
+ * `countedRuns` and `countedTier2`.
+ *
+ * The input is read through `snapshotPlainDataRecord` (which already refuses
+ * `__proto__`; `constructor` and `prototype` own keys are refused here), so
+ * no getter ever runs and a revoked or throwing Proxy becomes a typed
+ * refusal. Every list pays the accepted `readBoundedDenseArray` bound: an
+ * `O(1)` length/prototype pre-gate, the accepted engine-level `O(K)` bound of
+ * the single `Reflect.ownKeys` call, then `O(cap)` element traversal.
+ *
+ * Cost: `headMoves` is grouped once in O(M) (M <=
+ * `SHADOW_CONFORMANCE_MAX_SHELL_FACTS`), the shell and fleet sets are walked
+ * once each, and every run is evaluated against its one merge through the
+ * pre-grouped context, so the whole evaluation is O(M + R) in the capped
+ * head moves M and runs R — not O(M × R). Never throws, never echoes an
+ * input value.
+ */
+export function countedRunsForDay(input: unknown): CountedRunsForDayResult {
+  try {
+    return judgeCountedRunsForDay(input);
+  } catch {
+    // A revoked Proxy, or a reflection trap that throws, must become a typed refusal.
+    return { ok: false, reason: 'invalid-input' };
+  }
+}
+
+function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
+  const INVALID: CountedRunsForDayResult = { ok: false, reason: 'invalid-input' };
+  const snapshot = snapshotPlainDataRecord(input);
+  if (snapshot === null || hasPollutingOwnKey(snapshot) || !hasExactOwnKeys(snapshot, COUNTED_RUNS_INPUT_KEYS)) return INVALID;
+  const day = readUtcDay(snapshot.day);
+  const repoDigest = snapshot.repoDigest;
+  if (day === null || typeof repoDigest !== 'string' || !REPO_DIGEST_PATTERN.test(repoDigest)) return INVALID;
+  const shell = readExactPlainRecord(snapshot.shell, SHELL_INPUT_KEYS);
+  const fleet = readExactPlainRecord(snapshot.fleet, FLEET_INPUT_KEYS);
+  if (shell === null || fleet === null) return INVALID;
+  const events = boundedArray(shell.events, SHADOW_MERGE_SET_MAX_ITEMS);
+  const results = boundedArray(fleet.results, SHADOW_MERGE_SET_MAX_ITEMS);
+  const entries = boundedArray(fleet.entries, SHADOW_MERGE_SET_MAX_ITEMS);
+  const runsRaw = boundedArray(snapshot.runs, SHADOW_CONFORMANCE_MAX_RUNS);
+  const headMovesRaw = boundedArray(snapshot.headMoves, SHADOW_CONFORMANCE_MAX_SHELL_FACTS);
+  const incompleteRaw = boundedArray(snapshot.headMovesIncompleteFor, SHADOW_CONFORMANCE_MAX_SHELL_FACTS);
+  if (events === null || results === null || entries === null || runsRaw === null || headMovesRaw === null || incompleteRaw === null) {
+    return INVALID;
+  }
+  const shellEvents = collectShellEvents(events);
+  if (shellEvents === null) return INVALID;
+  const unknownLines = shell.unknownLines;
+  if (!isCount(unknownLines)) return INVALID;
+  // An incomplete shell record is never evidence either way.
+  if (unknownLines > 0) return { ok: false, reason: 'shell-events-incomplete' };
+  const fleetResults = collectFleetResults(results);
+  const fleetEntries = collectFleetEntries(entries);
+  if (fleetResults === null || fleetEntries === null) return INVALID;
+  const headMoves: ShadowShellHeadMove[] = [];
+  for (let index = 0; index < headMovesRaw.length; index += 1) {
+    const move = readShadowHeadMove(headMovesRaw[index]);
+    if (move === null) return INVALID;
+    headMoves.push(move);
+  }
+  const headMovesIncompleteFor: number[] = [];
+  for (let index = 0; index < incompleteRaw.length; index += 1) {
+    const pullRequest = readPullRequest(incompleteRaw[index]);
+    if (pullRequest === null) return INVALID;
+    headMovesIncompleteFor.push(pullRequest);
+  }
+  const runs: ShadowConformanceRun[] = [];
+  for (let index = 0; index < runsRaw.length; index += 1) {
+    const parsedRun = readShadowConformanceRunDetailed(runsRaw[index]);
+    if (!parsedRun.ok) return { ok: false, reason: parsedRun.reason };
+    runs.push(parsedRun.run);
+  }
+  const deduped = dedupeRunsByRunId(runs);
+  if (deduped.kind === 'unknown') return { ok: false, reason: deduped.reason };
+  const dedupedRuns = deduped.runs;
+
+  const dayStart = new Date(`${day}T00:00:00.000Z`).getTime();
+  const start = dayStart - SHADOW_DAY_BOUNDARY_GRACE_MS;
+  const end = dayStart + DAY_MS + SHADOW_DAY_BOUNDARY_GRACE_MS;
+
+  // A merged shell event without a head or without a pull request can never
+  // pair with a conducted run; refuse before the set walk runs.
+  for (const event of shellEvents) {
+    if (
+      event.kind === 'result' && event.outcome === 'merged' && inWindow(event.atIso, start, end)
+      && (event.headOid === null || event.pullRequest === null)
+    ) {
+      return { ok: false, reason: 'unpaired-log' };
+    }
+  }
+
+  const shellItems = shellSet(shellEvents, day, start, end, true);
+  if (hasLiveActionInShadow(fleetResults, repoDigest, day)) return { ok: false, reason: 'live-action-in-shadow' };
+  const fleetSet = resolveFleetSet(fleetResults, fleetEntries, repoDigest, day, start, end);
+  if ('refusal' in fleetSet) {
+    const reason = fleetSet.refusal.reason;
+    if (reason !== 'fleet-head-unresolved' && reason !== 'fleet-head-ambiguous') return INVALID;
+    return { ok: false, reason };
+  }
+  const fleetItems = fleetSet.items;
+
+  // Tier 2 is never batched: a batch-marked Tier 2 merge is a blocking refusal.
+  for (const run of dedupedRuns) {
+    if (run.tier === 2 && shellItems.excludedPullRequests.has(run.pullRequest)) {
+      return { ok: false, reason: 'tier2-batch-merge' };
+    }
+  }
+
+  // The same earliest-per-pair reduction the S1 comparator uses: a fleet
+  // would-merge counts for a shell merge only when its whole-second instant
+  // is at or before the merge's own instant.
+  const earliestFleetRows = new Map<string, FleetMergeItem>();
+  for (const item of fleetItems) {
+    const key = `${item.pullRequest}@${item.headOid}`;
+    const previous = earliestFleetRows.get(key);
+    if (previous === undefined || exactOrMillis(item.recordedAtIso) < exactOrMillis(previous.recordedAtIso)) {
+      earliestFleetRows.set(key, item);
+    }
+  }
+  for (const item of shellItems.items) {
+    if (!inDay(item.atIso, day)) continue;
+    const earliest = earliestFleetRows.get(`${item.pullRequest}@${item.headOid}`);
+    if (earliest === undefined || floorToSecond(exactOrMillis(earliest.recordedAtIso)) > exactOrMillis(item.atIso)) {
+      return { ok: false, reason: 'unmatched-record' };
+    }
+  }
+
+  // One conducted run per merged pull request on the day.
+  const runsByRunId = new Map<string, ShadowConformanceRun>();
+  const runIdsByPullRequest = new Map<number, Set<string>>();
+  for (const run of dedupedRuns) {
+    runsByRunId.set(run.runId, run);
+    let ids = runIdsByPullRequest.get(run.pullRequest);
+    if (ids === undefined) {
+      ids = new Set([run.runId]);
+      runIdsByPullRequest.set(run.pullRequest, ids);
+    } else {
+      ids.add(run.runId);
+    }
+  }
+  const matched: { readonly run: ShadowConformanceRun; readonly merge: ShadowShellMerge }[] = [];
+  for (const item of shellItems.items) {
+    if (!inDay(item.atIso, day)) continue;
+    const ids = runIdsByPullRequest.get(item.pullRequest);
+    if (ids === undefined) return { ok: false, reason: 'unpaired-log' };
+    if (ids.size > 1) return { ok: false, reason: 'pull-request-has-several-runs' };
+    const [only] = ids;
+    const run = runsByRunId.get(only);
+    if (run === undefined) return { ok: false, reason: 'unpaired-log' };
+    matched.push({ run, merge: item });
+  }
+
+  // The context groups `headMoves` exactly once; every run then evaluates
+  // against its one merge without rescanning the list.
+  const context = createShadowRunConformanceContext(day, headMoves, headMovesIncompleteFor);
+  if (context === null) return INVALID;
+  let countedRuns = 0;
+  let countedTier2 = 0;
+  for (const { run, merge } of matched) {
+    const verdict = evaluateRunS6WithContext(run, merge, context);
+    if (verdict.kind === 'unknown') {
+      return { ok: false, reason: verdict.reason === 'head-moves-incomplete' ? 'head-moves-incomplete' : 'invalid-input' };
+    }
+    if (verdict.kind === 'conforming') {
+      countedRuns += 1;
+      if (run.tier === 2) countedTier2 += 1;
+    }
+  }
+  return Object.freeze({ ok: true, countedRuns, countedTier2 });
 }

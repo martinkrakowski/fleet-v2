@@ -140,15 +140,16 @@ export function checksumOfMigration(sql: unknown, digest: (text: string) => stri
 /**
  * Whether the entry's own keys are exactly the schema's keys: any extra own
  * key (including a symbol or a prototype-polluting key such as `'__proto__'`,
- * `'constructor'` or `'prototype'`) is refused. `Reflect.ownKeys` is `O(k)`
- * with `k` bounded by the snapshot's `maxKeys` (3).
+ * `'constructor'` or `'prototype'`) is refused. `Object.keys` is `O(k)`
+ * with `k` bounded by the snapshot's `maxKeys` (3); the entry is snapshot plain data,
+ * which already refused symbol and non-enumerable keys.
  */
 function onlySchemaKeys(entry: Readonly<Record<string, unknown>>, schemaKeys: readonly string[]): boolean {
-  const ownKeys = Reflect.ownKeys(entry);
+  const ownKeys = Object.keys(entry);
   if (ownKeys.length !== schemaKeys.length) {
     return false;
   }
-  return ownKeys.every((key) => typeof key === 'string' && !POLLUTING_KEYS.has(key) && schemaKeys.includes(key));
+  return ownKeys.every((key) => !POLLUTING_KEYS.has(key) && schemaKeys.includes(key));
 }
 
 type SnapshotLimits = Parameters<typeof snapshotPlainData>[2];

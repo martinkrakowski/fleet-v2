@@ -8,6 +8,7 @@ import { z } from "zod";
 import type {
   ApiClientError,
   ApiClientResult,
+  ApiEnvelope,
   FleetApiClient,
 } from "./client.js";
 import {
@@ -447,6 +448,8 @@ export interface OwnerAnswerWaitOptions {
   waitMaxMs?: number;
   /** The sleep primitive (default a `setTimeout` promise). */
   sleep?: (ms: number) => Promise<void>;
+  /** The wall clock the budget is measured against (default `Date.now`). */
+  now?: () => number;
 }
 
 /** Build the registry. The tool/resource set never depends on runtime input. */
@@ -462,6 +465,7 @@ export function buildRegistry(
       new Promise<void>((resolve) => {
         setTimeout(resolve, ms);
       }));
+  const now = options?.now ?? (() => Date.now());
   // One limiter per registry, one registry per MCP process (plan §3.7, D13).
   const limiter = createToolRateLimiter();
   /**
@@ -817,8 +821,30 @@ export function buildRegistry(
           }
           waitInFlight = true;
           try {
-            let elapsedMs = 0;
+            /**
+             * The wait budget is wall-clock time in this loop, not a count of
+             * configured sleeps: each poll's own duration counts against it,
+             * and it is re-checked before every poll after the first, so no
+             * GET starts once the budget is spent — a poll that began over
+             * budget could still return an answer where `still-open` was owed.
+             */
+            const startMs = now();
+            let last: ApiEnvelope | undefined;
             for (;;) {
+              if (
+                last !== undefined &&
+                now() - startMs >= waitMaxMs
+              ) {
+                return toToolResult({
+                  operationId: last.operationId,
+                  code: last.code,
+                  result: {
+                    outcome: "still-open",
+                    questionId: input.questionId,
+                    question: projectQuestionResult(last.result).question,
+                  },
+                });
+              }
               const result = await client.get(
                 `/v1/questions/${encodeURIComponent(input.questionId)}`,
               );
@@ -837,19 +863,8 @@ export function buildRegistry(
                   result: projected,
                 });
               }
-              if (elapsedMs >= waitMaxMs) {
-                return toToolResult({
-                  operationId: result.operationId,
-                  code: result.code,
-                  result: {
-                    outcome: "still-open",
-                    questionId: input.questionId,
-                    question: projected.question,
-                  },
-                });
-              }
+              last = result;
               await sleep(waitPollIntervalMs);
-              elapsedMs += waitPollIntervalMs;
             }
           } finally {
             waitInFlight = false;

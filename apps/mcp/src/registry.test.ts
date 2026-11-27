@@ -593,11 +593,21 @@ describe("fleet_context_propose tool", () => {
 });
 
 describe("fleet_owner_answer_wait tool", () => {
-  const WAIT_OPTIONS = {
-    waitPollIntervalMs: 10,
-    waitMaxMs: 25,
-    sleep: async () => undefined,
-  };
+  /**
+   * A fake clock advanced only by `sleep`: `now` starts at 0 for each test,
+   * so the wait budget is deterministic without real delays.
+   */
+  function waitOptions() {
+    let clock = 0;
+    return {
+      waitPollIntervalMs: 10,
+      waitMaxMs: 25,
+      sleep: async () => {
+        clock += 10;
+      },
+      now: () => clock,
+    };
+  }
 
   function queueClient(
     responses: ApiClientResult[],
@@ -628,7 +638,7 @@ describe("fleet_owner_answer_wait tool", () => {
 
   it("declares kind read, scope read and the read annotations", () => {
     const tool = toolNamed(
-      buildRegistry(fakeClient({}), WAIT_OPTIONS),
+      buildRegistry(fakeClient({}), waitOptions()),
       "fleet_owner_answer_wait",
     );
     expect(tool.kind).toBe("read");
@@ -638,7 +648,7 @@ describe("fleet_owner_answer_wait tool", () => {
 
   it("refuses an extra key without calling the client", async () => {
     const client = queueClient([]);
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const registry = buildRegistry(client, waitOptions());
     const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
       questionId: "q-1",
       path: "/v1/relays",
@@ -662,7 +672,7 @@ describe("fleet_owner_answer_wait tool", () => {
         },
       },
     ]);
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const registry = buildRegistry(client, waitOptions());
     const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
       questionId: "q-1",
     });
@@ -678,7 +688,7 @@ describe("fleet_owner_answer_wait tool", () => {
     const client = queueClient([
       { operationId: "op-wait", code: "OK", result: { outcome: "not-found" } },
     ]);
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const registry = buildRegistry(client, waitOptions());
     const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
       questionId: "q-missing",
     });
@@ -699,7 +709,7 @@ describe("fleet_owner_answer_wait tool", () => {
       },
       { operationId: "op-2", code: "OK", result: { outcome: "found" } },
     ]);
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const registry = buildRegistry(client, waitOptions());
     const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
       questionId: "q-1",
     });
@@ -720,12 +730,12 @@ describe("fleet_owner_answer_wait tool", () => {
         question: { questionId: "q-1", state: "open" },
       },
     };
-    const client = queueClient([openResponse, openResponse, openResponse, openResponse]);
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const client = queueClient([openResponse, openResponse, openResponse]);
+    const registry = buildRegistry(client, waitOptions());
     const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
       questionId: "q-1",
     });
-    expect(client.gets).toHaveLength(4);
+    expect(client.gets).toHaveLength(3);
     expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
       operationId: "op-wait",
       code: "OK",
@@ -757,6 +767,50 @@ describe("fleet_owner_answer_wait tool", () => {
     });
   });
 
+  it("charges slow polls against the budget and never polls once it is spent", async () => {
+    const openResponse: ApiClientResult = {
+      operationId: "op-wait",
+      code: "OK",
+      result: {
+        outcome: "found",
+        question: { questionId: "q-1", state: "open" },
+      },
+    };
+    const answeredResponse: ApiClientResult = {
+      operationId: "op-wait",
+      code: "OK",
+      result: {
+        outcome: "found",
+        question: { questionId: "q-1", state: "answered" },
+      },
+    };
+    const client = queueClient([openResponse, answeredResponse]);
+    let clock = 0;
+    const slowGet = {
+      ...client,
+      get: async (path: string) => {
+        clock += 60;
+        return client.get(path);
+      },
+    };
+    const registry = buildRegistry(slowGet, {
+      waitPollIntervalMs: 15,
+      waitMaxMs: 50,
+      sleep: async () => undefined,
+      now: () => clock,
+    });
+    const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
+      questionId: "q-1",
+    });
+    // The first poll alone spends the budget: no second poll starts, so the
+    // queued answered response is never fetched and `still-open` is returned.
+    expect(client.gets).toHaveLength(1);
+    const parsed = JSON.parse(result.content[0]?.text ?? "");
+    expect(parsed.operationId).toBe("op-wait");
+    expect(parsed.result.outcome).toBe("still-open");
+    expect(parsed.result.question.state).toBe("open");
+  });
+
   it("allows one wait at a time and releases the slot afterwards", async () => {
     let release: ((result: ApiClientResult) => void) | undefined;
     let immediate: ApiClientResult | undefined;
@@ -779,7 +833,7 @@ describe("fleet_owner_answer_wait tool", () => {
         message: "the wait tool never posts",
       }),
     };
-    const registry = buildRegistry(client, WAIT_OPTIONS);
+    const registry = buildRegistry(client, waitOptions());
     const handler = toolNamed(registry, "fleet_owner_answer_wait").handler;
     const first = handler({ questionId: "q-1" });
     await new Promise<void>((resolve) => {

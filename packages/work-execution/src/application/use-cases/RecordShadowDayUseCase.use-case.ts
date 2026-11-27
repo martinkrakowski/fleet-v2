@@ -23,7 +23,7 @@ import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../doma
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { isMergeQueueEntryLive, type MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
 import { head12Of, parseLaneRunKey } from '../../domain/lane-run-keys.js';
-import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation } from '../../domain/shadow-day-merge-set.js';
+import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation, type ShadowDivergenceDetails } from '../../domain/shadow-day-merge-set.js';
 import {
   evaluateShadowGateAgreement,
   type ShadowGateAgreementEvaluation,
@@ -674,6 +674,18 @@ interface BuiltVerdicts {
   readonly premergeCarry?: {
     readonly unresolvedCount: number;
     readonly unresolvedIds: readonly string[];
+  };
+  /**
+   * Present only when at least one evaluated criterion (S1, S4' or S6')
+   * diverged: their non-digested divergence diagnostics, carried onto
+   * `RecordShadowDayResult` for CLI observability. Omitted entirely (never
+   * an empty object) when no evaluated criterion diverged, and never part of
+   * any verdict digest.
+   */
+  readonly divergenceDiagnostics?: {
+    readonly S1?: ShadowDivergenceDetails;
+    readonly S4?: ShadowDivergenceDetails;
+    readonly S6?: ShadowDivergenceDetails;
   };
 }
 
@@ -2761,6 +2773,10 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     const unevaluated = new Map<CutoverShadowCriterion, string>();
     let mergesCompared: number | null = null;
     let premergeCarry: BuiltVerdicts['premergeCarry'] = undefined;
+    let divergenceDiagnostics: NonNullable<BuiltVerdicts['divergenceDiagnostics']> | undefined;
+    const recordDivergenceDiagnostics = (criterion: 'S1' | 'S4' | 'S6', details: ShadowDivergenceDetails): void => {
+      divergenceDiagnostics = { ...divergenceDiagnostics, [criterion]: details };
+    };
     const recordedAtIso = this.deps.nowIso();
     for (const outcome of outcomes) {
       if (outcome.kind === 'unevaluated') {
@@ -2789,8 +2805,26 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
           unresolvedIds: outcome.premergeCarry.unresolvedIds,
         };
       }
+      // S1/S4'/S6' divergence diagnostics ride along the same way: non-digested,
+      // present only for an evaluated criterion that actually diverged, so the
+      // CLI can print what diverged without any of it entering a digest.
+      if (outcome.mergeSet?.divergenceDetails !== undefined) {
+        recordDivergenceDiagnostics('S1', outcome.mergeSet.divergenceDetails);
+      }
+      if (outcome.gateAgreement?.evaluation.divergenceDetails !== undefined) {
+        recordDivergenceDiagnostics('S4', outcome.gateAgreement.evaluation.divergenceDetails);
+      }
+      if (outcome.conformance?.divergenceDetails !== undefined) {
+        recordDivergenceDiagnostics('S6', outcome.conformance.divergenceDetails);
+      }
     }
-    return { verdicts, unevaluated, mergesCompared, ...(premergeCarry === undefined ? {} : { premergeCarry }) };
+    return {
+      verdicts,
+      unevaluated,
+      mergesCompared,
+      ...(premergeCarry === undefined ? {} : { premergeCarry }),
+      ...(divergenceDiagnostics === undefined ? {} : { divergenceDiagnostics }),
+    };
   }
 
   /** The use-case answer for a `recordShadowVerdicts` refusal code. */
@@ -2853,6 +2887,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       recorded,
       unevaluated,
       ...(built.premergeCarry === undefined ? {} : { premergeCarry: built.premergeCarry }),
+      ...(built.divergenceDiagnostics === undefined ? {} : { divergenceDiagnostics: built.divergenceDiagnostics }),
     };
   }
 

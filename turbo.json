@@ -21,7 +21,8 @@
       "persistent": true
     },
     "lint": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "env": ["FLEET_WEB_FORBIDDEN_NAMES"]
     },
     "typecheck": {
       "dependsOn": ["^build"],
@@ -30,7 +31,7 @@
     },
     "test": {
       "dependsOn": ["^build"],
-      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL", "FLEET_E2E_SSH", "FLEET_RECORD_FIXTURES", "OCM_WAIT_CONFIRM"],
+      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL", "FLEET_E2E_SSH", "FLEET_RECORD_FIXTURES", "OCM_WAIT_CONFIRM", "FLEET_WEB_FORBIDDEN_NAMES"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/bin/ocm-run",

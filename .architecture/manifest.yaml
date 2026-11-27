@@ -20,7 +20,7 @@ workspace:
     the existing Waves service supplies observation and decisions.
 planes:
   core: [work-execution, evidence-and-acceptance]
-  supporting: [brief-knowledge, operator-coordination, merge-coordination, tenancy, billing]
+  supporting: [brief-knowledge, operator-coordination, merge-coordination, tenancy, billing, cloud-runtime]
 
 monorepo:
   packageManager: yarn@4.12.0
@@ -1212,6 +1212,27 @@ bounded_contexts:
       Owns usage metering records and plan structure records for optional
       organisation-aware deployments. Scaffold only; no runtime behaviour and
       no core package imports it.
+    depends_on: []
+    layers:
+      domain:
+        entities: []
+        value_objects: []
+      application:
+        use_cases: []
+        ports:
+          in: []
+          out: []
+      infrastructure:
+        adapters: []
+
+  - name: cloud-runtime
+    type: supporting
+    plane: supporting
+    status: active
+    description: >-
+      Holds optional hosted infrastructure adapters implementing ports owned by
+      other contexts. This scaffold station holds empty layers until adapters
+      are added in later stations.
     depends_on: []
     layers:
       domain:

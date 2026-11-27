@@ -1049,11 +1049,11 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     }
   }
   const matched: { readonly run: ShadowConformanceRun; readonly merge: ShadowShellMerge }[] = [];
-  // A conducted run counts at most once: if several same-day shell merges
-  // name the same pull request (and therefore the same single run), only the
-  // first pairing is evaluated, so one conforming run can never be counted
-  // twice and inflate the certification streak total.
-  const matchedRunIds = new Set<string>();
+  // Every same-day shell merge pairs with the day's single conducted run for
+  // its pull request, and every pair is evaluated below: a later merge can
+  // still yield an unknown verdict (for example an unlinked head with
+  // incomplete head-move data), which must refuse the day rather than be
+  // silently skipped by an earlier conforming pairing.
   for (const item of shellItems.items) {
     if (!inDay(item.atIso, day)) continue;
     const ids = runIdsByPullRequest.get(item.pullRequest);
@@ -1062,8 +1062,6 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     const [only] = ids;
     const run = runsByRunId.get(only);
     if (run === undefined) return { ok: false, reason: 'unpaired-log' };
-    if (matchedRunIds.has(run.runId)) continue;
-    matchedRunIds.add(run.runId);
     matched.push({ run, merge: item });
   }
 
@@ -1073,12 +1071,18 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
   if (context === null) return INVALID;
   let countedRuns = 0;
   let countedTier2 = 0;
+  // A conducted run counts at most once: several same-day merges may pair
+  // with the same single run, but only the first conforming verdict for that
+  // run increments the totals; every pairing is still evaluated so an
+  // unknown verdict on any pairing refuses the day.
+  const countedRunIds = new Set<string>();
   for (const { run, merge } of matched) {
     const verdict = evaluateRunS6WithContext(run, merge, context);
     if (verdict.kind === 'unknown') {
       return { ok: false, reason: verdict.reason === 'head-moves-incomplete' ? 'head-moves-incomplete' : 'invalid-input' };
     }
-    if (verdict.kind === 'conforming') {
+    if (verdict.kind === 'conforming' && !countedRunIds.has(run.runId)) {
+      countedRunIds.add(run.runId);
       countedRuns += 1;
       if (run.tier === 2) countedTier2 += 1;
     }

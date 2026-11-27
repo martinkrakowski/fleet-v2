@@ -799,6 +799,23 @@ describe('countedRunsForDay (cut-over certification streak)', () => {
     expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
   });
 
+  it('a later merge for the same PR that would judge unknown refuses the day instead of being skipped', () => {
+    // The first merge conforms, but the second same-day merge moves to a head
+    // with no linking head move while the pull request is listed in
+    // `headMovesIncompleteFor`; every (run, merge) pairing must be evaluated,
+    // so the later unknown verdict refuses the day rather than the earlier
+    // conforming pairing counting the run.
+    const pair = streakPair(1, 1, 1, 10);
+    const laterMerge = shellEvent({ line: 3, atIso: inDayIso(15 * 60), pullRequest: pair.pullRequest, headOid: streakHead(7) });
+    const laterFleetRow = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(7).slice(0, 12)), recordedAtIso: inDayIso(14 * 60, 50) });
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, laterMerge], unknownLines: 0 },
+      fleet: { results: [pair.fleetResult, laterFleetRow], entries: [pair.fleetEntry, fleetEntry({ pullRequest: pair.pullRequest, headOid: streakHead(7) })] },
+      headMovesIncompleteFor: [pair.pullRequest],
+    });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('head-moves-incomplete'));
+  });
+
   it('a nonconforming S6 run (no gate result) is not counted', () => {
     const broken = streakPair(1, 1, 1, 10, { journal: [] });
     expect(countedRunsForDay(countedInputFor([broken]))).toEqual({ ok: true, countedRuns: 0, countedTier2: 0 });

@@ -31,7 +31,12 @@ import {
   underlyingModelFamily,
   type ReviewReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
-import { decideConductorReviewOutcome, snapshotPlainDataRecord } from '@fleet/work-execution';
+import {
+  MAX_RUN_ATTEMPT_IDS,
+  decideConductorReviewOutcome,
+  readBoundedDenseArray,
+  snapshotPlainDataRecord,
+} from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
 import { CONDUCTOR_HELP, type ConductorCliOptions } from './conductor.js';
@@ -204,11 +209,14 @@ export async function premergeAttestCommand(
   if (fieldOf(run, 'tier') !== 2) {
     return refuseRecord(io, { outcome: 'refused', reason: 'not-tier-2', runId });
   }
-  const attemptIds = fieldOf(run, 'attemptIds');
-  if (!Array.isArray(attemptIds) || attemptIds.length === 0) {
-    return refuseRecord(io, invalidRecord);
-  }
-  const attemptIdValue = attemptIds[attemptIds.length - 1];
+  // The attempt list is read through `readBoundedDenseArray`, never indexed
+  // directly: an accessor at the last index, a throwing Proxy, an array
+  // hole, a foreign own key or an enormous length is refused as an
+  // `invalid-record` in O(1) (the length/prototype pre-gate) without ever
+  // invoking a getter, and the last element is read from the fresh dense
+  // copy the helper returns.
+  const attemptIds = readBoundedDenseArray(fieldOf(run, 'attemptIds'), MAX_RUN_ATTEMPT_IDS);
+  const attemptIdValue = attemptIds === null || attemptIds.length === 0 ? undefined : attemptIds.array[attemptIds.length - 1];
   if (typeof attemptIdValue !== 'string' || attemptIdValue.trim() === '') {
     return refuseRecord(io, invalidRecord);
   }

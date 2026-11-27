@@ -410,19 +410,23 @@ function missingGeneratedTypesResult(
  */
 const PACKAGE_RUNNER_TOKENS = new Set(['yarn', 'npm', 'pnpm', 'bun', 'npx', 'turbo', 'corepack']);
 
-/** Whether one gate command's argv invokes the named package script at the script position (immediately after a package-runner token, optionally through `run`), with any trailing script arguments allowed. */
+/**
+ * Whether one gate command's argv invokes the named package script at the script position. The runner token is
+ * argv[0] only (or argv[1] when argv[0] is `corepack` fronting another runner), never a later element, so an
+ * argument of another command (`node ./scripts/check.js yarn lint:arch`) is not the script. The script follows
+ * the runner directly, optionally through `run`, with any trailing script arguments allowed.
+ */
 function invokesScript(command: GateCommand, script: string): boolean {
   const argv = command.argv;
-  for (let i = 0; i < argv.length; i++) {
-    if (!PACKAGE_RUNNER_TOKENS.has(argv[i] as string)) {
-      continue;
-    }
-    const scriptIndex = argv[i + 1] === 'run' ? i + 2 : i + 1;
-    if (argv[scriptIndex] === script) {
-      return true;
-    }
+  let runnerIndex = 0;
+  if (argv[0] === 'corepack' && PACKAGE_RUNNER_TOKENS.has(argv[1] as string)) {
+    runnerIndex = 1;
   }
-  return false;
+  if (!PACKAGE_RUNNER_TOKENS.has(argv[runnerIndex] as string)) {
+    return false;
+  }
+  const scriptIndex = argv[runnerIndex + 1] === 'run' ? runnerIndex + 2 : runnerIndex + 1;
+  return argv[scriptIndex] === script;
 }
 
 /** Whether one gate command's argv invokes `lint:arch` at the package-script position. */

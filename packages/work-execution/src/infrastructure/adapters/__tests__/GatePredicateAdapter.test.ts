@@ -1278,9 +1278,30 @@ describe('GatePredicateAdapter typed gate causes (TP5A1)', () => {
         : happyGit(argv),
     );
     const realResults = evaluatedResults(
-      await real.adapter.evaluateGatePredicates(commandRequest(['node', './scripts/check.js', 'yarn', 'lint:arch'])),
+      await real.adapter.evaluateGatePredicates(commandRequest(['yarn', 'run', 'lint:arch'])),
     );
     expect(realResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', cause: 'lint-arch-timeout' });
+
+    // A runner token that is merely a later argv element (an argument of another command) is not the runner.
+    const laterRunner = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const laterResults = evaluatedResults(
+      await laterRunner.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'yarn', 'lint:arch']),
+      ),
+    );
+    expect(laterResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(laterResults[2]).not.toHaveProperty('cause');
   });
 
   it('does not treat the bare run token as a package runner while still matching lint:arch with trailing arguments', async () => {

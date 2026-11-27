@@ -150,7 +150,7 @@ function walk(dir, out) {
   }
 }
 
-const compareText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const compareText = (a, b) => a.localeCompare(b, "en", { sensitivity: "variant", numeric: false });
 
 // A counted file is non-test, non-declaration TypeScript under a domain or application directory.
 export function isCountedFile(file, relParts) {

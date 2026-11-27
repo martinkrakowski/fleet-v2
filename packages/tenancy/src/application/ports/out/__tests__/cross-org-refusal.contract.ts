@@ -414,8 +414,10 @@ function isRefusalMarker(value: unknown): boolean {
   if (Object.hasOwn(record, "ok") && record.ok === false) {
     return true;
   }
-  if (Object.hasOwn(record, "status") && record.status === "refused") {
-    return true;
+  if (Object.hasOwn(record, "status")) {
+    // The contract requires the exact status/reason pair: a refusal whose
+    // reason is anything other than `not-found` is not a recognized marker.
+    return record.status === "refused" && record.reason === "not-found";
   }
   if (Object.hasOwn(record, "outcome") && record.outcome === "refused") {
     return true;
@@ -423,16 +425,32 @@ function isRefusalMarker(value: unknown): boolean {
   return false;
 }
 
-/** Whether a non-null `record`/`changedMember` payload is attached. */
-function carriesRecordPayload(value: unknown): boolean {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+/**
+ * Whether a non-null `record`/`changedMember` payload is attached — including
+ * a payload nested under a refusal marker (e.g.
+ * `{ status: 'refused', result: { record: {...} } }`). The walk is bounded by
+ * the same fixed depth as `leaksSeedId`, so cost stays O(1).
+ */
+function carriesRecordPayload(value: unknown, depth: number = 0): boolean {
+  if (value === null || typeof value !== "object" || depth > 4) {
     return false;
   }
+  if (Array.isArray(value)) {
+    return value.some((entry) => carriesRecordPayload(entry, depth + 1));
+  }
   const record = value as Record<string, unknown>;
-  return (
+  if (
     (Object.hasOwn(record, "record") && record.record !== null) ||
     (Object.hasOwn(record, "changedMember") && record.changedMember !== null)
-  );
+  ) {
+    return true;
+  }
+  for (const key of Object.keys(record)) {
+    if (carriesRecordPayload(record[key], depth + 1)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The outcome of one contract operation, before the result checks. */
@@ -615,27 +633,29 @@ export async function runCrossOrgRefusalContract(
     return { ok: false, reason: "missing-port-method", missingMethod: "delete" };
   }
 
-  if (!takeOperation()) {
-    return { ok: false, reason: "exhausted-budget" };
-  }
-  const seeded = await runOperation(
-    () => seedRecord(ORG_SEEDED, SEED_ID),
-    isProxy,
-    waitTimeout,
-    timeoutMs,
-  );
-  if (seeded.kind === "hostile") {
-    return { ok: false, reason: "hostile-input" };
-  }
-  if (seeded.kind === "timeout") {
-    return { ok: false, reason: "timeout" };
-  }
-  if (seeded.kind === "threw") {
-    return { ok: false, reason: "invalid-factory" };
-  }
-
   const violations: Violation[] = [];
   try {
+    // Seeding runs inside the `try` so a seed that creates the record and
+    // then stalls or rejects still reaches the `finally` cleanup below.
+    if (!takeOperation()) {
+      return { ok: false, reason: "exhausted-budget" };
+    }
+    const seeded = await runOperation(
+      () => seedRecord(ORG_SEEDED, SEED_ID),
+      isProxy,
+      waitTimeout,
+      timeoutMs,
+    );
+    if (seeded.kind === "hostile") {
+      return { ok: false, reason: "hostile-input" };
+    }
+    if (seeded.kind === "timeout") {
+      return { ok: false, reason: "timeout" };
+    }
+    if (seeded.kind === "threw") {
+      return { ok: false, reason: "invalid-factory" };
+    }
+
     // `get`: known absence is safe; a refusal marker is safe only when it
     // carries no seeded record payload and no leak.
     if (!takeOperation()) {
@@ -730,7 +750,10 @@ export async function runCrossOrgRefusalContract(
   } finally {
     if (hasCleanup && cleanupFn !== undefined) {
       try {
-        await resolveSafely(cleanupFn(ORG_SEEDED, SEED_ID), isProxy);
+        // The cleanup return value is resolved through the same bounded
+        // path as every other return value, so a never-settling cleanup
+        // hits the injected timeout instead of hanging the contract.
+        await resolveSafely(cleanupFn(ORG_SEEDED, SEED_ID), isProxy, waitTimeout, timeoutMs);
       } catch {
         // A cleanup error never masks the primary failure.
       }

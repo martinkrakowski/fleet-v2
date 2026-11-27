@@ -221,9 +221,9 @@ Fleet-v2 runs beside the shell train and compares results.
   - A daily `merge import` dry-run and `cutover shadow report`.
   - The fleet-v2 timer, offset 30 s from the shell tick.
 - **Single writer:** the shell train alone writes to the forge. Fleet-v2 writes only its journal, status and events, and journals one-way actions as `dry-run would-*` (MAP §11 and DT §4.3). The orchestrator enqueues through `merge enqueue` as well as `pr.sh`.
-- **Minimum duration:** 1 calendar day (owner decision 2026-11-17, amending DT §4.3(1)) and at least 20 merged PRs, whichever is later. At least 2 are Tier 2 and 1 is a chain. The 20-PR floor and the items marked *(proposed)* below are mine; the rest come from DT §4.3 and CON D4.
+- **Minimum duration:** a certification streak of 1 to 7 consecutive clean UTC days with the same non-null `releaseSha` on every day, the newest day at most 1 day old, and at least 20 counted runs in total with at least 4 Tier 2 (owner decision 2026-11-27, amending DT §4.3(1) and replacing the 2026-11-17 one-all-pass-day rule once the streak release is installed; see *Certification streak* below). The items marked *(proposed)* below are mine; the rest come from DT §4.3 and CON D4.
 
-**Pass criteria** (all must hold, on 1 all-pass day — owner decision 2026-11-17):
+**Pass criteria** (evaluated per UTC day across the certification streak; S4 and S6 volume floors apply on the newest day only — owner decision 2026-11-27):
 
 | # | Criterion | Source |
 |---|---|---|
@@ -239,6 +239,15 @@ Fleet-v2 runs beside the shell train and compares results.
 | S10 | Three kill-9 tests mid-pass: lease takeover, no duplicate action | DT §4.3(2) |
 | S11 | The brief parser and lint verdicts match the shell split and lint on a golden corpus of at least 5 briefs including exit-3 cases | proposed |
 | S12 | Ticks finish within the 45 s budget on at least 99% of ticks. No job `starved` | DT §3.1 |
+
+#### Certification streak (owner decision 2026-11-27)
+
+- **Span:** 1 to 7 consecutive clean UTC days, computed per `repoDigest`, with the same non-null `releaseSha` on every day, the newest day at most 1 day old, at least 20 counted runs in total, and at least 4 of them Tier 2.
+- **Counted run:** a conducted, non-batch shell merge on that day that is S1-matched and S6-conforming over its whole journal. Batches neither count nor break; Tier 2 is never batched.
+- **Clean day:** S2, S3, S5 and S7–S12 pass and `breaks = 0`, where `breaks` = S1 divergences + S6 nonconforming runs on the day + S4 false passes on the day + hand-lands (any first-parent commit on `main` that has no shell "result merged" event).
+- **Newest-day floors:** S4 (at least 30 agreeing heads) and S6 (5 runs: 3 Tier 1 and 2 Tier 2) floors apply only on the newest day of the span.
+- **Resets and rollback:** the streak resets on a non-clean day, a missing day record, or a release change. Days at or before `rolledBackAtIso` never join a span.
+- **Transition:** the legacy one-all-pass-day rule retires when the streak release is installed.
 
 Jev stays in shadow. D-JV3 (live) is a separate owner decision on the 20-merge record. The shell's `events.jsonl` Jev log is archived, not discarded.
 
@@ -340,7 +349,7 @@ Goal: stop every running lane and relaunch it on fleet-v2's rails without losing
 | D-CO6 | Local merges in `merge-main.sh`, `lane-rebase.sh`, `push-fix.sh` and `land-mc.sh` are retired under D22/D24 | Confirm | Decided 2026-11-03: as recommended |
 | D-CO7 | Keep chains (CO7–CO11) or retire them in favour of MC batches and KS5 | Keep until MC batching is proven | Decided 2026-11-03: as recommended |
 | D-CO8 | Switch scope | Staged: switch gate then retirement gate | Decided 2026-11-03: as recommended |
-| D-CO9 | Shadow length and rollback window | 1 all-pass day and 20 merges (amended 2026-11-17); 14 days | Decided 2026-11-03: as recommended; amended 2026-11-17 to 1 all-pass day |
+| D-CO9 | Shadow length and rollback window | 1–7 consecutive clean UTC days (same non-null `releaseSha`, newest ≤ 1 day old), ≥ 20 counted runs (≥ 4 Tier 2), S4/S6 floors on newest day (amended 2026-11-27); 14 days | Decided 2026-11-03 as recommended; amended 2026-11-17 to 1 all-pass day; amended 2026-11-27 to a certification streak, owner: accepted |
 | D-CO10 | Relaunch conducted runs by driver swap, not stop | Yes | Decided 2026-11-03: as recommended |
 
 ### Hard to undo

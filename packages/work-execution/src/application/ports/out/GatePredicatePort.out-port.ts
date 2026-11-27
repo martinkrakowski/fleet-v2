@@ -23,18 +23,27 @@ import type { AcceptanceSpecProps } from '../../../domain/value-objects/Acceptan
 export type GatePredicateKind = 'commit' | 'diff-check' | 'command';
 export type GatePredicateVerdict = 'pass' | 'fail' | 'unknown' | 'skipped';
 /**
- * Why a command verdict is `unknown` without being the command's own result:
- * `gate-slot-wait-limit` is host congestion (exit 75 with the fixed gate-slot
- * stderr line); `resource-exhausted` is the OS or cgroup killing the command
- * (exit 137 SIGKILL or 143 SIGTERM); `environment-not-installed` is the
- * worktree's dependencies being missing (no `node_modules/.yarn-state.yml`
- * and a failed or ineffective `yarn install --immutable`), or a command whose
- * output names a missing module while the state file is absent.
+ * Why a command verdict is `unknown` without being the command's own result,
+ * or why a `fail` is a typed host-side classification rather than the
+ * command's own verdict: `gate-slot-wait-limit` is host congestion (exit 75
+ * with the fixed gate-slot stderr line); `resource-exhausted` is the OS or
+ * cgroup killing the command (exit 137 SIGKILL or 143 SIGTERM);
+ * `environment-not-installed` is the worktree's dependencies being missing
+ * (no `node_modules/.yarn-state.yml` and a failed or ineffective `yarn
+ * install --immutable`), or a command whose output names a missing module
+ * while the state file is absent. `missing-generated-types` is a failing
+ * `typecheck` whose worktree host probe confirms the generated Next.js
+ * types (`apps/web/.next/types`) are absent — a generated-artifact gap, not
+ * a source error. `lint-arch-timeout` is a `lint:arch` command whose
+ * executor reports the typed `errorCode: 'timeout'` — the architecture
+ * budget, not a finding.
  */
 export type GatePredicateCause =
   | 'gate-slot-wait-limit'
   | 'resource-exhausted'
-  | 'environment-not-installed';
+  | 'environment-not-installed'
+  | 'missing-generated-types'
+  | 'lint-arch-timeout';
 
 export interface GatePredicateResult {
   /** 'commit', 'diff-check', or 'command <n>: <argv joined by spaces, cut to 120 characters>'. */
@@ -47,14 +56,17 @@ export interface GatePredicateResult {
   /** One short line; never command output. */
   readonly detail: string;
   /**
-   * Set only when an `unknown` command verdict is not the command's own
-   * result (KF-30c): `gate-slot-wait-limit` is host congestion (exit 75 with
+   * Set only when a command verdict is not the command's own unclassified
+   * result (KF-30c and TP5A1): `gate-slot-wait-limit` is host congestion (exit 75 with
    * the fixed gate-slot stderr line); `resource-exhausted` is the command
    * terminated by the OS or cgroup with exit 137 (SIGKILL) or 143 (SIGTERM);
    * `environment-not-installed` is the worktree's dependencies missing (no
    * `node_modules/.yarn-state.yml` after one bounded `yarn install
    * --immutable`, or a missing-module failure while the state file is
-   * absent). Any other result omits it.
+   * absent); `missing-generated-types` is a failing `typecheck` whose host
+   * probe confirms `apps/web/.next/types` is absent (verdict `fail`);
+   * `lint-arch-timeout` is a `lint:arch` command the executor classified as
+   * `errorCode: 'timeout'` (verdict `fail`). Any other result omits it.
    */
   readonly cause?: GatePredicateCause;
   /** Commands with a coverage declaration that ran. */

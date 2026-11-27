@@ -720,15 +720,14 @@ function excluded(
 }
 
 /**
- * The explicit exclusion list. On the base revision every mutating route is
- * uncovered: the MCP surface ships read tools only, so all 34 `message` (7)
- * and `operate` (27) routes are excluded with the follow-up unit that owns
- * each tool landing. The list is validated by the parity test; a stale,
- * redundant or reason-less entry fails the suite loudly.
+ * The explicit exclusion list. The MCP surface covers the owner-question ask
+ * (MX6c) and the knowledge proposal (MX6c) routes with real tools; the rest
+ * of the `message` (5) and `operate` (27) routes are excluded with the
+ * follow-up unit that owns each tool landing. The list is validated by the
+ * parity test; a stale, redundant or reason-less entry fails the suite loudly.
  */
 export const PARITY_EXCLUSIONS: readonly ParityExclusion[] = [
   // message scope — owner questions and relays; tools land with FVM1.
-  excluded("POST", "/v1/questions", "FVM1", "owner-question"),
   excluded("POST", "/v1/questions/:id/answers", "FVM1", "answer"),
   excluded("POST", "/v1/questions/:id/acknowledgement", "FVM1", "acknowledgement"),
   excluded("POST", "/v1/questions/sync", "FVM1", "question-sync"),
@@ -758,7 +757,6 @@ export const PARITY_EXCLUSIONS: readonly ParityExclusion[] = [
   excluded("POST", "/v1/knowledge/:id/publish", "FVM4", "knowledge-publish"),
   excluded("POST", "/v1/knowledge/:id/reuse", "FVM4", "knowledge-reuse"),
   excluded("POST", "/v1/knowledge/:id/supersede", "FVM4", "knowledge-supersede"),
-  excluded("POST", "/v1/knowledge/proposals", "FVM4", "knowledge-proposal"),
   excluded("POST", "/v1/knowledge/selections", "FVM4", "knowledge-selection"),
   excluded("POST", "/v1/projects", "FVM4", "project"),
   excluded("POST", "/v1/projects/:id/retire", "FVM4", "project-retire"),

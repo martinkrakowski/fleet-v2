@@ -101,13 +101,14 @@ export class SshExecutor implements CommandExecutorPort {
       return refusal('SshExecutor refuses an argument containing a NUL byte');
     }
     const outcome = await runSpawnOutcome('ssh', sshArgvFor(host, argv), spawnOptionsFor(options));
-    const { error, ...rest } = outcome;
+    const { error, errorCode, ...rest } = outcome;
     return {
       exitCode: rest.exitCode,
       signal: rest.signal,
       stdout: rest.stdout,
       stderr: rest.stderr,
       ...(error !== undefined ? { error } : {}),
+      ...(errorCode !== undefined ? { errorCode } : {}),
     };
   }
 }

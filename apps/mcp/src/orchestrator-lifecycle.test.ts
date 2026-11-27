@@ -574,6 +574,57 @@ describe("attachProcessLifecycleHooks", () => {
     }
   });
 
+  it("a signal retires the session first and only then exits, once", async () => {
+    vi.useFakeTimers();
+    try {
+      const { lifecycle, calls } = makeLifecycle({}, { orchestratorId: "mcp-exit" });
+      await lifecycle.start();
+      const exits: Array<{ code: number | undefined; retiresSoFar: number }> = [];
+      const proc = {
+        ...fakeProc(),
+        exit: (code?: number) => {
+          exits.push({
+            code,
+            retiresSoFar: calls.filter((call) => call.path.endsWith("/retire")).length,
+          });
+        },
+      };
+      const hooks = attachProcessLifecycleHooks(lifecycle, proc);
+      proc.emit("SIGTERM");
+      proc.emit("SIGINT");
+      // Nothing has exited synchronously: the retire call must come first.
+      expect(exits).toEqual([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(exits).toEqual([{ code: 143, retiresSoFar: 1 }]);
+      hooks.detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stdin close retires without exiting the process", async () => {
+    vi.useFakeTimers();
+    try {
+      const { lifecycle, calls } = makeLifecycle({}, { orchestratorId: "mcp-stdin" });
+      await lifecycle.start();
+      let exited = false;
+      const proc = {
+        ...fakeProc(),
+        exit: () => {
+          exited = true;
+        },
+      };
+      const hooks = attachProcessLifecycleHooks(lifecycle, proc);
+      proc.stdin.emit("close");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls.filter((call) => call.path.endsWith("/retire"))).toHaveLength(1);
+      expect(exited).toBe(false);
+      hooks.detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("detach() removes every hook so nothing fires afterwards", async () => {
     vi.useFakeTimers();
     try {

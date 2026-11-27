@@ -356,14 +356,18 @@ export function createOrchestratorLifecycle(
 
 /**
  * Wire SIGTERM, SIGINT and stdin close/end to `lifecycle.stop()`. Idempotent:
- * several signals firing together still retire at most once. Returns a
- * `detach()` so tests can unhook everything cleanly.
+ * several signals firing together still retire at most once. A signal handler
+ * replaces the default terminate-on-signal behaviour, so after the session is
+ * retired the signal handler exits the process (once, with 128 + the signal
+ * number); stdin close/end only retire. Returns a `detach()` so tests can
+ * unhook everything cleanly.
  */
 export function attachProcessLifecycleHooks(
   lifecycle: OrchestratorLifecycle,
   proc: {
     once: (event: string, listener: () => void) => unknown;
     removeListener: (event: string, listener: () => void) => unknown;
+    exit?: (code?: number) => unknown;
     stdin?: { once: (event: string, listener: () => void) => unknown; removeListener: (event: string, listener: () => void) => unknown };
   } = process,
 ): { detach: () => void } {
@@ -371,9 +375,20 @@ export function attachProcessLifecycleHooks(
   const stop = (): void => {
     void lifecycle.stop();
   };
+  let exiting = false;
+  const SIGNAL_EXIT_CODES: Record<string, number> = { SIGTERM: 143, SIGINT: 130 };
   for (const event of ["SIGTERM", "SIGINT"]) {
-    proc.once(event, stop);
-    listeners.push([event, stop]);
+    const onSignal = (): void => {
+      // Retire the session first, then exit. stop() never rejects.
+      void lifecycle.stop().then(() => {
+        if (!exiting) {
+          exiting = true;
+          proc.exit?.(SIGNAL_EXIT_CODES[event]);
+        }
+      });
+    };
+    proc.once(event, onSignal);
+    listeners.push([event, onSignal]);
   }
   const stdin = proc.stdin;
   if (stdin) {

@@ -949,7 +949,13 @@ describe('synthetic ~69 MB state-dir fixture', () => {
       }
     }, 240_000);
 
-    it('keeps all-runs status read peak RSS within 1 GB', () => {
+    // SB5: skipped until SB5 (indexed status read) lands. Measured 2026-11-27 on this fixture: all-runs
+    // peak RSS about 834 MB (per-run about 164 MB), under the 1 GB budget, while the plan measures 4-4.7 GB
+    // for the real `conductor status`. InspectLaneRunsUseCase alone reads only 6 of the stores (not
+    // assessments.json, work-orders.json or orchestrators.json), so this harness does not reproduce the
+    // real peak and the budget cannot fail as intended. SB5 must widen the fixture/harness to the full CLI
+    // read path, confirm it fails above 1 GB, then un-skip this test.
+    it.skip('keeps all-runs status read peak RSS within 1 GB', () => {
       const measured = measureStatusReadRss({
         stateDir: largeDir,
         runId: '',

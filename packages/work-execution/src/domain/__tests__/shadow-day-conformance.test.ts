@@ -260,7 +260,14 @@ function scored(
   reason: string,
   counts: ScoreCounts = {},
   codes: Partial<Record<ShadowNonconformanceCode, number>> = {},
+  diagnostics?: readonly { readonly n: number; readonly code: ShadowNonconformanceCode }[],
 ) {
+  const nonconformingOnDay = counts.nonconformingOnDay ?? 0;
+  // When a single broken run exists the fixtures almost always break run 6
+  // (`dayBroken`, `added`, `onTop`); only tests with a different broken run
+  // pass `diagnostics` explicitly. One nonconforming run on D with exactly
+  // one non-zero code therefore pins the run-6 diagnostic by default.
+  const resolved = diagnostics ?? (nonconformingOnDay === 1 ? brokenRun6FromCodes(codes) : []);
   return {
     status,
     reason,
@@ -268,9 +275,27 @@ function scored(
     conforming: counts.conforming ?? 0,
     conformingTier1: counts.conformingTier1 ?? 0,
     conformingTier2: counts.conformingTier2 ?? 0,
-    nonconformingOnDay: counts.nonconformingOnDay ?? 0,
+    nonconformingOnDay,
     byCode: zeroCodes(codes),
+    ...(nonconformingOnDay === 0
+      ? {}
+      : {
+          divergenceDetails: {
+            totalCount: nonconformingOnDay,
+            items: resolved
+              .map(({ n, code }) => ({ pr: pullFor(n), head12: head12(headFor(n)), side: 'fleet' as const, code }))
+              .sort((a, b) => a.pr - b.pr),
+          },
+        }),
   };
+}
+
+/** The one broken run 6 when `codes` names exactly one non-zero code, else nothing. */
+function brokenRun6FromCodes(
+  codes: Partial<Record<ShadowNonconformanceCode, number>>,
+): readonly { readonly n: number; readonly code: ShadowNonconformanceCode }[] {
+  const nonZero = SHADOW_NONCONFORMANCE_CODES.filter((code) => (codes[code] ?? 0) > 0);
+  return nonZero.length === 1 ? [{ n: 6, code: nonZero[0]! }] : [];
 }
 
 function refused() {
@@ -418,9 +443,63 @@ describe('S6\' conformance evaluator (SH12a)', () => {
   });
 
   it('no gate result on a run merged on D yields fail/gate-not-passed', () => {
-    expect(evaluate(onTop(dayBroken(1, withoutGate)))).toEqual(
+    const result = evaluate(onTop(dayBroken(1, withoutGate)));
+    expect(result).toEqual(
       scored('fail', 'gate-not-passed', { ...PASSING_COUNTS, mergedRuns: 6, nonconformingOnDay: 1 }, { 'gate-not-passed': 1 }),
     );
+    // The broken run's own diagnostic: the run's pull request and 12-hex head
+    // prefix, on the fleet side, with the day's earliest code.
+    expect(result.divergenceDetails).toEqual({
+      totalCount: 1,
+      items: [{ pr: pullFor(6), head12: head12(headFor(6)), side: 'fleet', code: 'gate-not-passed' }],
+    });
+  });
+
+  it('caps S6 divergenceDetails at 20 sorted items while preserving totalCount', () => {
+    // Twenty-five runs merged on D each break rule 2 (no gate result), so
+    // all twenty-five are nonconforming on D while only twenty items ride.
+    const broken = Array.from({ length: 25 }, (_, index) => withoutGate(conforming(6 + index, 1, iso(DAY, 16))));
+    const result = evaluate(inputFrom([...passing(), ...broken]));
+    expect(result.status).toBe('fail');
+    expect(result.reason).toBe('gate-not-passed');
+    expect(result.nonconformingOnDay).toBe(25);
+    expect(result.divergenceDetails?.totalCount).toBe(25);
+    expect(result.divergenceDetails?.items).toHaveLength(20);
+    expect(result.divergenceDetails?.items.map((item) => item.pr)).toEqual(Array.from({ length: 20 }, (_, index) => pullFor(6 + index)));
+    expect(result.divergenceDetails?.items.every((item) => item.side === 'fleet' && item.code === 'gate-not-passed')).toBe(true);
+  });
+
+  it('returns invalid-input without divergenceDetails on a malformed S6 record', () => {
+    const input = inputFrom(passing());
+    (input.runs as unknown[]).push({ runId: 7 });
+    const result = evaluate(input);
+    expect(result.status).toBe('unknown');
+    expect(result.reason).toBe('invalid-input');
+    expect(result).not.toHaveProperty('divergenceDetails');
+  });
+
+  it('never invokes a throwing getter on S6 runs and returns invalid-input without divergenceDetails', () => {
+    let calls = 0;
+    const runs: unknown[] = [];
+    // An accessor element on the runs list is refused in O(1) without the
+    // getter ever running — the same read-through-descriptors rule the
+    // evaluator applies to every list.
+    Object.defineProperty(runs, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return (inputFrom(passing()).runs as unknown[])[0];
+      },
+    });
+    runs.length = 1;
+    const input = inputFrom(passing());
+    (input as Record<string, unknown>).runs = runs;
+    const result = evaluate(input);
+    expect(result.status).toBe('unknown');
+    expect(result.reason).toBe('invalid-input');
+    expect(calls).toBe(0);
+    expect(result).not.toHaveProperty('divergenceDetails');
   });
 
   it('a gate-failed gate result only yields fail/gate-not-passed', () => {
@@ -531,13 +610,14 @@ describe('S6\' conformance evaluator (SH12a)', () => {
         'gate-not-passed',
         { ...PASSING_COUNTS, mergedRuns: 7, nonconformingOnDay: 2 },
         { 'gate-not-passed': 1, 'code-review-missing': 1 },
+        [{ n: 6, code: 'code-review-missing' }, { n: 7, code: 'gate-not-passed' }],
       ),
     );
   });
 
   it('a nonconforming run on D fails with its code before the floor is considered', () => {
     expect(evaluate(inputFrom([withoutGate(conforming(1, 1, iso(DAY, 12)))]))).toEqual(
-      scored('fail', 'gate-not-passed', { mergedRuns: 1, nonconformingOnDay: 1 }, { 'gate-not-passed': 1 }),
+      scored('fail', 'gate-not-passed', { mergedRuns: 1, nonconformingOnDay: 1 }, { 'gate-not-passed': 1 }, [{ n: 1, code: 'gate-not-passed' }]),
     );
   });
 
@@ -1309,7 +1389,6 @@ describe('duplicate runId dedupe and superseded attempts (S6d)', () => {
       superseded.run.headOid,
       olderHead,
       head12(olderHead),
-      String(superseded.run.pullRequest),
     );
   });
 
@@ -1388,7 +1467,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     ];
     const result = evaluate(withMoves(linked, moves));
     expect(result).toEqual(scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }));
-    expectCodesOnly(result, base.run.runId, base.run.headOid, headFor(60), headFor(61), String(base.run.pullRequest));
+    expectCodesOnly(result, base.run.runId, base.run.headOid, headFor(60), headFor(61));
   });
 
   it('a broken chain whose pull request is in headMovesIncompleteFor yields unknown/head-moves-incomplete', () => {
@@ -1444,7 +1523,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     expect(evaluate(onTop(once))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
     const result = evaluate(onTop(twice));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest));
+    expectCodesOnly(result, base.run.runId, key);
   });
 
   it('an open-pr intent while the state is gating yields fail/stray-one-way-action', () => {
@@ -1570,7 +1649,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     for (const broken of cases) {
       const result = evaluate(onTop(broken));
       expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-      expectCodesOnly(result, base.run.runId, key, resumed, String(base.run.pullRequest), 'park-escalated');
+      expectCodesOnly(result, base.run.runId, key, resumed, 'park-escalated');
     }
   });
 
@@ -1599,7 +1678,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     ]);
     const result = evaluate(onTop(twice));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, firstKey, secondKey, String(base.run.pullRequest));
+    expectCodesOnly(result, base.run.runId, firstKey, secondKey);
   });
 
   it('a second park-from-parked intent with a repeated key returns fail/stray-one-way-action', () => {
@@ -1611,7 +1690,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     const twice = extendJournal(base, [conductAt('parked', at), intentAt(key, at), intentAt(key, at), marker]);
     const result = evaluate(onTop(twice));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest));
+    expectCodesOnly(result, base.run.runId, key);
   });
 
   it('a park-escalated result placed before the park-from-parked intent returns fail/stray-one-way-action', () => {
@@ -1621,7 +1700,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     const broken = extendJournal(base, [marker, conductAt('parked', at), intentAt(key, at)]);
     const result = evaluate(onTop(broken));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest), 'park-escalated');
+    expectCodesOnly(result, base.run.runId, key, 'park-escalated');
   });
 
   it('a repeated park key issued before parked does not make the one parked escalation stray', () => {
@@ -1652,7 +1731,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     const markers = [resumeMarker, advanceMarker];
     const result = evaluate(onTop(extendJournal(base, markers)));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, resume, advance, String(base.run.pullRequest), 'park-escalated');
+    expectCodesOnly(result, base.run.runId, resume, advance, 'park-escalated');
     for (const dropped of [0, 1]) {
       const one = markers.filter((_, index) => index !== dropped);
       expect(evaluate(onTop(extendJournal(base, one)))).toEqual(
@@ -1671,7 +1750,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     const markers = [webMarker, cliMarker];
     const result = evaluate(onTop(extendJournal(base, markers)));
     expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-    expectCodesOnly(result, base.run.runId, web, cli, String(base.run.pullRequest), 'park-escalated');
+    expectCodesOnly(result, base.run.runId, web, cli, 'park-escalated');
     for (const dropped of [0, 1]) {
       const one = markers.filter((_, index) => index !== dropped);
       expect(evaluate(onTop(extendJournal(base, one)))).toEqual(
@@ -1798,7 +1877,7 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
       );
       const result = evaluate(onTop(run));
       expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
-      expectCodesOnly(result, base.run.runId, ordinalOne, ordinalTwo, String(base.run.pullRequest), 'park-escalated');
+      expectCodesOnly(result, base.run.runId, ordinalOne, ordinalTwo, 'park-escalated');
     }
     // Dropping either real marker (null one alone, or with the other)
     // leaves at most one real ordinal and conforms again.

@@ -31,6 +31,7 @@ import type {
 } from '../../application/ports/out/GatePredicatePort.out-port.js';
 import type {
   CommandExecutorPort,
+  CommandRunErrorCode,
   CommandRunResult,
 } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
@@ -218,8 +219,28 @@ function isUsableRun(run: unknown): run is CommandRunResult {
   if (error.present && error.value !== undefined && typeof error.value !== 'string') {
     return false;
   }
+  // TP5A1: the optional typed error code is accepted only absent, `undefined`
+  // or one of the known codes. An accessor (a getter the adapter must never
+  // invoke) is read through its own descriptor and refused without invoking
+  // it, as are a non-string or an unknown string.
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(run, 'errorCode');
+    if (descriptor !== undefined) {
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return false;
+      }
+      if (descriptor.value !== undefined && !COMMAND_RUN_ERROR_CODES.has(descriptor.value as CommandRunErrorCode)) {
+        return false;
+      }
+    }
+  } catch {
+    return false;
+  }
   return true;
 }
+
+/** The typed error codes a `CommandRunResult.errorCode` may carry. */
+const COMMAND_RUN_ERROR_CODES: ReadonlySet<CommandRunErrorCode> = new Set(['timeout', 'max-buffer', 'spawn-error']);
 
 /** A run that never reported a completed exit is not a verdict. Untrusted runtime input: an unusable shape reads as failed. */
 function gitFailed(run: unknown): boolean {
@@ -327,6 +348,95 @@ function environmentNotInstalledResult(
     cause: 'environment-not-installed',
     ...(outputTail === undefined ? {} : { outputTail }),
   };
+}
+
+/**
+ * TP5A1: a `lint:arch` command whose executor classified the run as a typed
+ * timeout (`errorCode: 'timeout'`) is the architecture budget expiring, not a
+ * finding. The classification comes only from the typed signal — free-text
+ * error output is never matched — and it is a hard `fail` with the typed
+ * cause, so the attempt's owner sees the budget, not a red herring finding.
+ */
+function lintArchTimeoutResult(
+  name: string,
+  run: CommandRunResult,
+  command: GateCommand,
+  durationMs: number,
+): GatePredicateResult {
+  const outputTail = boundedRedactedOutputTail(run.stdout, run.stderr);
+  return {
+    name,
+    kind: 'command',
+    verdict: 'fail',
+    exitCode: run.exitCode,
+    durationMs,
+    detail: detailForCommand(run, command, undefined),
+    cause: 'lint-arch-timeout',
+    ...(outputTail === undefined ? {} : { outputTail }),
+  };
+}
+
+/**
+ * TP5A1: a failing `typecheck` whose worktree host probe confirms the
+ * generated Next.js types (`apps/web/.next/types`) are absent is a
+ * generated-artifact gap, never the source's own error. Host-side state only:
+ * command output is never matched for `TS6053` or `.next/types`.
+ */
+function missingGeneratedTypesResult(
+  name: string,
+  run: CommandRunResult,
+  command: GateCommand,
+  durationMs: number,
+): GatePredicateResult {
+  const outputTail = boundedRedactedOutputTail(run.stdout, run.stderr);
+  return {
+    name,
+    kind: 'command',
+    verdict: 'fail',
+    exitCode: run.exitCode,
+    durationMs,
+    detail: detailForCommand(run, command, undefined),
+    cause: 'missing-generated-types',
+    ...(outputTail === undefined ? {} : { outputTail }),
+  };
+}
+
+/**
+ * Package-runner tokens that may be followed by a package script name
+ * (`yarn lint:arch`, `npm run lint:arch`, ...). A script name anywhere else in
+ * an argv — an argument to `node ./scripts/check.js`, say — does not make the
+ * command that script. The bare subcommand token `run` alone is not a runner:
+ * only a `run` directly after one of these tokens may introduce the script.
+ */
+const PACKAGE_RUNNER_TOKENS = new Set(['yarn', 'npm', 'pnpm', 'bun', 'npx', 'turbo', 'corepack']);
+
+/**
+ * Whether one gate command's argv invokes the named package script at the script position. The runner token is
+ * argv[0] only (or argv[1] when argv[0] is `corepack` fronting another runner), never a later element, so an
+ * argument of another command (`node ./scripts/check.js yarn lint:arch`) is not the script. The script follows
+ * the runner directly, optionally through `run`, with any trailing script arguments allowed.
+ */
+function invokesScript(command: GateCommand, script: string): boolean {
+  const argv = command.argv;
+  let runnerIndex = 0;
+  if (argv[0] === 'corepack' && PACKAGE_RUNNER_TOKENS.has(argv[1] as string)) {
+    runnerIndex = 1;
+  }
+  if (!PACKAGE_RUNNER_TOKENS.has(argv[runnerIndex] as string)) {
+    return false;
+  }
+  const scriptIndex = argv[runnerIndex + 1] === 'run' ? runnerIndex + 2 : runnerIndex + 1;
+  return argv[scriptIndex] === script;
+}
+
+/** Whether one gate command's argv invokes `lint:arch` at the package-script position. */
+function isLintArchCommand(command: GateCommand): boolean {
+  return invokesScript(command, 'lint:arch');
+}
+
+/** Whether one gate command's argv invokes `typecheck` at the package-script position. */
+function isTypecheckCommand(command: GateCommand): boolean {
+  return invokesScript(command, 'typecheck');
 }
 
 /**
@@ -1111,6 +1221,34 @@ export class GatePredicateAdapter implements GatePredicatePort {
   }
 
   /**
+   * TP5A1: whether the worktree's generated Next.js types are absent:
+   * `apps/web/tsconfig.json` exists (a web app worktree at all) and
+   * `apps/web/.next/types` does not exist (the generated artifacts were never
+   * produced). Host-side state only, probed through the host executor; any
+   * error, throw, non-zero exit or unusable probe reads as "not absent"
+   * (failing closed, so a failing typecheck stays the command's own verdict).
+   */
+  private async nextTypesAbsent(executor: CommandExecutorPort, worktreePath: string): Promise<boolean> {
+    try {
+      const probe = await executor.run(
+        [
+          'test',
+          '-f',
+          join(worktreePath, 'apps', 'web', 'tsconfig.json'),
+          '-a',
+          '!',
+          '-d',
+          join(worktreePath, 'apps', 'web', '.next', 'types'),
+        ],
+        { cwd: worktreePath, timeoutMs: PROBE_TIMEOUT_MS },
+      );
+      return isUsableRun(probe) && probe.error === undefined && probe.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Whether the worktree is a yarn project: `package.json` and `yarn.lock` both
    * exist, probed with one `test` through the host executor. Any failure reads
    * as not a yarn project, which leaves the gate behaving as before CB1.
@@ -1453,7 +1591,33 @@ export class GatePredicateAdapter implements GatePredicatePort {
       return resourceExhaustedResult(name, run.exitCode, this.nowMs() - started);
     }
 
+    // TP5A1: `lint:arch` whose executor classified the run as a typed timeout
+    // is the architecture budget expiring, never a finding. Only the typed
+    // signal classifies it, and only on a run that honours the port contract:
+    // a timeout is a run that never reported its own exit code (`null`) and
+    // carries the executor's error, never a completed run with an exit code.
+    // Free-text `error` output never does, and a non-`lint:arch` command or
+    // any other failure mode (exit 1, max-buffer, spawn-error) stays out of
+    // this path entirely. The code is read through its own data property, so
+    // a getter is never invoked and an invalid value was already refused by
+    // `isUsableRun`.
+    if (
+      isLintArchCommand(command) &&
+      run.exitCode === null &&
+      run.error !== undefined &&
+      ownDataProperty(run, 'errorCode').value === 'timeout'
+    ) {
+      return lintArchTimeoutResult(name, run, command, this.nowMs() - started);
+    }
+
     const raw = rawVerdict(run, this.isRemote(executor));
+    // TP5A1: a failing `typecheck` whose worktree host probe confirms the
+    // generated Next.js types are absent is a generated-artifact gap, not the
+    // source's own error. Host-side state only: command output is never
+    // matched for `TS6053` or `.next/types`.
+    if (raw === 'fail' && isTypecheckCommand(command) && (await this.nextTypesAbsent(executor, worktreePath))) {
+      return missingGeneratedTypesResult(name, run, command, this.nowMs() - started);
+    }
     // A command that failed while naming a missing module is the worktree
     // environment's failure, not the command's own verdict — but only when
     // the dependency state file really is absent; with it present the

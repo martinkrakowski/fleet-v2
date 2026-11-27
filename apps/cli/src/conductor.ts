@@ -75,6 +75,7 @@ import {
   retireConductorOrchestrator,
 } from './conductor-orchestrator.js';
 import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
+import { premergeCommand } from './conductor-premerge-attest.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 import { withFileLock } from './file-store.js';
 import type { CliIo } from './index.js';
@@ -118,6 +119,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
        fleet-v2 conductor reap --worktrees|--sessions|--reservations [--dry-run] [--yes] [--force-unsealed]
+       fleet-v2 conductor premerge attest --run <runId> [--yes]
 
 conductor status --stalled lists the runs held longer than
 policy.daemon.stallAfterMinutes (default 30), oldest first: a parked row is
@@ -2465,6 +2467,9 @@ export async function conductorCommand(
   }
   if (subcommand === 'reap') {
     return await reapCommand(argv.slice(1), io, runtime, options);
+  }
+  if (subcommand === 'premerge') {
+    return await premergeCommand(argv.slice(1), io, runtime, options);
   }
   const parsed = readControlOptions(argv.slice(1), io);
   if (parsed === null) {

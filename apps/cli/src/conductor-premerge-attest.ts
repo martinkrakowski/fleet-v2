@@ -74,7 +74,7 @@ export function readPremergeAttestFlags(argv: readonly string[], io: CliIo): Pre
     if (pendingRunValue) {
       pendingRunValue = false;
       const trimmed = token.trim();
-      if (trimmed === '') {
+      if (trimmed === '' || trimmed.startsWith('--')) {
         return usageError(io, 'conductor premerge attest: --run requires a non-empty run id');
       }
       run = trimmed;
@@ -377,13 +377,20 @@ export async function premergeAttestCommand(
   const requestedReviewerModel = fieldOf(assessment, 'requestedReviewerModel');
   let reviewerModel: string;
   if (requestedReviewerModel !== undefined) {
-    if (typeof requestedReviewerModel !== 'string' || requestedReviewerModel.trim() === '') {
+    // The use case compares the receipt's model with the assessment's value
+    // exactly, so a value with surrounding whitespace can never be recorded:
+    // it is refused here rather than rewritten and rejected downstream.
+    if (
+      typeof requestedReviewerModel !== 'string' ||
+      requestedReviewerModel === '' ||
+      requestedReviewerModel !== requestedReviewerModel.trim()
+    ) {
       return refuseRecord(io, { outcome: 'refused', reason: 'reviewer-unavailable', runId });
     }
-    if (isSameModelFamily(underlyingModelFamily(requestedReviewerModel.trim()), implementerFamily)) {
+    if (isSameModelFamily(underlyingModelFamily(requestedReviewerModel), implementerFamily)) {
       return refuseRecord(io, { outcome: 'refused', reason: 'reviewer-unavailable', runId });
     }
-    reviewerModel = requestedReviewerModel.trim();
+    reviewerModel = requestedReviewerModel;
   } else {
     const preMergeReviewer = fieldOf(receiptField.value, 'reviewerModel');
     if (

@@ -200,6 +200,8 @@ describe('conductor premerge attest usage errors (exit 2)', () => {
       ['--unknown'],
       ['--run'],
       ['--run', ''],
+      ['--run', '--yes'],
+      ['--yes', '--run', '--yes'],
       ['--run='],
       ['--run', RUN_ID, '--run', RUN_ID],
       [`--run=${RUN_ID}`, '--run', RUN_ID],
@@ -266,7 +268,7 @@ describe('conductor premerge attest records the Tier 2 owner receipt', () => {
 
   it('records requestedReviewerModel when defined and in a different model family from implementerModel', async () => {
     const { runtime, calls } = makeRuntime({
-      inspection: { outcome: 'found', assessment: assessmentRecord({ requestedReviewerModel: ' other-provider/qwen-3 ' }) },
+      inspection: { outcome: 'found', assessment: assessmentRecord({ requestedReviewerModel: 'other-provider/qwen-3' }) },
     });
     const { code, io } = await runAttest(runtime, ['--run', RUN_ID, '--yes']);
     expect(code).toBe(0);
@@ -276,7 +278,7 @@ describe('conductor premerge attest records the Tier 2 owner receipt', () => {
   });
 
   it('refuses with reviewer-unavailable and records nothing when requestedReviewerModel is empty, invalid, or same model family', async () => {
-    const cases: readonly unknown[] = ['', '   ', 7, null, IMPL, 'other-vendor/glm-4.5'];
+    const cases: readonly unknown[] = ['', '   ', ' other-provider/qwen-3 ', 7, null, IMPL, 'other-vendor/glm-4.5'];
     for (const requested of cases) {
       const { runtime, calls } = makeRuntime({
         inspection: { outcome: 'found', assessment: assessmentRecord({ requestedReviewerModel: requested }) },

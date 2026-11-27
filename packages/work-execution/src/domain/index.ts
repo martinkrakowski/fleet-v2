@@ -82,6 +82,7 @@ export * from "./shadow-day-conformance.js";
 export * from "./shadow-day-gate-agreement.js";
 export * from "./shadow-day-health.js";
 export * from "./shadow-day-intake.js";
+export * from "./shadow-day-main-reconcile.js";
 export * from "./shadow-day-merge-set.js";
 export * from "./shadow-day-shell-facts.js";
 export * from "./shadow-evidence-ledger.js";

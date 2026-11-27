@@ -50,6 +50,7 @@ export * from "./GhForgeMergeReadAdapter.adapter.js";
 export * from "./GhMergeVetoStateAdapter.adapter.js";
 export * from "./GhReviewThreadHelperAdapter.adapter.js";
 export * from "./GitMirrorPatchIdentityAdapter.adapter.js";
+export * from "./GitMirrorReceiptCarryEvidenceAdapter.adapter.js";
 export * from "./HeldWorkOrderRepositoryAdapter.adapter.js";
 export * from "./InMemoryReaperFindingRepositoryAdapter.adapter.js";
 export * from "./InMemoryRunTelemetryMarkAdapter.adapter.js";

@@ -7,6 +7,11 @@ import {
   readApiTokenFromFile,
   type FleetApiClient,
 } from "./client.js";
+import {
+  attachProcessLifecycleHooks,
+  createOrchestratorLifecycle,
+  parseOrchestratorCliArgs,
+} from "./orchestrator-lifecycle.js";
 import { buildRegistry } from "./registry.js";
 import { loadSdk } from "./sdk.js";
 
@@ -18,9 +23,20 @@ function clientFromEnv(): FleetApiClient {
   });
 }
 
-export async function startServer(): Promise<void> {
+export interface StartServerOptions {
+  argv?: readonly string[];
+  client?: FleetApiClient;
+}
+
+export async function startServer(options?: StartServerOptions): Promise<void> {
+  // Orchestrator identity comes only from the CLI argv, never the environment.
+  const parsed = parseOrchestratorCliArgs(options?.argv ?? []);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+  const client = options?.client ?? clientFromEnv();
   const { McpServer, StdioServerTransport } = await loadSdk();
-  const registry = buildRegistry(clientFromEnv());
+  const registry = buildRegistry(client);
   const server = new McpServer({ name: "fleet-v2", version: "0.1.0" });
   for (const tool of registry.tools) {
     server.registerTool(
@@ -42,4 +58,11 @@ export async function startServer(): Promise<void> {
     );
   }
   await server.connect(new StdioServerTransport());
+  const lifecycle = createOrchestratorLifecycle({
+    client,
+    config: parsed.config,
+  });
+  // Non-fatal: registration refusal or failure never stops the stdio server.
+  await lifecycle.start();
+  attachProcessLifecycleHooks(lifecycle);
 }

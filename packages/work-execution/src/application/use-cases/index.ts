@@ -68,6 +68,7 @@ export * from "./ReserveExecutionCapacityUseCase.use-case.js";
 export * from "./ResumeLaneRunUseCase.use-case.js";
 export * from "./ReviewChainUseCase.use-case.js";
 export * from "./run-journal-reads.js";
+export * from "./RunAttemptEnvironmentUseCase.use-case.js";
 export * from "./RunConductorPassUseCase.use-case.js";
 export * from "./RunDaemonTickUseCase.use-case.js";
 export * from "./RunMergePassUseCase.use-case.js";

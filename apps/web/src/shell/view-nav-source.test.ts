@@ -20,16 +20,11 @@ function entryText(nav: string, href: string): string {
 describe("View nav P12 sample labels", () => {
   const viewNav = read(SHELL_DIR, "view-nav.tsx");
   const sidebar = read(SHELL_DIR, "sidebar.tsx");
-  const briefPage = read(APP_DIR, "brief", "page.tsx");
-  const frozenCard = read(
-    APP_DIR,
-    "brief",
-    "components",
-    "frozen-brief-card.tsx",
-  );
+  const briefView = read(APP_DIR, "brief", "brief-view.tsx");
+  const briefMap = read(APP_DIR, "brief", "map-brief.ts");
 
-  it("marks Brief and Knowledge as sample", () => {
-    expect(entryText(viewNav, "/brief")).toContain("sample: true");
+  it("marks Knowledge as sample and Brief as not sample", () => {
+    expect(entryText(viewNav, "/brief")).toContain("sample: false");
     expect(entryText(viewNav, "/knowledge")).toContain("sample: true");
   });
 
@@ -50,10 +45,14 @@ describe("View nav P12 sample labels", () => {
     expect(viewNav).toContain('" (sample data)"');
   });
 
-  it("labels the /brief freeze digest as sample", () => {
-    expect(briefPage).not.toContain("`sha256:");
-    expect(briefPage).toContain("sample:");
-    expect(frozenCard).toContain("sample digest <b>{digest}</b>");
+  it("never invents a /brief digest and renders not recorded when absent", () => {
+    for (const source of [briefView, briefMap]) {
+      expect(source).not.toContain("`sha256:");
+      expect(source).not.toContain('"sha256:');
+      expect(source).not.toContain("sample:");
+    }
+    expect(briefMap).toContain('"not recorded"');
+    expect(briefView).toContain("formatBriefDigest(");
   });
 
   it("updates the rail footer", () => {

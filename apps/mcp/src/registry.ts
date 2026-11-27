@@ -824,9 +824,11 @@ export function buildRegistry(
             /**
              * The wait budget is wall-clock time in this loop, not a count of
              * configured sleeps: each poll's own duration counts against it,
-             * and it is re-checked before every poll after the first, so no
-             * GET starts once the budget is spent — a poll that began over
-             * budget could still return an answer where `still-open` was owed.
+             * it is re-checked before every poll after the first (so no GET
+             * starts once the budget is spent), and it is re-checked again
+             * after every GET (so a poll that straddled the deadline can
+             * neither sleep on nor return a late answer — `still-open` is
+             * owed once the budget is gone).
              */
             const startMs = now();
             let last: ApiEnvelope | undefined;
@@ -850,6 +852,21 @@ export function buildRegistry(
               );
               if (isFailure(result)) {
                 return toToolResult(result);
+              }
+              if (now() - startMs >= waitMaxMs) {
+                // The GET completed after the budget was spent: an answer
+                // returned now would be late, and sleeping a full interval
+                // before the next deadline check would overshoot the wait.
+                // `still-open` is owed instead.
+                return toToolResult({
+                  operationId: result.operationId,
+                  code: result.code,
+                  result: {
+                    outcome: "still-open",
+                    questionId: input.questionId,
+                    question: projectQuestionResult(result.result).question,
+                  },
+                });
               }
               const projected = projectQuestionResult(result.result);
               const open =

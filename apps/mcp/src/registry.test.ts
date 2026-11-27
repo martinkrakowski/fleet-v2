@@ -811,6 +811,47 @@ describe("fleet_owner_answer_wait tool", () => {
     expect(parsed.result.question.state).toBe("open");
   });
 
+  it("never returns a late answer from a GET that completed after the budget", async () => {
+    const answeredResponse: ApiClientResult = {
+      operationId: "op-wait",
+      code: "OK",
+      result: {
+        outcome: "found",
+        question: { questionId: "q-1", state: "answered" },
+      },
+    };
+    const client = queueClient([answeredResponse]);
+    let clock = 0;
+    const slowGet = {
+      ...client,
+      get: async (path: string) => {
+        clock += 60;
+        return client.get(path);
+      },
+    };
+    let sleeps = 0;
+    const registry = buildRegistry(slowGet, {
+      waitPollIntervalMs: 15,
+      waitMaxMs: 50,
+      sleep: async () => {
+        sleeps += 1;
+      },
+      now: () => clock,
+    });
+    const result = await toolNamed(registry, "fleet_owner_answer_wait").handler({
+      questionId: "q-1",
+    });
+    // The only GET started inside the budget but completed after it: the
+    // answered response is a late answer, so `still-open` is owed instead,
+    // immediately and without a further poll or sleep.
+    expect(client.gets).toHaveLength(1);
+    expect(sleeps).toBe(0);
+    const parsed = JSON.parse(result.content[0]?.text ?? "");
+    expect(parsed.operationId).toBe("op-wait");
+    expect(parsed.result.outcome).toBe("still-open");
+    expect(parsed.result.question.state).toBe("answered");
+  });
+
   it("allows one wait at a time and releases the slot afterwards", async () => {
     let release: ((result: ApiClientResult) => void) | undefined;
     let immediate: ApiClientResult | undefined;

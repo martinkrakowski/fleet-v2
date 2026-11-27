@@ -403,6 +403,7 @@ bounded_contexts:
           - ManageCutoverUseCase
           - RecordShadowDayUseCase
           - AttestShadowFactUseCase
+          - RunAttemptEnvironmentUseCase
           - RecordSeatObservationUseCase
         ports:
           in:
@@ -465,6 +466,7 @@ bounded_contexts:
             - ManageCutoverPort
             - RecordShadowDayPort
             - AttestShadowFactPort
+            - RunAttemptEnvironmentPort
             - RecordSeatObservationPort
           out:
             - WorkOrderRepositoryPort
@@ -581,6 +583,7 @@ bounded_contexts:
       ListAttemptJournalPort: "Return one attempt's action journal entries in recorded order, or a known absence for an unknown attempt; read-only, never contacts the runner, and carries no legality or next-action block."
       ListLaneRunsPort: "Return, read-only, the conductor schedule: every non-terminal lane run in creation order with its projected state, round, pending step, park, package keys and held slot, the held reservations by host, the admission count of active and in-flight runs, the halt marker and whether the driver lease has lapsed; the active-run cap is reported only from a recorded pass trace, never assumed; no lease holder, ssh alias, port, transport or worktree path crosses the port."
       ListConductorPassesPort: "Return, read-only, the most recent recorded conductor passes newest first, at most a bounded limit, each with its time, halt and progress flags, the recorded caps and each run's report in worker-take order; an unreadable or unknown-version trace store is reported unreadable, never an error and never guessed; no holder id crosses the port."
+      RunAttemptEnvironmentPort: "Drive the micro-VM driver port through one attempt's lifecycle against a fake driver only: an implementation environment (create, injectWorktree, seal, optional work, destroy in a finally) and then a fresh gate environment with a distinct environment id (create, injectWorktree, seal, gate, destroy in a finally); every driver and step outcome is snapshotted as plain data before any field is read, a step outcome that is malformed, hostile or not ok is a typed refusal, a create failure or a mismatched or reused handle never reaches a later step, and a refusal carries only a fixed reason, never an echoed value; the result declares the isolation as a fake-driver label and a disclaimer that a green run against the fake driver is not evidence of isolation."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."

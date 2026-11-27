@@ -44,10 +44,11 @@ const DRILL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/;
 
 /**
  * Percentage figures such as `99.9%`: at most three integer digits plus an
- * optional fractional part, not preceded by another digit (linear time, no
- * dynamic construction).
+ * optional fractional part of unbounded length (so a 19-fraction-digit figure
+ * like `99.99999999999999999%` is still matched), not preceded by another
+ * digit (linear time, no dynamic construction).
  */
-const PERCENTAGE_PATTERN = /(?<!\d)\d{1,3}(?:\.\d{1,16})?%/g;
+const PERCENTAGE_PATTERN = /(?<!\d)\d{1,3}(?:\.\d+)?%/g;
 
 /**
  * ID-shaped tokens in text; a drill ID backs a document only when it appears

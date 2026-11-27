@@ -40,6 +40,20 @@ describe('findUnbackedAvailabilityClaims', () => {
       });
     });
 
+    it('flags a percentage figure with more than 16 fractional digits when no drill record matches', () => {
+      // Regression: the previous pattern capped fractional digits at 16, so a
+      // 19-fraction-digit figure matched nothing and the guard returned pass.
+      const result = findUnbackedAvailabilityClaims(
+        [{ id: 'doc-1', text: 'Claimed 99.99999999999999999% uptime.' }],
+        [{ id: 'drill-7' }],
+        isProxy,
+      );
+      expect(result).toEqual({
+        status: 'flagged',
+        findings: [{ docId: 'doc-1', figure: '99.99999999999999999%' }],
+      });
+    });
+
     it('deduplicates repeated unbacked figures within the same document', () => {
       const result = findUnbackedAvailabilityClaims(
         [{ id: 'doc-1', text: '99.9% here and 99.9% again, plus 99.99% once.' }],

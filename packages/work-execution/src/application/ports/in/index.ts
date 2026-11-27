@@ -61,6 +61,7 @@ export * from "./RequestLaneRunStopPort.in-port.js";
 export * from "./ReserveExecutionCapacityPort.in-port.js";
 export * from "./ResumeLaneRunPort.in-port.js";
 export * from "./ReviewChainPort.in-port.js";
+export * from "./RunAttemptEnvironmentPort.in-port.js";
 export * from "./RunConductorPassPort.in-port.js";
 export * from "./RunDaemonTickPort.in-port.js";
 export * from "./RunMergePassPort.in-port.js";

@@ -240,6 +240,23 @@ describe("decideMigrationRun", () => {
     expect(ok.ok).toBe(true);
   });
 
+  it("accepts four-digit years below 0100 as real calendar dates and refuses their impossible days", () => {
+    const run = (appliedAtIso: string) =>
+      decideMigrationRun([{ id: "0001_a", checksum: "c1", appliedAtIso }], [available("0001_a", "c1")], isProxy);
+    expect(run("0001-01-01T00:00:00Z")).toEqual({ ok: true, toRun: [] });
+    expect(run("0099-12-31T23:59:59Z")).toEqual({ ok: true, toRun: [] });
+    expectInvalidInput(run("0001-02-29T00:00:00Z"), "applied");
+    expect(run("0004-02-29T00:00:00Z")).toEqual({ ok: true, toRun: [] });
+  });
+
+  it("accepts a checksum longer than 128 characters that checksumOfMigration itself accepts", () => {
+    const longChecksum = "c".repeat(129);
+    expect(checksumOfMigration("select 1;", () => longChecksum)).toEqual({ ok: true, value: longChecksum });
+    expect(
+      decideMigrationRun([applied("0001_a", longChecksum)], [available("0001_a", longChecksum)], isProxy),
+    ).toEqual({ ok: true, toRun: [] });
+  });
+
   it("refuses duplicate migration ids in applied or available", () => {
     expect(
       decideMigrationRun([applied("0001_a", "c1"), applied("0001_a", "c1")], [available("0001_a", "c1")], isProxy),
@@ -293,7 +310,7 @@ describe("checksumOfMigration", () => {
     const other = checksumOfMigration("select 1; select 3; select 4;", (text) => text.length.toString(16));
     expect(other.ok).toBe(true);
     if (other.ok && first.ok) {
-      expect(other.value === first.value).toBe(false);
+      expect(other.value).not.toBe(first.value);
     }
   });
 

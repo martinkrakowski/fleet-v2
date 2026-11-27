@@ -64,9 +64,18 @@ const MAX_WORKTREE_REF_LENGTH = 512;
 const MAX_NOW_ISO_LENGTH = 64;
 const ATTEMPT_ID_PATTERN = /^[A-Za-z0-9._-]{1,123}$/;
 const HANDLE_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
-// eslint-disable-next-line no-control-regex -- the validator's job is refusing control characters, not matching text containing them
-const CONTROL_CHARACTER_PATTERN = /[\x00-\x1f\x7f]/;
 const ISOLATIONS: ReadonlySet<string> = new Set(['microvm', 'user-space-kernel']);
+
+/** True when any character has a char code below 0x20 or equal to 0x7f. */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
 
 type Phase = 'impl' | 'gate';
 
@@ -169,7 +178,7 @@ function isValidWorktreeRef(value: unknown): value is string {
   if (length < 1 || length > MAX_WORKTREE_REF_LENGTH) {
     return false;
   }
-  if (CONTROL_CHARACTER_PATTERN.test(value)) {
+  if (hasControlCharacter(value)) {
     return false;
   }
   if (/^(?:[\\/]|[A-Za-z]:)/.test(value)) {
@@ -191,7 +200,7 @@ function isValidNowIso(value: unknown): value is string {
   if (length < 1 || length > MAX_NOW_ISO_LENGTH) {
     return false;
   }
-  return !CONTROL_CHARACTER_PATTERN.test(value);
+  return !hasControlCharacter(value);
 }
 
 function isIsolation(value: unknown): value is MicroVmIsolation {

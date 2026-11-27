@@ -662,7 +662,7 @@ describe('RunAttemptEnvironmentUseCase', () => {
       ['bigint', 10n],
       ['function', () => marker],
       ['empty array', []],
-      ['array with a hole', [, marker]],
+      ['array with a hole', Object.assign(new Array(2), { 1: marker })],
       ['array with elements', [marker]],
       ['sparse array of enormous length', new Array(2 ** 32 - 1)],
       ['array-like with enormous length', { length: 2 ** 32, 0: marker }],

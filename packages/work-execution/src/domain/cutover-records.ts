@@ -120,6 +120,21 @@ function isSafeStringField(value: unknown): value is string {
   );
 }
 
+/**
+ * A string that is length-gated on its UTF-16 length before the bounded byte
+ * check: a string's UTF-8 byte length is never less than its UTF-16 length, so
+ * anything over `MAX_STRING_BYTES` is refused here and never reaches the
+ * `TextEncoder` inside `isSafeStringField`.
+ */
+function isLengthGatedSafeString(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_STRING_BYTES && isSafeStringField(value);
+}
+
+/** `null` is allowed; any string is length-gated before the bounded byte check. */
+function isLengthGatedNullableIso(value: unknown): value is string | null {
+  return value === null || (isLengthGatedSafeString(value) && isZonedIsoDateTime(value));
+}
+
 function isCutoverState(value: unknown): value is CutoverState {
   return typeof value === 'string' && (CUTOVER_STATES as readonly string[]).includes(value);
 }
@@ -652,11 +667,11 @@ function readStreakDay(element: unknown): ValidatedStreakDay | null {
   if (typeof day !== 'string') {
     return null;
   }
-  const dayNumber = utcDayNumber(day);
+  const dayNumber = day.length === 10 ? utcDayNumber(day) : null;
   if (dayNumber === null) {
     return null;
   }
-  if (typeof releaseSha !== 'string' || releaseSha.length === 0 || !isSafeStringField(releaseSha)) {
+  if (typeof releaseSha !== 'string' || releaseSha.length === 0 || !isLengthGatedSafeString(releaseSha)) {
     return null;
   }
   if (typeof clean !== 'boolean') {
@@ -699,13 +714,13 @@ function readStreakOptions(options: unknown): { nowIso: string; rolledBackAtIso:
   }
   const { nowIso, rolledBackAtIso } = snapshot;
   if (
-    !isSafeStringField(nowIso) ||
+    !isLengthGatedSafeString(nowIso) ||
     !isZonedIsoDateTime(nowIso) ||
     Number.isNaN(Date.parse(nowIso))
   ) {
     return null;
   }
-  if (!isNullableIso(rolledBackAtIso)) {
+  if (!isLengthGatedNullableIso(rolledBackAtIso)) {
     return null;
   }
   return { nowIso, rolledBackAtIso };

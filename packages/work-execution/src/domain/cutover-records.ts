@@ -11,7 +11,13 @@ import {
   readMergeQueueEntryRecord,
 } from './merge-queue-records.js';
 import type { MergeParkReason, MergeQueueRepositoryRef } from './merge-queue-records.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import {
+  readBoundedDenseArray,
+  readExactPlainRecord,
+  readPlainRecordWithOptionalKeys,
+  snapshotPlainDataRecord,
+} from './plain-record-reads.js';
+import type { BoundedDenseArray } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isPlainRecordObject,
@@ -42,6 +48,30 @@ export type CutoverShadowCriterion = (typeof LEGACY_SHADOW_CRITERIA)[number];
 
 export const CUTOVER_SHADOW_CONSECUTIVE_DAYS = 1;
 export const CUTOVER_SHADOW_MIN_MERGES = 20;
+
+// SR1: the cutover certification streak (owner decision 2026-11-27, cutover-plan
+// §3.2). Replaces the single-day shadow-evidence check with a 1-to-7-day
+// consecutive clean UTC streak per `repoDigest`. The legacy constants above and
+// `readCutoverShadowEvidence` stay untouched until the streak release is
+// installed.
+
+/** The shortest streak that can certify. */
+export const CUTOVER_STREAK_MIN_DAYS = 1;
+/** The longest span the evaluator ever walks (the newest 7 days). */
+export const CUTOVER_STREAK_MAX_DAYS = 7;
+/** Certified runs summed over the span must reach this floor. */
+export const CUTOVER_STREAK_MIN_COUNTED_RUNS = 20;
+/** Tier-2 certified runs summed over the span must reach this floor. */
+export const CUTOVER_STREAK_MIN_TIER2_RUNS = 4;
+/** The newest remaining day may be at most this many UTC days before `nowIso`. */
+export const CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS = 1;
+/** The newest day must carry at least this many agreeing S4 heads. */
+export const CUTOVER_STREAK_MIN_S4_HEADS = 30;
+/** The newest day must carry at least this many S6 Tier-1 runs. */
+export const CUTOVER_STREAK_MIN_S6_TIER1 = 3;
+/** The newest day must carry at least this many S6 Tier-2 runs. */
+export const CUTOVER_STREAK_MIN_S6_TIER2 = 2;
+
 export const CUTOVER_ROLLBACK_WINDOW_DAYS = 14;
 export const CUTOVER_ROLLBACK_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -88,6 +118,21 @@ function isSafeStringField(value: unknown): value is string {
     new TextEncoder().encode(value).length <= MAX_STRING_BYTES &&
     !isSecretShapedText(value)
   );
+}
+
+/**
+ * A string that is length-gated on its UTF-16 length before the bounded byte
+ * check: a string's UTF-8 byte length is never less than its UTF-16 length, so
+ * anything over `MAX_STRING_BYTES` is refused here and never reaches the
+ * `TextEncoder` inside `isSafeStringField`.
+ */
+function isLengthGatedSafeString(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_STRING_BYTES && isSafeStringField(value);
+}
+
+/** `null` is allowed; any string is length-gated before the bounded byte check. */
+function isLengthGatedNullableIso(value: unknown): value is string | null {
+  return value === null || (isLengthGatedSafeString(value) && isZonedIsoDateTime(value));
 }
 
 function isCutoverState(value: unknown): value is CutoverState {
@@ -480,6 +525,356 @@ function isCloneableData(raw: unknown): boolean {
     return false;
   }
 }
+
+// SR1: the cutover certification streak evaluator (owner decision 2026-11-27,
+// cutover-plan §3.2). Pure: no filesystem, no subprocess, no clock — `nowIso`
+// is an argument. Never throws, never echoes an input value.
+
+/** One shadow-certification day, as the streak caller records it per repository digest. */
+export interface CutoverStreakDay {
+  /** UTC calendar date, `YYYY-MM-DD`. */
+  readonly day: string;
+  /** The release SHA the day certified against; 40 lowercase hex digits. */
+  readonly releaseSha: string;
+  /** Whether every shadow criterion passed that day. */
+  readonly clean: boolean;
+  /** Certified runs recorded that day. */
+  readonly countedRuns: number;
+  /** Certified Tier-2 runs recorded that day. */
+  readonly countedTier2: number;
+  /** S4 agreeing heads recorded that day. */
+  readonly s4AgreeingHeads: number;
+  /** S6 Tier-1 runs recorded that day. */
+  readonly s6Tier1Runs: number;
+  /** S6 Tier-2 runs recorded that day. */
+  readonly s6Tier2Runs: number;
+}
+
+/** The evaluator's clock and rollback filter; both fields required, `nowIso` a zoned ISO time. */
+export interface CutoverStreakOptions {
+  /** The evaluation instant, zoned ISO-8601. */
+  readonly nowIso: string;
+  /** When the last rollback happened; every day at or before its UTC day is dropped. */
+  readonly rolledBackAtIso: string | null;
+}
+
+/** Every refusal the streak evaluator can name. */
+export const CUTOVER_STREAK_REASONS = [
+  'invalid-options',
+  'invalid-days',
+  'no-days',
+  'newest-day-not-clean',
+  'newest-day-stale',
+  'counted-runs-below-floor',
+  'release-changed',
+  'tier2-runs-below-floor',
+  's4-heads-below-floor',
+  's6-runs-below-floor',
+] as const;
+export type CutoverStreakReason = (typeof CUTOVER_STREAK_REASONS)[number];
+
+/** Certified with the span summary, or refused with exactly one named reason. */
+export type CutoverStreakResult =
+  | {
+      readonly certified: true;
+      readonly spanStartDay: string;
+      readonly spanEndDay: string;
+      readonly spanDays: number;
+      readonly releaseSha: string;
+      readonly countedRuns: number;
+      readonly countedTier2: number;
+    }
+  | { readonly certified: false; readonly reason: CutoverStreakReason };
+
+const STREAK_OPTION_KEYS = ['nowIso', 'rolledBackAtIso'] as const;
+const STREAK_DAY_KEYS = [
+  'day',
+  'releaseSha',
+  'clean',
+  'countedRuns',
+  'countedTier2',
+  's4AgreeingHeads',
+  's6Tier1Runs',
+  's6Tier2Runs',
+] as const;
+/** The `days` container cap: at most this many day records are ever walked. */
+const CUTOVER_STREAK_MAX_INPUT_DAYS = 64;
+/** Any per-day count above this is refused. */
+const CUTOVER_STREAK_MAX_COUNT = 10_000;
+
+const INVALID_STREAK_OPTIONS = { certified: false, reason: 'invalid-options' } as const;
+const INVALID_STREAK_DAYS = { certified: false, reason: 'invalid-days' } as const;
+
+/** The upper bound on any one per-day count. */
+function isStreakCount(value: unknown): value is number {
+  return (
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= CUTOVER_STREAK_MAX_COUNT
+  );
+}
+
+/**
+ * `snapshotPlainDataRecord` plus the exact-key and pollution checks every
+ * streak record needs: a snapshot succeeds (plain prototype, own enumerable
+ * string data properties only, `__proto__` already refused by the snapshot),
+ * then a `constructor` or `prototype` own key is refused explicitly and the
+ * own keys must be exactly `keys` (same set, no extras, no symbols — the
+ * snapshot refuses symbol keys). Cost bound: `O(K)` in the own-key count `K`
+ * via `Reflect.ownKeys` and descriptor reads, no getter ever invoked (an
+ * accessor is refused from its own descriptor).
+ */
+function readExactSnapshot(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  const snapshot = snapshotPlainDataRecord(value);
+  if (snapshot === null) {
+    return null;
+  }
+  if (Object.hasOwn(snapshot, 'constructor') || Object.hasOwn(snapshot, 'prototype')) {
+    return null;
+  }
+  const ownKeys = Reflect.ownKeys(snapshot);
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => !keys.includes(key as string))) {
+    return null;
+  }
+  return snapshot;
+}
+
+/** The validated, narrowed fields of one day record, or null when any field is unusable. */
+interface ValidatedStreakDay {
+  readonly day: string;
+  readonly dayNumber: number;
+  readonly releaseSha: string;
+  readonly clean: boolean;
+  readonly countedRuns: number;
+  readonly countedTier2: number;
+  readonly s4AgreeingHeads: number;
+  readonly s6Tier1Runs: number;
+  readonly s6Tier2Runs: number;
+}
+
+/**
+ * One day record: exactly the eight keys of `CutoverStreakDay`, `day` a real
+ * UTC calendar date, `releaseSha` a 40-hex lowercase release SHA (which makes
+ * it bounded and secret-free), `clean` a boolean, every count a safe integer
+ * in `[0, 10_000]`. Cost bound: `O(K)`
+ * in the record's own-key count via `readExactSnapshot`, plus one
+ * `DAY_PATTERN`-bounded date check and one bounded byte count per string —
+ * no getter is ever invoked. Never throws.
+ */
+function readStreakDay(element: unknown): ValidatedStreakDay | null {
+  const snapshot = readExactSnapshot(element, STREAK_DAY_KEYS);
+  if (snapshot === null) {
+    return null;
+  }
+  const { day, releaseSha, clean, countedRuns, countedTier2, s4AgreeingHeads, s6Tier1Runs, s6Tier2Runs } = snapshot;
+  if (typeof day !== 'string') {
+    return null;
+  }
+  const dayNumber = day.length === 10 ? utcDayNumber(day) : null;
+  if (dayNumber === null) {
+    return null;
+  }
+  // The established release identity is a 40-hex lowercase SHA (the same shape
+  // `isMergeHex40` and the shadow ledger's release-SHA pattern enforce); a
+  // nonempty safe string like `"x"` must not pass the streak gate. The pattern
+  // already bounds the length at 40 and confines the text to hex, and the
+  // safe-string check keeps the secret-shape refusal explicit.
+  if (!isMergeHex40(releaseSha) || !isLengthGatedSafeString(releaseSha)) {
+    return null;
+  }
+  if (typeof clean !== 'boolean') {
+    return null;
+  }
+  if (
+    !isStreakCount(countedRuns) ||
+    !isStreakCount(countedTier2) ||
+    !isStreakCount(s4AgreeingHeads) ||
+    !isStreakCount(s6Tier1Runs) ||
+    !isStreakCount(s6Tier2Runs)
+  ) {
+    return null;
+  }
+  return {
+    day,
+    dayNumber,
+    releaseSha,
+    clean,
+    countedRuns,
+    countedTier2,
+    s4AgreeingHeads,
+    s6Tier1Runs,
+    s6Tier2Runs,
+  };
+}
+
+/**
+ * The validated options (`nowIso` a zoned, calendar-valid, bounded,
+ * secret-free ISO time that `Date.parse` accepts; `rolledBackAtIso` `null` or
+ * the same), or null when any field is unusable. Cost bound: constant — two
+ * bounded string checks and two parse calls on bounded text. Never throws
+ * (a Proxy stand-in for `options` surfaces as a null return from
+ * `readExactSnapshot`).
+ */
+function readStreakOptions(options: unknown): { nowIso: string; rolledBackAtIso: string | null } | null {
+  const snapshot = readExactSnapshot(options, STREAK_OPTION_KEYS);
+  if (snapshot === null) {
+    return null;
+  }
+  const { nowIso, rolledBackAtIso } = snapshot;
+  if (
+    !isLengthGatedSafeString(nowIso) ||
+    !isZonedIsoDateTime(nowIso) ||
+    Number.isNaN(Date.parse(nowIso))
+  ) {
+    return null;
+  }
+  if (!isLengthGatedNullableIso(rolledBackAtIso)) {
+    return null;
+  }
+  return { nowIso, rolledBackAtIso };
+}
+
+/**
+ * Evaluate the certification streak over `days` for the clock `options`
+ * (owner decision 2026-11-27, cutover-plan §3.2). `days` is at most
+ * `CUTOVER_STREAK_MAX_INPUT_DAYS` well-formed `CutoverStreakDay` records in
+ * strictly consecutive ascending UTC-day order; every day at or before the
+ * UTC day of `rolledBackAtIso` is dropped first, then the newest remaining
+ * day must be clean, no older than `CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS` UTC
+ * days and never in the future; the span walks backwards from it over at most
+ * `CUTOVER_STREAK_MAX_DAYS` clean days carrying the newest day's
+ * `releaseSha`, stopping at an unclean day or a release change (a release
+ * change that cuts the span below the cap is reported when the run floor is
+ * missed). The run and Tier-2 floors are summed over the span; the S4 and S6
+ * floors are checked on the newest span day only. Every failure returns
+ * `{ certified: false, reason }` and never throws.
+ *
+ * Hostile-input refusals (each mapped to a typed reason, never a pass):
+ * `options` null/undefined/primitive/array/array-like/getter/
+ * `__proto__`/`constructor`/`prototype`/extra/symbol/non-enumerable key,
+ * revoked or throwing-trap Proxy, or an invalid `nowIso`/`rolledBackAtIso`
+ * are `invalid-options`; `days` null/undefined/non-iterable/hole/wrong
+ * primitive/array-like/over-cap or enormous `length`/index getter/extra or
+ * symbol key, a revoked or throwing-trap Proxy on the container or an
+ * element, a malformed day record (getter, missing/extra key, polluting key,
+ * bad `day`, `null` or a non-40-hex `releaseSha`, non-boolean `clean`,
+ * out-of-range count), or a duplicate, unsorted or gapped day are
+ * `invalid-days`.
+ *
+ * Cost bounds: `readBoundedDenseArray(days, 64)` gates `O(1)` on prototype
+ * and `length` descriptor before any key enumeration, then `O(K)` in own-key
+ * count for `Reflect.ownKeys` and `O(64)` for element descriptor reads;
+ * `readExactSnapshot` is `O(K)` in own-key count via descriptors (no getter
+ * invoked); string and date checks are bounded by `MAX_STRING_BYTES` (64)
+ * and the 10-char `DAY_PATTERN` before `TextEncoder` or `Date.parse`; the
+ * streak evaluation itself is `O(N)` with `N <= 64`.
+ */
+export function evaluateCutoverStreak(days: unknown, options: unknown): CutoverStreakResult {
+  let clock: { nowIso: string; rolledBackAtIso: string | null } | null;
+  try {
+    clock = readStreakOptions(options);
+  } catch {
+    // A Proxy stand-in for `options` throwing inside the snapshot is a refusal, never an error.
+    clock = null;
+  }
+  if (clock === null) {
+    return INVALID_STREAK_OPTIONS;
+  }
+
+  let bounded: BoundedDenseArray | null;
+  try {
+    bounded = readBoundedDenseArray(days, CUTOVER_STREAK_MAX_INPUT_DAYS);
+  } catch {
+    return INVALID_STREAK_DAYS;
+  }
+  if (bounded === null) {
+    return INVALID_STREAK_DAYS;
+  }
+  const validated: ValidatedStreakDay[] = [];
+  try {
+    for (const element of bounded.array) {
+      const day = readStreakDay(element);
+      if (day === null) {
+        return INVALID_STREAK_DAYS;
+      }
+      validated.push(day);
+    }
+  } catch {
+    return INVALID_STREAK_DAYS;
+  }
+  // Input order, `i >= 1`: one equality per adjacent pair refuses an unsorted
+  // day, a duplicate day and a day gap alike.
+  for (let index = 1; index < validated.length; index += 1) {
+    if (validated[index].dayNumber !== validated[index - 1].dayNumber + 1) {
+      return INVALID_STREAK_DAYS;
+    }
+  }
+
+  const nowUtcDay = Math.floor(Date.parse(clock.nowIso) / DAY_MS);
+  let remaining = validated;
+  if (clock.rolledBackAtIso !== null) {
+    const rollbackUtcDay = Math.floor(Date.parse(clock.rolledBackAtIso) / DAY_MS);
+    remaining = validated.filter((day) => day.dayNumber > rollbackUtcDay);
+  }
+  if (remaining.length === 0) {
+    return { certified: false, reason: 'no-days' };
+  }
+  const newest = remaining[remaining.length - 1];
+  if (!newest.clean) {
+    return { certified: false, reason: 'newest-day-not-clean' };
+  }
+  const ageDays = nowUtcDay - newest.dayNumber;
+  if (ageDays < 0 || ageDays > CUTOVER_STREAK_MAX_NEWEST_AGE_DAYS) {
+    return { certified: false, reason: 'newest-day-stale' };
+  }
+
+  const span: ValidatedStreakDay[] = [];
+  let cutByReleaseChange = false;
+  for (let index = remaining.length - 1; index >= 0 && span.length < CUTOVER_STREAK_MAX_DAYS; index -= 1) {
+    const day = remaining[index];
+    if (!day.clean) {
+      break;
+    }
+    if (day.releaseSha !== newest.releaseSha) {
+      // Reached only for a clean day: an older clean day with a different
+      // release cut the span short of the cap.
+      cutByReleaseChange = true;
+      break;
+    }
+    span.unshift(day);
+  }
+  let countedRuns = 0;
+  let countedTier2 = 0;
+  for (const day of span) {
+    countedRuns += day.countedRuns;
+    countedTier2 += day.countedTier2;
+  }
+  if (countedRuns < CUTOVER_STREAK_MIN_COUNTED_RUNS) {
+    if (cutByReleaseChange) {
+      return { certified: false, reason: 'release-changed' };
+    }
+    return { certified: false, reason: 'counted-runs-below-floor' };
+  }
+  if (countedTier2 < CUTOVER_STREAK_MIN_TIER2_RUNS) {
+    return { certified: false, reason: 'tier2-runs-below-floor' };
+  }
+  // S4 and S6 floors are newest-day checks only: an older span day below the
+  // floor does not refuse.
+  if (newest.s4AgreeingHeads < CUTOVER_STREAK_MIN_S4_HEADS) {
+    return { certified: false, reason: 's4-heads-below-floor' };
+  }
+  if (newest.s6Tier1Runs < CUTOVER_STREAK_MIN_S6_TIER1 || newest.s6Tier2Runs < CUTOVER_STREAK_MIN_S6_TIER2) {
+    return { certified: false, reason: 's6-runs-below-floor' };
+  }
+  return {
+    certified: true,
+    spanStartDay: span[0].day,
+    spanEndDay: newest.day,
+    spanDays: span.length,
+    releaseSha: newest.releaseSha,
+    countedRuns,
+    countedTier2,
+  };
+}
+
 
 // BL14a: the §1 retirement ledger (plan §1, `docs/planning/2026-11-03_cutover-plan.md`).
 // A ledger records, for every pinned §1 script, that its replacement is verified.

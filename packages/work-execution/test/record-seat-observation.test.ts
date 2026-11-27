@@ -491,6 +491,55 @@ describe('RecordSeatObservationUseCase (dry run, windows and duplicates)', () =>
     expect(await store.listSeatObservations('seat-a')).toHaveLength(2);
   });
 
+  it('serializes the cooldown check-and-append per seat: concurrent observations record once', async () => {
+    // Each read returns a snapshot taken BEFORE a macrotask delay, so without
+    // per-seat serialization both requests read "no active window" before either append.
+    const store = new SeatObservationRepositoryAdapter();
+    const slow: RecordSeatObservationDependencies['observations'] = {
+      listSeatObservations: async (seatId?: string) => {
+        const snapshot = await store.listSeatObservations(seatId);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return snapshot;
+      },
+      appendSeatObservation: (record) => store.appendSeatObservation(record),
+    };
+    let id = 0;
+    const useCase = new RecordSeatObservationUseCase({
+      observations: slow,
+      attempts: attemptRepo([
+        attemptRecord(),
+        attemptRecord({
+          id: 'att-b',
+          seatSelection: { ...attemptRecord().seatSelection!, seatId: 'seat-b' },
+        }),
+      ]),
+      isProxy: types.isProxy,
+      nowIso: () => NOW,
+      mintObservationId: () => {
+        id += 1;
+        return `obs-${id}`;
+      },
+      observationCooldownMinutes: 60,
+    });
+    const results = await Promise.all([
+      useCase.execute({ ...attemptInput, observationId: 'obs-a' }, 'cli'),
+      useCase.execute({ ...attemptInput, observationId: 'obs-b' }, 'cli'),
+    ]);
+    const outcomes = results.map((result) => result.outcome).sort();
+    expect(outcomes).toEqual(['duplicate', 'recorded']);
+    expect(results.find((result) => result.outcome === 'duplicate')).toMatchObject({
+      reason: 'window-already-cooling',
+    });
+    expect(await store.listSeatObservations('seat-a')).toHaveLength(2);
+
+    // A different seat is keyed separately and is never held back by seat-a's window.
+    const other = await useCase.execute(
+      { ...attemptInput, seatId: 'seat-b', subject: { attemptId: 'att-b' }, observationId: 'obs-c' },
+      'cli',
+    );
+    expect(other.outcome).toBe('recorded');
+  });
+
   it('a repeat observation id is a duplicate that writes nothing new', async () => {
     const { useCase, store } = harness({ observationCooldownMinutes: 0 });
     await useCase.execute({ ...attemptInput, observationId: 'obs-1' }, 'cli');

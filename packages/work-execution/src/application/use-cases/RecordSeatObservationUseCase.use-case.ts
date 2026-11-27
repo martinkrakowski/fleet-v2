@@ -65,6 +65,34 @@ const SNAPSHOT_LIMITS = Object.freeze({
 
 const ID_MAX_LENGTH = 128;
 
+/**
+ * Per-seat serialization of the cooldown check-and-append. The window check
+ * reads the store and the append writes it; two concurrent observations for the
+ * same seat would otherwise both read "no active window" and both answer
+ * `recorded`. The chain is keyed by seat, so different seats never wait on each
+ * other, and it is shared by every use-case instance in the process.
+ */
+const seatTails = new Map<string, Promise<void>>();
+
+async function serializedBySeat<T>(seatId: string, work: () => Promise<T>): Promise<T> {
+  const previous = seatTails.get(seatId) ?? Promise.resolve();
+  let release: () => void = () => undefined;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => mine);
+  seatTails.set(seatId, tail);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (seatTails.get(seatId) === tail) {
+      seatTails.delete(seatId);
+    }
+  }
+}
+
 /** The input keys the use case reads, no more and no fewer. */
 const INPUT_KEYS: readonly string[] = ['seatId', 'outcome', 'subject', 'observationId', 'observedAtIso'];
 
@@ -377,7 +405,14 @@ export class RecordSeatObservationUseCase implements RecordSeatObservationPort {
   }
 
   /** The window and persistence half: a dry run writes nothing, a repeat is a duplicate. */
-  private async put(
+  private put(
+    record: SeatObservationRecord,
+    options?: { readonly dryRun?: boolean },
+  ): Promise<RecordSeatObservationResult> {
+    return serializedBySeat(record.seatId, () => this.putSerialized(record, options));
+  }
+
+  private async putSerialized(
     record: SeatObservationRecord,
     options?: { readonly dryRun?: boolean },
   ): Promise<RecordSeatObservationResult> {

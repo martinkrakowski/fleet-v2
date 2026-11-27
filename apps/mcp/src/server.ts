@@ -62,7 +62,9 @@ export async function startServer(options?: StartServerOptions): Promise<void> {
     client,
     config: parsed.config,
   });
+  // Hooks go on before registration so a shutdown signal or stdin close during
+  // a slow register() is still caught and the session gets retired.
+  attachProcessLifecycleHooks(lifecycle);
   // Non-fatal: registration refusal or failure never stops the stdio server.
   await lifecycle.start();
-  attachProcessLifecycleHooks(lifecycle);
 }

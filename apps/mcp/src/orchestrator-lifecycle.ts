@@ -220,14 +220,24 @@ export function createOrchestratorLifecycle(
   async function register(): Promise<StartLifecycleResult> {
     // The registration body is closed: exactly these six keys, never scopes,
     // status or times.
-    const response = await deps.client.post(REGISTER_PATH, {
-      orchestratorId,
-      cliKind: deps.config.cliKind,
-      model: deps.config.model,
-      host: deps.config.host,
-      projects: [...deps.config.projects],
-      claims: [...deps.config.claims],
-    });
+    let response: ApiClientResult;
+    try {
+      response = await deps.client.post(REGISTER_PATH, {
+        orchestratorId,
+        cliKind: deps.config.cliKind,
+        model: deps.config.model,
+        host: deps.config.host,
+        projects: [...deps.config.projects],
+        claims: [...deps.config.claims],
+      });
+    } catch (error) {
+      // A thrown or rejected client.post() must never reject start(): the
+      // stdio server stays up and serving regardless of registration.
+      return {
+        status: "failed",
+        reason: error instanceof Error ? error.message : "registration threw",
+      };
+    }
     if (!("result" in response)) {
       const code = response.code;
       if (code === "not-configured") {

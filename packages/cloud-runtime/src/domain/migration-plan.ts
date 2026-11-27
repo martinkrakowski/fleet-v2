@@ -131,7 +131,7 @@ export function checksumOfMigration(sql: unknown, digest: (text: string) => stri
   } catch {
     return { ok: false, reason: 'digest-failed', field: 'digest' };
   }
-  if (typeof value !== 'string' || value.length === 0) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_CHECKSUM_LENGTH) {
     return { ok: false, reason: 'digest-failed', field: 'digest' };
   }
   return { ok: true, value };

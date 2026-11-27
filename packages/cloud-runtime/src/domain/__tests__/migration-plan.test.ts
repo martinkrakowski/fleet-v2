@@ -252,6 +252,12 @@ describe("decideMigrationRun", () => {
   it("accepts a checksum longer than 128 characters that checksumOfMigration itself accepts", () => {
     const longChecksum = "c".repeat(129);
     expect(checksumOfMigration("select 1;", () => longChecksum)).toEqual({ ok: true, value: longChecksum });
+    // A digest longer than the planner can read back is refused at the source.
+    expect(checksumOfMigration("select 1;", () => "c".repeat(MAX_SQL_LENGTH + 1))).toEqual({
+      ok: false,
+      reason: "digest-failed",
+      field: "digest",
+    });
     expect(
       decideMigrationRun([applied("0001_a", longChecksum)], [available("0001_a", longChecksum)], isProxy),
     ).toEqual({ ok: true, toRun: [] });

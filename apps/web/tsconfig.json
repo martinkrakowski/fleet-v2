@@ -6,7 +6,6 @@
     "declaration": false,
     "emitDeclarationOnly": false,
     "noEmit": true,
-    "incremental": false,
     "strict": true,
     "jsx": "preserve",
     "plugins": [
@@ -20,6 +19,7 @@
       "esnext"
     ],
     "allowJs": true,
+    "incremental": true,
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "isolatedModules": true

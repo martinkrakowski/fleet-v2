@@ -35,7 +35,14 @@ import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
-import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT, runsWaitOnForge, pollSleepMs } from '../conductor.js';
+import {
+  formatAdmissionNoCapacityLog,
+  nextPollDelayMs,
+  PASS_CONCURRENCY_LIMIT,
+  runsWaitOnForge,
+  pollSleepMs,
+  sanitizeAdmissionBlockersForOutput,
+} from '../conductor.js';
 import type { ChangeWakeReader } from '../conductor-wake.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
 import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
@@ -1760,3 +1767,233 @@ describe('the live wiring reaches no host in tests (K7-7)', () => {
 function buildLiveDriver(runtime: FleetCliRuntime, maxActiveRuns = 1): ConductorDriver {
   return buildLiveConductorDriver(runtime, { maxActiveRuns });
 }
+
+describe('admission blockers in start and run output (AB-CB10)', () => {
+  const ESC = String.fromCharCode(0x1b);
+  const BEL = String.fromCharCode(0x07);
+  const DEL = String.fromCharCode(0x7f);
+  const C1 = String.fromCharCode(0x9b);
+  // Credential-shaped values are built at run time so no secret-shaped literal sits in this file.
+  const tokenShaped = `gh${'p'}_${'a1B2'.repeat(8)}`;
+  const assignmentShaped = `src/${'pass'}${'word'}=hunter22`;
+  const RUN_A = 'run-01JB0000000000000000000001';
+  const ATT_A = 'attempt-01JB000000000000000000001';
+  const hasControl = (text: string): boolean =>
+    Array.from(text).some((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+    });
+
+  async function startWith(blockedBy: unknown) {
+    const dir = tempStateDir();
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({
+      enabled: true,
+      startResult: { outcome: 'no-capacity', ...(blockedBy === undefined ? {} : { blockedBy }) } as StartLaneRunResult,
+    });
+    return runConductor(runtimeOf(dir), ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+  }
+
+  async function runWith(step: AdvanceLaneRunResult) {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [forgePass([step])] });
+    return runConductor(runtimeOf(dir), ['run', '--live', '--once'], { stateDir: dir, buildDriver: () => fake.driver });
+  }
+
+  const waiting = (blockedBy?: unknown): AdvanceLaneRunResult =>
+    ({ outcome: 'waiting', reason: 'admission', ...(blockedBy === undefined ? {} : { blockedBy }) }) as AdvanceLaneRunResult;
+
+  it('IDs and first path printed: start names blockers and the first overlapping path on stderr, stdout stays exact', async () => {
+    const blockedBy = {
+      runIds: [RUN_A],
+      attemptIds: [ATT_A],
+      overlaps: [{ kind: 'run', id: RUN_A, path: 'packages/a/src' }, { kind: 'run', id: RUN_A, path: 'packages/b/src' }],
+    };
+    const result = await startWith(blockedBy);
+    expect(result.code).toBe(1);
+    expect(parseDocument(result.stdout)).toEqual({ outcome: 'no-capacity', blockedBy });
+    expect(result.stderr.join('')).toContain(`conductor start: blocked by 1 run(s) and 1 reservation(s): ${RUN_A} (packages/a/src), ${ATT_A}\n`);
+    expect(result.stderr.join('')).not.toContain('packages/b/src');
+  });
+
+  it('IDs and first path printed: run logs the waiting admission step and carries blockedBy on stdout', async () => {
+    const blockedBy = { runIds: [RUN_A], attemptIds: [], overlaps: [{ kind: 'run', id: RUN_A, path: 'packages/a/src' }] };
+    const result = await runWith(waiting(blockedBy));
+    expect(result.code).toBe(0);
+    const line = parseDocument(result.stdout) as { runs: Array<{ steps: unknown[] }> };
+    expect(line.runs[0].steps[0]).toEqual({ outcome: 'waiting', reason: 'admission', blockedBy });
+    expect(result.stderr.join('')).toContain(`conductor run: ${RUN_ID} blocked by 1 run(s) and 0 reservation(s): ${RUN_A} (packages/a/src)`);
+  });
+
+  it('waiting admission without blockedBy logs nothing and completes pass', async () => {
+    const result = await runWith(waiting());
+    expect(result.code).toBe(0);
+    expect(result.stderr.join('')).not.toContain('blocked by');
+    const line = parseDocument(result.stdout) as { runs: Array<{ steps: unknown[] }> };
+    expect(line.runs[0].steps[0]).toEqual({ outcome: 'waiting', reason: 'admission' });
+  });
+
+  it('only the last step of a run is logged, and only when it waits on admission', async () => {
+    const blockedBy = { runIds: [RUN_A], attemptIds: [] };
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [forgePass([waiting(blockedBy), { outcome: 'done' }])] });
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], { stateDir: dir, buildDriver: () => fake.driver });
+    expect(result.stderr.join('')).not.toContain('blocked by');
+  });
+
+  it('more than 5 blockers truncated with +N more and oversized array (> 10_000) read up to cap without dropping counts', () => {
+    const seven = Array.from({ length: 7 }, (_v, i) => `run-0${i}`);
+    expect(formatAdmissionNoCapacityLog({ runIds: seven, attemptIds: [] })).toBe(
+      'blocked by 7 run(s) and 0 reservation(s): run-00, run-01, run-02, run-03, run-04, +2 more',
+    );
+    const huge = Array.from({ length: 10_005 }, (_v, i) => `run-${i}`);
+    const line = formatAdmissionNoCapacityLog({ runIds: huge, attemptIds: [] });
+    expect(line).toContain('blocked by 10005 run(s) and 0 reservation(s)');
+    expect(line).toContain('+10000 more');
+    const sanitized = sanitizeAdmissionBlockersForOutput({ runIds: huge, attemptIds: [] });
+    expect(sanitized?.runIds).toHaveLength(10_000);
+    expect(sanitized?.runIds[9_999]).toBe('run-9999');
+  });
+
+  it('plus-N more uses full array length when non-string entries are present', () => {
+    const line = formatAdmissionNoCapacityLog({ runIds: ['a', 'b', 'c', 'd', 'e', 42], attemptIds: [] });
+    expect(line).toContain('6 run(s)');
+    expect(line).toContain(', +1 more');
+  });
+
+  it('unreadable blocker reported separately and counted', () => {
+    const line = formatAdmissionNoCapacityLog({ runIds: ['run-x'], attemptIds: [], unreadable: ['run-x'] });
+    expect(line).toBe('blocked by 1 run(s) and 0 reservation(s): run-x; unreadable work order: run-x');
+    const many = formatAdmissionNoCapacityLog({ runIds: [], attemptIds: [], unreadable: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] });
+    expect(many).toContain('unreadable work order: a, b, c, d, e, +2 more');
+  });
+
+  it('malformed blockedBy fields fail closed without throwing', () => {
+    expect(formatAdmissionNoCapacityLog({ runIds: [1, null], attemptIds: [{}] })).toBe('blocked by 2 run(s) and 1 reservation(s)');
+    expect(formatAdmissionNoCapacityLog({})).toBeNull();
+    expect(formatAdmissionNoCapacityLog({ runIds: [], attemptIds: [] })).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput({ runIds: [1, 'ok'], attemptIds: 'x', overlaps: [{ kind: 'bad', id: 1, path: 2 }] })).toEqual({
+      runIds: ['ok'],
+      attemptIds: [],
+      overlaps: [],
+    });
+  });
+
+  it('non-array blockedBy fields do not throw and fail closed', () => {
+    expect(formatAdmissionNoCapacityLog({ runIds: {}, attemptIds: 'x', unreadable: {}, overlaps: 'x' })).toBeNull();
+    expect(formatAdmissionNoCapacityLog([RUN_A])).toBeNull();
+    expect(formatAdmissionNoCapacityLog('run')).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput([RUN_A])).toBeUndefined();
+    expect(sanitizeAdmissionBlockersForOutput('x')).toBeUndefined();
+  });
+
+  it('null blockedBy and null overlap entries fail closed', () => {
+    expect(formatAdmissionNoCapacityLog(null)).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput(null)).toBeUndefined();
+    expect(formatAdmissionNoCapacityLog({ runIds: [RUN_A], attemptIds: [], overlaps: [null, 3, [], { kind: 'run', id: RUN_A, path: 'p/x' }] })).toBe(
+      `blocked by 1 run(s) and 0 reservation(s): ${RUN_A} (p/x)`,
+    );
+  });
+
+  it('returns null for undefined blockedBy', () => {
+    expect(formatAdmissionNoCapacityLog(undefined)).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput(undefined)).toBeUndefined();
+  });
+
+  it('throwing getter on blockedBy or overlap is never invoked and fails closed', () => {
+    let calls = 0;
+    const withGetter = (): Record<string, unknown> => {
+      const record: Record<string, unknown> = {};
+      Object.defineProperty(record, 'runIds', { enumerable: true, get: () => { calls += 1; throw new Error('getter ran'); } });
+      return record;
+    };
+    expect(formatAdmissionNoCapacityLog(withGetter())).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput(withGetter())).toEqual({ runIds: [], attemptIds: [] });
+    const overlap: Record<string, unknown> = { kind: 'run', id: RUN_A };
+    Object.defineProperty(overlap, 'path', { enumerable: true, get: () => { calls += 1; throw new Error('getter ran'); } });
+    expect(formatAdmissionNoCapacityLog({ runIds: [RUN_A], attemptIds: [], overlaps: [overlap] })).toBe(`blocked by 1 run(s) and 0 reservation(s): ${RUN_A}`);
+    expect(calls).toBe(0);
+  });
+
+  it('revoked Proxy as blockedBy or nested array/overlap fails closed without throwing', () => {
+    const revoked = (target: object): object => {
+      const { proxy, revoke } = Proxy.revocable(target, {});
+      revoke();
+      return proxy;
+    };
+    const throwingTrap = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error('trap'); } });
+    expect(formatAdmissionNoCapacityLog(revoked({}))).toBeNull();
+    expect(formatAdmissionNoCapacityLog(throwingTrap)).toBeNull();
+    expect(sanitizeAdmissionBlockersForOutput(revoked({}))).toBeUndefined();
+    expect(formatAdmissionNoCapacityLog({ runIds: revoked([]), attemptIds: [ATT_A] })).toBe(`blocked by 0 run(s) and 1 reservation(s): ${ATT_A}`);
+    expect(formatAdmissionNoCapacityLog({ runIds: [RUN_A], attemptIds: [], overlaps: revoked([]) })).toBe(`blocked by 1 run(s) and 0 reservation(s): ${RUN_A}`);
+    expect(formatAdmissionNoCapacityLog({ runIds: [RUN_A], attemptIds: [], overlaps: [revoked({})] })).toBe(`blocked by 1 run(s) and 0 reservation(s): ${RUN_A}`);
+    expect(sanitizeAdmissionBlockersForOutput({ runIds: [RUN_A], attemptIds: revoked([]), unreadable: revoked([]) })).toEqual({ runIds: [RUN_A], attemptIds: [] });
+  });
+
+  it('credential-shaped blocker IDs and paths are redacted in both stdout JSON and stderr', async () => {
+    const blockedBy = {
+      runIds: [tokenShaped],
+      attemptIds: [ATT_A],
+      unreadable: [tokenShaped],
+      overlaps: [{ kind: 'attempt', id: ATT_A, path: assignmentShaped }],
+    };
+    const started = await startWith(blockedBy);
+    const ran = await runWith(waiting(blockedBy));
+    for (const output of [started.stdout.join(''), started.stderr.join(''), ran.stdout.join(''), ran.stderr.join('')]) {
+      expect(output).not.toContain(tokenShaped);
+      expect(output).not.toContain('hunter22');
+    }
+    expect(started.stderr.join('')).toContain('[REDACTED]');
+    expect(parseDocument(started.stdout)).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['[REDACTED]'], attemptIds: [ATT_A], unreadable: ['[REDACTED]'], overlaps: [{ kind: 'attempt', id: ATT_A, path: '[REDACTED]' }] },
+    });
+  });
+
+  it('ordinary words that merely contain credential prefixes are not redacted', () => {
+    const path = 'packages/task-queue-handlers/src';
+    expect(formatAdmissionNoCapacityLog({ runIds: ['run-1'], attemptIds: [], overlaps: [{ kind: 'run', id: 'run-1', path }] })).toContain(path);
+  });
+
+  it('ANSI escape sequences and control characters are stripped from stderr log', async () => {
+    const hostile = `${ESC}[31mred${ESC}[0m-${ESC}]8;;http://x${BEL}link${ESC}]8;;${BEL}-${BEL}-${DEL}-${C1}1m-end`;
+    const blockedBy = { runIds: [`run-${hostile}`], attemptIds: [], overlaps: [{ kind: 'run', id: `run-${hostile}`, path: `p/${hostile}` }] };
+    const started = await startWith(blockedBy);
+    const ran = await runWith(waiting(blockedBy));
+    for (const stderr of [started.stderr.join(''), ran.stderr.join('')]) {
+      expect(hasControl(stderr.split('\n').join(''))).toBe(false);
+      expect(stderr).toContain('run-red-link');
+    }
+    expect(started.stderr).toHaveLength(1);
+  });
+
+  it('an oversized run id is bounded in the run log line', async () => {
+    const dir = tempStateDir();
+    const longId = `run-${'q'.repeat(5000)}`;
+    const fake = makeFakeDriver({
+      enabled: true,
+      passes: [completedPass({ runs: [{ runId: longId, outcome: 'advanced', steps: [waiting({ runIds: [RUN_A], attemptIds: [] })] }] })],
+    });
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], { stateDir: dir, buildDriver: () => fake.driver });
+    const line = result.stderr.find((entry) => entry.startsWith('conductor run: ')) ?? '';
+    expect(line).toContain(`${'q'.repeat(100)}...`);
+    expect(line.length).toBeLessThan(400);
+  });
+
+  it('oversized ID and unreadable item are bounded in stderr', () => {
+    const big = 'x'.repeat(3_000_000);
+    const line = formatAdmissionNoCapacityLog({ runIds: [big], attemptIds: [], unreadable: [big], overlaps: [{ kind: 'run', id: big, path: 'y'.repeat(1000) }] });
+    expect(line).not.toBeNull();
+    expect((line ?? '').length).toBeLessThan(120 + 240 + 400);
+    expect(line).toContain(`${'x'.repeat(117)}...`);
+    const mid = 'z'.repeat(500);
+    const midLine = formatAdmissionNoCapacityLog({ runIds: ['r'], attemptIds: [], overlaps: [{ kind: 'run', id: 'r', path: mid }] });
+    expect(midLine).toContain(`(${'z'.repeat(237)}...)`);
+    expect(sanitizeAdmissionBlockersForOutput({ runIds: [big], attemptIds: [] })?.runIds[0]).toHaveLength(4096);
+  });
+});
+

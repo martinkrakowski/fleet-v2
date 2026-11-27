@@ -309,6 +309,31 @@ describe('mintGateReceiptFromVmExit', () => {
       })(),
       (() => {
         const environment = freshnessSource();
+        (environment['environmentState'] as Record<string, unknown>)['worktreeRef'] = '../../other';
+        return environment;
+      })(),
+      (() => {
+        const environment = freshnessSource();
+        (environment['environmentState'] as Record<string, unknown>)['worktreeRef'] = 'wt\\..\\escape';
+        return environment;
+      })(),
+      (() => {
+        const environment = freshnessSource();
+        (environment['environmentState'] as Record<string, unknown>)['worktreeRef'] = 'wt/../../escape';
+        return environment;
+      })(),
+      (() => {
+        const environment = freshnessSource();
+        (environment['environmentState'] as Record<string, unknown>)['worktreeRef'] = '/etc/passwd';
+        return environment;
+      })(),
+      (() => {
+        const environment = freshnessSource();
+        (environment['environmentState'] as Record<string, unknown>)['worktreeRef'] = 'C:\\host\\wt';
+        return environment;
+      })(),
+      (() => {
+        const environment = freshnessSource();
         (environment['environmentState'] as Record<string, unknown>)['attemptId'] = null;
         return environment;
       })(),

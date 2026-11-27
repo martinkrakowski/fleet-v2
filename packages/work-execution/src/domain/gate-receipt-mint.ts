@@ -276,6 +276,15 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 
+/** True when any `/` or `\` separated path segment is exactly `..`, so the
+ * reference climbs out of its worktree root. Callers length-check the string
+ * (1..512) first, so this is O(length) bounded by one split over at most 512
+ * characters.
+ */
+function hasParentPathSegment(value: string): boolean {
+  return value.split(/[\\/]/).some((segment) => segment === '..');
+}
+
 /** A bounded 1..128 id: `[A-Za-z0-9._:-]{1,128}` (which already excludes
  * control characters) that carries no secret shape. O(length).
  */
@@ -471,7 +480,12 @@ export function mintGateReceiptFromVmExit(
       worktreeRef.length < 1 ||
       worktreeRef.length > MAX_WORKTREE_REF_LENGTH ||
       hasControlCharacter(worktreeRef) ||
-      containsSecretShape(worktreeRef)
+      containsSecretShape(worktreeRef) ||
+      // A worktree reference is relative: an absolute host path (POSIX root,
+      // a backslash root or a drive letter) or a `..` path segment would let
+      // malformed host state escape the worktree, so both fail closed.
+      /^(?:[\\/]|[A-Za-z]:)/.test(worktreeRef) ||
+      hasParentPathSegment(worktreeRef)
     ) {
       return refusedMint('invalid-freshness-source');
     }

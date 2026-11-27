@@ -262,11 +262,21 @@ export function classifyHostedRows<T>(
       quarantined.push({ index, reason: "parser-threw" });
       continue;
     }
-    if (!parsed.ok) {
-      quarantined.push({ index, reason: sanitizeReason(parsed.reason) });
+    // Reading `parsed.ok` / `parsed.reason` is itself untrusted: a parser may
+    // return `null` or expose throwing accessors. Guard those reads too so a
+    // hostile parse result quarantines instead of escaping.
+    let parseOutcome: { ok: true; value: T } | { ok: false; reason: string };
+    try {
+      parseOutcome = parsed.ok ? { ok: true, value: parsed.value } : { ok: false, reason: parsed.reason };
+    } catch {
+      quarantined.push({ index, reason: "parser-threw" });
       continue;
     }
-    validRows.push(parsed.value);
+    if (!parseOutcome.ok) {
+      quarantined.push({ index, reason: sanitizeReason(parseOutcome.reason) });
+      continue;
+    }
+    validRows.push(parseOutcome.value);
   }
 
   return Object.freeze({
@@ -400,8 +410,12 @@ export function describeQuarantine(result: unknown, isProxy?: IsProxy): string {
 /**
  * Read a summary-side array through descriptors only: a genuine `Array` with
  * `Array.prototype`, not a Proxy per `detector`, with a plain data `length`
- * descriptor holding a non-negative safe integer. Null on any mismatch.
- * Cost bound: O(1) — fixed descriptor reads, no element enumeration.
+ * descriptor holding a non-negative safe integer, and every canonical index
+ * `0..length-1` present as an own enumerable data property (no holes, no
+ * sparse arrays, no accessors, no extra or `__proto__`/symbol keys).
+ * Null on any mismatch.
+ * Cost bound: O(length) — one `Reflect.ownKeys` pass plus one descriptor
+ * read per canonical index, bounded by the summary array length.
  */
 function readSummaryArray(value: unknown, detector: IsProxy): readonly unknown[] | null {
   try {
@@ -416,11 +430,29 @@ function readSummaryArray(value: unknown, detector: IsProxy): readonly unknown[]
       lengthDescriptor === undefined ||
       lengthDescriptor.get !== undefined ||
       lengthDescriptor.set !== undefined ||
+      !("value" in lengthDescriptor) ||
       typeof lengthDescriptor.value !== "number" ||
       !Number.isSafeInteger(lengthDescriptor.value) ||
       lengthDescriptor.value < 0
     ) {
       return null;
+    }
+    const length = lengthDescriptor.value;
+    const ownKeys = Reflect.ownKeys(value as object);
+    if (ownKeys.length !== length + 1) {
+      return null;
+    }
+    for (let i = 0; i < length; i += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(i));
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined ||
+        !("value" in descriptor) ||
+        !descriptor.enumerable
+      ) {
+        return null;
+      }
     }
     return value;
   } catch {

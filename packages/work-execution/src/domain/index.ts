@@ -22,6 +22,7 @@ export * from "./execution-records.js";
 export * from "./expand-contract-check.js";
 export * from "./forge-credential.js";
 export * from "./gate-receipt-key.js";
+export * from "./gate-receipt-mint.js";
 export * from "./held-work-order.js";
 export * from "./host-lifecycle.js";
 export * from "./host-placement.js";

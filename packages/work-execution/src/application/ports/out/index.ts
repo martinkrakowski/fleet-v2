@@ -82,6 +82,7 @@ export * from "./ProjectProbeRecordPort.out-port.js";
 export * from "./ProjectProfileReadPort.out-port.js";
 export * from "./PullRequestFindingsReadPort.out-port.js";
 export * from "./ReaperFindingRepositoryPort.out-port.js";
+export * from "./ReceiptCarryEvidencePort.out-port.js";
 export * from "./RelaunchPlanRepositoryPort.out-port.js";
 export * from "./ReleaseStorePort.out-port.js";
 export * from "./RepositoryFactsPort.out-port.js";

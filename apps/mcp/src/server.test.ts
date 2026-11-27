@@ -104,4 +104,19 @@ describe("startServer", () => {
     await startServer();
     expect(sdkMocks.state.connectCalls).toBe(1);
   });
+
+  it("rejects an invalid --kind CLI arg before connecting stdio", async () => {
+    await expect(
+      startServer({ argv: ["--kind", "not-a-cli"] }),
+    ).rejects.toThrow("--kind");
+    expect(sdkMocks.state.connectCalls).toBe(0);
+    expect(sdkMocks.tools).toHaveLength(0);
+  });
+
+  it("starts with valid CLI args and still makes no network call", async () => {
+    await startServer({
+      argv: ["--kind", "opencode", "--claim", "request-review"],
+    });
+    expect(sdkMocks.state.connectCalls).toBe(1);
+  });
 });

@@ -4,6 +4,7 @@ export * from "./admission-order.js";
 export * from "./artifact-manifest.js";
 export * from "./attempt-environment.js";
 export * from "./authority-event-mapping.js";
+export * from "./authority-event-org-export.js";
 export * from "./auto-merge.js";
 export * from "./base-branch.js";
 export * from "./brief-answer.js";

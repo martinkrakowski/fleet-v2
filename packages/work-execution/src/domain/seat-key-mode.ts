@@ -28,6 +28,9 @@ export const SEAT_KEY_MODE_LIMITS: PlainDataLimits = Object.freeze({
 
 /** The declared key modes a seat plan can be evaluated against. */
 export const KEY_MODES = ['byok', 'managed', 'self-host'] as const;
+// Frozen so runtime consumers cannot append undeclared modes that the guard
+// would then accept as known.
+Object.freeze(KEY_MODES);
 
 export type KeyMode = (typeof KEY_MODES)[number];
 
@@ -45,7 +48,12 @@ const REQUIRED_KEYS: readonly string[] = ['seatId', 'keyMode', 'keyedSeats'];
 
 const POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
 
-const MALFORMED: SeatKeyModeResult = { ok: false, reason: 'malformed-input' };
+// Fresh refusal per failure path: a shared mutable instance could be reassigned
+// by a caller (e.g. Object.assign(result, { ok: true })) and poison later
+// refusals.
+function malformed(): SeatKeyModeResult {
+  return Object.freeze({ ok: false as const, reason: 'malformed-input' as const });
+}
 
 function isPollutingKey(key: string): boolean {
   return POLLUTING_KEYS.includes(key);
@@ -71,44 +79,44 @@ export function assertSeatAllowedForKeyMode(input: unknown, isProxy: IsProxy): S
   // refusal here, mapped to 'malformed-input' regardless of path.
   const snap = snapshotPlainData(input, isProxy, SEAT_KEY_MODE_LIMITS);
   if (!snap.ok) {
-    return MALFORMED;
+    return malformed();
   }
   const value = snap.value;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return MALFORMED;
+    return malformed();
   }
   // One enumeration: exactly the 3 required keys, no extras, no polluting key.
   const keys = Reflect.ownKeys(value);
   if (keys.length !== REQUIRED_KEYS.length) {
-    return MALFORMED;
+    return malformed();
   }
   for (const key of keys) {
     if (typeof key !== 'string' || !REQUIRED_KEYS.includes(key)) {
-      return MALFORMED;
+      return malformed();
     }
     if (isPollutingKey(key)) {
-      return MALFORMED;
+      return malformed();
     }
   }
   const record = value as Record<string, unknown>;
   if (!isAcceptableId(record['seatId'])) {
-    return MALFORMED;
+    return malformed();
   }
   const rawKeyMode = record['keyMode'];
   if (typeof rawKeyMode !== 'string') {
-    return MALFORMED;
+    return malformed();
   }
   if (!KEY_MODES.includes(rawKeyMode as KeyMode)) {
     return { ok: false, reason: 'unknown-key-mode' };
   }
   const rawKeyedSeats = record['keyedSeats'];
   if (!Array.isArray(rawKeyedSeats)) {
-    return MALFORMED;
+    return malformed();
   }
   const keyedSet = new Set<string>();
   for (const entry of rawKeyedSeats) {
     if (!isAcceptableId(entry)) {
-      return MALFORMED;
+      return malformed();
     }
     keyedSet.add(entry);
   }

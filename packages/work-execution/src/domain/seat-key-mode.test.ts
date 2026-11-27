@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import type { IsProxy } from '@fleet/shared';
 
 import { SEAT_CATALOG_SEAT_BOUND, seatPlanFromCatalog, type SeatCatalog } from './seat-selection.js';
-import { assertSeatAllowedForKeyMode, type SeatKeyModeResult } from './seat-key-mode.js';
+import { assertSeatAllowedForKeyMode, KEY_MODES, type SeatKeyModeResult } from './seat-key-mode.js';
 
 const isProxy: IsProxy = types.isProxy;
 
@@ -41,6 +41,20 @@ function validInput(overrides: Record<string, unknown> = {}): Record<string, unk
 // ---------------------------------------------------------------------------
 
 describe('assertSeatAllowedForKeyMode', () => {
+  it('keeps KEY_MODES frozen so undeclared modes cannot be appended at runtime', () => {
+    expect(Object.isFrozen(KEY_MODES)).toBe(true);
+  });
+
+  it('returns a fresh frozen malformed-input refusal so one mutated result cannot poison later ones', () => {
+    const first = refusalOf(null);
+    const mutated = Object.assign(Object.create(Object.getPrototypeOf(first)), first, { ok: true });
+    expect(mutated).not.toBe(first);
+    expect(first.ok).toBe(false);
+    const second = refusalOf(null);
+    expect(second.ok).toBe(false);
+    expect(Object.isFrozen(second)).toBe(true);
+  });
+
   it('allows a listed seat under managed keyMode', () => {
     okFor(validInput({ keyMode: 'managed' }));
   });

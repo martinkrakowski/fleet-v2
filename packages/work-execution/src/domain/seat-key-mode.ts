@@ -10,9 +10,16 @@ import { snapshotPlainData, type IsProxy, type PlainDataLimits } from '@fleet/sh
 
 import { SEAT_CATALOG_SEAT_BOUND } from './seat-selection.js';
 
-/** Domain-sized snapshot bounds: 1 root object + 2 string fields + 1 allow-list array of at most 256 entries = 260 nodes <= 264, at depth <= 2. */
+/**
+ * Domain-sized snapshot bounds: 1 root object + 2 string fields + 1 allow-list
+ * array of at most 256 entries = 260 nodes <= 264. The snapshot visits the
+ * root at depth 0, the allow-list array at depth 1, and its entries at depth
+ * 2, so `maxDepth` must be 3 for the whole shape to pass the depth bound
+ * (`depth + 1 > maxDepth` never fires for it); anything deeper inside the
+ * array is still refused as malformed by the field validation below.
+ */
 export const SEAT_KEY_MODE_LIMITS: PlainDataLimits = Object.freeze({
-  maxDepth: 2,
+  maxDepth: 3,
   maxKeys: 3,
   maxArrayLength: SEAT_CATALOG_SEAT_BOUND,
   maxNodes: 264,

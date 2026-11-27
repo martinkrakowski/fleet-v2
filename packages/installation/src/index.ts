@@ -12,6 +12,7 @@ export * from './auto-merge-revision.js';
 export * from './runner-defaults.js';
 export * from './conductor-revision.js';
 export * from './keys.js';
+export * from './chart-values.js';
 export {
   CONDUCTOR_REAPER_REPAIR_KINDS,
   POLICY_KEYS,

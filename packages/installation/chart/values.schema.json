@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fleet self-host chart values",
+  "description": "Values for the self-host deployment chart. MIT packages only: no licence key is required and no hosted-only package or capability key is accepted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "allowRemote": {
+          "type": "boolean"
+        }
+      }
+    },
+    "web": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "apiUrl": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "size": {
+          "type": "string",
+          "minLength": 1
+        },
+        "storageClass": {
+          "type": "string"
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "stateDir": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

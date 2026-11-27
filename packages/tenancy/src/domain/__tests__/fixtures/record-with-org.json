@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "run-0002",
+  "kind": "work-run",
+  "status": "active",
+  "organizationId": "acme-org",
+  "payload": {
+    "title": "Hosted record with an organisation",
+    "steps": ["prepare", "apply", "verify"]
+  }
+}

@@ -70,9 +70,12 @@ class FakeDriver implements SandboxDriver {
   /** When true, create never settles. Only the adapter's deadline can finish the call. */
   neverSettleCreate = false;
   neverSettleDestroy = false;
+  neverSettleInspect = false;
   /** Returned as the create/destroy promise so a test can settle it after the deadline. */
   holdCreate: Promise<SandboxCreateResult> | null = null;
   holdDestroy: Promise<SandboxDestroyResult> | null = null;
+  /** Returned as the inspect promise so a test can settle it after the deadline. */
+  holdInspect: Promise<SandboxInspectResult> | null = null;
 
   async create(payload: SandboxCreatePayload): Promise<SandboxCreateResult> {
     this.createCalls.push(payload);
@@ -100,6 +103,14 @@ class FakeDriver implements SandboxDriver {
 
   async inspect(sessionId: string): Promise<SandboxInspectResult> {
     this.inspectCalls.push(sessionId);
+    if (this.neverSettleInspect) {
+      return new Promise<SandboxInspectResult>(() => {});
+    }
+    if (this.holdInspect !== null) {
+      const pending = this.holdInspect;
+      this.holdInspect = null;
+      return pending;
+    }
     if (this.rawInspectResult !== null) {
       return this.rawInspectResult.value as SandboxInspectResult;
     }
@@ -550,6 +561,31 @@ describe('SandboxRunnerAdapter', () => {
       expect(second.outcome).toBe('terminated');
       expect(driver.destroyCalls).toHaveLength(2);
     });
+
+    it('returns unknown without echoing driver error text when driver destroy rejects, and retries on the next stop', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      driver.destroyResult = new Error('destroy failed for ' + SESSION_ID);
+      const first = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(first).toStrictEqual({
+        outcome: 'unknown',
+        reason: 'Sandbox driver did not answer the destroy request',
+      });
+      expect(JSON.stringify(first).includes(SESSION_ID)).toBe(false);
+      // The live record is kept: a later stop calls destroy again and can terminate.
+      driver.destroyResult = { outcome: 'destroyed' };
+      const second = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+      });
+      expect(second.outcome).toBe('terminated');
+      expect(driver.destroyCalls).toStrictEqual([SESSION_ID, SESSION_ID]);
+    });
   });
 
   describe('inspectSession with an unreachable runner', () => {
@@ -769,6 +805,53 @@ describe('SandboxRunnerAdapter', () => {
         );
       }
       expect(driver.createCalls).toHaveLength(before);
+    });
+
+    it('refuses leading-dash references without echoing the values and without calling driver', async () => {
+      const { adapter, driver } = makeAdapter();
+      await expectStarted(adapter);
+      const before = driver.createCalls.length;
+      const dashWorktree = '-' + 'worktree'.repeat(2);
+      const dashBrief = '-' + 'brief.json';
+      const dashCommit = '-' + 'c0ffee00';
+      const cases: [string, Partial<StartRunnerSessionRequest>][] = [
+        ['a leading-dash worktreePath', { worktreePath: dashWorktree }],
+        ['a leading-dash briefPackagePath', { briefPackagePath: dashBrief }],
+        ['a leading-dash baseCommit', { baseCommit: dashCommit }],
+      ];
+      for (const [name, overrides] of cases) {
+        const result = await adapter.startSession(startRequest(overrides));
+        expect(result, name).toMatchObject({ outcome: 'refused' });
+        for (const value of [dashWorktree, dashBrief, dashCommit]) {
+          expect(String((result as { reason?: string }).reason ?? '').includes(value), name).toBe(
+            false,
+          );
+        }
+      }
+      expect(driver.createCalls).toHaveLength(before);
+
+      const dashInspect = await adapter.inspectSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        worktreePath: dashWorktree,
+      });
+      expect(dashInspect).toStrictEqual({
+        runnerReachable: 'unreachable',
+        workspacePreparation: 'unprepared',
+        workerCommand: 'not-started',
+        completionReceipt: null,
+        artifactsCollected: false,
+      });
+      expect(driver.inspectCalls).toHaveLength(0);
+
+      const dashStop = await adapter.stopSession({
+        attemptId: ATTEMPT_ID,
+        sessionId: SESSION_ID,
+        gracePeriodSeconds: 5,
+        worktreePath: dashWorktree,
+      });
+      expect(dashStop).toMatchObject({ outcome: 'refused' });
+      expect(driver.destroyCalls).toHaveLength(0);
     });
 
     it('refuses invalid model, agent or variant values before calling driver', async () => {
@@ -1618,6 +1701,83 @@ describe('SandboxRunnerAdapter', () => {
       },
       // Removing the race leaves `pending` forever. This testTimeout fails the
       // test instead of hanging the suite.
+      2_000,
+    );
+
+    it(
+      'returns unreachableStatus when inspect never settles within driverTimeoutMs and ignores a late inspect result',
+      async () => {
+        const UNREACHABLE = {
+          runnerReachable: 'unreachable',
+          workspacePreparation: 'unprepared',
+          workerCommand: 'not-started',
+          completionReceipt: null,
+          artifactsCollected: false,
+        };
+        // Positive control: the same deadline, with a driver that settles, inspects once.
+        const controlClock = manualClock();
+        const control = makeAdapter({
+          driverTimeoutMs: 40_000,
+          setTimer: controlClock.setTimer,
+          clearTimer: controlClock.clearTimer,
+        });
+        const controlStatus = await control.adapter.inspectSession({
+          attemptId: ATTEMPT_ID,
+          sessionId: SESSION_ID,
+        });
+        expect(controlStatus.runnerReachable).toBe('reachable');
+        expect(control.driver.inspectCalls).toStrictEqual([SESSION_ID]);
+        expect(controlClock.delays).toEqual([40_000]);
+        expect(controlClock.fired).toBe(0);
+        expect(controlClock.cleared).toHaveLength(1);
+
+        const clock = manualClock();
+        const { adapter, driver } = makeAdapter({
+          driverTimeoutMs: 40_000,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+        });
+        driver.neverSettleInspect = true;
+        const pending = adapter.inspectSession({
+          attemptId: ATTEMPT_ID,
+          sessionId: SESSION_ID,
+        });
+        expect(driver.inspectCalls).toStrictEqual([SESSION_ID]);
+        expect(clock.delays).toEqual([40_000]);
+        expect(clock.fired).toBe(0);
+        clock.fire();
+        const status = await pending;
+        expect(status).toStrictEqual(UNREACHABLE);
+        expect(clock.fired).toBe(1);
+        expect(clock.cleared).toHaveLength(1);
+
+        // An inspect result settling after the deadline is ignored and does not
+        // reject or alter the returned unreachable status.
+        const lateClock = manualClock();
+        const late = makeAdapter({
+          driverTimeoutMs: 40_000,
+          setTimer: lateClock.setTimer,
+          clearTimer: lateClock.clearTimer,
+        });
+        let resolveInspect: (value: SandboxInspectResult) => void = () => {};
+        late.driver.holdInspect = new Promise<SandboxInspectResult>((resolve) => {
+          resolveInspect = resolve;
+        });
+        const latePending = late.adapter.inspectSession({
+          attemptId: ATTEMPT_ID,
+          sessionId: SESSION_ID,
+        });
+        expect(late.driver.inspectCalls).toStrictEqual([SESSION_ID]);
+        lateClock.fire();
+        const lateStatus = await latePending;
+        expect(lateStatus).toStrictEqual(UNREACHABLE);
+        resolveInspect(INSPECTED);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(lateStatus).toStrictEqual(UNREACHABLE);
+        expect(lateClock.fired).toBe(1);
+        expect(lateClock.cleared).toHaveLength(1);
+      },
       2_000,
     );
 

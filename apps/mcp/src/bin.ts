@@ -3,7 +3,7 @@
 // only file allowed to write to stderr (one line on a fatal error).
 import { startServer } from "./server.js";
 
-startServer().catch((error: unknown) => {
+startServer({ argv: process.argv.slice(2) }).catch((error: unknown) => {
   // eslint-disable-next-line no-console -- application boundary: one fatal-error line; the message may carry caller paths
   console.error(
     `fleet-v2-mcp failed to start: ${error instanceof Error ? error.message : String(error)}`,

@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "status": "ratchet-baseline",
+  "counts": {
+    "getOwnPropertyDescriptor": 255,
+    "Reflect.ownKeys": 86,
+    "getPrototypeOf": 96,
+    "Proxy": 1,
+    "structuredClone": 6,
+    "JSON.parse": 18
+  },
+  "packages": {
+    "billing": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "brief-knowledge": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "cloud-runtime": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "evidence-and-acceptance": {
+      "getOwnPropertyDescriptor": 13,
+      "Reflect.ownKeys": 1,
+      "getPrototypeOf": 5,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 3
+    },
+    "installation": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "merge-coordination": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "onboarding": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "operator-coordination": {
+      "getOwnPropertyDescriptor": 30,
+      "Reflect.ownKeys": 16,
+      "getPrototypeOf": 18,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "shared": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "tenancy": {
+      "getOwnPropertyDescriptor": 11,
+      "Reflect.ownKeys": 7,
+      "getPrototypeOf": 6,
+      "Proxy": 1,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "tooling": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "ui": {
+      "getOwnPropertyDescriptor": 0,
+      "Reflect.ownKeys": 0,
+      "getPrototypeOf": 0,
+      "Proxy": 0,
+      "structuredClone": 0,
+      "JSON.parse": 0
+    },
+    "work-execution": {
+      "getOwnPropertyDescriptor": 201,
+      "Reflect.ownKeys": 62,
+      "getPrototypeOf": 67,
+      "Proxy": 0,
+      "structuredClone": 6,
+      "JSON.parse": 15
+    }
+  }
+}

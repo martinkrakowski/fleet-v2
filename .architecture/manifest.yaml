@@ -75,6 +75,23 @@ monorepo:
             },
           },
           {
+            // Hostile input is handled once, at the boundary (docs/planning/2026-11-27_hostile-input-at-boundary-plan.md,
+            // D-HIB4). Warn-only until HIB13; scripts/check-hostile-input-ratchet.mjs fails CI on any increase.
+            files: ['**/domain/**/*.ts', '**/application/**/*.ts'],
+            ignores: ['**/__tests__/**', '**/*.test.ts', '**/*.test.tsx'],
+            rules: {
+              'no-restricted-syntax': [
+                'warn',
+                { selector: "CallExpression[callee.property.name='getOwnPropertyDescriptor']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+                { selector: "CallExpression[callee.object.name='Reflect'][callee.property.name='ownKeys']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+                { selector: "CallExpression[callee.property.name='getPrototypeOf']", message: 'Hostile input is decoded once at the boundary; do not hand-roll reflection here.' },
+                { selector: "NewExpression[callee.name='Proxy']", message: 'Hostile input is decoded once at the boundary; no Proxy in domain or application code.' },
+                { selector: "CallExpression[callee.name='structuredClone']", message: 'Hostile input is decoded once at the boundary; use the snapshot kernel in @fleet/shared.' },
+                { selector: "CallExpression[callee.object.name='JSON'][callee.property.name='parse']", message: 'JSON is parsed once at the boundary by the bounded reader, never in domain or application code.' },
+              ],
+            },
+          },
+          {
             files: ['**/*.in-port.ts', '**/*.out-port.ts'],
             rules: {
               '@typescript-eslint/no-empty-object-type': ['error', { allowInterfaces: 'always' }],
@@ -154,6 +171,7 @@ monorepo:
             "sync:dry": "hexagen sync --dry-run",
             "sync:check": "hexagen sync --check --allow-dirty",
             "lint:arch": "hexagen arch validate",
+            "check:hostile-input": "node scripts/check-hostile-input-ratchet.mjs",
             "format": "prettier --write \"**/*.{ts,tsx,json,yaml,md}\""
           },
           "devDependencies": {
@@ -404,6 +422,8 @@ bounded_contexts:
           - RecordShadowDayUseCase
           - AttestShadowFactUseCase
           - RecordSeatCallUseCase
+          - RunAttemptEnvironmentUseCase
+          - RecordSeatObservationUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -466,6 +486,8 @@ bounded_contexts:
             - RecordShadowDayPort
             - AttestShadowFactPort
             - RecordSeatCallPort
+            - RunAttemptEnvironmentPort
+            - RecordSeatObservationPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -525,6 +547,7 @@ bounded_contexts:
             - MergeForgeActionPort
             - MergeGrantPort
             - PatchIdentityPort
+            - ReceiptCarryEvidencePort
             - MergeVerificationPort
             - MergeVetoPort
             - MergeVetoStatePort
@@ -562,7 +585,7 @@ bounded_contexts:
             - AuthorityEventSinkPort
             - CloudProviderPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, SandboxRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GhReviewThreadHelperAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter, SeatTicketRepositoryAdapter, SeatObservationRepositoryAdapter, SeatCatalogAdapter, ReaperFindingRepositoryAdapter, InMemoryReaperFindingRepositoryAdapter, MergePolicyAdapter, ReleaseStoreAdapter, ChainAttentionAdapter, LaneScorecardFileAdapter, LaneUsageLogFileAdapter, PullRequestFindingsReadAdapter, LaneEditSaveAdapter, CutoverJournalAdapter, RelaunchPlanRepositoryAdapter, CutoverRecordRepositoryAdapter, ShadowEvidenceAdapter, ShadowAttestationAdapter, MergeRecordRepositoryAdapter, GhMergeVetoStateAdapter, TrainHealthStateReadAdapter, SpdSayHostAudibleAlertAdapter, TrainHealthAttentionAdapter, AuthorityEventJournalAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, SandboxRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GhReviewThreadHelperAdapter, GitMirrorPatchIdentityAdapter, GitMirrorReceiptCarryEvidenceAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter, SeatTicketRepositoryAdapter, SeatObservationRepositoryAdapter, SeatCatalogAdapter, ReaperFindingRepositoryAdapter, InMemoryReaperFindingRepositoryAdapter, MergePolicyAdapter, ReleaseStoreAdapter, ChainAttentionAdapter, LaneScorecardFileAdapter, LaneUsageLogFileAdapter, PullRequestFindingsReadAdapter, LaneEditSaveAdapter, CutoverJournalAdapter, RelaunchPlanRepositoryAdapter, CutoverRecordRepositoryAdapter, ShadowEvidenceAdapter, ShadowAttestationAdapter, MergeRecordRepositoryAdapter, GhMergeVetoStateAdapter, TrainHealthStateReadAdapter, SpdSayHostAudibleAlertAdapter, TrainHealthAttentionAdapter, AuthorityEventJournalAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       ImportLanePlanPort: "Import one validated plan sidecar revision per (projectId, planId): project match, greater-revision CAS with digest idempotency, the cycle check across every stored plan, dropped lanes kept; it authorizes nothing."
@@ -581,6 +604,7 @@ bounded_contexts:
       ListAttemptJournalPort: "Return one attempt's action journal entries in recorded order, or a known absence for an unknown attempt; read-only, never contacts the runner, and carries no legality or next-action block."
       ListLaneRunsPort: "Return, read-only, the conductor schedule: every non-terminal lane run in creation order with its projected state, round, pending step, park, package keys and held slot, the held reservations by host, the admission count of active and in-flight runs, the halt marker and whether the driver lease has lapsed; the active-run cap is reported only from a recorded pass trace, never assumed; no lease holder, ssh alias, port, transport or worktree path crosses the port."
       ListConductorPassesPort: "Return, read-only, the most recent recorded conductor passes newest first, at most a bounded limit, each with its time, halt and progress flags, the recorded caps and each run's report in worker-take order; an unreadable or unknown-version trace store is reported unreadable, never an error and never guessed; no holder id crosses the port."
+      RunAttemptEnvironmentPort: "Drive the micro-VM driver port through one attempt's lifecycle against a fake driver only: an implementation environment (create, injectWorktree, seal, optional work, destroy in a finally) and then a fresh gate environment with a distinct environment id (create, injectWorktree, seal, gate, destroy in a finally); every driver and step outcome is snapshotted as plain data before any field is read, a step outcome that is malformed, hostile or not ok is a typed refusal, a create failure or a mismatched or reused handle never reaches a later step, and a refusal carries only a fixed reason, never an echoed value; the result declares the isolation as a fake-driver label and a disclaimer that a green run against the fake driver is not evidence of isolation."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
@@ -660,6 +684,7 @@ bounded_contexts:
       MergeForgeActionPort: "Apply one repo-scoped forge action (merge-pr, update-branch, post-status, create-branch, merge-main-into-branch, open-pr or delete-branch) through a stable action id at the expected head, and read a branch's head; the request carries actionId, repository{owner,repo}, pullRequestNumber, branchName and expectedHeadSha, a status field is refused on any kind but post-status, and create-branch creates only a registered chain/<name> branch at the given commit, reporting an existing branch at that commit as already applied and one at another commit as a refusal; merge-main-into-branch merges main into a registered chain/<name> branch through the forge's merge API, reporting already up to date as already applied, a conflict as a refusal of kind conflict and a missing branch as branch-gone; open-pr opens chain/<name> into main, or adopts the one open pull request with that head and base and rewrites its title and body, and never pushes; delete-branch deletes only a chain/<name> or recorded link branch whose forge tip equals expectedHeadSha, reporting a missing branch as already applied and another tip as a refusal."
       MergeGrantPort: "Issue one merge policy grant bound to (repository, pull request, expected head sha) at policy:merge@<revision> through operator coordination; it never decides eligibility."
       PatchIdentityPort: "Decide whether an update-branch carry is allowed under the speed-plan file rule and patch-id guard against a bare mirror of the repository with allow-listed argv through the command executor; never touches the live checkout."
+      ReceiptCarryEvidencePort: "Read the git facts that qualify a Tier 2 premerge receipt carry across a base-merge head update (parents, whether the main parent is on main, the automatic merge tree versus the new head tree, files changed from the reviewed head, files changed on main over the range) from a bare mirror with allow-listed read-only argv through the command executor; never touches the live checkout."
       MergeVerificationPort: "Request and read the verification receipt for one exact head through the evidence context's procedure; a receipt naming another head is unknown."
       MergeVetoPort: "Ask one Jev veto question bound to the verified head over the shared decision client and record the answer, confidence, mode and decision receipt id; unknown never blocks."
       MergeVetoStatePort: "Read the veto state fields (tier, title, changed paths, additions, deletions, hard-to-undo, fix rounds, reviewer families, resolved threads, major blockers, head-changed flag) for one pull request at one exact head, read-only; unreadable or unconfigured state is reported as unavailable, never guessed."
@@ -703,6 +728,7 @@ bounded_contexts:
       RecordShadowDayPort: "Evaluate one completed UTC day of the cutover shadow period for one repository and record, in the shadow-evidence ledger by compare-and-set, each criterion that reached a definite pass or fail verdict; a criterion whose sources are unreadable, incomplete or not yet built is reported as unevaluated and recorded nowhere; it refuses the current day, a future day, a day whose grace period has not ended and a day older than seven days; it reads the shell train state and the fleet stores read-only and writes only the ledger; ids, digests and codes only."
 
       AttestShadowFactPort: "Record one owner-attested one-time shadow fact (s2-forge-error-backoff, s2-canary-parks, s3-wake-after-outage) into the installation's shadow-attestation ledger by compare-and-set on the caller's expected revision: the first attestation of a fact is kept and a later one is a no-op, nothing is removed and no revoke exists; the observed day and timestamp come from the daemon clock and never from the request, so a fact cannot be backdated and must be attested on or before the shadow day it counts for; the request's note, evidence and authority are hashed into the canonical digest and never stored; the write is keyed cutover/attest@<operationId> in the cutover journal with the intent durable before the compare-and-set and one final result after, so a replay with the same operation id and payload returns the stored record without writing, a replay with a different payload or after a refused result is refused, and a crash between intent and result is completed idempotently on a matching digest; a missing or blank authority label is refused; an unreadable or unknown-version ledger or journal is reported and nothing is written; ids, digests and codes only."
+      RecordSeatObservationPort: "Record one SeatObservationRecord for an existing attempt or review request whose committed seat matches the given seat id and which has no result or receipt yet: the attempt's committed seatSelection seat id, a review request's seat at the journal key's plan seat index (the installation's high-risk-reviewer chain order for a pre-merge step, which has no SeatPlan role), a review journal result other than review-no-receipt or a found review receipt refusing the subject; at most one cooling observation per seat per observation window, a repeat id or a window already open answered as a duplicate without a second write; a dry run validates and writes nothing; every invalid or hostile input is a typed refusal and the subject's attempts and installation health are never mutated."
       CutoverRecordRepositoryPort: "Store and read the one CutoverRecord v1 of an installation with compare-and-set on its revision; an absent version reads as 1, and an unknown version or an unreadable record is reported, never treated as absent; it performs no forge, host or git action."
       ShadowEvidencePort: "Store and read the one cutover shadow-evidence ledger v1 of an installation with compare-and-set on its revision: per UTC day the release sha, the merges compared and at most one verdict per criterion S1-S12 (pass or fail, a reason code and an input digest); a recorded day-and-criterion verdict is never changed, an identical repeat is a no-op and any other is refused; the newest 31 days are kept; an absent ledger is known absence, and an unknown version or an unreadable ledger is reported, never treated as absent and never overwritten; ids, digests and codes only."
       ShadowAttestationPort: "Store and read the one cutover shadow attestation ledger v1 of an installation with compare-and-set on its revision: at most one sticky observation per named one-time fact (the UTC day observed, the release sha then current or null, a reason code and an input digest); the first attestation of a fact is kept and a later one for the same fact is a no-op; nothing is removed; an absent ledger is known absence, and an unknown version or an unreadable ledger is reported, never treated as absent and never overwritten; ids, digests and codes only."
@@ -876,6 +902,7 @@ bounded_contexts:
       - { adapter: RelaunchPlanRepositoryAdapter, implements: RelaunchPlanRepositoryPort, integration: local-transactional-store }
       - { adapter: CutoverRecordRepositoryAdapter, implements: CutoverRecordRepositoryPort, integration: local-transactional-store }
       - { adapter: ShadowEvidenceAdapter, implements: ShadowEvidencePort, integration: local-transactional-store }
+      - { adapter: GitMirrorReceiptCarryEvidenceAdapter, implements: ReceiptCarryEvidencePort, integration: read-only-git-mirror }
       - { adapter: ShadowAttestationAdapter, implements: ShadowAttestationPort, integration: local-transactional-store }
       - { adapter: TrainHealthStateReadAdapter, implements: TrainHealthStateReadPort, integration: in-process-composed-ports-read-only }
       - { adapter: SpdSayHostAudibleAlertAdapter, implements: HostAudibleAlertPort, integration: local-speech-client-subprocess-fixed-argv }

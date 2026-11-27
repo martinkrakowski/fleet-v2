@@ -11,6 +11,7 @@ import { head12Of, parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_ONE_WAY_STEPS } from './lane-run-records.js';
 import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
+import { divergenceDetailsOf, type ShadowDivergenceDetails, type ShadowDivergenceDiagnosticItem } from './shadow-day-merge-set.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 
@@ -158,6 +159,14 @@ export type ShadowConformanceEvaluation = ShadowCriterionEvaluation & {
   readonly conformingTier2: number;
   readonly nonconformingOnDay: number;
   readonly byCode: Readonly<Record<ShadowNonconformanceCode, number>>;
+  /**
+   * Non-digested diagnostics, present only when `nonconformingOnDay` is
+   * positive: the same count plus at most `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX`
+   * items (`pr` from the run's validated pull request, `head12` the prefix of
+   * its validated head oid, `side: 'fleet'`, `code` the nonconformance code).
+   * Never part of any verdict digest.
+   */
+  readonly divergenceDetails?: ShadowDivergenceDetails;
 };
 
 type ReviewReceipt = ShadowConformanceRun['reviewReceipts'][number];
@@ -234,6 +243,8 @@ interface Score {
   readonly counts: Counts;
   readonly dayCodes: readonly ShadowNonconformanceCode[];
   readonly unknownReason: string | null;
+  /** Non-digested diagnostics: one item per nonconforming-on-day run that parsed. */
+  readonly divergenceItems: readonly ShadowDivergenceDiagnosticItem[];
 }
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -304,11 +315,19 @@ function judgeConformance(input: unknown): ShadowConformanceEvaluation {
 }
 
 function verdictFor(score: Score): ShadowConformanceEvaluation {
-  if (score.unknownReason !== null) return conformanceResult('unknown', score.unknownReason, score.counts);
+  // Non-digested diagnostics: the same `nonconformingOnDay` count the day
+  // already carries, bounded to `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX` items.
+  // Cost: O(R log R) over the merged runs R (R <=
+  // SHADOW_CONFORMANCE_MAX_RUNS) for the sort inside
+  // `divergenceDetailsOf`. The counts themselves are untouched.
+  const divergenceDetails = score.counts.nonconformingOnDay > 0
+    ? divergenceDetailsOf(score.counts.nonconformingOnDay, score.divergenceItems)
+    : undefined;
+  if (score.unknownReason !== null) return conformanceResult('unknown', score.unknownReason, score.counts, divergenceDetails);
   const dayCode = earliestCode(score.dayCodes);
-  if (dayCode !== null) return conformanceResult('fail', dayCode, score.counts);
-  if (floorShort(score.counts)) return conformanceResult('fail', 'too-few-conforming-runs', score.counts);
-  return conformanceResult('pass', 'conducted-runs-conform', score.counts);
+  if (dayCode !== null) return conformanceResult('fail', dayCode, score.counts, divergenceDetails);
+  if (floorShort(score.counts)) return conformanceResult('fail', 'too-few-conforming-runs', score.counts, divergenceDetails);
+  return conformanceResult('pass', 'conducted-runs-conform', score.counts, divergenceDetails);
 }
 
 /**
@@ -528,11 +547,12 @@ function scoreMerged(merged: readonly MergedRun[], context: RuleContext): Score 
   const counts = zeroCounts();
   counts.mergedRuns = merged.length;
   const dayCodes: ShadowNonconformanceCode[] = [];
+  const divergenceItems: ShadowDivergenceDiagnosticItem[] = [];
   let unknownReason: string | null = null;
   for (const item of merged) {
-    unknownReason = noteVerdict(item, context, counts, dayCodes, unknownReason);
+    unknownReason = noteVerdict(item, context, counts, dayCodes, divergenceItems, unknownReason);
   }
-  return { counts, dayCodes, unknownReason };
+  return { counts, dayCodes, unknownReason, divergenceItems };
 }
 
 function noteVerdict(
@@ -540,6 +560,7 @@ function noteVerdict(
   context: RuleContext,
   counts: Counts,
   dayCodes: ShadowNonconformanceCode[],
+  divergenceItems: ShadowDivergenceDiagnosticItem[],
   unknownReason: string | null,
 ): string | null {
   const verdict = firstVerdict(item.run, item.merge, context);
@@ -548,7 +569,18 @@ function noteVerdict(
     return unknownReason;
   }
   if (isUnknownVerdict(verdict)) return unknownReason ?? unknownReasonOf(verdict);
-  noteNonconforming(counts, dayCodes, verdict, item.merge.atIso, context);
+  // The diagnostic rides only when the run is really nonconforming on day D
+  // (exactly when `noteNonconforming` raises `nonconformingOnDay`), parsed
+  // from values the reader already validated; a run whose pull request or
+  // head somehow failed validation contributes no item but stays counted.
+  let diagnostic: ShadowDivergenceDiagnosticItem | null = null;
+  if (Number.isSafeInteger(item.run.pullRequest) && item.run.pullRequest > 0) {
+    const head12 = head12Of(item.run.headOid);
+    if (head12 !== null) {
+      diagnostic = { pr: item.run.pullRequest, head12, side: 'fleet', code: verdict };
+    }
+  }
+  noteNonconforming(counts, dayCodes, divergenceItems, diagnostic, verdict, item.merge.atIso, context);
   return unknownReason;
 }
 
@@ -561,6 +593,8 @@ function noteConforming(counts: Counts, tier: 1 | 2): void {
 function noteNonconforming(
   counts: Counts,
   dayCodes: ShadowNonconformanceCode[],
+  divergenceItems: ShadowDivergenceDiagnosticItem[],
+  diagnostic: ShadowDivergenceDiagnosticItem | null,
   code: ShadowNonconformanceCode,
   atIso: string,
   context: RuleContext,
@@ -569,6 +603,7 @@ function noteNonconforming(
   if (!inWindow(atIso, context.dayStart, context.windowEnd)) return;
   counts.nonconformingOnDay += 1;
   dayCodes.push(code);
+  if (diagnostic !== null) divergenceItems.push(diagnostic);
 }
 
 function firstVerdict(run: ShadowConformanceRun, merge: ShadowShellMerge, context: RuleContext): RuleVerdict {
@@ -1113,6 +1148,7 @@ function conformanceResult(
   status: ShadowCriterionEvaluation['status'],
   reason: string,
   counts: Counts,
+  divergenceDetails?: ShadowDivergenceDetails,
 ): ShadowConformanceEvaluation {
   return Object.freeze({
     status,
@@ -1123,6 +1159,7 @@ function conformanceResult(
     conformingTier2: counts.conformingTier2,
     nonconformingOnDay: counts.nonconformingOnDay,
     byCode: Object.freeze({ ...counts.byCode }),
+    ...(divergenceDetails === undefined ? {} : { divergenceDetails }),
   });
 }
 

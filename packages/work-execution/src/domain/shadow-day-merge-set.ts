@@ -27,6 +27,54 @@ export const SHADOW_DAY_BOUNDARY_GRACE_MS = 600_000;
 /** A sanity cap on how many events, results or entries one evaluator walks before refusing as unevaluable. */
 export const SHADOW_MERGE_SET_MAX_ITEMS = 100_000;
 
+/** At most this many per-criterion divergence diagnostics ride on an evaluation as non-digested observability. */
+export const SHADOW_DIVERGENCE_DIAGNOSTICS_MAX = 20;
+
+/**
+ * One non-digested divergence diagnostic. Every field is read from values an
+ * evaluator has already validated, so this type adds no untrusted-input
+ * boundary: `pr` is a positive safe integer, `head12` the 12-hex prefix of a
+ * validated 40/64-hex commit id, `side` the side the divergence is on, and
+ * `code` an evaluator's own divergence code.
+ */
+export interface ShadowDivergenceDiagnosticItem {
+  readonly pr: number;
+  readonly head12: string;
+  readonly side: 'fleet' | 'shell';
+  readonly code: string;
+}
+
+/**
+ * A criterion's non-digested divergence diagnostics: the full divergence
+ * count (the same number the criterion already counted) plus at most
+ * `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX` deterministically sorted items. Never
+ * part of any verdict digest; never echoes a free-text or secret-shaped
+ * value — `code` is an evaluator's own fixed code.
+ */
+export interface ShadowDivergenceDetails {
+  readonly totalCount: number;
+  readonly items: readonly ShadowDivergenceDiagnosticItem[];
+}
+
+/** Deterministic diagnostic order: by pull request, then head, side and code. */
+export function sortDivergenceDiagnosticItems(
+  items: readonly ShadowDivergenceDiagnosticItem[],
+): readonly ShadowDivergenceDiagnosticItem[] {
+  const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  return items
+    .slice()
+    .sort((a, b) => a.pr - b.pr || compare(a.head12, b.head12) || compare(a.side, b.side) || compare(a.code, b.code))
+    .slice(0, SHADOW_DIVERGENCE_DIAGNOSTICS_MAX);
+}
+
+/** Freezes the bounded, sorted diagnostic payload a criterion attaches when its divergence count is positive. */
+export function divergenceDetailsOf(
+  totalCount: number,
+  items: readonly ShadowDivergenceDiagnosticItem[],
+): ShadowDivergenceDetails {
+  return Object.freeze({ totalCount, items: Object.freeze(sortDivergenceDiagnosticItems(items).slice()) });
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const SHELL_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
@@ -44,12 +92,27 @@ export type ShadowDayMergeSetEvaluation = ShadowCriterionEvaluation & {
   readonly excludedBatchMerges: number;
   readonly compared: number;
   readonly divergences: number;
+  /**
+   * Non-digested diagnostics, present only when `divergences` is positive:
+   * the same divergence count plus at most
+   * `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX` parsed per-divergence items.
+   * Malformed divergence keys stay counted in `divergences` but are omitted
+   * from `items`. Never part of any verdict digest.
+   */
+  readonly divergenceDetails?: ShadowDivergenceDetails;
 };
 
 interface ShellMergeItem { readonly pullRequest: number; readonly headOid: string; readonly atIso: string; }
 interface FleetMergeItem { readonly pullRequest: number; readonly headOid: string; readonly recordedAtIso: string; }
 
-function evaluation(status: ShadowCriterionEvaluation, merges: number, excluded: number, compared: number, divergences: number): ShadowDayMergeSetEvaluation {
+function evaluation(
+  status: ShadowCriterionEvaluation,
+  merges: number,
+  excluded: number,
+  compared: number,
+  divergences: number,
+  divergenceDetails?: ShadowDivergenceDetails,
+): ShadowDayMergeSetEvaluation {
   return Object.freeze({
     status: status.status,
     reason: status.reason,
@@ -57,6 +120,7 @@ function evaluation(status: ShadowCriterionEvaluation, merges: number, excluded:
     excludedBatchMerges: excluded,
     compared,
     divergences,
+    ...(divergenceDetails === undefined ? {} : { divergenceDetails }),
   });
 }
 
@@ -503,7 +567,16 @@ function judgeComparison(
     }
   }
 
-  const surviving = survivingDivergences([...comparison.divergences, ...orderingDivergences], dedupedFleetItems, shellItems.items, day);
+  const divergenceList = [...comparison.divergences, ...orderingDivergences];
+  const surviving = survivingDivergences(divergenceList, dedupedFleetItems, shellItems.items, day);
+  // Non-digested diagnostics: the same divergence count the day already
+  // carries, parsed into bounded per-divergence items. `survivingDivergences`
+  // above already counted every listed divergence exactly as today, so this
+  // extraction never changes a verdict, count or digest; a divergence whose
+  // key is not a parseable `<pr>@<head>` pair (e.g. an `invalid-item` entry)
+  // is omitted from `items` while staying counted. Cost: O(D log D) over the
+  // comparator-capped and day-surviving divergences D.
+  const divergenceDetails = surviving > 0 ? mergeDivergenceDetails(surviving, divergenceList) : undefined;
   // The comparator caps its divergence list; beyond the cap an omitted
   // divergence may yet be same-day, so an all-grace listed set can never
   // certify a pass — the verdict stays open instead.
@@ -511,9 +584,52 @@ function judgeComparison(
     return evaluation({ status: 'unknown', reason: 'merge-set-comparison-truncated' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving);
   }
   if (surviving > 0) {
-    return evaluation({ status: 'fail', reason: 'merge-set-divergence' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving);
+    return evaluation({ status: 'fail', reason: 'merge-set-divergence' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving, divergenceDetails);
   }
   return evaluation({ status: 'pass', reason: 'merge-set-equal' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, 0);
+}
+
+/**
+ * The side a merge-set divergence sits on, by its own fixed code:
+ * `missing-in-fleet` names a merge only the shell recorded, and
+ * `missing-in-shell` / `fleet-recorded-after-merge` name fleet-side rows.
+ * Any other code (an `invalid-item`, whose key is not a `<pr>@<head>` pair)
+ * carries no side.
+ */
+function sideOfMergeDivergence(code: string): 'fleet' | 'shell' | null {
+  if (code === 'missing-in-fleet') return 'shell';
+  if (code === 'missing-in-shell' || code === 'fleet-recorded-after-merge') return 'fleet';
+  return null;
+}
+
+/**
+ * Parses a comparator key `<pr>@<headOid>`: a positive safe integer pull
+ * request and a 40/64-hex head the `head12Of` prefix accepts, else null.
+ * Cost: O(1) over a comparator-capped key string.
+ */
+function parseMergeDivergenceKey(key: string): { readonly pr: number; readonly head12: string } | null {
+  const separator = key.indexOf('@');
+  if (separator <= 0) return null;
+  const prText = key.slice(0, separator);
+  if (!/^\d+$/.test(prText)) return null;
+  const pr = Number(prText);
+  if (!Number.isSafeInteger(pr) || pr <= 0) return null;
+  const head12 = head12Of(key.slice(separator + 1));
+  if (head12 === null) return null;
+  return { pr, head12 };
+}
+
+/** Cost: O(D log D) over the listed divergences D (comparator-capped). */
+function mergeDivergenceDetails(totalCount: number, divergences: readonly { readonly key: string; readonly code: string }[]): ShadowDivergenceDetails {
+  const items: ShadowDivergenceDiagnosticItem[] = [];
+  for (const divergence of divergences) {
+    const side = sideOfMergeDivergence(divergence.code);
+    if (side === null) continue;
+    const parsed = parseMergeDivergenceKey(divergence.key);
+    if (parsed === null) continue;
+    items.push({ pr: parsed.pr, head12: parsed.head12, side, code: divergence.code });
+  }
+  return divergenceDetailsOf(totalCount, items);
 }
 
 /**

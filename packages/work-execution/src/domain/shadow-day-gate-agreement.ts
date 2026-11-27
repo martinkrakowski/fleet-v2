@@ -7,10 +7,12 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
+import { head12Of } from './lane-run-keys.js';
 import { isCalendarDateTime, readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
 import { compareShadowGateVerdicts } from './shadow-comparators.js';
 import type { ShadowComparisonResult, ShadowDivergence } from './shadow-comparators.js';
 import type { ShadowCriterionEvaluation, ShadowCriterionStatus } from './shadow-evidence-ledger.js';
+import { divergenceDetailsOf, type ShadowDivergenceDetails, type ShadowDivergenceDiagnosticItem } from './shadow-day-merge-set.js';
 
 /** Heads that must agree across the trailing window before a day can pass. */
 export const SHADOW_GATE_MIN_AGREEING_HEADS = 30;
@@ -50,6 +52,15 @@ export type ShadowGateAgreementEvaluation = ShadowCriterionEvaluation & {
   readonly unsettled: number;
   /** True only when the comparator's divergence list was truncated. */
   readonly truncated: boolean;
+  /**
+   * Non-digested diagnostics, present only when the tallied divergences
+   * (`falsePasses + stricterFails + valueDiffers`) are positive: the same
+   * total plus at most `SHADOW_DIVERGENCE_DIAGNOSTICS_MAX` items. `ValidHead`
+   * carries no pull request, so every item uses `pr: 0` and the 12-hex head
+   * prefix; the orchestrator joins the head to a pull request by hand. Never
+   * part of any verdict digest.
+   */
+  readonly divergenceDetails?: ShadowDivergenceDetails;
 };
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -103,7 +114,7 @@ const ZERO_COUNTS: GateCounts = Object.freeze({
 });
 
 /** Cost: O(1). Copies the counts onto a frozen result and returns it. */
-function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateCounts): ShadowGateAgreementEvaluation {
+function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateCounts, divergenceDetails?: ShadowDivergenceDetails): ShadowGateAgreementEvaluation {
   return Object.freeze({
     status,
     reason,
@@ -113,6 +124,7 @@ function evaluation(status: ShadowCriterionStatus, reason: string, counts: GateC
     stricterFails: counts.stricterFails,
     unsettled: counts.unsettled,
     truncated: counts.truncated,
+    ...(divergenceDetails === undefined ? {} : { divergenceDetails }),
   });
 }
 
@@ -384,15 +396,15 @@ function countsFrom(compared: number, tallies: DivergenceTally, unsettled: numbe
 }
 
 /** Cost: O(1) once the tallies exist. False pass on D outranks the agreeing-head floor. */
-function decide(compared: number, tallies: DivergenceTally, unsettled: number): ShadowGateAgreementEvaluation {
+function decide(compared: number, tallies: DivergenceTally, unsettled: number, divergenceDetails?: ShadowDivergenceDetails): ShadowGateAgreementEvaluation {
   const counts = countsFrom(compared, tallies, unsettled, false);
   if (tallies.falsePassOnDay) {
-    return evaluation('fail', 'gate-false-pass', counts);
+    return evaluation('fail', 'gate-false-pass', counts, divergenceDetails);
   }
   if (counts.agreeing < SHADOW_GATE_MIN_AGREEING_HEADS) {
-    return evaluation('fail', 'too-few-agreeing-heads', counts);
+    return evaluation('fail', 'too-few-agreeing-heads', counts, divergenceDetails);
   }
-  return evaluation('pass', 'gate-verdicts-agree', counts);
+  return evaluation('pass', 'gate-verdicts-agree', counts, divergenceDetails);
 }
 
 /**
@@ -417,14 +429,56 @@ function verdictFromComparison(
   if (tallies === null) {
     return INCOMPLETE;
   }
+  // Non-digested diagnostics over the tallied divergences only (never the
+  // incomplete codes, which leave the day `unknown` above). The tallies are
+  // already counted exactly as today, so this extraction never changes a
+  // verdict, count or digest. Cost: O(D log D) over the comparator-capped
+  // divergences D (D <= SHADOW_DIVERGENCE_MAX).
+  const totalCount = tallies.falsePasses + tallies.stricterFails + tallies.valueDiffers;
+  const divergenceDetails = totalCount > 0 ? gateDivergenceDetails(totalCount, comparison.divergences) : undefined;
   if (comparison.truncated) {
     return evaluation(
       'unknown',
       'gate-comparison-incomplete',
       countsFrom(comparison.compared, tallies, unsettled, true),
+      divergenceDetails,
     );
   }
-  return decide(comparison.compared, tallies, unsettled);
+  return decide(comparison.compared, tallies, unsettled, divergenceDetails);
+}
+
+/**
+ * The side a gate divergence's anomaly sits on, by its own fixed code: a
+ * `false-pass` is a fleet verdict that passed where the shell did not, so the
+ * false pass is on the fleet; a `stricter-fail` is a fleet verdict the shell
+ * passed, so the contradicted (too lenient) verdict is on the shell; a
+ * `value-differs` names no wrong side and points at the shell's recorded
+ * value. Any other code (`invalid-item` and friends) carries no side — those
+ * leave the day `unknown` before any diagnostic is built.
+ */
+function sideOfGateDivergence(code: string): 'fleet' | 'shell' | null {
+  if (code === 'false-pass') return 'fleet';
+  if (code === 'stricter-fail' || code === 'value-differs') return 'shell';
+  return null;
+}
+
+/**
+ * Cost: O(D log D) over the listed divergences D (comparator-capped). A
+ * divergence whose key is not `<40hex>#gate` is omitted from `items` while
+ * staying counted in `totalCount`; nothing here runs a getter or throws —
+ * every key and code was validated by the comparator before this reads it.
+ */
+function gateDivergenceDetails(totalCount: number, divergences: readonly ShadowDivergence[]): ShadowDivergenceDetails {
+  const items: ShadowDivergenceDiagnosticItem[] = [];
+  for (const divergence of divergences) {
+    const side = sideOfGateDivergence(divergence.code);
+    if (side === null) continue;
+    const headOid = headOidFromGateKey(divergence.key);
+    const head12 = headOid === null ? null : head12Of(headOid);
+    if (head12 === null) continue;
+    items.push({ pr: 0, head12, side, code: divergence.code });
+  }
+  return divergenceDetailsOf(totalCount, items);
 }
 
 /** Cost: linear in the deduped heads, bounded by `SHADOW_GATE_MAX_HEADS`, plus the comparator's own linear walk. */

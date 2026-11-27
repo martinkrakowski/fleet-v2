@@ -1109,3 +1109,455 @@ describe('GatePredicateAdapter failed output tail (GD2)', () => {
     expect(out).not.toContain('BEGIN');
   });
 });
+
+/**
+ * TP5A1: the typed host-side gate causes. `lint-arch-timeout` classifies a
+ * `lint:arch` run ONLY from the executor's typed `errorCode: 'timeout'`
+ * (never free-text error output); `missing-generated-types` classifies a
+ * failing `typecheck` ONLY from the host-side probe of
+ * `apps/web/.next/types` (never from command output). Both are hard `fail`
+ * verdicts that never route to the congestion retry path.
+ */
+describe('GatePredicateAdapter typed gate causes (TP5A1)', () => {
+  /**
+   * An executor returning raw values (no spread), so a run can be `null`,
+   * carry an accessor property, or an invalid `errorCode` exactly as it would
+   * arrive over an untrusted boundary.
+   */
+  class RawScriptedExecutor implements CommandExecutorPort {
+    readonly argvRecords: string[][] = [];
+
+    constructor(private readonly script: (argv: readonly string[]) => unknown) {}
+
+    async run(argv: readonly string[]): Promise<CommandRunResult> {
+      this.argvRecords.push([...argv]);
+      const scripted = this.script(argv);
+      if (scripted === null || typeof scripted !== 'object') {
+        return scripted as CommandRunResult;
+      }
+      // A clean-run default, overlaid with the script's own data properties —
+      // copied as property descriptors, so an accessor property (a getter the
+      // adapter must never invoke) survives instead of being read here.
+      const base: Record<string, unknown> = { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      for (const key of Object.keys(scripted)) {
+        const descriptor = Object.getOwnPropertyDescriptor(scripted, key);
+        if (descriptor !== undefined) {
+          Object.defineProperty(base, key, descriptor);
+        }
+      }
+      return base as unknown as CommandRunResult;
+    }
+  }
+
+  function makeRawAdapter(script: (argv: readonly string[]) => unknown): {
+    adapter: GatePredicateAdapter;
+    executor: RawScriptedExecutor;
+  } {
+    const executor = new RawScriptedExecutor(script);
+    const fakeDiff = new FakeLaneDiffCheck({ outcome: 'clean' });
+    let now = 0;
+    const adapter = new GatePredicateAdapter({
+      executorForRecordedHost: () => ({ ok: true, executor }),
+      laneDiffCheckFor: () => fakeDiff,
+      nowMs: () => {
+        now += 1;
+        return now;
+      },
+    });
+    return { adapter, executor };
+  }
+
+  function commandRequest(argv: readonly string[]): EvaluateGatePredicatesRequest {
+    return {
+      ...REQUEST,
+      spec: { commitRequired: true, diffCheck: true, commands: [{ argv: [...argv] }] },
+    };
+  }
+
+  const LINT_ARCH = ['corepack', 'yarn', 'lint:arch'];
+  const TYPECHECK = ['corepack', 'yarn', 'typecheck'];
+
+  it('emits lint-arch-timeout only for lint:arch with typed errorCode timeout', async () => {
+    // lint:arch with the typed timeout signal: fail with the typed cause.
+    const typed = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const typedResults = evaluatedResults(
+      await typed.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(typedResults[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'fail',
+      exitCode: null,
+      cause: 'lint-arch-timeout',
+    });
+
+    // The same free-text error without the typed code stays unknown, no cause.
+    const freeText = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+          }
+        : happyGit(argv),
+    );
+    const freeTextResults = evaluatedResults(
+      await freeText.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(freeTextResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown' });
+    expect(freeTextResults[2]).not.toHaveProperty('cause');
+
+    // A non-lint:arch command with the typed timeout stays unknown, no cause.
+    const otherCommand = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const otherResults = evaluatedResults(
+      await otherCommand.adapter.evaluateGatePredicates(commandRequest(['corepack', 'yarn', 'build'])),
+    );
+    expect(otherResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown' });
+    expect(otherResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('does not emit lint-arch-timeout when lint:arch is only an argument of another command', async () => {
+    // `node ./scripts/check.js lint:arch` carries lint:arch as a mere argument:
+    // a typed timeout of that command is an ordinary unknown result, never
+    // the lint-arch-timeout cause.
+    const unrelated = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const unrelatedResults = evaluatedResults(
+      await unrelated.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'lint:arch']),
+      ),
+    );
+    expect(unrelatedResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(unrelatedResults[2]).not.toHaveProperty('cause');
+
+    // The same argv invoking the script at the package-script position DOES
+    // emit the cause, so the guard above is not a constant.
+    const real = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const realResults = evaluatedResults(
+      await real.adapter.evaluateGatePredicates(commandRequest(['yarn', 'run', 'lint:arch'])),
+    );
+    expect(realResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', cause: 'lint-arch-timeout' });
+
+    // A runner token that is merely a later argv element (an argument of another command) is not the runner.
+    const laterRunner = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const laterResults = evaluatedResults(
+      await laterRunner.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'yarn', 'lint:arch']),
+      ),
+    );
+    expect(laterResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(laterResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('does not treat the bare run token as a package runner while still matching lint:arch with trailing arguments', async () => {
+    const timedOut = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: null,
+            signal: 'SIGTERM',
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+
+    // `node ./scripts/check.js run lint:arch` carries a bare `run` token, not a
+    // package runner: the typed timeout of that command is an ordinary unknown
+    // result, never the lint-arch-timeout cause.
+    const bareRunResults = evaluatedResults(
+      await timedOut.adapter.evaluateGatePredicates(
+        commandRequest(['node', './scripts/check.js', 'run', 'lint:arch']),
+      ),
+    );
+    expect(bareRunResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(bareRunResults[2]).not.toHaveProperty('cause');
+
+    // The same typed timeout on `yarn lint:arch --fix` — the script followed by
+    // trailing script arguments — DOES emit the cause, so the guard above is
+    // not a constant.
+    const trailingArgsResults = evaluatedResults(
+      await timedOut.adapter.evaluateGatePredicates(commandRequest(['yarn', 'lint:arch', '--fix'])),
+    );
+    expect(trailingArgsResults[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'fail',
+      cause: 'lint-arch-timeout',
+    });
+  });
+
+  it('emits lint-arch-timeout only when the run never reported an exit code with an executor error', async () => {
+    // A run claiming exitCode 0 alongside the typed timeout code violates the
+    // port contract (an executor error never yields an exit code): it is never
+    // classified as lint-arch-timeout; the executor error keeps it unknown.
+    const completed = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? {
+            exitCode: 0,
+            signal: null,
+            stdout: '',
+            stderr: '',
+            error: 'command exceeded its 1000ms timeout and its process tree was killed',
+            errorCode: 'timeout',
+          }
+        : happyGit(argv),
+    );
+    const completedResults = evaluatedResults(
+      await completed.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(completedResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: 0 });
+    expect(completedResults[2]).not.toHaveProperty('cause');
+
+    // A run with no exit code but no executor error is also out of contract:
+    // unknown, no cause.
+    const noError = makeRawAdapter((argv) =>
+      argv[0] === 'sh'
+        ? { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', errorCode: 'timeout' }
+        : happyGit(argv),
+    );
+    const noErrorResults = evaluatedResults(
+      await noError.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(noErrorResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(noErrorResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('returns fail without lint-arch-timeout when lint:arch exits 1 and unknown when exitCode is null', async () => {
+    // Exit 1: the command's own hard failure, never the typed timeout cause.
+    const exited = makeRawAdapter((argv) =>
+      argv[0] === 'sh' ? { exitCode: 1, signal: null, stdout: '', stderr: '' } : happyGit(argv),
+    );
+    const exitedResults = evaluatedResults(
+      await exited.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(exitedResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', exitCode: 1 });
+    expect(exitedResults[2]).not.toHaveProperty('cause');
+
+    // Exit code null without the typed code: unknown, no cause.
+    const noExit = makeRawAdapter((argv) =>
+      argv[0] === 'sh' ? { exitCode: null, signal: null, stdout: '', stderr: '' } : happyGit(argv),
+    );
+    const noExitResults = evaluatedResults(
+      await noExit.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(noExitResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(noExitResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('keeps lint:arch exits 137 and 143 as unknown with resource-exhausted', async () => {
+    for (const exitCode of [137, 143]) {
+      const { adapter } = makeRawAdapter((argv) =>
+        argv[0] === 'sh' ? { exitCode, signal: null, stdout: '', stderr: '' } : happyGit(argv),
+      );
+      const results = evaluatedResults(await adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)));
+      expect(results[2]).toMatchObject({
+        kind: 'command',
+        verdict: 'unknown',
+        exitCode,
+        cause: 'resource-exhausted',
+      });
+    }
+  });
+
+  it('emits missing-generated-types only when the host probe confirms apps/web/.next/types absent', async () => {
+    const failingTypecheck = {
+      exitCode: 2,
+      signal: null,
+      stdout: "error TS6053: Cannot find file '/lanes/w1/apps/web/.next/types'",
+      stderr: '',
+    };
+    // Probe exit 0: tsconfig.json exists and .next/types is absent.
+    const absent = makeRawAdapter((argv) => {
+      if (argv[0] === 'test') return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      if (argv[0] === 'sh') return { ...failingTypecheck };
+      return happyGit(argv);
+    });
+    const absentResults = evaluatedResults(
+      await absent.adapter.evaluateGatePredicates(commandRequest(TYPECHECK)),
+    );
+    expect(absentResults[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'fail',
+      exitCode: 2,
+      cause: 'missing-generated-types',
+    });
+    // The host probe ran (the `.next`-types probe among the test probes), and
+    // the classification never came from the output.
+    const probeCalls = absent.executor.argvRecords.filter((argv) => argv[0] === 'test');
+    expect(
+      probeCalls.filter((argv) => argv.some((arg) => arg.includes('.next'))),
+    ).toHaveLength(1);
+
+    // Probe exit 1 (.next/types present): the failure stays the command's own,
+    // even with TS6053 and .next/types in the output.
+    const present = makeRawAdapter((argv) => {
+      if (argv[0] === 'test') return { exitCode: 1, signal: null, stdout: '', stderr: '' };
+      if (argv[0] === 'sh') return { ...failingTypecheck };
+      return happyGit(argv);
+    });
+    const presentResults = evaluatedResults(
+      await present.adapter.evaluateGatePredicates(commandRequest(TYPECHECK)),
+    );
+    expect(presentResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', exitCode: 2 });
+    expect(presentResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('does not emit missing-generated-types when host probe errors or throws', async () => {
+    const failingTypecheck = { exitCode: 2, signal: null, stdout: '', stderr: '' };
+    // Probe reports its own error: failing closed, no typed cause.
+    const probeError = makeRawAdapter((argv) => {
+      if (argv[0] === 'test')
+        return { exitCode: 1, signal: null, stdout: '', stderr: '', error: 'probe failed' };
+      if (argv[0] === 'sh') return { ...failingTypecheck };
+      return happyGit(argv);
+    });
+    const probeErrorResults = evaluatedResults(
+      await probeError.adapter.evaluateGatePredicates(commandRequest(TYPECHECK)),
+    );
+    expect(probeErrorResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', exitCode: 2 });
+    expect(probeErrorResults[2]).not.toHaveProperty('cause');
+
+    // Probe throws: nextTypesAbsent catches and reads false, no typed cause.
+    const probeThrows = makeRawAdapter((argv) => {
+      if (argv[0] === 'test') throw new Error('probe exploded');
+      if (argv[0] === 'sh') return { ...failingTypecheck };
+      return happyGit(argv);
+    });
+    const probeThrowsResults = evaluatedResults(
+      await probeThrows.adapter.evaluateGatePredicates(commandRequest(TYPECHECK)),
+    );
+    expect(probeThrowsResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', exitCode: 2 });
+    expect(probeThrowsResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('refuses CommandRunResult with invalid or non-string errorCode as unknown', async () => {
+    for (const errorCode of ['bogus', 7, true]) {
+      const { adapter } = makeRawAdapter((argv) =>
+        argv[0] === 'sh'
+          ? { exitCode: 1, signal: null, stdout: '', stderr: '', errorCode }
+          : happyGit(argv),
+      );
+      const results = evaluatedResults(await adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)));
+      expect(results[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+      expect(results[2]).not.toHaveProperty('cause');
+    }
+  });
+
+  it('refuses getter on errorCode without invoking it', async () => {
+    let reads = 0;
+    const run: CommandRunResult = { exitCode: 1, signal: null, stdout: '', stderr: '' };
+    Object.defineProperty(run, 'errorCode', {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return 'timeout';
+      },
+    });
+    const { adapter } = makeRawAdapter((argv) => (argv[0] === 'sh' ? run : happyGit(argv)));
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)));
+    expect(reads).toBe(0);
+    expect(results[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(results[2]).not.toHaveProperty('cause');
+  });
+
+  it('accepts CommandRunResult when optional errorCode is omitted', async () => {
+    // A legacy/scripted executor's clean run: classified normally, no cause.
+    const passing = makeRawAdapter((argv) =>
+      argv[0] === 'sh' ? { exitCode: 0, signal: null, stdout: '', stderr: '' } : happyGit(argv),
+    );
+    const passingResults = evaluatedResults(
+      await passing.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(passingResults[2]).toMatchObject({ kind: 'command', verdict: 'pass', exitCode: 0 });
+    expect(passingResults[2]).not.toHaveProperty('cause');
+
+    const failing = makeRawAdapter((argv) =>
+      argv[0] === 'sh' ? { exitCode: 1, signal: null, stdout: '', stderr: '' } : happyGit(argv),
+    );
+    const failingResults = evaluatedResults(
+      await failing.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(failingResults[2]).toMatchObject({ kind: 'command', verdict: 'fail', exitCode: 1 });
+    expect(failingResults[2]).not.toHaveProperty('cause');
+  });
+
+  it('refuses non-array spec commands as unavailable without executing anything', async () => {
+    const { adapter, executor } = makeRawAdapter(() => {
+      throw new Error('no command must run for a malformed spec');
+    });
+    const request = commandRequest(LINT_ARCH);
+    const malformed = {
+      ...request,
+      spec: { ...request.spec, commands: 'not-an-array' },
+    } as unknown as EvaluateGatePredicatesRequest;
+    const result = await adapter.evaluateGatePredicates(malformed);
+    expect(result.outcome).toBe('unavailable');
+    expect(executor.argvRecords).toHaveLength(0);
+  });
+
+  it('returns unknown without cause when the executor returns a null run or null exitCode', async () => {
+    // The executor itself returned null: the whole run is refused, unknown.
+    const nullRun = makeRawAdapter((argv) => (argv[0] === 'sh' ? null : happyGit(argv)));
+    const nullRunResults = evaluatedResults(
+      await nullRun.adapter.evaluateGatePredicates(commandRequest(LINT_ARCH)),
+    );
+    expect(nullRunResults[2]).toMatchObject({ kind: 'command', verdict: 'unknown', exitCode: null });
+    expect(nullRunResults[2]).not.toHaveProperty('cause');
+  });
+});

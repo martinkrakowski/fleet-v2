@@ -774,12 +774,17 @@ export async function runCrossOrgRefusalContract(
         if (verifyRepo.kind === "timeout") {
           return { ok: false, reason: "timeout" };
         }
-        const screenedSecond = screenPlainObject(
-          verifyRepo.value,
-          isProxy,
-          REPO_ALLOWED_KEYS,
-          "invalid-factory",
-        );
+        // A verifying repo that cannot be built proves nothing, so the
+        // refused delete stays a violation below.
+        const screenedSecond =
+          verifyRepo.kind === "threw"
+            ? ({ ok: false } as const)
+            : screenPlainObject(
+                verifyRepo.value,
+                isProxy,
+                REPO_ALLOWED_KEYS,
+                "invalid-factory",
+              );
         const secondGet = screenedSecond.ok
           ? screenedSecond.record.get
           : undefined;
@@ -814,11 +819,16 @@ export async function runCrossOrgRefusalContract(
               violations.push("delete");
             } else if (
               snapshot.value === null ||
-              snapshot.value === undefined ||
-              isRefusalMarker(snapshot.value)
+              typeof snapshot.value !== "object" ||
+              Array.isArray(snapshot.value) ||
+              isRefusalMarker(snapshot.value) ||
+              !leaksSeedId(snapshot.value, SEED_ID, 0)
             ) {
-              // The seeded record the refused delete had to leave alone is
-              // gone: the delete was carried out despite the refusal.
+              // Only positive record evidence proves the delete left the
+              // seeded record alone: an object that carries the seeded id.
+              // Absence, a refusal marker, a primitive (`false`, `true`) or
+              // an object without the id is not evidence, so the delete was
+              // carried out despite the refusal, or cannot be shown not to be.
               violations.push("delete");
             }
           }

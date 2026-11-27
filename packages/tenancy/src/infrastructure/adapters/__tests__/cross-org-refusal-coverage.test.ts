@@ -458,6 +458,32 @@ describe('cross-org refusal coverage enumeration', () => {
     });
   });
 
+  it('requires positive record evidence after a refused delete, not merely a non-null non-refusal result', async () => {
+    // A delete that returns `false` is accepted as a refusal; the verifying
+    // read through the seeded organisation must then SHOW the record. A
+    // seeded-org read that returns a bare primitive, an empty object or a
+    // refusal marker is not evidence, and a record carrying the seeded id is.
+    function falseDeleteFactory(seededRead: unknown): object {
+      return {
+        createForOrg: (orgId: string) => ({
+          get: async () => (orgId === 'org-b' ? seededRead : null),
+          list: async () => [],
+          delete: async () => false,
+        }),
+        seedRecord: async () => undefined,
+      };
+    }
+    const evidence = { id: SEED_ID, organizationId: 'org-b' };
+    expect(await runCrossOrgRefusalContract(falseDeleteFactory(evidence), types.isProxy)).toEqual({ ok: true });
+    for (const notEvidence of [false, true, 0, 'present', {}, [], null, { status: 'refused', reason: 'not-found' }]) {
+      expect(await runCrossOrgRefusalContract(falseDeleteFactory(notEvidence), types.isProxy)).toEqual({
+        ok: false,
+        reason: 'cross-org-leak',
+        violations: ['delete'],
+      });
+    }
+  });
+
   it('passes for OrganizationRepositoryAdapter and MembershipRepositoryAdapter and reports cross-org leaks on a leaky fake', async () => {
     const organizationAdapter = new OrganizationRepositoryAdapter();
     const organizationFactory = {

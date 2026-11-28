@@ -25,111 +25,56 @@ export const KILLALL_READ_SNAPSHOT_LIMITS: SnapshotLimits = Object.freeze({
 });
 
 /**
- * One bounded, getter-free snapshot of a port answer, read through its own
- * property descriptors: `snapshotPlainData` refuses every accessor, symbol
- * key, array, non-plain prototype and over-bound node without running a
- * getter or a Proxy trap (the `isProxy` detector is the neutral `() => false`
- * per KA3-1, so `structuredClone` below is the Proxy refusal), then
- * `readExactPlainRecord` demands exactly the expected keys, then
- * `structuredClone` refuses every remaining `Proxy` (its traps run only after
- * the snapshot proved there are no own accessors to fire). Cost: bounded by
- * `KILLALL_READ_SNAPSHOT_LIMITS`, one exact-key pass over at most the keys
- * named here, and one clone of that bounded snapshot. Any throw — a revoked
- * Proxy, a lying trap — is a `null` refusal, never a propagated error.
+ * One bounded, getter-free snapshot of a port answer. `snapshotPlainData`
+ * runs the injected `isProxy` detector before any reflection and refuses
+ * every accessor, symbol key, array, non-plain prototype and over-bound node
+ * without running a getter or a Proxy trap; `readExactPlainRecord` then
+ * demands exactly the expected keys. Cost: bounded by
+ * `KILLALL_READ_SNAPSHOT_LIMITS` plus one exact-key pass over the keys named
+ * here. A refusal is `null`, never a propagated error.
  */
-function readExactPortSnapshot(raw: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  const snap = snapshotPlainData(raw, () => false, KILLALL_READ_SNAPSHOT_LIMITS);
+function readExactPortSnapshot(
+  raw: unknown,
+  keys: readonly string[],
+  isProxy: IsProxy,
+): Record<string, unknown> | null {
+  const snap = snapshotPlainData(raw, isProxy, KILLALL_READ_SNAPSHOT_LIMITS);
   if (!snap.ok) {
     return null;
   }
-  const exact = readExactPlainRecord(snap.value, keys);
-  if (exact === null) {
-    return null;
-  }
-  try {
-    structuredClone(raw);
-  } catch {
-    return null;
-  }
-  return exact;
+  return readExactPlainRecord(snap.value, keys);
 }
 
 /**
  * The result of reading a port's `read` method: `ok: true` carries the method
- * (possibly `undefined` when the port has none); `ok: false` is a refused,
- * hostile port (a throwing reflection, an accessor, or a prototype chain too
- * deep to trust), which every caller maps to its fail-closed verdict.
+ * (possibly `undefined` when the port has none); `ok: false` is a refused
+ * port (a Proxy or a throwing lookup), which every caller maps to its
+ * fail-closed verdict.
  */
 type PortMethodRead =
   | { readonly ok: true; readonly value: unknown }
   | { readonly ok: false };
 
-/** The `read` key every halt/pause port exposes. */
-const PORT_METHOD_KEY = 'read';
-
-/** The prototype hops one method lookup may traverse. A real adapter reaches
- * its method within one or two hops; more is a lying reflection, refused. */
-const PORT_METHOD_MAX_HOPS = 8;
-
-/** The neutral detector used when a caller passes none: it refuses nothing, so
- * the Proxy refusal below falls back to the walk's own throw/refusal bounds.
+/** The neutral detector used when a caller passes none: it refuses nothing.
  * Production callers bind `types.isProxy` once in infrastructure and thread it
- * through the use cases (fix round 2, item 1). */
+ * through the use cases. */
 const NEUTRAL_IS_PROXY: IsProxy = () => false;
 
 /**
- * One bounded, getter-free read of a port's `read` method. The port object is
- * untrusted, so the FIRST operation on it is the injected `isProxy` detector
- * (`node:util` `types.isProxy` in production, threaded from the composition):
- * a Proxy — including one whose descriptor and prototype traps hide `read` and
- * report a null prototype, which the descriptor walk alone would misread as a
- * genuinely absent method — is refused fail-closed before any trap can run.
- * The walk then touches only `getOwnPropertyDescriptor` and `getPrototypeOf`
- * along the prototype chain — reflection that never fires a getter or a `get`
- * trap — and returns the data-descriptor value. An accessor descriptor
- * (`get`/`set`) is refused without being invoked; a throwing reflection (a
- * revoked or hostile Proxy) and a chain deeper than `PORT_METHOD_MAX_HOPS` (a
- * lying or cyclic trap) are refused fail-closed. Cost: one detector call plus
- * at most `PORT_METHOD_MAX_HOPS` descriptor reads and as many prototype
- * reads, all O(1) per hop, no unbounded work.
+ * One read of a port's `read` method. The port object is the first thing the
+ * injected `isProxy` detector sees: a Proxy, including one that hides `read`,
+ * is refused fail-closed before any trap can run. A throwing lookup is a
+ * refusal too. Cost: one detector call and one property read.
  */
 function readPortMethod(port: object, isProxy: IsProxy): PortMethodRead {
   try {
     if (isProxy(port) === true) {
       return { ok: false };
     }
+    return { ok: true, value: (port as { readonly read?: unknown }).read };
   } catch {
     return { ok: false };
   }
-  let cursor: object | null = port;
-  for (let hops = 0; hops < PORT_METHOD_MAX_HOPS; hops += 1) {
-    if (cursor === null) {
-      // The chain ended without a descriptor: the method is genuinely absent.
-      return { ok: true, value: undefined };
-    }
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Reflect.getOwnPropertyDescriptor(cursor, PORT_METHOD_KEY);
-    } catch {
-      return { ok: false };
-    }
-    if (descriptor !== undefined) {
-      // An accessor (`get`/`set`) is refused, never invoked: running it would
-      // be exactly the side effect the hostile-input rule forbids.
-      if (descriptor.get !== undefined || descriptor.set !== undefined) {
-        return { ok: false };
-      }
-      return { ok: true, value: descriptor.value };
-    }
-    try {
-      cursor = Reflect.getPrototypeOf(cursor);
-    } catch {
-      return { ok: false };
-    }
-  }
-  // Still no end in sight after the hop bound: a lying or cyclic prototype
-  // chain.
-  return { ok: false };
 }
 
 /**
@@ -148,9 +93,7 @@ export async function isChainPassHalted(
     return false;
   }
   // The port object itself is untrusted: a Proxy is refused by the detector
-  // before any reflection; the `read` method is then read through property
-  // descriptors (never a getter or a Proxy get trap) and a refused read
-  // fails closed.
+  // before any trap runs; a refused read fails closed.
   const method = readPortMethod(halt, isProxy);
   if (!method.ok || typeof method.value !== 'function') {
     return true;
@@ -159,7 +102,7 @@ export async function isChainPassHalted(
     // `read` is a prototype method: call it against the port so `this` is the
     // adapter, never an undefined receiver.
     const state = await (method.value as (this: object) => unknown).call(halt);
-    const exact = readExactPortSnapshot(state, ['state', 'record']);
+    const exact = readExactPortSnapshot(state, ['state', 'record'], isProxy);
     if (exact === null || exact.state !== 'clear') {
       return true;
     }
@@ -232,7 +175,7 @@ export async function isKillallHalted(
   }
   try {
     const answer = await (method.value as (this: object) => unknown).call(killallHalt);
-    const exact = readExactPortSnapshot(answer, ['state']);
+    const exact = readExactPortSnapshot(answer, ['state'], isProxy);
     return !(exact !== null && exact.state === 'clear');
   } catch {
     return true;
@@ -255,16 +198,15 @@ export async function isKillallTrainPaused(
   if (killallTrainPause === null) {
     return true;
   }
-  // The port object itself is untrusted: mirror the halt read's detector and
-  // descriptor walk; a refused walk, an absent or non-callable `read` all
-  // fail closed.
+  // The port object itself is untrusted: mirror the halt read's detector;
+  // a refused read, an absent or non-callable `read` all fail closed.
   const method = readPortMethod(killallTrainPause, isProxy);
   if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
   try {
     const answer = await (method.value as (this: object) => unknown).call(killallTrainPause);
-    const exact = readExactPortSnapshot(answer, ['status']);
+    const exact = readExactPortSnapshot(answer, ['status'], isProxy);
     return !(exact !== null && exact.status === 'clear');
   } catch {
     return true;

@@ -23,7 +23,6 @@ import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-por
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import { isSupersedablePredecessor } from '../../domain/merge-queue-operations.js';
-import type { IsProxy } from '@fleet/shared';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
@@ -58,9 +57,6 @@ export interface DecideShadowMergeDependencies {
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   /** Read-only peek at the real merge queue, for the base partition's head. */
   readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
-  /** Fix round 2: the trusted Proxy detector, forwarded to the inner merge
-   * pass so a Proxy port is refused before its traps run. */
-  readonly isProxy?: IsProxy;
   readonly newUlid: () => string;
   readonly nowIso: () => string;
 }
@@ -247,7 +243,6 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
       verification: this.deps.verification,
       journal: this.deps.journal,
       halt: this.deps.halt,
-      isProxy: this.deps.isProxy,
       newUlid: this.deps.newUlid,
       nowIso: this.deps.nowIso,
     });

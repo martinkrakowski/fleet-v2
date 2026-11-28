@@ -37,6 +37,15 @@ import { LaneRunRepositoryAdapter } from '../../../../infrastructure/adapters/La
 import { LaneRunJournalAdapter } from '../../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
+import { ReviewRequestAdapter } from '../../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
+import {
+  assessmentIdForAttempt,
+  EvidenceAssessmentRepositoryAdapter,
+  InspectAcceptanceEvidenceUseCase,
+  RecordReviewReceiptUseCase,
+  type EvidenceAssessmentRecord,
+  type ReviewReceiptRecord,
+} from '@fleet/evidence-and-acceptance';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-11-25T10:00:00.000Z';
@@ -741,5 +750,171 @@ describe('premerge RM3: Tier 2 never publishes success without the exact-head ow
     const posted = await advance(harness);
     expect(posted).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
     expect(successStatuses(harness)).toHaveLength(0);
+  });
+});
+
+/**
+ * RM3 owner-receipt path end to end: the manual receipt is written through
+ * the evidence context's own `RecordReviewReceiptUseCase` (which enforces the
+ * independence and exact-request checks) into an in-memory assessment
+ * repository, and the lane run reads it back through the real
+ * `ReviewRequestAdapter` over `InspectAcceptanceEvidenceUseCase`. The only
+ * seam between the contexts is the assessment store; no forge, no subprocess,
+ * no network.
+ */
+describe('premerge RM3: a manual owner receipt written through RecordReviewReceiptUseCase releases the Tier 2 hold', () => {
+  const ASSESSMENT_ID = assessmentIdForAttempt('attempt-example-1');
+  const OWNER_RECEIPT_ID = 'rcp-owner-example-1';
+
+  /** The pending assessment the manual receipt is appended to. */
+  function assessment(overrides: Partial<EvidenceAssessmentRecord> = {}): EvidenceAssessmentRecord {
+    return {
+      id: ASSESSMENT_ID,
+      projectId: PROJECT_ID,
+      attemptId: 'attempt-example-1',
+      candidateHeadSha: COMMIT,
+      policyRevision: 'policy-example-1',
+      implementerModel: 'implementer-example-1',
+      requiredChecks: [],
+      state: 'pending',
+      verificationReceipts: [],
+      reviewReceipts: [],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 1,
+      updatedAtIso: NOW,
+      ...overrides,
+    };
+  }
+
+  /** The manual owner receipt: `requestId` omitted, kind `pre-merge`, at the exact head. */
+  function ownerReceiptRecord(overrides: Partial<ReviewReceiptRecord> = {}): ReviewReceiptRecord {
+    return {
+      id: OWNER_RECEIPT_ID,
+      assessmentId: ASSESSMENT_ID,
+      projectId: PROJECT_ID,
+      attemptId: 'attempt-example-1',
+      candidateHeadSha: COMMIT,
+      reviewerModel: 'reviewer-example-1',
+      implementerModel: 'implementer-example-1',
+      readOnlyVerified: true,
+      result: 'pass',
+      findings: [],
+      evidenceRef: 'conductor-premerge-attest:' + RUN_ID + '@' + HEAD12,
+      policyRevision: 'policy-example-1',
+      completedAtIso: NOW,
+      kind: 'pre-merge',
+      ...overrides,
+    };
+  }
+
+  /**
+   * Wires the receipt write and the read-back: the receipt is recorded
+   * through `RecordReviewReceiptUseCase` into the in-memory repository, and
+   * the advance's review port is the real `ReviewRequestAdapter` reading the
+   * same repository through `InspectAcceptanceEvidenceUseCase`.
+   */
+  async function attestedHarness(
+    assessmentRecord: EvidenceAssessmentRecord,
+    receipt: ReviewReceiptRecord,
+  ): Promise<{ harness: Harness; reviewRequestAdapter: ReviewRequestAdapter }> {
+    const repo = new EvidenceAssessmentRepositoryAdapter();
+    await repo.saveAssessment(assessmentRecord);
+    const inspect = new InspectAcceptanceEvidenceUseCase({ repo });
+    const recorded = await new RecordReviewReceiptUseCase({ repo }).recordReviewReceipt({
+      assessmentId: assessmentRecord.id,
+      receipt,
+      nowIso: LATER,
+    });
+    expect(recorded.outcome).toBe('recorded');
+    const harness = await mergingHarness({ premergeMode: 'auto-attest' });
+    const reviewRequestAdapter = new ReviewRequestAdapter({
+      inspectAcceptanceEvidence: (request) => inspect.inspectAcceptanceEvidence(request),
+    });
+    return { harness, reviewRequestAdapter };
+  }
+
+  /** The advance run over `deps` with the review port replaced. */
+  async function advanceWithReviewAdapter(harness: Harness, reviewRequest: ReviewRequestAdapter) {
+    const useCase = new AdvanceLaneRunUseCase({ ...harness.deps, reviewRequest });
+    return useCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+  }
+
+  it('accepts a manual pre-merge receipt written via RecordReviewReceiptUseCase in tier2OwnerPremergeReleased', async () => {
+    const { harness, reviewRequestAdapter } = await attestedHarness(assessment(), ownerReceiptRecord());
+    const posted = await advanceWithReviewAdapter(harness, reviewRequestAdapter);
+    expect(posted).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(successStatuses(harness)).toHaveLength(1);
+  });
+
+  it('keeps Tier 2 premerge waiting when receipt candidateHeadSha differs from PR head', async () => {
+    // The receipt is genuine but about an older head: the assessment stores
+    // that older head and the PR still sits at COMMIT, so the exact-head gate
+    // keeps waiting.
+    const { harness, reviewRequestAdapter } = await attestedHarness(
+      assessment({ candidateHeadSha: OTHER_COMMIT }),
+      ownerReceiptRecord({ candidateHeadSha: OTHER_COMMIT }),
+    );
+    const posted = await advanceWithReviewAdapter(harness, reviewRequestAdapter);
+    expect(posted).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    expect(successStatuses(harness)).toHaveLength(0);
+  });
+
+  it('keeps Tier 2 premerge waiting when receipt requestId is non-null', async () => {
+    // An automated receipt (a real review request id, never null) is not an
+    // owner attestation, however it is named or worded.
+    const { harness, reviewRequestAdapter } = await attestedHarness(
+      assessment(),
+      ownerReceiptRecord({ requestId: 'review-example-1', reviewerModel: 'reviewer-example-2' }),
+    );
+    const posted = await advanceWithReviewAdapter(harness, reviewRequestAdapter);
+    expect(posted).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    expect(successStatuses(harness)).toHaveLength(0);
+  });
+
+  it('keeps Tier 2 premerge waiting when pre-merge review verdict is failed', async () => {
+    // The recorded owner receipt passes at the exact head, so the hold reads
+    // `released` — but the journaled automated pre-merge review failed, and
+    // RM3 keeps the released hold waiting when the review verdict is neither
+    // `none` nor `passed`.
+    const { harness, reviewRequestAdapter } = await attestedHarness(assessment(), ownerReceiptRecord());
+    const key = reviewRequestKey(0);
+    await appendIntent(harness, key, 'review-example-1', NOW);
+    await appendResult(harness, key, 'completed', 'review-failed', NOW);
+    const posted = await advanceWithReviewAdapter(harness, reviewRequestAdapter);
+    expect(posted).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    expect(successStatuses(harness)).toHaveLength(0);
+  });
+
+  it('keeps Tier 1 premerge unaffected without a manual owner receipt', async () => {
+    // No assessment exists at all: the real adapter answers not-found and the
+    // Tier 1 hold releases exactly as before RM3.
+    const repo = new EvidenceAssessmentRepositoryAdapter();
+    const inspect = new InspectAcceptanceEvidenceUseCase({ repo });
+    const tier1 = await mergingHarness({ premergeMode: 'auto-attest' }, runRecord({ tier: 1 }));
+    const posted = await advanceWithReviewAdapter(
+      tier1,
+      new ReviewRequestAdapter({ inspectAcceptanceEvidence: (request) => inspect.inspectAcceptanceEvidence(request) }),
+    );
+    expect(posted).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(successStatuses(tier1)).toHaveLength(1);
   });
 });

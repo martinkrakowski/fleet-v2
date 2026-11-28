@@ -73,7 +73,7 @@ export function canonicalLanePlanSidecarJson(sidecar: LanePlanSidecar): string {
       mergedPr: lane.mergedPr === null
         ? null
         : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
-      ...(lane.rollupOf ? { rollupOf: true } : {}),
+      ...(lane.rollupOf && sidecar.featureSet !== null ? { rollupOf: true } : {}),
     })),
     ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
   });
@@ -734,7 +734,7 @@ function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar 
   const planId = root.planId as string;
   const featureSet = buildNormalizedFeatureSet(root);
   const lanes = (plainArrayCopy(root.lanes) as unknown[]).map((raw) =>
-    buildNormalizedLane(raw, projectId, planId, featureSet !== null),
+    buildNormalizedLane(raw, projectId, planId),
   );
   const decisions = hasOwn(root, 'decisions')
     ? (plainArrayCopy(root.decisions) as unknown[]).map((raw) => buildNormalizedDecision(raw))
@@ -755,16 +755,7 @@ function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar 
   };
 }
 
-/**
- * `rollupOf` only has a meaning inside a feature set: a plan with no feature set normalizes every
- * lane to `rollupOf: false`, so the normalized sidecar and its canonical JSON never disagree.
- */
-function buildNormalizedLane(
-  raw: unknown,
-  projectId: string,
-  planId: string,
-  hasFeatureSet: boolean,
-): PlannedLaneSidecar {
+function buildNormalizedLane(raw: unknown, projectId: string, planId: string): PlannedLaneSidecar {
   const lane = raw as Record<string, unknown>;
   const after = hasOwn(lane, 'after')
     ? (plainArrayCopy(lane.after) as unknown[]).map(
@@ -790,7 +781,7 @@ function buildNormalizedLane(
     status: (lane.status === undefined ? 'planned' : lane.status) as PlannedLaneStatus,
     brief: lane.brief === undefined ? null : (lane.brief as string | null),
     mergedPr,
-    rollupOf: hasFeatureSet && lane.rollupOf === true,
+    rollupOf: lane.rollupOf === true,
   };
 }
 

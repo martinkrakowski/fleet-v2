@@ -436,6 +436,28 @@ describe('LanePlan featureSet and PlannedLane rollupOf (PV1)', () => {
     expect(createError(withFeature(proxy))).toBe('LanePlan input could not be read');
   });
 
+  it('create refuses constructor, prototype and non-enumerable featureSet keys and a getter-backed title', () => {
+    const exact = 'LanePlan featureSet: must have exactly id and title';
+    expect(createError(withFeature(JSON.parse('{"id":"f","title":"T","constructor":1}')))).toBe(exact);
+    expect(createError(withFeature(JSON.parse('{"id":"f","title":"T","prototype":1}')))).toBe(exact);
+    const hidden = { id: 'f', title: 'T' };
+    Object.defineProperty(hidden, 'extra', { value: 1, enumerable: false });
+    expect(createError(withFeature(hidden))).toBe(exact);
+    const nonEnumerableTitle = { id: 'f' };
+    Object.defineProperty(nonEnumerableTitle, 'title', { value: 'T', enumerable: false });
+    expect(createError(withFeature(nonEnumerableTitle))).toBe(exact);
+    let calls = 0;
+    const titleGetter = {
+      id: 'f',
+      get title() {
+        calls += 1;
+        return 'T';
+      },
+    };
+    expect(createError(withFeature(titleGetter))).toBe('LanePlan featureSet.title: must be a string');
+    expect(calls).toBe(0);
+  });
+
   it('create refuses a bad featureSet id or title with a fixed message that never echoes a secret', () => {
     const secret = fakeSecretShape();
     expect(createError(withFeature({ id: 1, title: 'T' }))).toBe('LanePlan featureSet.id: must be a string');

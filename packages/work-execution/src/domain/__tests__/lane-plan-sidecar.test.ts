@@ -565,13 +565,36 @@ describe('featureSet and rollupOf (PV1)', () => {
     expect(canonicalLanePlanSidecarJson(both.sidecar)).not.toBe(canonicalLanePlanSidecarJson(onlyFeature.sidecar));
   });
 
-  it('a rollupOf lane in a plan with no featureSet normalizes to false and keeps the pre-PV1 canonical JSON', () => {
+  it('a rollupOf lane in a plan with no featureSet keeps rollupOf true but omits it from the canonical JSON', () => {
     const result = parseLanePlanSidecar(withLane(0, { rollupOf: true }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.sidecar.featureSet).toBeNull();
-    expect(result.sidecar.lanes[0].rollupOf).toBe(false);
+    expect(result.sidecar.lanes[0].rollupOf).toBe(true);
     expect(canonicalLanePlanSidecarJson(result.sidecar)).toBe(PRE_PV1_CANONICAL);
+  });
+
+  it('refuses constructor, prototype and non-enumerable featureSet keys and a getter-backed title', () => {
+    const constructorKeyed = JSON.parse('{"id":"f","title":"T","constructor":1}') as unknown;
+    expect(refusedErrors(withFeatureSet(constructorKeyed))).toEqual(['sidecar.featureSet: unknown key']);
+    const prototypeKeyed = JSON.parse('{"id":"f","title":"T","prototype":1}') as unknown;
+    expect(refusedErrors(withFeatureSet(prototypeKeyed))).toEqual(['sidecar.featureSet: unknown key']);
+    const hidden = { id: 'f', title: 'T' };
+    Object.defineProperty(hidden, 'extra', { value: 1, enumerable: false });
+    expect(refusedErrors(withFeatureSet(hidden))).toEqual(['sidecar.featureSet: unknown key']);
+    const nonEnumerableTitle = { id: 'f' };
+    Object.defineProperty(nonEnumerableTitle, 'title', { value: 'T', enumerable: false });
+    expect(refusedErrors(withFeatureSet(nonEnumerableTitle)).length).toBeGreaterThan(0);
+    let getterCalls = 0;
+    const titleGetter = {
+      id: 'f',
+      get title() {
+        getterCalls += 1;
+        return 'T';
+      },
+    };
+    expect(refusedErrors(withFeatureSet(titleGetter))).toEqual(['sidecar.featureSet.title: must be a string']);
+    expect(getterCalls).toBe(0);
   });
 
   it.each([

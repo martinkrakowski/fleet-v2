@@ -1351,3 +1351,262 @@ describe('Proxy refusal by identity, not by what a trap reports (fix round 3)', 
     ).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// IH1b: optional lane-runner host tunnel resilience and reservation exclusion
+// ---------------------------------------------------------------------------
+
+/** A sunrise-shaped ssh opencode lane-runner host whose tunnel is optional. */
+function optionalSshHostFixture(alias: string, port: number): Record<string, unknown> {
+  return {
+    transport: 'ssh',
+    sshAlias: alias,
+    worktreeRoot: `/tmp/fleet-ih1b-${alias}-worktrees`,
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port, capabilities: RUNNER_CAPABILITIES, maxLanes: 2, optional: true },
+  };
+}
+
+describe('IH1b: optional tunnel members and upHosts', () => {
+  /** An adapter that opens its forward: the probe answers closed once, then open. */
+  function upMember(
+    hostName: string,
+    remotePort: number,
+    options: { readonly optional?: boolean } = {},
+  ): { readonly adapter: RunnerTunnelAdapter; readonly child: FakeChild } {
+    const child = fakeChild();
+    let probes = 0;
+    const adapter = new RunnerTunnelAdapter({
+      hostName,
+      sshHost: `${hostName}.example`,
+      remotePort,
+      isPortListening: async () => {
+        probes += 1;
+        return probes > 1;
+      },
+      spawner: () => child,
+      sleep: async () => undefined,
+      ...(options.optional ? { optional: true } : {}),
+    });
+    return { adapter, child };
+  }
+
+  /** An adapter whose forward never opens: the child dies during the bounded wait. */
+  function downMember(hostName: string, remotePort: number, optional?: boolean): RunnerTunnelAdapter {
+    return new RunnerTunnelAdapter({
+      hostName,
+      sshHost: `${hostName}.example`,
+      remotePort,
+      isPortListening: async () => false,
+      spawner: () => fakeChild({ exitAt: 'immediately' }),
+      sleep: async () => undefined,
+      ...(optional ? { optional: true } : {}),
+    });
+  }
+
+  it('an optional member that fails is skipped: the required member opens and onOptionalFailed names only its host key', async () => {
+    const optional = downMember('runner-b', 4266, true);
+    const required = upMember('runner-a', 4166);
+    const failedHosts: string[] = [];
+    const set = new RunnerTunnelSetAdapter([optional, required.adapter]);
+    expect(await set.ensureTunnel({ onOptionalFailed: (hostName) => failedHosts.push(hostName) })).toBe('opened');
+    // The optional host key alone is reported — never its alias or its port.
+    expect(failedHosts).toEqual(['runner-b']);
+    expect(set.owned).toBe(true);
+    expect([...(set.upHosts() ?? [])]).toEqual(['runner-a']);
+    await set.stop();
+    expect(set.owned).toBe(false);
+  });
+
+  it('a throwing onOptionalFailed does not reject the start nor orphan an opened required member', async () => {
+    const required = upMember('runner-a', 4166);
+    const optional = downMember('runner-b', 4266, true);
+    const set = new RunnerTunnelSetAdapter([required.adapter, optional]);
+    let calls = 0;
+    await expect(
+      set.ensureTunnel({
+        onOptionalFailed: () => {
+          calls += 1;
+          throw new Error('the report itself failed');
+        },
+      }),
+    ).resolves.toBe('opened');
+    expect(calls).toBe(1);
+    // The required member's child survived the throwing report and stays owned.
+    expect(set.owned).toBe(true);
+    expect([...(set.upHosts() ?? [])]).toEqual(['runner-a']);
+    await set.stop();
+    expect(set.owned).toBe(false);
+  });
+
+  it('a required member that fails stops every opened member and leaves upHosts empty, even beside an optional member', async () => {
+    const optional = upMember('runner-b', 4266, { optional: true });
+    const required = downMember('runner-a', 4166);
+    const set = new RunnerTunnelSetAdapter([optional.adapter, required]);
+    expect(await set.ensureTunnel()).toBe('failed');
+    // The already-opened optional member's child was stopped, not orphaned.
+    expect(optional.child.killCalls).toHaveLength(1);
+    expect(set.owned).toBe(false);
+    expect(set.upHosts()).toEqual(new Set());
+  });
+
+  it('a single optional ssh host composes the set adapter, and its failed tunnel is reported and skipped, not fatal', async () => {
+    const installation = installationWithHosts({ 'runner-a': optionalSshHostFixture('alias-a', 4166) });
+    const runtime = createFleetCliRuntime({
+      stateDir: tempStateDir(),
+      installation,
+      runSubprocess: () => {
+        throw new Error('the conductor must never dispatch a subprocess');
+      },
+    });
+    // The single optional host takes the set adapter, whose one member carries
+    // the host key and the optional flag from the installation record.
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelSetAdapter);
+    const members = (runtime.runnerTunnel as unknown as { members: readonly RunnerTunnelAdapter[] }).members;
+    expect(members).toHaveLength(1);
+    expect(members[0]!.hostName).toBe('runner-a');
+    expect(members[0]!.optional).toBe(true);
+    // The ssh of this one member refuses before spawn (an option-shaped
+    // alias), which is the deterministic "tunnel down" of a real host.
+    Object.defineProperty(members[0]!, 'sshHost', { value: '-oProxyCommand=x' });
+    const failedHosts: string[] = [];
+    expect(
+      await runtime.runnerTunnel.ensureTunnel({ onOptionalFailed: (hostName) => failedHosts.push(hostName) }),
+    ).toBe('not-applicable');
+    expect(failedHosts).toEqual(['runner-a']);
+    expect(runtime.runnerTunnel.upHosts?.()).toEqual(new Set());
+  });
+
+  it('a single required ssh host keeps the single adapter and carries the installation host key', () => {
+    const runtime = createFleetCliRuntime({
+      stateDir: tempStateDir(),
+      installation: installationWithHosts({ 'runner-a': sshHostFixture('alias-a', 4166) }),
+      runSubprocess: () => {
+        throw new Error('the conductor must never dispatch a subprocess');
+      },
+    });
+    expect(runtime.runnerTunnel).toBeInstanceOf(RunnerTunnelAdapter);
+    expect(runtime.runnerTunnel).not.toBeInstanceOf(RunnerTunnelSetAdapter);
+    expect((runtime.runnerTunnel as RunnerTunnelAdapter).hostName).toBe('runner-a');
+    // Before ensureTunnel the up-set is null (unrestricted), not empty.
+    expect(runtime.runnerTunnel.upHosts?.()).toBeNull();
+  });
+
+  it('a single adapter reports its host in upHosts once opened or already-listening, the empty set when failed, and keeps the host on an early exit', async () => {
+    const opened = new RunnerTunnelAdapter({
+      hostName: 'lane-host',
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: probeOf([false, true]),
+      spawner: () => fakeChild(),
+      sleep: async () => undefined,
+    });
+    expect(await opened.ensureTunnel()).toBe('opened');
+    expect(opened.upHosts()).toEqual(new Set(['lane-host']));
+    // An owned child exiting mid-run keeps the host reported: `ocm-run`
+    // reopens its own forward on the next pass.
+    const earlyChild = (opened as unknown as { child: FakeChild }).child;
+    earlyChild.crash({ code: 255 });
+    await earlyChild.exited;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(opened.upHosts()).toEqual(new Set(['lane-host']));
+
+    const listening = new RunnerTunnelAdapter({
+      hostName: 'lane-host',
+      sshHost: 'lane-host',
+      remotePort: 46001,
+      isPortListening: probeOf([true]),
+      spawner: () => fakeChild(),
+      sleep: async () => undefined,
+    });
+    expect(await listening.ensureTunnel()).toBe('already-listening');
+    expect(listening.upHosts()).toEqual(new Set(['lane-host']));
+
+    const failed = new RunnerTunnelAdapter({
+      hostName: 'lane-host',
+      sshHost: 'lane-host',
+      remotePort: 46002,
+      isPortListening: probeOf([false, false]),
+      spawner: () => fakeChild({ exitAt: 'immediately' }),
+      sleep: async () => undefined,
+    });
+    expect(await failed.ensureTunnel()).toBe('failed');
+    // A sole ssh host whose tunnel failed is not up — the empty set, not null.
+    expect(failed.upHosts()).toEqual(new Set());
+  });
+
+  it('an optional member that exits early is dropped from upHosts; a required member never is', async () => {
+    const optional = upMember('runner-b', 4266, { optional: true });
+    const required = upMember('runner-a', 4166);
+    const set = new RunnerTunnelSetAdapter([optional.adapter, required.adapter]);
+    expect(await set.ensureTunnel()).toBe('opened');
+    expect([...(set.upHosts() ?? [])].sort()).toEqual(['runner-a', 'runner-b']);
+    optional.child.crash({ code: 255 });
+    await optional.child.exited;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect([...(set.upHosts() ?? [])]).toEqual(['runner-a']);
+    required.child.crash({ code: 255 });
+    await required.child.exited;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect([...(set.upHosts() ?? [])]).toEqual(['runner-a']);
+  });
+
+  it('conductor run --live reports a failed optional host by host key only, and the run continues', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver([completedPass()]);
+    const tunnel: RunnerTunnelPort = {
+      ensureTunnel: async (handlers) => {
+        handlers?.onOptionalFailed?.('runner-b');
+        return 'opened';
+      },
+      stop: async () => undefined,
+      release: async () => undefined,
+    };
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+      tunnel,
+    });
+    expect(result.code).toBe(0);
+    const lines = result.stderr.filter((line) => line.includes('optional runner tunnel failed'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('optional runner tunnel failed for host runner-b; skipping');
+    // The alias and the port never reach the report line.
+    expect(lines[0]).not.toContain('example');
+    expect(lines[0]).not.toContain('4266');
+  });
+});
+
+describe('IH1b: resolveRunnerTunnelTargets reads runner.optional defensively', () => {
+  const asInstallation = (value: unknown): FleetInstallation | undefined => value as FleetInstallation | undefined;
+
+  it('an accessor on runner.optional refuses the host without invoking the getter', () => {
+    const hostileRunner: Record<string, unknown> = { kind: 'opencode', port: 4166 };
+    Object.defineProperty(hostileRunner, 'optional', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('the optional getter must never run');
+      },
+    });
+    const hostileHost = { ...sshHostFixture('alias-a', 4166), runner: hostileRunner };
+    expect(
+      resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': hostileHost } })),
+    ).toEqual([]);
+  });
+
+  it('a non-boolean optional reads as false and a true optional reaches the target', () => {
+    const stringOptional = {
+      ...sshHostFixture('alias-a', 4166),
+      runner: { kind: 'opencode', port: 4166, capabilities: RUNNER_CAPABILITIES, maxLanes: 2, optional: 'yes' },
+    };
+    expect(
+      resolveRunnerTunnelTargets(asInstallation({ schemaVersion: 2, hosts: { 'runner-a': stringOptional } })),
+    ).toEqual([{ hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166 }]);
+    expect(
+      resolveRunnerTunnelTargets(
+        asInstallation({ schemaVersion: 2, hosts: { 'runner-a': optionalSshHostFixture('alias-a', 4166) } }),
+      ),
+    ).toEqual([{ hostName: 'runner-a', sshHost: 'alias-a', remotePort: 4166, optional: true }]);
+  });
+});

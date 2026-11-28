@@ -1612,6 +1612,11 @@ async function runCommand(
       onEarlyExit: () => {
         io.stderr(`${RUNNER_TUNNEL_EXITED_MESSAGE}\n`);
       },
+      // IH1b: a failed optional host is reported by its host key alone (never
+      // the alias, the port or subprocess output) and the run continues.
+      onOptionalFailed: (hostName) => {
+        io.stderr(`conductor run --live: optional runner tunnel failed for host ${hostName}; skipping\n`);
+      },
     });
     const raced = await Promise.race([startPromise.then((outcome) => ({ outcome })), interrupted]);
     if (raced === 'interrupted') {

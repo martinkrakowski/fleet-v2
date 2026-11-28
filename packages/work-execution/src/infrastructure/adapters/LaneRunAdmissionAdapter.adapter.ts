@@ -69,6 +69,12 @@ export interface LaneRunAdmissionAdapterOptions {
   readonly candidateHosts?: readonly ReserveExecutionCapacityCandidateHost[];
   /** KS5: read whether a parked run's PR has merged; absent reads fail closed (the run keeps blocking). */
   readonly forgeRead?: Pick<ForgeReadPort, 'readPullRequest'>;
+  /**
+   * IH1b: whether a candidate host's runner tunnel is up. Absent means
+   * unrestricted. Consulted by `reserveFirst` only — never by `admit`, whose
+   * attempt is pinned to the run's own host regardless of tunnel state.
+   */
+  readonly isHostUp?: (hostName: string) => boolean;
   readonly newReservationId: () => string;
 }
 
@@ -108,12 +114,22 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     if (routableHosts.length === 0) {
       return { outcome: 'refused', reason: 'no-review-route' };
     }
+    // IH1b: a host whose runner tunnel is down is never offered to the
+    // reserve. The exclusion happens here only — `admit` stays unpinned-host
+    // agnostic — so a later attempt of a run already pinned to that host is
+    // never refused or parked because its tunnel is down. Every candidate
+    // host excluded is `no-capacity`: a wait, never a park.
+    const isHostUp = this.options.isHostUp;
+    const availableHosts = isHostUp ? routableHosts.filter((host) => isHostUp(host.name)) : routableHosts;
+    if (availableHosts.length === 0) {
+      return { outcome: 'no-capacity' };
+    }
     const reserved = await this.options.reserve.reserveExecutionCapacity({
       reservationId: this.options.newReservationId(),
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
       seatTool: request.seatTool,
-      candidateHosts: routableHosts,
+      candidateHosts: availableHosts,
       nowIso: request.nowIso,
     });
     if (reserved.outcome === 'reserved') {

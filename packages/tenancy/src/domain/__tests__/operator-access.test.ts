@@ -143,7 +143,7 @@ describe('parseOperatorAccessGrant', () => {
       expect(parse(value), name).toEqual({ outcome: 'refused', reason: 'invalid-grant' });
     }
     expect(getterRan).toBe(false);
-    const { organizationId: _omitted, ...missing } = grant();
+    const missing = Object.fromEntries(Object.entries(grant()).filter(([key]) => key !== 'organizationId'));
     expect(parse(missing)).toEqual({ outcome: 'refused', reason: 'invalid-grant' });
     expect(parse(grant({ reason: undefined }))).toEqual({ outcome: 'refused', reason: 'invalid-grant' });
   });

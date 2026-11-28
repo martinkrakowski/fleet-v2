@@ -111,6 +111,8 @@ export * from "./single-record-cas-store.js";
 export * from "./SingleRecordStore.helper.js";
 export * from "./spawn-run.js";
 export * from "./SpdSayHostAudibleAlertAdapter.adapter.js";
+export * from "./SpendBudgetAdapter.adapter.js";
+export * from "./SpendLedgerFileAdapter.adapter.js";
 export * from "./SshExecutor.adapter.js";
 export * from "./StallAttentionAdapter.adapter.js";
 export * from "./state-files.js";

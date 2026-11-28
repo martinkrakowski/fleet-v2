@@ -32,8 +32,16 @@ import {
   HeldWorkOrderRepositoryAdapter,
   ListHeldWorkOrdersUseCase,
   ProcessTreeTerminationAdapter,
+  BriefReadRepositoryAdapter,
+  DeclarationRepositoryAdapter,
+  DeclareLaneActivityUseCase,
+  DEFAULT_BOARD_POLICY,
   ImportLanePlanUseCase,
   ImportTrainStateUseCase,
+  LinkPullRequestUseCase,
+  OwnerItemsWriteAdapter,
+  RecordBriefReadUseCase,
+  SyncPlanDecisionsUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
@@ -615,6 +623,33 @@ export function composeExecution(input: ComposeExecutionInput) {
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
   // defaults to a no-op, exactly as the work-order adapter's does.
   const lanePlanRepository = new LanePlanRepositoryAdapter({ stateDir });
+  // WB7a: the lane-activity stores and the use cases that write them. The
+  // owner-item writer delegates in-process to the coordination root's use
+  // cases, so a plan import can open and resolve decision items.
+  const declarationRepository = new DeclarationRepositoryAdapter({ stateDir });
+  const briefReadRepository = new BriefReadRepositoryAdapter({ stateDir });
+  const ownerItemsWrite = new OwnerItemsWriteAdapter({
+    recordOwnerItem: (body, actor) => coordination.recordOwnerItem.recordOwnerItem(body, actor),
+    resolveOwnerItem: (req, actor) => coordination.resolveOwnerItem.resolveOwnerItem(req, actor),
+  });
+  const linkPullRequest = new LinkPullRequestUseCase({
+    lanePlanRepo: lanePlanRepository,
+    nowIso: () => new Date().toISOString(),
+  });
+  const declareLaneActivity = new DeclareLaneActivityUseCase({
+    declarations: declarationRepository,
+    nowIso: () => new Date().toISOString(),
+    ttlMinutes: DEFAULT_BOARD_POLICY.declarationTtlMinutes,
+  });
+  const recordBriefRead = new RecordBriefReadUseCase({
+    briefReads: briefReadRepository,
+    nowIso: () => new Date().toISOString(),
+  });
+  const syncPlanDecisions = new SyncPlanDecisionsUseCase({
+    plans: lanePlanRepository,
+    ownerItems: ownerItemsWrite,
+    nowIso: () => new Date().toISOString(),
+  });
   // WB5b: a completed merge saves its record (merge-records.json) beside the
   // other work-execution stores; without it `merge-pr` refuses.
   const mergeRecordRepository = new MergeRecordRepositoryAdapter({ stateDir });
@@ -625,6 +660,12 @@ export function composeExecution(input: ComposeExecutionInput) {
 
   const execution = {
     lanePlanRepository,
+    declarationRepository,
+    briefReadRepository,
+    linkPullRequest,
+    declareLaneActivity,
+    recordBriefRead,
+    syncPlanDecisions,
     heldWorkOrderRepository,
     listHeldWorkOrders,
     workOrderRepository,

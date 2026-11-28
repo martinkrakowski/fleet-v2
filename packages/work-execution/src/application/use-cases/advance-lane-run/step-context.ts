@@ -3,6 +3,7 @@ import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-ca
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { LaneRunFacts } from '../../../domain/lane-run-decider.js';
+import type { PremergeCarry } from '../../../domain/receipt-carry.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
@@ -483,9 +484,10 @@ export async function appendRunIntent(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
   key: string,
   mintedId: string | null,
+  carry?: PremergeCarry,
 ): Promise<AdvanceStepRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
-    laneRunIntentEntry(ctx.deps.newUlid(), request.runId, key, mintedId, request.nowIso),
+    laneRunIntentEntry(ctx.deps.newUlid(), request.runId, key, mintedId, request.nowIso, carry),
   );
   return appended.outcome === 'appended' ? null
     : { reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };

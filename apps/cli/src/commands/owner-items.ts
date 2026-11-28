@@ -1,6 +1,6 @@
 /**
- * The `owner-items` command group of the CLI driver: `add`, `list` and
- * `resolve` wire the existing OwnerItem use cases (WB7a subset). An owner item
+ * The `owner-items` command group of the CLI driver: `add`, `list`, `resolve`
+ * and `withdraw` wire the existing OwnerItem use cases (WB7a). An owner item
  * grants nothing. The actor is always the literal `cli`, never a flag and
  * never the body.
  */
@@ -10,10 +10,23 @@ import {
   OWNER_ITEM_REF_KINDS,
   OWNER_ITEM_RESOLUTION_KINDS,
   OWNER_ITEM_STATES,
+  OWNER_ITEM_WITHDRAW_REASONS,
   type OwnerItemRefRecord,
 } from '@fleet/operator-coordination';
 import { str, enumOf, firstPositional, CliUsageError } from './payload.js';
 import type { CommandHandler, Payload } from './payload.js';
+import { confirmFromStdin } from '../hosts.js';
+import type { FleetCliRuntime } from '../composition.js';
+import type { CliIo } from '../index.js';
+
+/** Options the driver and tests inject; the default reads stdin like hosts. */
+export interface OwnerItemsCliOptions {
+  /**
+   * The confirmation gate for a write. The default reads one line from stdin
+   * and accepts only an explicit y/yes; a declined or closed stdin refuses.
+   */
+  readonly confirm?: (question: string) => Promise<boolean>;
+}
 
 /** Parse one `--ref` token into a typed ref record; a malformed token is usage. */
 function typedRef(token: string): OwnerItemRefRecord {
@@ -174,4 +187,58 @@ export const ownerItemsCommands: Readonly<Record<string, CommandHandler>> = {
     }
     return result;
   },
+  withdraw: async () => {
+    // `index.ts` intercepts `owner-items withdraw` and calls `withdrawOwnerItem`
+    // directly, so it can pass the `CliIo` and the injected confirm gate; this
+    // entry only keeps the group's help listing complete.
+    throw new CliUsageError('owner-items withdraw must be dispatched via runCli');
+  },
 };
+
+/**
+ * `owner-items withdraw <id> --reason <reason> [--yes]`: withdraw one owner
+ * item. The use case owns every rule; merge and decision items cannot be
+ * withdrawn (D11) and come back as a `refused` result with code `kind`.
+ */
+export async function withdrawOwnerItem(
+  p: Payload,
+  rt: FleetCliRuntime,
+  io: CliIo,
+  options: OwnerItemsCliOptions = {},
+): Promise<unknown> {
+  const positionals = p['positional'];
+  const count = Array.isArray(positionals) ? positionals.length : 0;
+  if (count !== 1) {
+    throw new CliUsageError('owner-items withdraw requires exactly one owner item id');
+  }
+  // `firstPositional` trims, so a whitespace-only id reaches here as '';
+  // refuse it before the use case is called.
+  const itemId = firstPositional(p);
+  if (itemId === '') {
+    throw new CliUsageError('owner-items withdraw requires a non-empty owner item id');
+  }
+  for (const key of Object.keys(p)) {
+    if (key !== 'reason' && key !== 'yes' && key !== 'positional') {
+      throw new CliUsageError(`Unexpected flag: ${key}`);
+    }
+  }
+  if (Object.hasOwn(p, 'yes') && p['yes'] !== true) {
+    throw new CliUsageError('--yes takes no value');
+  }
+  const reason = enumOf(p, 'reason', OWNER_ITEM_WITHDRAW_REASONS, 'withdraw reason');
+  if (p['yes'] !== true) {
+    const confirm = options.confirm ?? confirmFromStdin(io);
+    if (!(await confirm(`Withdraw owner item ${itemId} (${reason})? [y/N] `))) {
+      return { outcome: 'refused', reason: 'confirmation-declined' };
+    }
+  }
+  const result = await rt.coordination.resolveOwnerItem.resolveOwnerItem(
+    { action: 'withdraw', itemId, reason },
+    'cli',
+  );
+  if (result.outcome === 'resolved' || result.outcome === 'unchanged') {
+    return { outcome: result.outcome, itemId: result.item.itemId };
+  }
+  return result;
+}
+

@@ -84,8 +84,16 @@ import {
   GhReviewThreadHelperAdapter,
   type ReviewThreadHelperPort,
   InspectAttemptUseCase,
+  BriefReadRepositoryAdapter,
+  DeclarationRepositoryAdapter,
+  DeclareLaneActivityUseCase,
+  ImportLanePlanUseCase,
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
+  LanePlanRepositoryAdapter,
+  LinkPullRequestUseCase,
+  RecordBriefReadUseCase,
+  SyncPlanDecisionsUseCase,
   InventoryRelaunchUseCase,
   PlanRelaunchUseCase,
   AdoptLaneUseCase,
@@ -1029,6 +1037,8 @@ export interface FleetCliRuntime {
     readonly inspectHeadCiState: InspectHeadCiStateUseCase;
   };
   readonly execution: {
+    /** WB4a/WB7a: the imported lane-plan store behind the `plan` group. */
+    readonly lanePlanRepository: LanePlanRepositoryAdapter;
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
     readonly attemptRepository: AttemptRepositoryAdapter;
     readonly executionJournal: ExecutionJournalAdapter;
@@ -1059,6 +1069,15 @@ export interface FleetCliRuntime {
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
     readonly inspectWorkOrder: InspectWorkOrderUseCase;
+    /** WB7a: the lane-activity stores behind `plan declare` and `plan brief-check`. */
+    readonly declarationRepository: DeclarationRepositoryAdapter;
+    readonly briefReadRepository: BriefReadRepositoryAdapter;
+    /** WB7a: the plan use cases behind the `plan` command group. */
+    readonly importLanePlan: ImportLanePlanUseCase;
+    readonly linkPullRequest: LinkPullRequestUseCase;
+    readonly declareLaneActivity: DeclareLaneActivityUseCase;
+    readonly recordBriefRead: RecordBriefReadUseCase;
+    readonly syncPlanDecisions: SyncPlanDecisionsUseCase;
     /** KF-36b-1b: the operator's close command; built after the conductor composes its lane-run stores. */
     readonly closeWorkOrder: CloseWorkOrderUseCase;
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */

@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // DT9a: the shadow merge pass — one repository, keyed dry-run journal, no forge write.
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -186,7 +187,7 @@ function makeUseCase(
   const forgeRead = forgeReadFake(forgeResult);
   const verification = verificationFake();
   let ulid = 0;
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: queueFake(records),
     forgeRead,
     verification,
@@ -639,7 +640,7 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     const forgeRead = forgeReadFake(greenForge);
     const verification = verificationFake();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead,
       verification,
@@ -801,7 +802,7 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
 
   it('reads a missing halt dependency as halted', async () => {
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead: forgeReadFake(greenForge),
       verification: verificationFake(),
@@ -881,7 +882,7 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
   ): { useCase: RunMergePassUseCase; journal: LaneRunJournalAdapter; request: RunMergePassRequest } {
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: fixture.queue,
       forgeRead: forgeReadFake(forgeResult),
       verification: verificationFake(),
@@ -990,7 +991,7 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
       },
     };
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead: forgeReadFake(greenForge),
       verification: verification as unknown as MergeVerificationPort & { calls: number },

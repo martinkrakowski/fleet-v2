@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { describe, expect, it } from 'vitest';
 
 import { LANE_DIFF_SECRET_PATTERNS, SECRET_PATTERNS } from '@fleet/shared';
@@ -231,7 +232,7 @@ function harness(script: {
   const attention = new FakeAttention();
   attention.raiseScript = script.raise;
   attention.clearScript = script.clear;
-  const useCase = new RefreshChainsUseCase({
+  const useCase = new RefreshChainsUseCase({ isProxy: types.isProxy,
     chains,
     forge,
     attention,
@@ -334,7 +335,7 @@ describe('RefreshChainsUseCase', () => {
       const chains = new FakeChains([startedRecord()], trace);
       const forge = new FakeForge(trace);
       const attention = new FakeAttention();
-      const useCase = new RefreshChainsUseCase({ chains, forge, attention, halt: clearHalt, now: () => NOW, ...extra });
+      const useCase = new RefreshChainsUseCase({ isProxy: types.isProxy, chains, forge, attention, halt: clearHalt, now: () => NOW, ...extra });
       const result = await useCase.runRefreshChains(command());
       expect(result.reasonCode).toBe('shadow-would-refresh-1');
       expect(trace).toEqual(['list', 'head']);

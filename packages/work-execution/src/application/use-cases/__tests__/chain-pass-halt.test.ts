@@ -19,16 +19,16 @@ describe('isChainPassHalted', () => {
       // Guard: an absent dependency keeps the optional chain-pass semantics,
       // so only exactly `undefined` reads as not halted; `null` is not
       // excused (it is not callable and not undefined) and would fail here.
-      expect(await isChainPassHalted(undefined)).toBe(false);
+      expect(await isChainPassHalted(undefined, types.isProxy)).toBe(false);
     });
 
     it('returns true when halt port has no callable read method', async () => {
       // Guard: the `typeof halt.read !== 'function'` branch; each of these
       // shapes misses it only if the implementation skips the check, in which
       // case `{}` throws instead of answering `true`.
-      expect(await isChainPassHalted({} as never)).toBe(true);
-      expect(await isChainPassHalted({ read: 1 } as never)).toBe(true);
-      expect(await isChainPassHalted({ read: null } as never)).toBe(true);
+      expect(await isChainPassHalted({} as never, types.isProxy)).toBe(true);
+      expect(await isChainPassHalted({ read: 1 } as never, types.isProxy)).toBe(true);
+      expect(await isChainPassHalted({ read: null } as never, types.isProxy)).toBe(true);
     });
   });
 
@@ -38,7 +38,7 @@ describe('isChainPassHalted', () => {
       // an implementation that runs the record validator on `null` answers
       // `true` and fails here.
       const read = vi.fn(async () => ({ state: 'clear', record: null }) as never);
-      expect(await isChainPassHalted({ read } as never)).toBe(false);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(false);
       expect(read).toHaveBeenCalledTimes(1);
     });
 
@@ -47,7 +47,7 @@ describe('isChainPassHalted', () => {
       // implementation that answers a constant `false` passes only the false
       // cases and fails the halted/unreadable cases below.
       const read = vi.fn(async () => ({ state: 'clear', record: validRecord() }) as never);
-      expect(await isChainPassHalted({ read } as never)).toBe(false);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(false);
       expect(read).toHaveBeenCalledTimes(1);
     });
   });
@@ -56,18 +56,18 @@ describe('isChainPassHalted', () => {
     it('returns true when state is halted', async () => {
       // Guard: the `tag !== 'clear'` branch with the documented 'halted' tag.
       const read = vi.fn(async () => ({ state: 'halted', record: validRecord() }) as never);
-      expect(await isChainPassHalted({ read } as never)).toBe(true);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(true);
       expect(read).toHaveBeenCalledTimes(1);
     });
 
     it('returns true when state is an unknown tag', async () => {
       // Guard: any tag other than 'clear' fails closed; unknown is never success.
-      expect(await isChainPassHalted({ read: async () => ({ state: 'garbage' }) } as never)).toBe(true);
+      expect(await isChainPassHalted({ read: async () => ({ state: 'garbage' }) } as never, types.isProxy)).toBe(true);
     });
 
     it('returns true when state is unreadable', async () => {
       // Guard: `unreadable` is a halt (fail closed), never a success.
-      expect(await isChainPassHalted({ read: async () => ({ state: 'unreadable' }) } as never)).toBe(true);
+      expect(await isChainPassHalted({ read: async () => ({ state: 'unreadable' }) } as never, types.isProxy)).toBe(true);
     });
 
     it('returns true when clear record has halted true', async () => {
@@ -79,7 +79,7 @@ describe('isChainPassHalted', () => {
             state: 'clear',
             record: { version: 1, halted: true, changedAtIso: '2026-11-01T12:00:00.000Z' },
           }),
-        } as never),
+        } as never, types.isProxy),
       ).toBe(true);
     });
 
@@ -87,13 +87,13 @@ describe('isChainPassHalted', () => {
       // Guard: a missing `record` key reads as `undefined`, not `null`, so the
       // `record === null` excuse must not fire; an implementation that treats
       // any falsy record as null answers `false` and fails here.
-      expect(await isChainPassHalted({ read: async () => ({ state: 'clear' }) } as never)).toBe(true);
+      expect(await isChainPassHalted({ read: async () => ({ state: 'clear' }) } as never, types.isProxy)).toBe(true);
     });
 
     it('returns true when clear record is an array', async () => {
       // Guard: `Array.isArray(record)` before the record validator; arrays are
       // not plain records even though `typeof [] === 'object'`.
-      expect(await isChainPassHalted({ read: async () => ({ state: 'clear', record: [] }) } as never)).toBe(true);
+      expect(await isChainPassHalted({ read: async () => ({ state: 'clear', record: [] }) } as never, types.isProxy)).toBe(true);
     });
 
     it('returns true when clear record is an array with a hole', async () => {
@@ -102,7 +102,7 @@ describe('isChainPassHalted', () => {
       const holey = [undefined as unknown];
       delete holey[0];
       expect(
-        await isChainPassHalted({ read: async () => ({ state: 'clear', record: holey }) } as never),
+        await isChainPassHalted({ read: async () => ({ state: 'clear', record: holey }) } as never, types.isProxy),
       ).toBe(true);
     });
 
@@ -111,7 +111,7 @@ describe('isChainPassHalted', () => {
       // isChainPassHalted answers `true` for every refused record; each case
       // here breaks one of the three required fields' rules.
       const read = async (record: unknown) =>
-        isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never);
+        isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never, types.isProxy);
       expect(await read({ halted: false, changedAtIso: '2026-11-01T12:00:00.000Z' })).toBe(true);
       expect(await read({ version: 1, changedAtIso: '2026-11-01T12:00:00.000Z' })).toBe(true);
       expect(await read({ version: 2, halted: false, changedAtIso: '2026-11-01T12:00:00.000Z' })).toBe(true);
@@ -130,7 +130,7 @@ describe('isChainPassHalted', () => {
             state: 'clear',
             record: { ...validRecord(), extra: 'k' },
           }),
-        } as never),
+        } as never, types.isProxy),
       ).toBe(true);
     });
   });
@@ -141,7 +141,7 @@ describe('isChainPassHalted', () => {
       // Array.isArray(state)` refusal; `new String('clear')` is boxed, not a
       // plain object, so a truthy-object shortcut fails this case.
       const read = async (answer: unknown) =>
-        isChainPassHalted({ read: async () => answer } as never);
+        isChainPassHalted({ read: async () => answer } as never, types.isProxy);
       expect(await read(null)).toBe(true);
       expect(await read(undefined)).toBe(true);
       expect(await read('clear')).toBe(true);
@@ -162,7 +162,7 @@ describe('isChainPassHalted', () => {
         configurable: true,
       });
       const read = vi.fn(async () => answer as never);
-      expect(await isChainPassHalted({ read } as never)).toBe(true);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(true);
       expect(read).toHaveBeenCalledTimes(1);
     });
 
@@ -177,7 +177,7 @@ describe('isChainPassHalted', () => {
         enumerable: true,
         configurable: true,
       });
-      expect(await isChainPassHalted({ read: async () => answer } as never)).toBe(true);
+      expect(await isChainPassHalted({ read: async () => answer } as never, types.isProxy)).toBe(true);
     });
 
     it('returns true when read throws synchronously', async () => {
@@ -186,7 +186,7 @@ describe('isChainPassHalted', () => {
       const read = vi.fn(() => {
         throw new Error('read threw');
       });
-      expect(await isChainPassHalted({ read } as never)).toBe(true);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(true);
       expect(read).toHaveBeenCalledTimes(1);
     });
 
@@ -196,7 +196,7 @@ describe('isChainPassHalted', () => {
       const read = vi.fn(async () => {
         throw new Error('read rejected');
       });
-      expect(await isChainPassHalted({ read } as never)).toBe(true);
+      expect(await isChainPassHalted({ read } as never, types.isProxy)).toBe(true);
       expect(read).toHaveBeenCalledTimes(1);
     });
   });
@@ -215,7 +215,7 @@ describe('isChainPassHalted', () => {
         configurable: true,
       });
       expect(
-        await isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never),
+        await isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never, types.isProxy),
       ).toBe(true);
       expect(({} as { polluted?: string }).polluted).toBeUndefined();
       expect(Object.getPrototypeOf(record)).toBe(Object.prototype);
@@ -241,18 +241,18 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // Guard: the `halt === null` arm of the absent-dependency check. The
     // pre-KA3-1 implementation read `halt.read` on `null` and threw a
     // TypeError, so a call without that arm throws instead of answering.
-    await expect(isChainPassHalted(null)).resolves.toBe(false);
+    await expect(isChainPassHalted(null, types.isProxy)).resolves.toBe(false);
   });
 
   it('isTrainStepBlocked treats null halt as not blocked when requireConductorHalt is false', async () => {
-    // Guard: `isChainPassHalted(deps.halt)` (the false branch) with a null
+    // Guard: `isChainPassHalted(deps.halt, types.isProxy)` (the false branch) with a null
     // halt plus absent killall reads; every part answers false, so a
     // constant-true or required-pass (null = halted) implementation fails.
     await expect(isTrainStepBlocked({ halt: null }, false)).resolves.toBe(false);
   });
 
   it('isTrainStepBlocked treats null halt as blocked when requireConductorHalt is true', async () => {
-    // Guard: `isRequiredPassHalted(deps.halt)` (the true branch), whose
+    // Guard: `isRequiredPassHalted(deps.halt, types.isProxy)` (the true branch), whose
     // fail-closed contract answers halted for a null halt.
     await expect(isTrainStepBlocked({ halt: null }, true)).resolves.toBe(true);
   });
@@ -261,33 +261,33 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // Guard: the only not-halted answer, exactly `{ state: 'clear' }`, read
     // through the bounded snapshot and the exact-key record check.
     const read = vi.fn(async () => clearMarker as never);
-    await expect(isKillallHalted({ read } as never)).resolves.toBe(false);
+    await expect(isKillallHalted({ read } as never, types.isProxy)).resolves.toBe(false);
     expect(read).toHaveBeenCalledTimes(1);
   });
 
   it('isKillallHalted returns false for an undefined marker read', async () => {
     // Guard: `killallHalt === undefined` is the NOT-halted case, so a
     // fail-closed-everything (constant true) implementation fails here.
-    await expect(isKillallHalted(undefined)).resolves.toBe(false);
+    await expect(isKillallHalted(undefined, types.isProxy)).resolves.toBe(false);
   });
 
   it('isKillallHalted returns false when the read method is absent', async () => {
     // Guard: the `killallHalt.read === undefined` arm, distinct from a
     // non-callable read; `{}` keeps the absent-dependency behaviour.
-    await expect(isKillallHalted({} as never)).resolves.toBe(false);
+    await expect(isKillallHalted({} as never, types.isProxy)).resolves.toBe(false);
   });
 
   it('isKillallHalted returns true for a halted marker', async () => {
     // Guard: a 'halted' state is a halt; an implementation that trusts only
     // 'clear' still passes this, so it pins nothing alone — it rules out a
     // constant-false implementation together with the clear cases.
-    await expect(isKillallHalted({ read: async () => haltedMarker } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => haltedMarker } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true when read returns null', async () => {
     // Guard: a `null` read answer is not a plain record, so the snapshot or
     // exact-key read refuses it and the verdict is halted.
-    await expect(isKillallHalted({ read: async () => null } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => null } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true when read throws', async () => {
@@ -295,7 +295,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     const read = vi.fn(() => {
       throw new Error('read threw');
     });
-    await expect(isKillallHalted({ read } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read } as never, types.isProxy)).resolves.toBe(true);
     expect(read).toHaveBeenCalledTimes(1);
   });
 
@@ -306,21 +306,21 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
         read: async () => {
           throw new Error('read rejected');
         },
-      } as never),
+      } as never, types.isProxy),
     ).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true when killallHalt.read resolves to undefined', async () => {
     // Guard: `undefined` as the read ANSWER is off-contract (distinct from an
     // undefined port or an absent read method) and fails closed.
-    await expect(isKillallHalted({ read: async () => undefined } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => undefined } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true when killallHalt.read resolves to a non-iterable or wrong primitive', async () => {
     // Guard: wrong primitives are refused by the snapshot ('unsupported-type'
     // or not-plain) and never read as clear.
     for (const answer of [1, 'clear', true, Symbol.iterator, 1n, () => 'clear']) {
-      await expect(isKillallHalted({ read: async () => answer } as never)).resolves.toBe(true);
+      await expect(isKillallHalted({ read: async () => answer } as never, types.isProxy)).resolves.toBe(true);
     }
   });
 
@@ -329,15 +329,15 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // never a plain record; a hole cannot make an array pass.
     const holey: string[] = ['clear'];
     delete holey[0];
-    await expect(isKillallHalted({ read: async () => ['clear'] } as never)).resolves.toBe(true);
-    await expect(isKillallHalted({ read: async () => holey } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => ['clear'] } as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => holey } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true when killallHalt.read resolves to an array-like object', async () => {
     // Guard: an array-like has a numeric own key the exact-key read refuses
     // (exactly ['state']), so it never reads as clear.
     await expect(
-      isKillallHalted({ read: async () => ({ length: 1, 0: 'clear', state: 'clear' }) } as never),
+      isKillallHalted({ read: async () => ({ length: 1, 0: 'clear', state: 'clear' }) } as never, types.isProxy),
     ).resolves.toBe(true);
   });
 
@@ -356,7 +356,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
       enumerable: true,
       configurable: true,
     });
-    await expect(isKillallHalted({ read: async () => ownGetter } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => ownGetter } as never, types.isProxy)).resolves.toBe(true);
     expect(ownFired).toBe(false);
 
     let inheritedFired = false;
@@ -370,7 +370,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
       configurable: true,
     });
     const inherited = Object.create(inheritedProto) as Record<string, unknown>;
-    await expect(isKillallHalted({ read: async () => inherited } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => inherited } as never, types.isProxy)).resolves.toBe(true);
     expect(inheritedFired).toBe(false);
   });
 
@@ -407,7 +407,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // instead of rejecting the promise.
     const { proxy, revoke } = Proxy.revocable<{ state?: string }>({ state: 'clear' }, {});
     revoke();
-    await expect(isKillallHalted({ read: async () => proxy } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => proxy } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true for an enormous key or string length within bounds', async () => {
@@ -415,11 +415,11 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // own key ('too-long'), and the cost stays bounded because the refusal
     // never echoes the text.
     await expect(
-      isKillallHalted({ read: async () => ({ state: 'c'.repeat(129) }) } as never),
+      isKillallHalted({ read: async () => ({ state: 'c'.repeat(129) }) } as never, types.isProxy),
     ).resolves.toBe(true);
     const longKey: Record<string, unknown> = {};
     Object.defineProperty(longKey, 'x'.repeat(129), { value: 'clear', enumerable: true });
-    await expect(isKillallHalted({ read: async () => longKey } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => longKey } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true for prototype-polluting own keys __proto__, constructor, and prototype', async () => {
@@ -429,7 +429,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     for (const key of ['__proto__', 'constructor', 'prototype']) {
       const answer: Record<string, unknown> = { state: 'clear' };
       Object.defineProperty(answer, key, { value: 'clear', enumerable: true, writable: true, configurable: true });
-      await expect(isKillallHalted({ read: async () => answer } as never)).resolves.toBe(true);
+      await expect(isKillallHalted({ read: async () => answer } as never, types.isProxy)).resolves.toBe(true);
     }
     expect(({} as { polluted?: string }).polluted).toBeUndefined();
   });
@@ -446,14 +446,14 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
       enumerable: true,
       configurable: true,
     });
-    await expect(isKillallHalted({ read: async () => answer } as never)).resolves.toBe(true);
+    await expect(isKillallHalted({ read: async () => answer } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isChainPassHalted returns true when clear record has invalid version, non-boolean halted, or invalid changedAtIso', async () => {
     // Guard: the exact-key snapshot plus readConductorHaltRecord keep the
     // fail-closed record agreement under a 'clear' tag.
     const read = async (record: unknown) =>
-      isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never);
+      isChainPassHalted({ read: async () => ({ state: 'clear', record }) } as never, types.isProxy);
     await expect(read({ version: 2, halted: false, changedAtIso: '2026-11-01T12:00:00.000Z' })).resolves.toBe(true);
     await expect(read({ version: 1, halted: 'false', changedAtIso: '2026-11-01T12:00:00.000Z' })).resolves.toBe(true);
     await expect(read({ version: 1, halted: false, changedAtIso: '2026-11-01T12:00:00' })).resolves.toBe(true);
@@ -464,36 +464,36 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // `{ status: 'clear' }`; everything else — 'paused', 'unreadable', a
     // null or missing port, a throw, a rejection, a wrong primitive, an
     // array, an accessor, an extra key — is a pause (fail closed).
-    await expect(isKillallTrainPaused(undefined)).resolves.toBe(false);
-    await expect(isKillallTrainPaused({ read: async () => ({ status: 'clear' }) } as never)).resolves.toBe(false);
-    await expect(isKillallTrainPaused({ read: async () => ({ status: 'paused' }) } as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused({ read: async () => ({ status: 'unreadable' }) } as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused(null as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused({ read: 1 } as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(undefined, types.isProxy)).resolves.toBe(false);
+    await expect(isKillallTrainPaused({ read: async () => ({ status: 'clear' }) } as never, types.isProxy)).resolves.toBe(false);
+    await expect(isKillallTrainPaused({ read: async () => ({ status: 'paused' }) } as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: async () => ({ status: 'unreadable' }) } as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(null as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: 1 } as never, types.isProxy)).resolves.toBe(true);
     await expect(
       isKillallTrainPaused({
         read: () => {
           throw new Error('read threw');
         },
-      } as never),
+      } as never, types.isProxy),
     ).resolves.toBe(true);
     await expect(
       isKillallTrainPaused({
         read: async () => {
           throw new Error('read rejected');
         },
-      } as never),
+      } as never, types.isProxy),
     ).resolves.toBe(true);
-    await expect(isKillallTrainPaused({ read: async () => null } as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused({ read: async () => ({ status: 'clear', extra: 1 }) } as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused({ read: async () => ({}) } as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: async () => null } as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: async () => ({ status: 'clear', extra: 1 }) } as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: async () => ({}) } as never, types.isProxy)).resolves.toBe(true);
     const accessor: Record<string, unknown> = {};
     Object.defineProperty(accessor, 'status', {
       get: () => 'clear',
       enumerable: true,
       configurable: true,
     });
-    await expect(isKillallTrainPaused({ read: async () => accessor } as never)).resolves.toBe(true);
+    await expect(isKillallTrainPaused({ read: async () => accessor } as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true for a port whose read accessor throws, without throwing', async () => {
@@ -507,9 +507,9 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
       enumerable: true,
       configurable: true,
     });
-    await expect(isKillallHalted(port as never)).resolves.toBe(true);
-    await expect(isChainPassHalted(port as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused(port as never)).resolves.toBe(true);
+    await expect(isKillallHalted(port as never, types.isProxy)).resolves.toBe(true);
+    await expect(isChainPassHalted(port as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(port as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true for a revoked Proxy port without throwing', async () => {
@@ -517,9 +517,9 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // is caught and read fail-closed instead of rejecting the promise.
     const { proxy, revoke } = Proxy.revocable<{ read?: unknown }>({ read: async () => ({ state: 'clear' }) }, {});
     revoke();
-    await expect(isKillallHalted(proxy as never)).resolves.toBe(true);
-    await expect(isChainPassHalted(proxy as never)).resolves.toBe(true);
-    await expect(isKillallTrainPaused(proxy as never)).resolves.toBe(true);
+    await expect(isKillallHalted(proxy as never, types.isProxy)).resolves.toBe(true);
+    await expect(isChainPassHalted(proxy as never, types.isProxy)).resolves.toBe(true);
+    await expect(isKillallTrainPaused(proxy as never, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns true for a Proxy port with lying reflection traps without running any trap', async () => {
@@ -554,7 +554,7 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // Guard: a normal adapter whose `read` lives on its prototype still
     // answers: the Proxy refusal must not break ordinary ports.
     const proto = { read: async () => ({ state: 'clear' }) };
-    await expect(isKillallHalted(Object.create(proto) as never)).resolves.toBe(false);
+    await expect(isKillallHalted(Object.create(proto) as never, types.isProxy)).resolves.toBe(false);
   });
 
   it('isKillallHalted returns true for a Proxy port whose traps hide the read method, without running a trap', async () => {

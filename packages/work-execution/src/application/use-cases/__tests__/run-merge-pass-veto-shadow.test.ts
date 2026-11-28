@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // OG-16a: the advisory merge veto — one recorded row per entry, log-only, and
 // the next pass merges (or would-hold) over the stored answer. Since SH24a the
 // recording runs under a LIVE policy with `veto.mode === 'shadow'`; per owner
@@ -289,7 +290,7 @@ function wire(
         },
   );
   let ulid = 0;
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue,
     queueWriter: queue,
     forgeRead: forgeReadFake(forgeResult),
@@ -668,7 +669,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, recorded under a live polic
     const entry = makeEntry();
     const w = wire([entry]);
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: w.queue,
       forgeRead: forgeReadFake(greenForge),
       verification: verificationFake(),
@@ -792,7 +793,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, recorded under a live polic
   /** A clock that lapses the deadline once `lapsed()` is true. */
   function lapsingUseCase(w: Wiring, lapsed: () => boolean): RunMergePassUseCase {
     let ulid = 0;
-    return new RunMergePassUseCase({
+    return new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: w.queue,
       queueWriter: w.queue,
       forgeRead: forgeReadFake(greenForge),

@@ -43,7 +43,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
     // Guard: `isKillallHalted` under a 'halted' marker blocks the enqueue
     // before `queue.enqueueMergeEntry`; a queue spy proves it is untouched.
     const queue = makeQueue();
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: clearHalt,
       killallHalt: { read: async () => ({ state: 'halted' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
@@ -83,7 +83,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
   it('enqueue refuses with halted without calling queue when killallHalt is unreadable', async () => {
     // Guard: `isKillallHalted` fails closed on an unreadable marker answer.
     const queue = makeQueue();
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: clearHalt,
       killallHalt: { read: async () => ({ state: 'unreadable' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
@@ -96,7 +96,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
   it('enqueue refuses with halted without calling queue when killallTrainPause is paused', async () => {
     // Guard: `isKillallTrainPaused` under a 'paused' status blocks the enqueue.
     const queue = makeQueue();
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: clearHalt,
       killallHalt: clearMarker,
@@ -109,7 +109,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
   it('enqueue refuses with halted without calling queue when killallTrainPause is unreadable', async () => {
     // Guard: `isKillallTrainPaused` fails closed on an unreadable pause.
     const queue = makeQueue();
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: clearHalt,
       killallHalt: clearMarker,
@@ -124,7 +124,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
     // `requireConductorHalt: false`, so a clear-with-agreeing-record answer
     // is the only non-halt).
     const queue = makeQueue();
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: {
         read: async () => ({
@@ -149,7 +149,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
       delegateCalls += 1;
       return { outcome: 'created', entries: [], record: {} as never };
     };
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: clearHalt,
       killallHalt: clearMarker,
@@ -167,7 +167,7 @@ describe('EnqueueMergeUseCase (KA3-1 halt and pause guards)', () => {
     const haltRead = vi.fn(async () => ({ state: 'halted', record: null }) as never);
     const killallRead = vi.fn(async () => ({ state: 'halted' }) as never);
     const pauseRead = vi.fn(async () => ({ status: 'paused' }) as never);
-    const useCase = new EnqueueMergeUseCase({
+    const useCase = new EnqueueMergeUseCase({ isProxy: types.isProxy,
       queue,
       halt: { read: haltRead } as unknown as Pick<ConductorHaltPort, 'read'>,
       killallHalt: { read: killallRead } as unknown as Pick<KillallHaltMarkerPort, 'read'>,

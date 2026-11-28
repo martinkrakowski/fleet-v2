@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // FX07B: a duplicate-key or replay on the retro would-merge must be checked
 // against the merge-pr key before would-already-merged is written.
 import { describe, expect, it } from 'vitest';
@@ -260,7 +261,7 @@ function harness(options: {
   };
   const port = options.port ?? journal;
   const build = (clock: () => string, deadlineIso: string) =>
-    new RunMergePassUseCase({
+    new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue(records),
       forgeRead: forge,
       verification: verificationFake,
@@ -274,7 +275,7 @@ function harness(options: {
     journal,
     request,
     forge,
-    useCase: new RunMergePassUseCase({
+    useCase: new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue(records),
       forgeRead: forge,
       verification: verificationFake,

@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 /**
  * S2 shadow park-reasons e2e (lane SHT1), narrowed per owner decision
  * 2026-11-17: the merge-pass park reasons reachable on `origin/main` are
@@ -860,7 +861,7 @@ async function observerPass(deps: {
     readonly applyMergeTransition: (request: unknown) => Promise<unknown>;
   };
 }): Promise<readonly ObserverReport[]> {
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: {
       listMergeEntries: async () => [passEntry()],
     },

@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // EV2: the shadow retro `would-merge` on the first `already-merged`
 // observation. Two layers are pinned here: the pure decider helper
 // `isMergedHeadRetroMergeEligible` (hostile-input refusals and every
@@ -215,7 +216,7 @@ function makeUseCase(
       return journal.listForKey(key);
     },
   };
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: makeQueue(records),
     forgeRead: forgeReadFake(forgeResult),
     verification: verificationFake,
@@ -959,7 +960,7 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
     };
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue([makeEntry()]),
       forgeRead: forgeRead as unknown as ForgeMergeReadPort,
       verification: verificationFake,
@@ -1047,7 +1048,7 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
   it('returns no-action entry-failed when the journal read throws', async () => {
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue([makeEntry()]),
       forgeRead: forgeReadFake(retroForge()),
       verification: verificationFake,
@@ -1081,7 +1082,7 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
   it('returns no-action with the refusal reason when the would-merge append is refused', async () => {
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue([makeEntry()]),
       forgeRead: forgeReadFake(retroForge()),
       verification: verificationFake,
@@ -1120,7 +1121,7 @@ describe('RunMergePassUseCase retro would-merge (EV2)', () => {
   it('returns no-action entry-failed when the journal append throws', async () => {
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: makeQueue([makeEntry()]),
       forgeRead: forgeReadFake(retroForge()),
       verification: verificationFake,

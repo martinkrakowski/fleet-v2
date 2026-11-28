@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // SweepChainsUseCase tests (lane CO11): only a landed chain record's own
 // `chain/<name>` branch is swept, dry-run is the default, apply runs only on
 // the exact `mode: 'apply'`, every record and member is validated before the
@@ -91,7 +92,7 @@ interface Harness {
 function harness(overrides: { now?: () => string } = {}): Harness {
   const chains = new FakeChains();
   const forge = new FakeForge();
-  const useCase = new SweepChainsUseCase({
+  const useCase = new SweepChainsUseCase({ isProxy: types.isProxy,
     chains: chains as never,
     forge: forge as unknown as MergeForgeActionPort,
     now: overrides.now ?? (() => NOW),

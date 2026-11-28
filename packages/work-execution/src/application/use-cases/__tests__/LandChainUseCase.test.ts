@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // Lane CO10: LandChainUseCase — the adversarial parser, the read phase, the
 // keyed intent + compare-and-set landing mark, the post-mark re-check with
 // withdrawal, and the enqueue. Every fake below is in-memory.
@@ -936,7 +937,7 @@ describe('LandChainUseCase halt gate', () => {
 
   it('a missing halt dependency refuses an apply run as halted', async () => {
     const world = makeWorld();
-    const result = await new LandChainUseCase({
+    const result = await new LandChainUseCase({ isProxy: types.isProxy,
       ...world.deps,
       halt: undefined as unknown as LandChainDependencies['halt'],
     }).execute({ ...BASE_COMMAND });

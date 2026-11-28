@@ -21,10 +21,10 @@ export class EnqueueMergeUseCase implements EnqueueMergePort {
       readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
       /** KA3-1: the killall train pause; absent reads as not paused. */
       readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
-      /** Fix round 2: the trusted Proxy detector (`types.isProxy`, bound in
+      /** The trusted Proxy detector (`types.isProxy`, bound in
        * infrastructure), so a Proxy port is refused before its traps run.
-       * Absent, the neutral detector keeps the prior behaviour. */
-      readonly isProxy?: IsProxy;
+       * Required: there is no neutral default. */
+      readonly isProxy: IsProxy;
     },
   ) {}
 

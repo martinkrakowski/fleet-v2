@@ -307,6 +307,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     verification,
     journal: input.conductor.laneRunJournal,
     halt: input.conductor.halt,
+    isProxy: types.isProxy,
     newUlid: () => newUlid(),
     nowIso: now,
   });
@@ -331,6 +332,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
           forge: shadowForge,
           attention: chainAttention,
           halt: input.conductor.halt,
+          isProxy: types.isProxy,
           now,
           mode: 'shadow',
         })

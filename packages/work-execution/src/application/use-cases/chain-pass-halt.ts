@@ -55,11 +55,6 @@ type PortMethodRead =
   | { readonly ok: true; readonly value: unknown }
   | { readonly ok: false };
 
-/** The neutral detector used when a caller passes none: it refuses nothing.
- * Production callers bind `types.isProxy` once in infrastructure and thread it
- * through the use cases. */
-const NEUTRAL_IS_PROXY: IsProxy = () => false;
-
 /**
  * One read of a port's `read` method. The port object is the first thing the
  * injected `isProxy` detector sees: a Proxy, including one that hides `read`,
@@ -85,8 +80,8 @@ function readPortMethod(port: object, isProxy: IsProxy): PortMethodRead {
  * agree with that tag — read as halted.
  */
 export async function isChainPassHalted(
-  halt?: Pick<ConductorHaltPort, 'read'> | null,
-  isProxy: IsProxy = NEUTRAL_IS_PROXY,
+  halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   if (halt === undefined || halt === null) {
     // An absent dependency keeps today's behaviour: not halted, never thrown on.
@@ -129,7 +124,7 @@ export async function isChainPassHalted(
  */
 export async function isRequiredPassHalted(
   halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
-  isProxy: IsProxy = NEUTRAL_IS_PROXY,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   if (halt === undefined || halt === null) {
     return true;
@@ -149,8 +144,8 @@ export async function isRequiredPassHalted(
  * Cost: O(1) shape checks plus one bounded `readExactPortSnapshot` per call.
  */
 export async function isKillallHalted(
-  killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null,
-  isProxy: IsProxy = NEUTRAL_IS_PROXY,
+  killallHalt: Pick<KillallHaltMarkerPort, 'read'> | null | undefined,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   if (killallHalt === undefined) {
     return false;
@@ -189,8 +184,8 @@ export async function isKillallHalted(
  * Cost: O(1) shape checks plus one bounded `readExactPortSnapshot` per call.
  */
 export async function isKillallTrainPaused(
-  killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null,
-  isProxy: IsProxy = NEUTRAL_IS_PROXY,
+  killallTrainPause: Pick<KillallTrainPausePort, 'read'> | null | undefined,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   if (killallTrainPause === undefined) {
     return false;
@@ -226,7 +221,7 @@ export async function isTrainStepBlocked(
     readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
   },
   requireConductorHalt: boolean,
-  isProxy: IsProxy = NEUTRAL_IS_PROXY,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   return (
     (requireConductorHalt

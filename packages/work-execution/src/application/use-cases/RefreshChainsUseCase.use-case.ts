@@ -38,6 +38,7 @@ import type {
 import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
+import type { IsProxy } from '@fleet/shared';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeBranchHeadResult, MergeForgeActionPort, MergeForgeActionResult } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -129,6 +130,8 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
        * once).
        */
       readonly halt: Pick<ConductorHaltPort, 'read'>;
+      /** The trusted Proxy detector (`types.isProxy`, bound in infrastructure). Required: no neutral default exists, so a Proxy port cannot read as clear. */
+      readonly isProxy: IsProxy;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -168,7 +171,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     if (listed.status === 'unreadable') {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
     }
-    if (await isRequiredPassHalted(this.deps.halt)) {
+    if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
       // The halt is read here at the pass start, again before each started
       // chain, and directly before each chain's merge (inside `forgeCall`,
       // the only one-way action of `refreshOne`).
@@ -202,7 +205,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
         budgetHit = true;
         break;
       }
-      if (await isRequiredPassHalted(this.deps.halt)) {
+      if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
         return { outcome: 'refused', reasonCode: 'halted', chains };
       }
       const decision = await this.refreshOne(command, record, mainSha, chains);
@@ -393,7 +396,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
   ): Promise<
     Awaited<ReturnType<MergeForgeActionPort['performMergeForgeAction']>> | 'budget-exhausted' | 'halted'
   > {
-    if (await isRequiredPassHalted(this.deps.halt)) {
+    if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
       return 'halted';
     }
     if (!this.hasBudget(command.deadlineIso)) {

@@ -103,9 +103,9 @@ export interface RunDaemonTickDependencies {
   readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
   /** KA3-1: the killall train pause; absent reads as not paused. */
   readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
-  /** Fix round 2: the trusted Proxy detector (`types.isProxy`, bound in
+  /** The trusted Proxy detector (`types.isProxy`, bound in
    * infrastructure); a Proxy port is refused before its traps run. */
-  readonly isProxy?: IsProxy;
+  readonly isProxy: IsProxy;
   readonly status: Pick<DaemonStatusPort, 'read' | 'write'>;
   readonly lease: Pick<DaemonLeasePort, 'acquire' | 'release' | 'read'>;
   readonly events: Pick<DaemonEventProjectionPort, 'append'>;

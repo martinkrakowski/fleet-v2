@@ -31,6 +31,7 @@ import type {
 } from '../ports/in/SweepChainsPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
 import { isChainPassHalted } from './chain-pass-halt.js';
+import type { IsProxy } from '@fleet/shared';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -327,6 +328,8 @@ export class SweepChainsUseCase implements SweepChainsPort {
        * any delete and before any swept mark. Read once, at the start of apply.
        */
       readonly halt?: Pick<ConductorHaltPort, 'read'>;
+      /** The trusted Proxy detector (`types.isProxy`, bound in infrastructure). Required: no neutral default exists, so a Proxy port cannot read as clear. */
+      readonly isProxy: IsProxy;
     },
   ) {}
 
@@ -503,7 +506,7 @@ export class SweepChainsUseCase implements SweepChainsPort {
   }
 
   private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
-    if (await isChainPassHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt, this.deps.isProxy)) {
       // Read once per pass: refused before any delete and before any swept
       // mark. Never re-read per delete, so a delete already sent always
       // finishes and its chain is recorded as swept.

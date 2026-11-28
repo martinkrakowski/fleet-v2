@@ -1000,6 +1000,37 @@ describe('countedRunsForDay (cut-over certification streak)', () => {
     expect(gets).toBe(0);
   });
 
+  it('repeated identical shell merges of one run are evaluated as a single pairing, so 200 repeats still count the run once', () => {
+    // 200 repeats exceed the per-run distinct-pairing bound of 64; only the
+    // exact-repeat collapse keeps this day countable.
+    const pair = streakPair(1, 1, 2, 10);
+    const repeats = Array.from({ length: 200 }, (_, index) => shellEvent({
+      line: 3 + index,
+      atIso: pair.shellEvent.atIso,
+      pullRequest: pair.pullRequest,
+      headOid: streakHead(1),
+    }));
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, ...repeats], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a run paired with more than 64 distinct same-day shell merges refuses with invalid-input while exactly 64 still count', () => {
+    const pair = streakPair(1, 1, 2, 10);
+    const merges = (count: number): Record<string, unknown>[] => Array.from({ length: count }, (_, index) => shellEvent({
+      line: 3 + index,
+      atIso: inDayIso(10 * 60 + 1 + index),
+      pullRequest: pair.pullRequest,
+      headOid: streakHead(1),
+    }));
+    const inputWith = (count: number): Record<string, unknown> => countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, ...merges(count)], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(inputWith(63))).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+    expect(countedRunsForDay(inputWith(64))).toEqual(refusedWith('invalid-input'));
+  });
+
   it('groups headMoves once, not per run: 2,000 runs and 200,000 head moves are read in a single scan and match the per-run path', () => {
     const pairs: StreakPair[] = [];
     const headMoves: Record<string, unknown>[] = [];

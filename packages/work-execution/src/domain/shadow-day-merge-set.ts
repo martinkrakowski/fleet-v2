@@ -920,6 +920,9 @@ export function countedRunsForDay(input: unknown): CountedRunsForDayResult {
   }
 }
 
+/** The most distinct same-day merges one conducted run may pair with before the day is refused. */
+const COUNTED_RUNS_MAX_PAIRINGS_PER_RUN = 64;
+
 function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
   const INVALID: CountedRunsForDayResult = { ok: false, reason: 'invalid-input' };
   const snapshot = snapshotPlainDataRecord(input);
@@ -1049,6 +1052,8 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     }
   }
   const matched: { readonly run: ShadowConformanceRun; readonly merge: ShadowShellMerge }[] = [];
+  const seenPairings = new Set<string>();
+  const pairingCounts = new Map<string, number>();
   // Every same-day shell merge pairs with the day's single conducted run for
   // its pull request, and every pair is evaluated below: a later merge can
   // still yield an unknown verdict (for example an unlinked head with
@@ -1062,6 +1067,15 @@ function judgeCountedRunsForDay(input: unknown): CountedRunsForDayResult {
     const [only] = ids;
     const run = runsByRunId.get(only);
     if (run === undefined) return { ok: false, reason: 'unpaired-log' };
+    // An exact repeat of a pairing already queued has the same verdict, so it
+    // is evaluated once; the number of distinct pairings per run is bounded,
+    // so the evaluation work stays linear in the capped input.
+    const pairingKey = `${run.runId}|${item.headOid}|${item.atIso}`;
+    if (seenPairings.has(pairingKey)) continue;
+    seenPairings.add(pairingKey);
+    const pairingsForRun = (pairingCounts.get(run.runId) ?? 0) + 1;
+    if (pairingsForRun > COUNTED_RUNS_MAX_PAIRINGS_PER_RUN) return INVALID;
+    pairingCounts.set(run.runId, pairingsForRun);
     matched.push({ run, merge: item });
   }
 

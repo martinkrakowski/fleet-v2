@@ -63,15 +63,17 @@ export async function premergeCarryFactsOf(
     ) {
       return NO_PREMERGE_CARRY;
     }
+    // Checked before a journalled carry is replayed too, so a PR retargeted after the
+    // carry was recorded never reuses it. The evidence is computed against the run's own base branch: a PR whose
+    // forge base is anything else (or unknown) is a definitive no, never a carry.
+    if (pr.baseRef !== resolveLaneRunBaseBranch(record)) {
+      return { carry: null, refused: true };
+    }
+
     // Idempotent per (run, carried head): a journalled carry is the fact; no git is read again.
     const recorded = laneRunRecordedPremergeCarry(entries, record.runId, pr.head12);
     if (premergeCarryMatches(recorded, laneHead, pr.headSha) && recorded.attemptId === latest.id) {
       return { carry: recorded, refused: false };
-    }
-    // The evidence is computed against the run's own base branch: a PR whose
-    // forge base is anything else (or unknown) is a definitive no, never a carry.
-    if (pr.baseRef !== resolveLaneRunBaseBranch(record)) {
-      return { carry: null, refused: true };
     }
     const port = ctx.deps.receiptCarryEvidence;
     const digest = ctx.deps.repositoryDigest;

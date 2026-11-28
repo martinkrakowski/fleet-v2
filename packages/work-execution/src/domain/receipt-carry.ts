@@ -102,8 +102,10 @@ function pathsOf(value: unknown): readonly string[] | null {
 
 /**
  * True for an array whose `length` exceeds the path cap (`O(1)`: one length read,
- * inside `try/catch`). A Proxy that lies here only turns a shape the strict
- * reader would refuse anyway into a different refusal; it can never carry.
+ * inside `try/catch`). A Proxy that lies here turns a shape the strict reader
+ * would refuse anyway into the definitive `too-many-paths` (a park, a human
+ * look) instead of a wait; it can never carry. The inputs come from the
+ * conductor's own adapters, which return plain arrays.
  */
 function isOversizeList(value: unknown): boolean {
   try {

@@ -65,6 +65,9 @@ const RUNTIME_ONLY = new Set([
   // result depends on the ambient value, because every test that reads them sets them itself.
   "FLEET_REVIEW_API_BASE_URL",
   "FLEET_REVIEW_API_SCHEMA",
+  // Opt-in switch for the gated peak-RSS suite in status-memory-budget.test.ts (SB1): set by hand when
+  // running vitest directly; it only enables extra tests, so no task result depends on it. SB7 may declare it.
+  "FLEET_STATUS_BUDGET",
   "FLEET_API_ALLOWED_ORIGINS",
   "FLEET_API_ALLOW_REMOTE",
   "FLEET_TELEMETRY_ENDPOINT",

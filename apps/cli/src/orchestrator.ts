@@ -299,19 +299,19 @@ export function snapshotOutcome(value: unknown, allowed: readonly string[]): Use
   if (top === null || typeof top.outcome !== 'string' || !allowed.includes(top.outcome)) {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable outcome');
   }
-  if (top.reason !== undefined && typeof top.reason !== 'string') {
+  if ('reason' in top && typeof top.reason !== 'string') {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable reason');
   }
-  if (top.code !== undefined && typeof top.code !== 'string') {
+  if ('code' in top && typeof top.code !== 'string') {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable code');
   }
-  if (top.revision !== undefined && !isRevision(top.revision)) {
+  if ('revision' in top && !isRevision(top.revision)) {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable revision');
   }
-  if (top.session !== undefined && snapshotSessionRecord(top.session) === null) {
+  if ('session' in top && snapshotSessionRecord(top.session) === null) {
     throw new InvalidStoreDataError('an orchestrator use case answered with an invalid session record');
   }
-  return top.reason === undefined ? { outcome: top.outcome } : { outcome: top.outcome, reason: top.reason };
+  return 'reason' in top ? { outcome: top.outcome, reason: top.reason as string } : { outcome: top.outcome };
 }
 
 interface SessionListEntry {
@@ -434,8 +434,11 @@ const STORE_UNAVAILABLE = {
   reason: 'the orchestrator store is not available in this runtime',
 } as const;
 
+const ISO_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
+/** A zoned ISO-8601 instant the clock may answer; looser `Date.parse` strings are refused. */
 function isValidIso(value: string): boolean {
-  return Number.isFinite(Date.parse(value));
+  return ISO_INSTANT_PATTERN.test(value) && Number.isFinite(Date.parse(value));
 }
 
 function describeError(error: unknown): string {
@@ -713,6 +716,7 @@ async function attachCommand(
   if (options.attachStdinClose === true) {
     process.stdin.on('end', onStop);
     process.stdin.on('close', onStop);
+    process.stdin.resume();
   }
 
   /** Record one successful poll on the session; one retry after a revision conflict. */
@@ -738,9 +742,9 @@ async function attachCommand(
 
   const seen = new Set<string>();
   let failure: AttachFailure | null = null;
-  // A failed poll is reported at once and retried next round; it is only an unknown
-  // end state when no later poll succeeded before the session ended.
-  let lastPollFailure: AttachFailure | null = null;
+  // A failed poll is reported at once and retried next round, but the first one is
+  // remembered: unknown state is never success, so the run ends with exit 1.
+  let pollFailure: AttachFailure | null = null;
   let endReason = 'stopped';
   const sleep = options.sleep ?? abortableSleep;
   const deadline = maxMs === undefined ? Number.POSITIVE_INFINITY : clockMs() + maxMs;
@@ -770,7 +774,7 @@ async function attachCommand(
       }
       if (!polled.ok) {
         io.stderr(`${JSON.stringify({ outcome: polled.outcome, reason: polled.reason })}\n`);
-        lastPollFailure = { outcome: polled.outcome, reason: polled.reason };
+        pollFailure ??= { outcome: polled.outcome, reason: polled.reason };
       } else {
         const nowMs = clockMs();
         for (const request of polled.requests) {
@@ -787,7 +791,6 @@ async function attachCommand(
           failure = recorded;
           break;
         }
-        lastPollFailure = null;
       }
       if (flags.has('once')) {
         endReason = 'once';
@@ -809,6 +812,7 @@ async function attachCommand(
     if (options.attachStdinClose === true) {
       process.stdin.removeListener('end', onStop);
       process.stdin.removeListener('close', onStop);
+      process.stdin.pause();
     }
   }
 
@@ -824,7 +828,7 @@ async function attachCommand(
     printJson(io, { outcome: 'unknown', reason: describeError(error) });
     return 1;
   }
-  if (failure === null && lastPollFailure !== null) failure = lastPollFailure;
+  if (failure === null && pollFailure !== null) failure = pollFailure;
   if (failure !== null) {
     printJson(io, { outcome: failure.outcome, orchestratorId, reason: failure.reason });
     return 1;

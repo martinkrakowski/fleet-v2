@@ -341,6 +341,28 @@ describe('orchestrator CLI', () => {
       });
     });
 
+    it('pending drops a non-queued record the store returns even though the query asked for queued ones', async () => {
+      const cancelled = requestRecord({ requestId: REQUEST_B, state: 'cancelled' });
+      const queued = requestRecord();
+      const result = await run(
+        ['pending'],
+        runtimeWith({
+          orchestratorRequestRepository: { list: async () => ({ outcome: 'ok', requests: [cancelled, queued], truncated: false }) },
+        }),
+      );
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.stdout) as { requests: { requestId: string }[] };
+      expect(body.requests.map((request) => request.requestId)).toEqual([REQUEST_A]);
+    });
+
+    it('rejects a clock answer that is not a zoned ISO instant with an unknown outcome', async () => {
+      for (const argv of [['status'], ['pending']]) {
+        const result = await run(argv, realRuntime(), { ...baseOptions(), now: () => 'Nov 27 2026' });
+        expect(result.code).toBe(1);
+        expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'unknown' });
+      }
+    });
+
     it('--format hook prints exactly one labelled data line when queued and nothing when none match', async () => {
       const empty = await run(['pending', '--format', 'hook'], realRuntime());
       expect(empty.code).toBe(0);
@@ -596,7 +618,7 @@ describe('orchestrator CLI', () => {
       expect(stored?.session.status).toBe('retired');
     });
 
-    it('attach retries a failed poll next round and exits 0 when a later poll succeeds', async () => {
+    it('attach keeps polling after a failed poll but remembers it and exits 1 even when a later poll succeeds', async () => {
       let polls = 0;
       const runtime = runtimeWith({
         orchestratorSessionRepository: sessions,
@@ -608,10 +630,27 @@ describe('orchestrator CLI', () => {
         },
       });
       const result = await run(['attach', '--kind', 'agy', '--max', '60s', '--interval', '30s'], runtime);
-      expect(result.code).toBe(0);
+      expect(result.code).toBe(1);
+      expect(polls).toBeGreaterThanOrEqual(2);
       expect(result.stderr.trim().split('\n')).toHaveLength(1);
-      expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'detached', reason: 'max-elapsed' });
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'unknown', orchestratorId: ORCH_ID });
       expect((await sessions.get(ORCH_ID))?.session.lastPolledRequestsAtIso).not.toBeNull();
+    });
+
+    it('a stopSignal aborted while attach is waiting wakes the real sleep at once and ends with reason stopped', async () => {
+      const controller = new AbortController();
+      const started = Date.now();
+      const pending = run(['attach', '--kind', 'agy', '--interval', '60s'], realRuntime(), {
+        now,
+        newOrchestratorId: () => '01FIXTUREAAAAAAAAAAAAAAAAA',
+        hostName: 'fixture-host',
+        stopSignal: controller.signal,
+      });
+      setTimeout(() => controller.abort(), 50);
+      const result = await pending;
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'detached', reason: 'stopped' });
+      expect(Date.now() - started).toBeLessThan(30_000);
     });
 
     /** A session repository whose Nth `get` answers with a getter-bearing record. */
@@ -728,6 +767,8 @@ describe('orchestrator CLI', () => {
         { outcome: 'renewed', code: 7 },
         { outcome: 'renewed', reason: 7 },
         { outcome: 'renewed', revision: 0 },
+        { outcome: 'renewed', reason: undefined },
+        { outcome: 'renewed', code: undefined },
         { outcome: 'renewed', session: { orchestratorId: 'x' } },
         { outcome: 'renewed', extra: true },
         null,

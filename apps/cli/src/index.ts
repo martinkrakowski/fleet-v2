@@ -1035,7 +1035,8 @@ export async function runCli(
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
     }
     if (group === 'orchestrator') {
-      return await orchestratorCommand(restArgv.slice(1), io, activeRuntime, { ...orchestratorOptions });
+      // A real `attach` retires its session when standard input closes (its parent went away).
+      return await orchestratorCommand(restArgv.slice(1), io, activeRuntime, { attachStdinClose: true, ...orchestratorOptions });
     }
     if (group === 'report') {
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});

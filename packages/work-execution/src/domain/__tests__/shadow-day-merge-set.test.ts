@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildMergeKey, type MergeKeyOneWayAction } from '../lane-run-keys.js';
-import { evaluateShadowMergeSet, SHADOW_DAY_BOUNDARY_GRACE_MS } from '../shadow-day-merge-set.js';
+import { buildLaneRunStepKey, buildMergeKey, laneRunPremergeKey, type MergeKeyOneWayAction } from '../lane-run-keys.js';
+import { countedRunsForDay, evaluateShadowMergeSet, SHADOW_DAY_BOUNDARY_GRACE_MS } from '../shadow-day-merge-set.js';
 
 const DAY = '2026-11-10';
 const DIGEST = '0123456789ab';
@@ -662,4 +662,413 @@ describe('evaluateShadowMergeSet hostile input', () => {
     Object.defineProperty(parsed.fleet, 'constructor', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
     expect(evaluateShadowMergeSet(parsed)).toEqual(INVALID);
   });
+});
+
+// --- SR3: countedRunsForDay (cut-over certification streak) ---
+
+function streakRunId(n: number): string {
+  return `run-0${String(n).padStart(25, '0')}`;
+}
+
+function streakHead(n: number): string {
+  return `${n.toString(16).padStart(12, 'b')}${'c'.repeat(28)}`;
+}
+
+function gateKeyFor(runId: string, headOid: string): string {
+  const built = buildLaneRunStepKey({
+    runId,
+    round: 0,
+    step: 'gate',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: headOid.slice(0, 12),
+    retry: null,
+  });
+  if (!built.ok) throw new Error('fixture gate key refused');
+  return built.key;
+}
+
+function premergeKeyFor(runId: string, headOid: string): string {
+  const built = laneRunPremergeKey(runId, 0, headOid.slice(0, 12));
+  if (!built.ok) throw new Error('fixture premerge key refused');
+  return built.key;
+}
+
+/** A conducted run that passes every S6 rule against a merge of its own head. */
+function conformingStreakRun(n: number, tier: 1 | 2, pullRequest: number, headOid: string, mergeAtIso: string): Record<string, unknown> {
+  const runId = streakRunId(n);
+  const recordedAtIso = new Date(Date.parse(mergeAtIso) - 3_600_000).toISOString();
+  const receipts = tier === 1
+    ? [{ kind: 'brief-check', result: 'pass' }, { kind: 'code-review', result: 'pass' }]
+    : [{ kind: 'brief-check', result: 'pass' }, { kind: 'code-review', result: 'pass' }, { kind: 'pre-merge', result: 'pass' }];
+  const journal = [
+    { kind: 'result', key: gateKeyFor(runId, headOid), recordedAtIso, outcome: 'completed', reasonCode: 'gate-passed', state: null },
+    { kind: 'result', key: premergeKeyFor(runId, headOid), recordedAtIso, outcome: 'completed', reasonCode: 'premerge-success', state: null },
+  ];
+  return { runId, tier, pullRequest, headOid, reviewReceipts: receipts, journal };
+}
+
+interface StreakPair {
+  readonly pullRequest: number;
+  readonly tier: 1 | 2;
+  readonly run: Record<string, unknown>;
+  readonly shellEvent: Record<string, unknown>;
+  readonly fleetResult: Record<string, unknown>;
+  readonly fleetEntry: Record<string, unknown>;
+}
+
+function streakPair(n: number, tier: 1 | 2, line: number, hour: number, runOverrides: Record<string, unknown> = {}): StreakPair {
+  const pullRequest = 4000 + n;
+  const headOid = streakHead(n);
+  const atIso = inDayIso(hour * 60);
+  return {
+    pullRequest,
+    tier,
+    run: { ...conformingStreakRun(n, tier, pullRequest, headOid, atIso), ...runOverrides },
+    shellEvent: shellEvent({ line, atIso, pullRequest, headOid }),
+    fleetResult: fleetResult({ key: mergeKey(DIGEST, pullRequest, headOid.slice(0, 12)), recordedAtIso: inDayIso(hour * 60 - 10, 50) }),
+    fleetEntry: fleetEntry({ pullRequest, headOid }),
+  };
+}
+
+function countedInputFor(pairs: readonly StreakPair[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    day: DAY,
+    repoDigest: DIGEST,
+    shell: { events: pairs.map((pair) => pair.shellEvent), unknownLines: 0 },
+    fleet: { results: pairs.map((pair) => pair.fleetResult), entries: pairs.map((pair) => pair.fleetEntry) },
+    runs: pairs.map((pair) => pair.run),
+    headMoves: [],
+    headMovesIncompleteFor: [],
+    ...overrides,
+  };
+}
+
+function refusedWith(reason: string): { ok: false; reason: string } {
+  return { ok: false, reason };
+}
+
+describe('countedRunsForDay (cut-over certification streak)', () => {
+  it('counts conforming S1-matched non-batch Tier 1 and Tier 2 runs, with countedTier2 split out', () => {
+    const pairs = [streakPair(1, 1, 1, 10), streakPair(2, 1, 2, 11), streakPair(3, 2, 3, 12)];
+    expect(countedRunsForDay(countedInputFor(pairs))).toEqual({ ok: true, countedRuns: 3, countedTier2: 1 });
+  });
+
+  it('excludes batch merges from the count while still counting the non-batch run', () => {
+    const batch = streakPair(9, 1, 2, 12);
+    const openedEvent = shellEvent({ line: 1, atIso: inDayIso(9 * 60), kind: 'batch', outcome: 'opened', pullRequest: batch.pullRequest, headOid: streakHead(9), detailCode: 'none' });
+    const batchedShell = { ...batch.shellEvent, detailCode: 'batch-member' };
+    const nonBatch = streakPair(1, 1, 3, 10);
+    const input = countedInputFor([nonBatch], {
+      shell: { events: [openedEvent, batchedShell, nonBatch.shellEvent], unknownLines: 0 },
+      fleet: {
+        results: [batch.fleetResult, nonBatch.fleetResult],
+        entries: [batch.fleetEntry, nonBatch.fleetEntry],
+      },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a batch-excluded PR with an unresolved fleet head neither counts nor breaks the day', () => {
+    // Batches neither count nor break: the excluded batch merge's fleet
+    // would-merge row must be dropped before fleet resolution, so its
+    // unresolvable head cannot refuse the day for the non-batch run.
+    const batch = streakPair(9, 1, 2, 12);
+    const openedEvent = shellEvent({ line: 1, atIso: inDayIso(9 * 60), kind: 'batch', outcome: 'opened', pullRequest: batch.pullRequest, headOid: streakHead(9), detailCode: 'none' });
+    const batchedShell = { ...batch.shellEvent, detailCode: 'batch-member' };
+    const nonBatch = streakPair(1, 1, 3, 10);
+    const unresolvedBatchRow = fleetResult({ key: mergeKey(DIGEST, batch.pullRequest, '999999999999') });
+    const input = countedInputFor([nonBatch], {
+      shell: { events: [openedEvent, batchedShell, nonBatch.shellEvent], unknownLines: 0 },
+      fleet: {
+        results: [batch.fleetResult, unresolvedBatchRow, nonBatch.fleetResult],
+        entries: [batch.fleetEntry, nonBatch.fleetEntry],
+      },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a conducted run matched by two same-day shell merges is counted once, not twice', () => {
+    const pair = streakPair(1, 1, 2, 10);
+    const secondMerge = shellEvent({ line: 3, atIso: inDayIso(15 * 60), pullRequest: pair.pullRequest, headOid: streakHead(1) });
+    const secondFleetRow = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(1).slice(0, 12)), recordedAtIso: inDayIso(14 * 60, 50) });
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, secondMerge], unknownLines: 0 },
+      fleet: { results: [pair.fleetResult, secondFleetRow], entries: [pair.fleetEntry] },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a later merge for the same PR that would judge unknown refuses the day instead of being skipped', () => {
+    // The first merge conforms, but the second same-day merge moves to a head
+    // with no linking head move while the pull request is listed in
+    // `headMovesIncompleteFor`; every (run, merge) pairing must be evaluated,
+    // so the later unknown verdict refuses the day rather than the earlier
+    // conforming pairing counting the run.
+    const pair = streakPair(1, 1, 1, 10);
+    const laterMerge = shellEvent({ line: 3, atIso: inDayIso(15 * 60), pullRequest: pair.pullRequest, headOid: streakHead(7) });
+    const laterFleetRow = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(7).slice(0, 12)), recordedAtIso: inDayIso(14 * 60, 50) });
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, laterMerge], unknownLines: 0 },
+      fleet: { results: [pair.fleetResult, laterFleetRow], entries: [pair.fleetEntry, fleetEntry({ pullRequest: pair.pullRequest, headOid: streakHead(7) })] },
+      headMovesIncompleteFor: [pair.pullRequest],
+    });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('head-moves-incomplete'));
+  });
+
+  it('a nonconforming S6 run (no gate result) is not counted', () => {
+    const broken = streakPair(1, 1, 1, 10, { journal: [] });
+    expect(countedRunsForDay(countedInputFor([broken]))).toEqual({ ok: true, countedRuns: 0, countedTier2: 0 });
+  });
+
+  it('refuses a batch-marked Tier 2 merge with tier2-batch-merge', () => {
+    const batch = streakPair(9, 2, 2, 12);
+    const openedEvent = shellEvent({ line: 1, atIso: inDayIso(9 * 60), kind: 'batch', outcome: 'opened', pullRequest: batch.pullRequest, headOid: streakHead(9), detailCode: 'none' });
+    const batchedShell = { ...batch.shellEvent, detailCode: 'batch-member' };
+    const input = countedInputFor([batch], {
+      shell: { events: [openedEvent, batchedShell], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('tier2-batch-merge'));
+  });
+
+  it('refuses a null-head shell merge event with unpaired-log before the set walk runs', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, shellEvent({ line: 2, atIso: inDayIso(11 * 60), headOid: null })], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('unpaired-log'));
+  });
+
+  it('refuses a shell merge on the day with no conducted run with unpaired-log', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const input = countedInputFor([pair], { runs: [] });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('unpaired-log'));
+  });
+
+  it('refuses a shell merge unmatched by a fleet would-merge row with unmatched-record', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const input = countedInputFor([pair], { fleet: { results: [], entries: [pair.fleetEntry] } });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('unmatched-record'));
+  });
+
+  it('refuses a fleet would-merge recorded at a later whole second than the shell merge with unmatched-record', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const lateResult = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(1).slice(0, 12)), recordedAtIso: inDayIso(10 * 60, 1) });
+    const input = countedInputFor([pair], { fleet: { results: [lateResult], entries: [pair.fleetEntry] } });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('unmatched-record'));
+  });
+
+  it('refuses an incomplete shell log with shell-events-incomplete', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const input = countedInputFor([pair], { shell: { events: [pair.shellEvent], unknownLines: 1 } });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('shell-events-incomplete'));
+  });
+
+  it('refuses a live fleet merge action on the day with live-action-in-shadow', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const liveResult = fleetResult({ key: mergeKey(DIGEST, pair.pullRequest, streakHead(1).slice(0, 12)), outcome: 'merged' });
+    const input = countedInputFor([pair], { fleet: { results: [liveResult], entries: [pair.fleetEntry] } });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('live-action-in-shadow'));
+  });
+
+  it('refuses an unresolved and an ambiguous fleet head', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const unresolved = fleetResult({ key: mergeKey(DIGEST, 99, '999999999999') });
+    expect(countedRunsForDay(countedInputFor([pair], { fleet: { results: [pair.fleetResult, unresolved], entries: [pair.fleetEntry] } })))
+      .toEqual(refusedWith('fleet-head-unresolved'));
+    const sharedPrefix = streakHead(2).slice(0, 12);
+    const headX = `${sharedPrefix}${'1'.repeat(28)}`;
+    const headY = `${sharedPrefix}${'2'.repeat(28)}`;
+    const ambiguous = streakPair(2, 1, 2, 11);
+    const ambiguousInput = countedInputFor([pair, ambiguous], {
+      fleet: {
+        results: [pair.fleetResult, ambiguous.fleetResult],
+        entries: [pair.fleetEntry, fleetEntry({ pullRequest: ambiguous.pullRequest, headOid: headX }), fleetEntry({ pullRequest: ambiguous.pullRequest, headOid: headY })],
+      },
+    });
+    expect(countedRunsForDay(ambiguousInput)).toEqual(refusedWith('fleet-head-ambiguous'));
+  });
+
+  it('refuses a conflicting duplicate runId with duplicate-run-conflict and two runs on one PR with pull-request-has-several-runs', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const conflicting = { ...pair.run, headOid: streakHead(50) };
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [pair.run, conflicting] })))
+      .toEqual(refusedWith('duplicate-run-conflict'));
+    const secondRunOnSamePr = conformingStreakRun(7, 1, pair.pullRequest, streakHead(7), inDayIso(10 * 60));
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [pair.run, secondRunOnSamePr] })))
+      .toEqual(refusedWith('pull-request-has-several-runs'));
+  });
+
+  it('refuses an unlinked run whose pull request is in headMovesIncompleteFor with head-moves-incomplete', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const otherHead = streakHead(77);
+    const unlinkedRun = conformingStreakRun(1, 1, pair.pullRequest, otherHead, inDayIso(10 * 60));
+    const input = countedInputFor([pair], { runs: [unlinkedRun], headMovesIncompleteFor: [pair.pullRequest] });
+    expect(countedRunsForDay(input)).toEqual(refusedWith('head-moves-incomplete'));
+  });
+
+  it('refuses a run with an absent or unknown tier with invalid-tier', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const withoutTier: Record<string, unknown> = { ...pair.run };
+    delete withoutTier.tier;
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [withoutTier] }))).toEqual(refusedWith('invalid-tier'));
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [{ ...pair.run, tier: 3 }] }))).toEqual(refusedWith('invalid-tier'));
+  });
+
+  it('refuses a run with a missing or unreadable journal with unreadable-journal', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const withoutJournal: Record<string, unknown> = { ...pair.run };
+    delete withoutJournal.journal;
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [withoutJournal] }))).toEqual(refusedWith('unreadable-journal'));
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [{ ...pair.run, journal: [{ kind: 'intent' }] }] })))
+      .toEqual(refusedWith('unreadable-journal'));
+  });
+
+  it('refuses a run with missing or malformed reviewReceipts with missing-review-receipts', () => {
+    const pair = streakPair(1, 1, 1, 10);
+    const withoutReceipts: Record<string, unknown> = { ...pair.run };
+    delete withoutReceipts.reviewReceipts;
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [withoutReceipts] }))).toEqual(refusedWith('missing-review-receipts'));
+    expect(countedRunsForDay(countedInputFor([pair], { runs: [{ ...pair.run, reviewReceipts: [{ kind: 'code-review' }] }] })))
+      .toEqual(refusedWith('missing-review-receipts'));
+  });
+
+  it('refuses hostile and malformed inputs with invalid-input', () => {
+    for (const hostile of [null, undefined, 5, 'day', true, [], { length: 1, 0: {} }]) {
+      expect(countedRunsForDay(hostile)).toEqual(refusedWith('invalid-input'));
+    }
+    const pair = streakPair(1, 1, 1, 10);
+    const base = countedInputFor([pair]);
+    expect(countedRunsForDay({ ...base, day: 'not-a-day' })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, repoDigest: 'zz' })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, extra: 1 })).toEqual(refusedWith('invalid-input'));
+    const missingRuns = { ...base };
+    delete missingRuns.runs;
+    expect(countedRunsForDay(missingRuns)).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, runs: 'not-a-list' })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, shell: { events: 'no', unknownLines: 0 } })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, fleet: { results: [], entries: {} } })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, headMoves: [null] })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, headMovesIncompleteFor: [0] })).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay({ ...base, shell: { events: [shellEvent()], unknownLines: 'none' } })).toEqual(refusedWith('invalid-input'));
+    // An array hole in runs is refused before any element is read.
+    const holed = [pair.run];
+    holed.length = 3;
+    expect(countedRunsForDay({ ...base, runs: holed })).toEqual(refusedWith('invalid-input'));
+    // An over-cap runs list is refused from its length alone.
+    expect(countedRunsForDay({ ...base, runs: new Array(2001).fill(pair.run) })).toEqual(refusedWith('invalid-input'));
+    // A getter on the root never runs and is refused.
+    let calls = 0;
+    const getterInput: Record<string, unknown> = { ...base };
+    delete getterInput.day;
+    Object.defineProperty(getterInput, 'day', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return DAY;
+      },
+    });
+    expect(countedRunsForDay(getterInput)).toEqual(refusedWith('invalid-input'));
+    expect(calls).toBe(0);
+    // A revoked Proxy and a throwing-trap Proxy are refused.
+    const { proxy, revoke } = Proxy.revocable(base, {});
+    revoke();
+    expect(countedRunsForDay(proxy)).toEqual(refusedWith('invalid-input'));
+    expect(countedRunsForDay(new Proxy(base, { ownKeys() { throw new Error('ownKeys trap'); } }))).toEqual(refusedWith('invalid-input'));
+    // Prototype-polluting own keys are refused.
+    const pollutedInput = { ...base };
+    Object.defineProperty(pollutedInput, 'constructor', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+    expect(countedRunsForDay(pollutedInput)).toEqual(refusedWith('invalid-input'));
+    const protoInput = { ...base };
+    Object.defineProperty(protoInput, '__proto__', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+    expect(countedRunsForDay(protoInput)).toEqual(refusedWith('invalid-input'));
+    const prototypeInput = { ...base };
+    Object.defineProperty(prototypeInput, 'prototype', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+    expect(countedRunsForDay(prototypeInput)).toEqual(refusedWith('invalid-input'));
+  });
+
+  it('a transparent Proxy over a valid input yields exactly the plain data result with no get trap run', () => {
+    const pairs = [streakPair(1, 1, 1, 10), streakPair(2, 2, 2, 11)];
+    let gets = 0;
+    const proxied = new Proxy(countedInputFor(pairs), {
+      get(target, property, receiver) {
+        gets += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(countedRunsForDay(proxied)).toEqual({ ok: true, countedRuns: 2, countedTier2: 1 });
+    expect(gets).toBe(0);
+  });
+
+  it('repeated identical shell merges of one run are evaluated as a single pairing, so 200 repeats still count the run once', () => {
+    // 200 repeats exceed the per-run distinct-pairing bound of 64; only the
+    // exact-repeat collapse keeps this day countable.
+    const pair = streakPair(1, 1, 2, 10);
+    const repeats = Array.from({ length: 200 }, (_, index) => shellEvent({
+      line: 3 + index,
+      atIso: pair.shellEvent.atIso,
+      pullRequest: pair.pullRequest,
+      headOid: streakHead(1),
+    }));
+    const input = countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, ...repeats], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+  });
+
+  it('a run paired with more than 64 distinct same-day shell merges refuses with invalid-input while exactly 64 still count', () => {
+    const pair = streakPair(1, 1, 2, 10);
+    const merges = (count: number): Record<string, unknown>[] => Array.from({ length: count }, (_, index) => shellEvent({
+      line: 3 + index,
+      atIso: inDayIso(10 * 60 + 1 + index),
+      pullRequest: pair.pullRequest,
+      headOid: streakHead(1),
+    }));
+    const inputWith = (count: number): Record<string, unknown> => countedInputFor([pair], {
+      shell: { events: [pair.shellEvent, ...merges(count)], unknownLines: 0 },
+    });
+    expect(countedRunsForDay(inputWith(63))).toEqual({ ok: true, countedRuns: 1, countedTier2: 0 });
+    expect(countedRunsForDay(inputWith(64))).toEqual(refusedWith('invalid-input'));
+  });
+
+  it('groups headMoves once, not per run: 2,000 runs and 200,000 head moves are read in a single scan and match the per-run path', () => {
+    const pairs: StreakPair[] = [];
+    const headMoves: Record<string, unknown>[] = [];
+    for (let n = 1; n <= 2_000; n += 1) {
+      const tier: 1 | 2 = n <= 1_500 ? 1 : 2;
+      pairs.push(streakPair(n, tier, n, 10 + (n % 8)));
+      const pullRequest = 4000 + n;
+      let fromN = 500_000 + n * 100;
+      for (let hop = 0; hop < 100; hop += 1) {
+        headMoves.push({
+          pullRequest,
+          fromHeadOid: streakHead(fromN),
+          toHeadOid: streakHead(fromN + 1),
+          atIso: `${DAY}T${String(Math.floor(hop / 60)).padStart(2, '0')}:${String(hop % 60).padStart(2, '0')}:00.000Z`,
+        });
+        fromN += 1;
+      }
+    }
+    let descriptorCalls = 0;
+    let ownKeysCalls = 0;
+    const instrumentedMoves = new Proxy(headMoves, {
+      getOwnPropertyDescriptor(target, property) {
+        descriptorCalls += 1;
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+      ownKeys(target) {
+        ownKeysCalls += 1;
+        return Reflect.ownKeys(target);
+      },
+      get() {
+        throw new Error('a get trap must never run on headMoves');
+      },
+    });
+    const input = countedInputFor(pairs, { headMoves: instrumentedMoves });
+    expect(countedRunsForDay(input)).toEqual({ ok: true, countedRuns: 2_000, countedTier2: 500 });
+    // One length descriptor plus one descriptor per element: the 200,000-move
+    // list was read and grouped exactly once, never once per run.
+    expect(ownKeysCalls).toBe(1);
+    expect(descriptorCalls).toBe(headMoves.length + 1);
+  }, 120_000);
 });

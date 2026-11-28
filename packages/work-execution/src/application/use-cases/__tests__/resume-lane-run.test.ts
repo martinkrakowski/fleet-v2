@@ -1167,7 +1167,9 @@ describe('reviewTransportRetry record (AB-TP4A)', () => {
   };
 
   function withRetry(overrides: Partial<LaneRunRecord> = {}): LaneRunRecord {
-    return runRecord({ reviewTransportRetry: RETRY, ...overrides });
+    // A non-null retry state is the parked review step's retry state (the field
+    // contract, fix round 1): the fixture parks the run so the record stays valid.
+    return runRecord({ parked: PARKED, parkCount: 1, reviewTransportRetry: RETRY, ...overrides });
   }
 
   it('survives LaneRun.create, toRecord, readLaneRunRecord and a JSON round-trip', () => {
@@ -1251,7 +1253,9 @@ describe('reviewTransportRetry record (AB-TP4A)', () => {
     ['a non-ISO nextRetryAtIso', { ...RETRY, nextRetryAtIso: 'not a date' }],
     ['a null step', { ...RETRY, step: null }],
   ] as readonly [string, unknown][])('%s is refused by LaneRun.create and LaneRunRepositoryAdapter.create', async (_name, bad) => {
-    const badRecord = { ...BASE_RECORD, reviewTransportRetry: bad };
+    // Parked: the bad-value cases exercise the retry field validators themselves,
+    // not the parked-null refusal (fix round 1).
+    const badRecord = { ...BASE_RECORD, parked: PARKED, parkCount: 1, reviewTransportRetry: bad };
     const refused = LaneRun.create(badRecord);
     expect(refused.success).toBe(false);
     if (refused.success) {
@@ -1267,6 +1271,22 @@ describe('reviewTransportRetry record (AB-TP4A)', () => {
     });
   });
 
+  it('a non-null retry on a run that has left its park (parked null) is refused (fix round 1)', async () => {
+    const leftThePark = { ...BASE_RECORD, reviewTransportRetry: RETRY };
+    const refused = LaneRun.create(leftThePark);
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      throw new Error('fixture must be refused');
+    }
+    expect(refused.code).toBe('invalid');
+    expect(refused.error.message).toBe('LaneRun reviewTransportRetry is invalid');
+    expect(readLaneRunRecord(leftThePark).ok).toBe(false);
+    expect(await new LaneRunRepositoryAdapter().create(leftThePark as unknown as LaneRunRecord)).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-record',
+    });
+  });
+
   it('a throwing getter on the retry value is refused by LaneRun.create without running the accessor', () => {
     const throwingRetry: Record<string, unknown> = { ...RETRY };
     Object.defineProperty(throwingRetry, 'step', {
@@ -1275,9 +1295,9 @@ describe('reviewTransportRetry record (AB-TP4A)', () => {
         throw new Error('getter must never run');
       },
     });
-    const refused = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: throwingRetry });
+    const refused = LaneRun.create({ ...BASE_RECORD, parked: PARKED, parkCount: 1, reviewTransportRetry: throwingRetry });
     expect(refused.success).toBe(false);
-    const throwingKey: Record<string, unknown> = { ...runRecord() };
+    const throwingKey: Record<string, unknown> = { ...withRetry() };
     Object.defineProperty(throwingKey, 'reviewTransportRetry', {
       enumerable: true,
       get: () => {

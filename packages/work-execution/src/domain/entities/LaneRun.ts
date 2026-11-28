@@ -150,7 +150,7 @@ export class LaneRun {
     if (!parkAndLease.ok) {
       return invalid(parkAndLease.error);
     }
-    const branchFields = readOptionalBranchFields(recordInput);
+    const branchFields = readOptionalBranchFields(recordInput, parkAndLease.parked);
     if (!branchFields.ok) {
       return invalid(branchFields.error);
     }
@@ -493,7 +493,10 @@ function readOptionalProvenance(recordInput: Record<string, unknown>): {
  * the file's complexity cap of 12. Returns the first refusal, with the same
  * messages as the inline checks it replaced.
  */
-function readOptionalBranchFields(recordInput: Record<string, unknown>): {
+function readOptionalBranchFields(
+  recordInput: Record<string, unknown>,
+  parked: LaneRunParkRecord | null,
+): {
   ok: true;
   branchName: string | undefined;
   baseBranch: BaseBranchValue | undefined;
@@ -516,7 +519,7 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   if (!provenance.ok) {
     return { ok: false, error: provenance.error };
   }
-  const reviewTransportRetry = readOptionalReviewTransportRetry(recordInput);
+  const reviewTransportRetry = readOptionalReviewTransportRetry(recordInput, parked);
   if (!reviewTransportRetry.ok) {
     return { ok: false, error: reviewTransportRetry.error };
   }
@@ -537,8 +540,16 @@ const REVIEW_RETRY_MAX_COUNT = 100;
  * the record; an explicit `null` is valid (the run left the park). When the key is present with a
  * value, the value is snapshotted once (own enumerable keys via descriptors, no getter runs) and
  * every field is validated; any failure is refused with the fixed message, never defaulted.
+ * A non-null value is only meaningful while the run is parked (fix round 1): when `parked` is
+ * `null` the run has left its park, so a surviving retry state is refused like any other
+ * malformed value instead of preserving a retry count past the park. The caller passes the
+ * `parked` snapshot `readValidatedParkAndLease` already read (which runs first in
+ * `createUnchecked`), so this reader reflects on nothing new.
  */
-function readOptionalReviewTransportRetry(recordInput: Record<string, unknown>): {
+function readOptionalReviewTransportRetry(
+  recordInput: Record<string, unknown>,
+  parked: LaneRunParkRecord | null,
+): {
   ok: true;
   reviewTransportRetry: LaneRunReviewRetryRecord | null | undefined;
 } | { ok: false; error: string } {
@@ -547,6 +558,9 @@ function readOptionalReviewTransportRetry(recordInput: Record<string, unknown>):
   }
   if (recordInput.reviewTransportRetry === null) {
     return { ok: true, reviewTransportRetry: null };
+  }
+  if (parked === null) {
+    return { ok: false, error: 'LaneRun reviewTransportRetry is invalid' };
   }
   const retrySnapshot = readExactPlainRecord(recordInput.reviewTransportRetry, [
     'step',

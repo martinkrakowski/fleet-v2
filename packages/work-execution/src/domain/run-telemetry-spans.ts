@@ -19,6 +19,7 @@ import { CAPACITY_RELEASE_STATES } from './value-objects/AttemptState.vo.js';
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
 import { LANE_RUN_MAX_ROUND, type LaneRunKeyStep, type LaneRunRecord } from './lane-run-records.js';
 import type { AttemptRecord, AttemptUsageRecord } from './execution-records.js';
+import { snapshotPlainDataRecord } from './plain-record-reads.js';
 import {
   attemptIdentity,
   attemptTraceRoot,
@@ -28,6 +29,8 @@ import {
   roundIdentity,
   runRootIdentity,
   runTraceRoot,
+  seatCallRootIdentity,
+  seatCallTraceRoot,
   telemetryDigest,
   telemetryHashInput,
   telemetrySpanId,
@@ -40,8 +43,9 @@ import {
   type TelemetrySpanIdentity,
   type TelemetryTraceRoot,
 } from './run-telemetry-ids.js';
-import { TELEMETRY_MAX_EVENTS, TelemetrySpan } from './run-telemetry.js';
+import { isTelemetryZonedInstant, TELEMETRY_MAX_EVENTS, TelemetrySpan } from './run-telemetry.js';
 import type { TelemetrySpanEvent, TelemetrySpanName, TelemetrySpanStatus } from './run-telemetry.js';
+import { TELEMETRY_PLAN_SEAT_TOOLS, TELEMETRY_SEAT_CALL_OUTCOMES } from './run-telemetry-attributes.js';
 import type { TelemetrySpanKind } from './run-telemetry-attributes.js';
 
 /** The plain input facts of the run mapper (plan §3.3): no raw id leaves it. */
@@ -1047,5 +1051,93 @@ export function attemptTraceSpans(hmac: TelemetryHmac, facts: AttemptTraceTeleme
     return { spans: builder.spans, rejectedInvalid: builder.rejected.count };
   } catch {
     return { spans: [], rejectedInvalid: 1 };
+  }
+}
+
+/** The exact own keys of the facts `seatCallSpan` reads. */
+const SEAT_CALL_FACT_KEYS: readonly string[] = ['callId', 'tool', 'outcome', 'wallSeconds', 'label', 'nowIso'];
+
+/** True when the snapshot's own keys are exactly `expected`: equal length plus membership, O(ownKeys). */
+function hasExactKeys(snapshot: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(snapshot);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+}
+
+/**
+ * Map one plan-billed seat call to a single closed `seat-call` AGENT span.
+ * `facts` is untrusted: it is snapshotted through own data descriptors first
+ * (no getter runs; a revoked Proxy throws and reads as null) and must carry
+ * exactly `callId`, `tool` (agy, grok or claude), `outcome` (ok, empty, error
+ * or timeout), `wallSeconds` (finite, at least 0), `label` (null or an opaque
+ * seat label, hashed and never sent raw) and `nowIso` (a zoned ISO instant,
+ * the span's end). The span always says `fleet.seat.billing = plan` and carries
+ * no token, cost, model, provider, prompt, output, path, branch or session id.
+ * Null on any invalid input or failed digest, id or span build; never throws.
+ */
+export function seatCallSpan(hmac: TelemetryHmac, facts: unknown): TelemetrySpan | null {
+  try {
+    const snapshot = snapshotPlainDataRecord(facts);
+    if (snapshot === null || !hasExactKeys(snapshot, SEAT_CALL_FACT_KEYS)) {
+      return null;
+    }
+    const { callId, tool, outcome, wallSeconds, label, nowIso } = snapshot;
+    const callInput = telemetryHashInput(callId);
+    if (callInput === null) {
+      return null;
+    }
+    if (typeof tool !== 'string' || !(TELEMETRY_PLAN_SEAT_TOOLS as readonly string[]).includes(tool)) {
+      return null;
+    }
+    if (typeof outcome !== 'string' || !(TELEMETRY_SEAT_CALL_OUTCOMES as readonly string[]).includes(outcome)) {
+      return null;
+    }
+    if (typeof wallSeconds !== 'number' || !Number.isFinite(wallSeconds) || wallSeconds < 0) {
+      return null;
+    }
+    if (!isTelemetryZonedInstant(nowIso)) {
+      return null;
+    }
+    let labelDigest: string | null = null;
+    if (label !== null) {
+      const labelInput = telemetryHashInput(label);
+      if (labelInput === null) {
+        return null;
+      }
+      labelDigest = telemetryDigest(hmac, 'seat-label', labelInput);
+      if (labelDigest === null) {
+        return null;
+      }
+    }
+    const root = seatCallTraceRoot(callInput);
+    if (root === null) {
+      return null;
+    }
+    const traceId = telemetryTraceId(hmac, root);
+    const spanId = telemetrySpanId(hmac, root, seatCallRootIdentity());
+    if (traceId === null || spanId === null) {
+      return null;
+    }
+    const endMs = Date.parse(nowIso);
+    const startMs = Math.max(0, endMs - Math.round(wallSeconds * 1000));
+    return TelemetrySpan.build({
+      traceId,
+      spanId,
+      parentSpanId: null,
+      name: 'seat-call',
+      kind: 'AGENT',
+      startIso: new Date(startMs).toISOString(),
+      endIso: new Date(endMs).toISOString(),
+      status: { code: outcome === 'error' || outcome === 'timeout' ? 'error' : 'ok', reasonCode: null },
+      attributes: {
+        'fleet.seat.billing': 'plan',
+        'fleet.seat.tool': tool,
+        'fleet.outcome': outcome,
+        'fleet.usage.wall_seconds': wallSeconds,
+        ...(labelDigest === null ? {} : { 'fleet.seat.label_digest': labelDigest }),
+      },
+      events: [],
+    });
+  } catch {
+    return null;
   }
 }

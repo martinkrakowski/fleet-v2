@@ -421,6 +421,7 @@ bounded_contexts:
           - ManageCutoverUseCase
           - RecordShadowDayUseCase
           - AttestShadowFactUseCase
+          - RecordSeatCallUseCase
           - RunAttemptEnvironmentUseCase
           - RecordSeatObservationUseCase
         ports:
@@ -484,6 +485,7 @@ bounded_contexts:
             - ManageCutoverPort
             - RecordShadowDayPort
             - AttestShadowFactPort
+            - RecordSeatCallPort
             - RunAttemptEnvironmentPort
             - RecordSeatObservationPort
           out:
@@ -651,6 +653,7 @@ bounded_contexts:
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
       ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
       ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
+      RecordSeatCallPort: "Record one plan-billed seat call (agy, grok or claude) as a single metadata-only seat-call span through the run telemetry port: tool, outcome, wall seconds and an optional salted digest of an opaque seat label, always billed as plan and never carrying tokens, cost, a model, a provider, a prompt, an output, a path, a branch or a session id; a dry run sends nothing, and an unconfigured use case, an invalid request, a failed span build or a failed send is a typed result, never a throw; ids and codes only."
       CloseWorkOrderPort: "Close one active work order as merged or stopped on the operator's explicit confirmation, releasing its owned paths; refused while any lane run naming it is not terminal, any of its attempts is outside the capacity-release states or holds a reservation, or it is already terminal; closing as merged needs a lane run naming it that ended merged; an unknown id is not-found; a stale revision is refused, never overwritten."
       ListStaleWorkOrdersPort: "List, read-only, the work orders whose state disagrees with their lane runs: active work orders whose every run is terminal, active work orders with no run, and non-terminal runs whose work order is terminal; never writes."
       ReapLaneWorktreesPort: "On the operator's explicit request, list or remove the clean worktree of every lane run that is terminal and whose work order is terminal and whose attempts are all cancelled or collected with no held reservation; never removes a dirty, locked or unlisted worktree and never deletes a branch; a dry run removes nothing."

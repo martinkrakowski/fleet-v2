@@ -330,8 +330,8 @@ describe('span dispositions', () => {
 });
 
 describe('digest kinds cover every exported kind', () => {
-  it('declares exactly the three kinds', () => {
-    expect([...TELEMETRY_DIGEST_KINDS]).toEqual(['work-order', 'attempt', 'project']);
+  it('declares exactly the four kinds', () => {
+    expect([...TELEMETRY_DIGEST_KINDS]).toEqual(['work-order', 'attempt', 'project', 'seat-label']);
   });
 
   it('dispositions from a throwing getter, a proxy, a class instance or hidden keys are refused, never thrown', () => {

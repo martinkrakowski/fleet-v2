@@ -37,6 +37,7 @@ import {
 } from './lane-run-transitions.js';
 import type { LaneRunFailureCause, RunStopMode } from './lane-run-transitions.js';
 import type { LaneRunMergeEnqueueFact } from './lane-run-step-facts.js';
+import { isUncertainStep } from './lane-run-uncertain.js';
 import { premergeCarryMatches } from './receipt-carry.js';
 import type { PremergeCarry } from './receipt-carry.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
@@ -317,7 +318,7 @@ export interface LaneRunFacts {
   /** `policy.conductor.stopGraceMinutes` (D12, default 45) (K2 / K7). */
   readonly stopGraceMinutes: number;
   /** The run's last keyed intent without a result (§3.5) (K1b; reconcile in K4/K6). */
-  readonly pendingIntent: { readonly key: string; readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous' } | null;
+  readonly pendingIntent: { readonly key: string; readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous'; readonly uncertain?: true } | null;
   /** Capacity, one active run per package, global cap (§3.6) (K3/K4). */
   readonly admission: 'admitted' | 'no-capacity' | 'package-busy' | 'global-cap';
   /** Run usage ≥ `policy.perLaneCostCeiling`; unreadable usage = false (K4). */
@@ -488,7 +489,7 @@ export type LaneRunDecision =
       readonly seatIndex: number; readonly retry: number | null }
   | { readonly kind: 'enter'; readonly to: LaneRunStateValue }
   | { readonly kind: 'park'; readonly reason: LaneRunParkReason; readonly qualifier: string | null;
-      readonly parkedFrom: LaneRunStateValue }
+      readonly parkedFrom: LaneRunStateValue; readonly reasonCode?: 'uncertain' }
   | { readonly kind: 'wait'; readonly reason: LaneRunWaitReason }
   | { readonly kind: 'done' };
 
@@ -1534,6 +1535,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           });
         }
         return park('ambiguous', 'gate');
+      }
+      // UN1: an uncertain intent (latest result `uncertain` on dispatch, push,
+      // merge-enqueue or premerge) extends ambiguous and never retries: the
+      // park carries `reasonCode: 'uncertain'` so the owner sees why. A plain
+      // ambiguous result on the same step keeps the legacy park without it.
+      if (facts.pendingIntent.uncertain === true && isUncertainStep(facts.pendingIntent.step)) {
+        return { kind: 'park', reason: 'ambiguous', qualifier: facts.pendingIntent.step, parkedFrom: facts.state, reasonCode: 'uncertain' };
       }
       return park('ambiguous', facts.pendingIntent.step);
     }

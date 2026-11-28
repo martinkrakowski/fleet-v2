@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   LANE_RUN_JOURNAL_ENTRY_VERSION,
   LANE_RUN_JOURNAL_SCHEMA_VERSION,
+  isNonFinalLaneRunOutcome,
   laneRunJournalDispatchResult,
   laneRunJournalPendingIntent,
   laneRunJournalState,
@@ -18,6 +19,7 @@ import type {
 } from '../lane-run-journal.js';
 import {
   buildLaneRunStepKey,
+  laneRunMergeEnqueueKey,
   laneRunPremergeKey,
   laneRunResumeKey,
   laneRunStopForceKey,
@@ -857,5 +859,96 @@ describe('premerge carry journal record (U6)', () => {
     if (read.ok) {
       expect(read.entry.carry).toBeUndefined();
     }
+  });
+});
+
+describe('uncertain outcomes (UN1)', () => {
+  it('isNonFinalLaneRunOutcome is true for ambiguous and uncertain and false for every final outcome', () => {
+    expect(isNonFinalLaneRunOutcome('ambiguous')).toBe(true);
+    expect(isNonFinalLaneRunOutcome('uncertain')).toBe(true);
+    for (const final of ['completed', 'refused', 'not-started', 'cancelled-unstarted', 'reconciled', 'overtaken', 'dry-run', null] as const) {
+      expect(isNonFinalLaneRunOutcome(final)).toBe(false);
+    }
+  });
+
+  const PUSH_KEY = mustBuild(buildLaneRunStepKey({
+    runId: RUN_ID, round: 1, step: 'push', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: null,
+  }));
+  const MERGE_ENQUEUE_KEY = mustBuild(laneRunMergeEnqueueKey(RUN_ID, 1, HEAD12));
+  const GATE_KEY = mustBuild(buildLaneRunStepKey({
+    runId: RUN_ID, round: 1, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: null,
+  }));
+
+  it('uncertain is accepted as a non-final result on a dispatch, push, merge-enqueue and premerge intent', () => {
+    for (const key of [DISPATCH_KEY, PUSH_KEY, MERGE_ENQUEUE_KEY, PREMERGE_KEY]) {
+      const runIdExtra = { runId: RUN_ID };
+      const intentEntry = { ...intent(key), ...runIdExtra };
+      const resultEntry = { ...result(key, 'uncertain'), ...runIdExtra };
+      const append = prepareLaneRunJournalAppend([intentEntry], resultEntry);
+      expect(append.ok).toBe(true);
+    }
+  });
+
+  it('uncertain on a gate intent is refused by the append decision', () => {
+    const intentEntry = intent(GATE_KEY);
+    expect(prepareLaneRunJournalAppend([intentEntry], result(GATE_KEY, 'uncertain'))).toEqual({
+      ok: false,
+      reason: 'invalid-entry',
+      detail: expect.any(String),
+    });
+  });
+
+  it('the append decision refuses an uncertain result on a step name that is not a declared step', () => {
+    const bogusKey = `${RUN_ID}/r1/frobnicate/0`;
+    const read = readLaneRunJournalEntry(result(bogusKey, 'uncertain'));
+    expect(read.ok).toBe(false);
+    expect(prepareLaneRunJournalAppend([intent(bogusKey)], result(bogusKey, 'uncertain'))).toEqual({
+      ok: false,
+      reason: 'invalid-entry',
+      detail: expect.any(String),
+    });
+  });
+
+  it('an uncertain result followed by a reconciled result is accepted and a result after the final one is refused', () => {
+    const intentEntry = intent(DISPATCH_KEY);
+    const uncertain = result(DISPATCH_KEY, 'uncertain');
+    const reconciled = result(DISPATCH_KEY, 'reconciled');
+    expect(prepareLaneRunJournalAppend([intentEntry], uncertain).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, uncertain], reconciled).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, uncertain, reconciled], result(DISPATCH_KEY, 'completed'))).toEqual({
+      ok: false,
+      reason: 'result-after-final',
+      detail: null,
+    });
+  });
+
+  it('a key whose latest result is uncertain reads as pending ambiguous', () => {
+    expect(laneRunJournalPendingIntent([intent(PUSH_KEY), result(PUSH_KEY, 'uncertain')], RUN_ID)).toEqual({
+      key: PUSH_KEY,
+      step: 'push',
+      reconciliation: 'ambiguous',
+      uncertain: true,
+    });
+    expect(laneRunJournalPendingIntent([intent(MERGE_ENQUEUE_KEY, { runId: RUN_ID }), result(MERGE_ENQUEUE_KEY, 'uncertain', { runId: RUN_ID })], RUN_ID)).toEqual({
+      key: MERGE_ENQUEUE_KEY,
+      step: 'merge-enqueue',
+      reconciliation: 'ambiguous',
+      uncertain: true,
+    });
+    // A plain ambiguous result carries no uncertain mark, and a later ambiguous result clears it.
+    expect(laneRunJournalPendingIntent([intent(PUSH_KEY), result(PUSH_KEY, 'ambiguous')], RUN_ID)).toEqual({
+      key: PUSH_KEY,
+      step: 'push',
+      reconciliation: 'ambiguous',
+    });
+    expect(laneRunJournalPendingIntent([intent(PUSH_KEY), result(PUSH_KEY, 'uncertain'), result(PUSH_KEY, 'ambiguous')], RUN_ID)).toEqual({
+      key: PUSH_KEY,
+      step: 'push',
+      reconciliation: 'ambiguous',
+    });
+  });
+
+  it('laneRunJournalDispatchResult treats an uncertain result like an ambiguous one', () => {
+    expect(laneRunJournalDispatchResult([intent(DISPATCH_KEY), result(DISPATCH_KEY, 'uncertain')], DISPATCH_KEY)).toBe('started');
   });
 });

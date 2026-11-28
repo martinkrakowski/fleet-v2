@@ -26,6 +26,7 @@ import type { ParkEscalationMode } from './park-escalation.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
+import { isUncertainStep } from './lane-run-uncertain.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 
 export const LANE_RUN_JOURNAL_ENTRY_VERSION = 1 as const;
@@ -38,14 +39,19 @@ export const LANE_RUN_JOURNAL_ENTRY_KINDS = ['intent', 'result', 'conduct'] as c
 export type LaneRunJournalEntryKind = (typeof LANE_RUN_JOURNAL_ENTRY_KINDS)[number];
 
 /**
- * A result's outcome. `ambiguous` is the only non-final outcome: a key may collect any number of
- * `ambiguous` results, then at most one final result, and nothing after it. The request channel
+ * A result's outcome. `ambiguous` and (UN1) `uncertain` are the non-final outcomes: a key may collect any
+ * number of them, then at most one final result, and nothing after it. The request channel
  * (O2c) additionally treats `not-started` as non-final: it does not move the request, so a later
  * final result is still allowed there.
+ *
+ * UN1: `uncertain` extends `ambiguous` for interrupted side effects (dispatch, push,
+ * merge-enqueue, premerge): it does not say *whether* the effect landed and forbids an automatic
+ * retry. Everywhere `ambiguous` reads as non-final, `uncertain` reads the same; the pending intent
+ * keeps `reconciliation: 'ambiguous'` so every existing consumer already handles it.
  */
 export const LANE_RUN_JOURNAL_OUTCOMES = [
   'completed', 'refused', 'not-started', 'cancelled-unstarted', 'reconciled', 'overtaken', 'dry-run',
-  'ambiguous',
+  'ambiguous', 'uncertain',
 ] as const;
 export type LaneRunJournalOutcome = (typeof LANE_RUN_JOURNAL_OUTCOMES)[number];
 
@@ -766,6 +772,18 @@ function resultRefusal(
   if (intent.runId !== entry.runId) {
     return { ok: false, reason: 'invalid-entry', detail: 'LaneRunJournal result runId must equal its intent\'s' };
   }
+  // UN1: `uncertain` is only a result on an uncertain step (dispatch, push, merge-enqueue,
+  // premerge); on any other declared step — e.g. `gate`, which keeps its own automatic retry —
+  // the entry is invalid.
+  if (entry.outcome === 'uncertain') {
+    const parsed = parseLaneRunKey(entry.key);
+    const step = parsed?.kind === 'step'
+      ? parsed.step
+      : (parsed?.kind === 'premerge' || parsed?.kind === 'merge-enqueue') ? parsed.kind : null;
+    if (!isUncertainStep(step)) {
+      return { ok: false, reason: 'invalid-entry', detail: 'LaneRunJournal uncertain result requires an uncertain step (dispatch, push, merge-enqueue, premerge)' };
+    }
+  }
   for (const existingEntry of existing) {
     if (existingEntry.kind === 'result' && existingEntry.key === entry.key && isClosedByFinalResult(existingEntry)) {
       return { ok: false, reason: 'result-after-final', detail: null };
@@ -774,11 +792,12 @@ function resultRefusal(
   return null;
 }
 
-/** Whether an existing result closes its key: every outcome except `ambiguous`, and except
- *  `not-started` on the request channel (O2c), where a not-started result does not move the
- *  request and a later final result is still allowed. */
+/** Whether an existing result closes its key: every outcome except `ambiguous` and `uncertain`
+ *  (UN1: `uncertain` extends `ambiguous` for interrupted side effects), and except `not-started`
+ *  on the request channel (O2c), where a not-started result does not move the request and a later
+ *  final result is still allowed. */
 function isClosedByFinalResult(entry: LaneRunJournalEntryRecord): boolean {
-  if (entry.outcome === 'ambiguous') {
+  if (entry.outcome === 'ambiguous' || entry.outcome === 'uncertain') {
     return false;
   }
   if (entry.outcome === 'not-started') {
@@ -816,6 +835,11 @@ export interface LaneRunJournalPendingIntent {
   readonly key: string;
   readonly step: LaneRunKeyStep;
   readonly reconciliation: 'unread' | 'ambiguous';
+  /**
+   * UN1: present and `true` only when the key's latest result is `uncertain`, so a consumer can tell an
+   * interrupted side effect from a plain `ambiguous` result. Absent otherwise.
+   */
+  readonly uncertain?: true;
 }
 
 /**
@@ -854,6 +878,7 @@ function pendingStepIntent(
       key: entry.key,
       step: parsed.kind,
       reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+      ...uncertainMark(entries, entry.key),
     };
   }
   if (parsed?.kind !== 'step') {
@@ -866,16 +891,38 @@ function pendingStepIntent(
     key: entry.key,
     step: parsed.step,
     reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+    ...uncertainMark(entries, entry.key),
   };
+}
+
+/** `{ uncertain: true }` when the key's latest result is `uncertain`, else nothing. */
+function uncertainMark(entries: readonly LaneRunJournalEntryRecord[], key: string): { readonly uncertain?: true } {
+  let latest: unknown = null;
+  for (const other of entries) {
+    if (other.kind === 'result' && other.key === key) {
+      latest = other.outcome;
+    }
+  }
+  return latest === 'uncertain' ? { uncertain: true } : {};
 }
 
 function entryHasFinalResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {
   for (const other of entries) {
-    if (other.kind === 'result' && other.key === key && other.outcome !== 'ambiguous') {
+    if (other.kind === 'result' && other.key === key && isNonFinalLaneRunOutcome(other.outcome) === false) {
       return true;
     }
   }
   return false;
+}
+
+/**
+ * UN1: whether a result outcome leaves its key open for a later final result —
+ * true for `ambiguous` and for `uncertain` (an interrupted side effect whose
+ * landing is unproven). Every site that would treat an `uncertain` result as
+ * final must read through this predicate instead of an inline `!== 'ambiguous'`.
+ */
+export function isNonFinalLaneRunOutcome(outcome: unknown): boolean {
+  return outcome === 'ambiguous' || outcome === 'uncertain';
 }
 
 function entryHasAnyResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {
@@ -918,7 +965,7 @@ export function laneRunJournalDispatchResult(entries: readonly LaneRunJournalEnt
     }
     if (entry.kind === 'intent') {
       hasIntent = true;
-    } else if (entry.kind === 'result' && entry.outcome !== 'ambiguous') {
+    } else if (entry.kind === 'result' && !isNonFinalLaneRunOutcome(entry.outcome)) {
       finalOutcome = entry.outcome;
     }
   }

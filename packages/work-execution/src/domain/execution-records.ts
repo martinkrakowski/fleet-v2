@@ -430,7 +430,7 @@ export interface ActionJournalEntryRecord {
   readonly action: 'dispatch' | 'reconcile' | 'stop' | 'collect' | 'forge' | 'accept';
   readonly baseCommit: string;
   readonly recordedAtIso: string;
-  readonly status: 'intent-recorded' | 'completed' | 'ambiguous' | 'refused';
+  readonly status: 'intent-recorded' | 'completed' | 'ambiguous' | 'uncertain' | 'refused';
   readonly sessionId: string | null;
   readonly detail: string | null;
   /** The typed stop reason of a refused or ended action (S1); absent on other entries. */

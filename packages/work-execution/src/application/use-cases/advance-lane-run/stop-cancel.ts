@@ -5,6 +5,7 @@ import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPor
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import { LANE_RUN_INTENT_ABANDONED_REASON_CODE } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
+import { isNonFinalLaneRunOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunStopEffect } from '../../../domain/lane-run-transitions.js';
@@ -139,7 +140,7 @@ export async function abandonAmbiguousIntentForStop(ctx: AdvanceStepContext,
     return { kind: 'unchanged' };
   }
   const keyEntries = await ctx.deps.runJournal.listForKey(pending.key);
-  if (!keyEntries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous')) {
+  if (!keyEntries.some((entry) => entry.kind === 'result' && !isNonFinalLaneRunOutcome(entry.outcome))) {
     const resultRefusal = await appendRunResult(ctx, request, pending.key, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE);
     if (resultRefusal !== null) {
       return { kind: 'refused', result: refusedResult(resultRefusal) };

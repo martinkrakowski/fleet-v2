@@ -418,7 +418,12 @@ function walkChain(
       return { ok: false, reason: 'broken-chain', index };
     }
     const expectedHash = hashEvent(event, event.previousHash, sha256Hex);
-    if (expectedHash === null || event.hash !== expectedHash) {
+    if (expectedHash === null) {
+      // A hasher that throws or returns a malformed digest is a hasher
+      // failure, not evidence of tampering: refuse with `invalid-hasher`.
+      return { ok: false, reason: 'invalid-hasher', index };
+    }
+    if (event.hash !== expectedHash) {
       return { ok: false, reason: 'hash-mismatch', index };
     }
     lastHashByOrg.set(event.organizationId, event.hash);

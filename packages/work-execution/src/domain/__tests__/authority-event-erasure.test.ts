@@ -17,6 +17,7 @@ import {
   pseudonymiseActors,
   verifyEventChain,
   type ChainedEventInput,
+  type Sha256HexFn,
 } from '../authority-event-erasure.js';
 
 /** A real SHA-256 helper: 64 lowercase hex characters per call. */
@@ -232,6 +233,31 @@ describe('verifyEventChain', () => {
         throw new Error('boom');
       }, types.isProxy),
     ).toEqual({ ok: false, reason: 'invalid-hasher' });
+  });
+
+  it('reports invalid-hasher, not hash-mismatch, when a hasher passing the canary fails while hashing an event', () => {
+    const events = chainOf([baseInput()]);
+    let calls = 0;
+    const flakyHasher: Sha256HexFn = (text: string) => {
+      calls += 1;
+      if (calls <= 1) return sha256(text); // the empty-string canary
+      throw new Error('boom');
+    };
+    expect(verifyEventChain(events, flakyHasher, types.isProxy)).toEqual({
+      ok: false,
+      reason: 'invalid-hasher',
+      index: 0,
+    });
+    let malformedCalls = 0;
+    const malformedHasher: Sha256HexFn = (text: string) => {
+      malformedCalls += 1;
+      return malformedCalls <= 1 ? sha256(text) : 'nothex';
+    };
+    expect(verifyEventChain(events, malformedHasher, types.isProxy)).toEqual({
+      ok: false,
+      reason: 'invalid-hasher',
+      index: 0,
+    });
   });
 
   it('refuses missing or throwing isProxy detector', () => {

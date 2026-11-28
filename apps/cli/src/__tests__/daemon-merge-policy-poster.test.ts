@@ -122,6 +122,7 @@ describe('MergePolicyAdapter + toDaemonRepositoryRefs forward premergePosterLogi
 /** Minimal daemon-tick ports: a clear clock, an empty queue and one completed merge pass. */
 function tickDeps(): RunDaemonTickDependencies {
   return {
+    isProxy: types.isProxy,
     pause: { read: async () => ({ state: 'clear', record: null }) },
     halt: { read: async () => ({ state: 'clear', record: null }) },
     status: {

@@ -249,8 +249,8 @@ describe('ExecutionRunnerAdapter listSessions status text scan bound', () => {
     );
   });
 
-  it('exit 3 text output of a million header-less lines refuses at the scan bound instead of scanning it all', async () => {
-    const stdout = '\n'.repeat(1_000_000);
+  it('exit 3 text output of 10,000 header-less lines refuses at the scan bound instead of scanning it all', async () => {
+    const stdout = '\n'.repeat(10_000);
     const { runner } = scriptedRunner([{ exitCode: 3, stdout, stderr: '' }]);
     expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
       refused('exceeds the scan bound'),

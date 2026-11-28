@@ -1049,7 +1049,9 @@ function withSanitizedAdmissionBlockers(result: RunConductorPassResult): RunCond
               }
               const blocked = safeOwnDataValue(step, 'blockedBy');
               if (!blocked.present) {
-                return step;
+                // A fresh object, never the original: an own accessor on `blockedBy` reads as absent here
+                // and must not reach JSON.stringify.
+                return { outcome: 'waiting' as const, reason: 'admission' as const };
               }
               const sanitized = sanitizeAdmissionBlockersForOutput(blocked.value);
               return sanitized === undefined

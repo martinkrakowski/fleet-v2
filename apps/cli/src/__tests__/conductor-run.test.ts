@@ -1836,6 +1836,23 @@ describe('admission blockers in start and run output (AB-CB10)', () => {
     expect(line.runs[0].steps[0]).toEqual({ outcome: 'waiting', reason: 'admission' });
   });
 
+  it('a waiting admission step whose blockedBy is an own accessor never runs it and prints no blockedBy', async () => {
+    let calls = 0;
+    const step: Record<string, unknown> = { outcome: 'waiting', reason: 'admission' };
+    Object.defineProperty(step, 'blockedBy', {
+      enumerable: true,
+      get: () => {
+        calls += 1;
+        throw new Error('getter ran');
+      },
+    });
+    const result = await runWith(step as unknown as AdvanceLaneRunResult);
+    expect(calls).toBe(0);
+    expect(result.code).toBe(0);
+    const line = parseDocument(result.stdout) as { runs: Array<{ steps: unknown[] }> };
+    expect(line.runs[0].steps[0]).toEqual({ outcome: 'waiting', reason: 'admission' });
+  });
+
   it('only the last step of a run is logged, and only when it waits on admission', async () => {
     const blockedBy = { runIds: [RUN_A], attemptIds: [] };
     const dir = tempStateDir();

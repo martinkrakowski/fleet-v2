@@ -53,7 +53,7 @@ Every boundary above that is not yet wired refuses or reports its own absence ra
 
 `apps/cli` is the operator entry point and a composition root. `apps/api` (Nitro, its own composition root), `apps/mcp` (an MCP server over the API) and `apps/web` (Next.js) are the operator surfaces. They call application ports and own no domain rules.
 
-Dependency direction, trust rules and the migration order are in [docs/architecture.md](docs/architecture.md). How the tree was generated is in [docs/scaffold-verification.md](docs/scaffold-verification.md). Runbooks are under [docs/runbooks](docs/runbooks): a first run, onboarding a project, reconciling an attempt, checking runner readiness, recovering a state file, and Hexagen verification procedures.
+Dependency direction, trust rules and the migration order are in [docs/architecture.md](docs/architecture.md). How the tree was generated is in [docs/scaffold-verification.md](docs/scaffold-verification.md). Runbooks are under [docs/runbooks](docs/runbooks): a first run, onboarding a project, reconciling an attempt, checking runner readiness, recovering a state file, answering owner questions, and Hexagen verification procedures.
 
 ## Quick start
 

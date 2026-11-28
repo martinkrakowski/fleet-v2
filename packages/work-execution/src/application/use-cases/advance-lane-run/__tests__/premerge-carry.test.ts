@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../../domain/execution-records.js';
 import { LaneRun } from '../../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../../domain/lane-run-records.js';
-import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../../domain/lane-run-keys.js';
+import { laneRunPremergeKey } from '../../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../../domain/lane-run-step-facts.js';
 import type { AdvanceLaneRunDependencies } from '../../AdvanceLaneRunUseCase.use-case.js';
@@ -27,7 +27,7 @@ import type {
   ExecuteAuthorizedForgeActionRequest,
   ExecuteAuthorizedForgeActionResult,
 } from '../../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
-import type { FindLatestReceiptOfKindResult, ReviewRequestFinding } from '../../../ports/out/ReviewRequestPort.out-port.js';
+import type { FindLatestReceiptOfKindResult } from '../../../ports/out/ReviewRequestPort.out-port.js';
 import type { PremergeMode } from '../../../../domain/lane-run-transitions.js';
 import { LaneRunRepositoryAdapter } from '../../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
@@ -430,9 +430,6 @@ async function mergingHarness(
   return harness;
 }
 
-function finding(index: number, severity: ReviewRequestFinding['severity']): ReviewRequestFinding {
-  return { findingId: `f-${index}`, severity, summary: 'untrusted reviewer prose', filePath: null, line: null };
-}
 
 /** The owner receipt object: `requestId === null` at the exact head (manual receipts carry no request id). */
 function ownerReceiptObject(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -458,23 +455,7 @@ function automatedReceipt(overrides: Record<string, unknown> = {}): FindLatestRe
   return ownerReceipt({ requestId: 'review-example-1', reviewerModel: 'reviewer-example-1', ...overrides });
 }
 
-function reviewRequestKey(seatIndex: number): string {
-  const built = buildLaneRunStepKey({
-    runId: RUN_ID, round: 0, step: 'pre-merge', seatIndex, attemptOrdinal: null, head12: HEAD12, retry: null,
-  });
-  expect(built.ok).toBe(true);
-  if (!built.ok) {
-    throw new Error('fixture must build a review key');
-  }
-  return built.key;
-}
 
-/** Journals a passed automated pre-merge review request, so `preMergeReview.verdict` is `passed`. */
-async function journalPassedPreMergeReview(harness: Harness): Promise<void> {
-  const key = reviewRequestKey(0);
-  await appendIntent(harness, key, 'review-example-1', NOW);
-  await appendResult(harness, key, 'completed', 'review-passed', NOW);
-}
 
 const successStatuses = (harness: Harness): (string | undefined)[] =>
   harness.forgeRequests.map((request) => request.status?.state).filter((state) => state === 'success');

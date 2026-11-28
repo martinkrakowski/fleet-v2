@@ -851,7 +851,7 @@ describe('premerge carry journal record (U6)', () => {
   });
 
   it('a premerge intent without carry still reads as before', () => {
-    const { carry: _carry, ...plain } = intent(premergeKeyAt(TO), null);
+    const plain = Object.fromEntries(Object.entries(intent(premergeKeyAt(TO), null)).filter(([key]) => key !== 'carry'));
     const read = readLaneRunJournalEntry(plain);
     expect(read.ok).toBe(true);
     if (read.ok) {

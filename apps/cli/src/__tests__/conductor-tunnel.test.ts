@@ -1418,6 +1418,27 @@ describe('IH1b: optional tunnel members and upHosts', () => {
     expect(set.owned).toBe(false);
   });
 
+  it('a throwing onOptionalFailed does not reject the start nor orphan an opened required member', async () => {
+    const required = upMember('runner-a', 4166);
+    const optional = downMember('runner-b', 4266, true);
+    const set = new RunnerTunnelSetAdapter([required.adapter, optional]);
+    let calls = 0;
+    await expect(
+      set.ensureTunnel({
+        onOptionalFailed: () => {
+          calls += 1;
+          throw new Error('the report itself failed');
+        },
+      }),
+    ).resolves.toBe('opened');
+    expect(calls).toBe(1);
+    // The required member's child survived the throwing report and stays owned.
+    expect(set.owned).toBe(true);
+    expect([...(set.upHosts() ?? [])]).toEqual(['runner-a']);
+    await set.stop();
+    expect(set.owned).toBe(false);
+  });
+
   it('a required member that fails stops every opened member and leaves upHosts empty, even beside an optional member', async () => {
     const optional = upMember('runner-b', 4266, { optional: true });
     const required = downMember('runner-a', 4166);

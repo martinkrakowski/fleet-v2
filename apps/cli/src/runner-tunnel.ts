@@ -511,9 +511,16 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
       if (outcome === 'failed') {
         if (member.optional === true) {
           // IH1b: an optional member's failure names its host key once and
-          // skips the member; the members already opened keep running.
+          // skips the member; the members already opened keep running. The
+          // callback is reporting, never an owner of the start: a throwing
+          // report must neither reject the start nor orphan an earlier
+          // member's child, so it is caught and the skip proceeds.
           if (member.hostName !== undefined) {
-            handlers.onOptionalFailed?.(member.hostName);
+            try {
+              handlers.onOptionalFailed?.(member.hostName);
+            } catch {
+              // Swallowed: the report failed, the skip did not.
+            }
           }
           continue;
         }

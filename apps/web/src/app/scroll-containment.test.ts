@@ -112,12 +112,16 @@ describe("opt-in containment roots of the routes", () => {
   });
 
   it("/brief opts in on its root element", () => {
-    const brief = read("brief", "page.tsx");
-    expect(
-      brief.match(
-        /<div\s*\n\s*className=\{\[styles\.stack, styles\.view\][\s\S]*?data-contained-scroll\s*\n\s*>/,
-      ),
-    ).toBeTruthy();
+    const view = read("brief", "brief-view.tsx");
+    expect(view).toContain(
+      "<div className={ROOT_CLASS} data-contained-scroll>",
+    );
+    expect(view).toContain(
+      'const ROOT_CLASS = [styles.stack, styles.view].filter(Boolean).join(" ");',
+    );
+    const page = read("brief", "page.tsx");
+    expect(page).toContain('export const dynamic = "force-dynamic";');
+    expect(page).not.toContain('"use client"');
   });
 
   it("/projects opts in on its root element", () => {
@@ -173,12 +177,12 @@ describe("keyboard-accessible scroll regions", () => {
   });
 
   it("names the brief work-order list and detail column", () => {
-    const card = read("brief", "components", "work-order-list-card.tsx");
+    const card = read("brief", "brief-view.tsx");
     expectScrollRegion(
       openingTag(card, /<CardBody[^>]*styles\.woScroll[^>]*>/, "brief work-order scroll body"),
       "Work orders",
     );
-    const brief = read("brief", "page.tsx");
+    const brief = card;
     expectScrollRegion(
       openingTag(brief, /<div[^>]*styles\.detail[^>]*>/, "brief detail column"),
       "Brief detail",

@@ -74,7 +74,7 @@ const VIEWS = [
   {
     href: "/brief",
     label: "Brief",
-    sample: true,
+    sample: false,
     icon: (
       <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M7 3h7l4 4v14H7z" />

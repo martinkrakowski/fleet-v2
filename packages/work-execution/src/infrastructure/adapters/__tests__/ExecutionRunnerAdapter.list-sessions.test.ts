@@ -76,6 +76,26 @@ describe('ExecutionRunnerAdapter listSessions refusals', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('a malformed non-null runner (array or non-string host) returns unreadable without invoking runner', async () => {
+    const { runner, calls } = scriptedRunner([{ exitCode: 0, stdout: '', stderr: '' }]);
+    const adapter = adapterWith(runner);
+    // A non-plain-record runner is malformed, never treated as absent.
+    expect(
+      await adapter.listSessions({
+        worktreePath: worktree,
+        runner: ['not-a-record'] as unknown as typeof runnerRecord,
+      }),
+    ).toEqual(refused('Malformed recorded runner'));
+    // A non-string recorded host is malformed, never compared as null.
+    expect(
+      await adapter.listSessions({
+        worktreePath: worktree,
+        runner: { ...runnerRecord, host: 42 as unknown as string },
+      }),
+    ).toEqual(refused('Malformed recorded runner host'));
+    expect(calls).toHaveLength(0);
+  });
+
   it('thrown runner subprocess returns unreachable', async () => {
     const { runner, calls } = scriptedRunner([new Error('spawn boom')]);
     const adapter = adapterWith(runner);
@@ -237,10 +257,16 @@ describe('parseListSessionsPayload hostile shapes', () => {
     expect(parseListSessionsPayload(enormousSessions, types.isProxy)).toEqual(
       payloadRefusal,
     );
-    // A `__proto__` own key never pollutes the prototype.
+    // A `__proto__` own key is refused unreadable and never pollutes the
+    // prototype.
     const polluting = JSON.parse('{"__proto__": {"polluted": true}, "sessions": ["ses_ok"]}');
-    expect(parseListSessionsPayload(polluting, types.isProxy)).toEqual({ ok: true, sessions: ['ses_ok'] });
+    expect(parseListSessionsPayload(polluting, types.isProxy)).toEqual(
+      refused('prototype-polluting key'),
+    );
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    // Inherited `sessions` is not an own property, so it is not read.
+    const inherited = Object.create({ sessions: ['ses_inherited'] });
+    expect(parseListSessionsPayload(inherited, types.isProxy)).toEqual(payloadRefusal);
   });
 
   it('accepts an array of session-id strings and a record with a sessions array', () => {

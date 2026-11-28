@@ -454,8 +454,25 @@ export function parseListSessionsPayload(
     };
   }
   const data: unknown = snapshot.value;
+  // `data` is a frozen snapshot copy, so own-key reflection on it is safe. A
+  // record whose own `sessions` is missing is not a session list, and an own
+  // prototype-polluting key (`__proto__`, `constructor`, `prototype`) is
+  // refused outright rather than read past.
+  if (isPlainRecord(data)) {
+    for (const pollutingKey of ['__proto__', 'constructor', 'prototype'] as const) {
+      if (Object.hasOwn(data, pollutingKey)) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: `Runner session payload holds a prototype-polluting key (${pollutingKey})`,
+        };
+      }
+    }
+  }
   const rawSessions: unknown =
-    Array.isArray(data) ? data : isPlainRecord(data) ? data['sessions'] : undefined;
+    Array.isArray(data)
+      ? data
+      : isPlainRecord(data) && Object.hasOwn(data, 'sessions') ? data['sessions'] : undefined;
   if (!Array.isArray(rawSessions)) {
     return { ok: false, error: 'unreadable', reason: 'Runner session payload is not a session list' };
   }
@@ -1207,11 +1224,22 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { ok: false, error: 'unreadable', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
     }
     let remotePort: number | undefined = configuredPort;
-    if (isPlainRecord(runnerRaw)) {
+    if (runnerRaw !== null && runnerRaw !== undefined) {
+      // A malformed non-null runner must fail closed: it is never treated as
+      // absent, so the command cannot run without matching the supplied
+      // runner.
+      if (!isPlainRecord(runnerRaw)) {
+        return { ok: false, error: 'unreadable', reason: 'Malformed recorded runner' };
+      }
       const recordedPort: unknown = runnerRaw['remotePort'];
       const recordedHost: unknown = runnerRaw['host'];
       if (typeof recordedPort !== 'number' || !Number.isInteger(recordedPort)) {
         return { ok: false, error: 'unreadable', reason: 'Attempt has no recorded runner port' };
+      }
+      // A non-string recorded host is malformed, not absent: it never falls
+      // back to a null-host comparison.
+      if (recordedHost !== null && typeof recordedHost !== 'string') {
+        return { ok: false, error: 'unreadable', reason: 'Malformed recorded runner host' };
       }
       if (typeof recordedHost === 'string' && !isSafeSshHost(recordedHost)) {
         return { ok: false, error: 'unreadable', reason: `Unsafe recorded runner host: ${recordedHost}` };

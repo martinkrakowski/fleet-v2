@@ -16,6 +16,7 @@ import type {
   LeaseRefusal,
   LeaseRenewRequest,
 } from '../../../domain/lane-run-lease.js';
+import type { FenceRefusal } from '../../../domain/fence-token.js';
 
 export type ConductorDriverLeaseResult =
   | { readonly outcome: 'ok'; readonly lease: ConductorDriverLeaseRecord }
@@ -47,4 +48,12 @@ export interface ConductorDriverLeasePort {
   release(request: LeaseHoldRequest): Promise<ConductorDriverLeaseResult>;
   /** null when the request names the current, unexpired lease; else why not. Read-only. */
   check(request: LeaseHoldRequest): Promise<LeaseRefusal | null>;
+  /**
+   * Verify one `FenceToken` against the current lease without writing.
+   * `null` when the token names the current, unexpired lease; else the typed
+   * refusal (`invalid-token`, `no-lease`, `stale-fence`, `fence-ahead`,
+   * `holder-mismatch`, `lease-expired`, `no-lease-readable`). An unreadable
+   * lease file is `no-lease-readable`, never a pass.
+   */
+  verifyFence(token: unknown, nowIso: string): Promise<FenceRefusal | null>;
 }

@@ -192,6 +192,8 @@ interface HostRunnerCommon {
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
   readonly gateSlot?: GateSlotSection;
+  /** When true the runner may be absent without blocking; absent means `false` (required). */
+  readonly optional?: boolean;
 }
 
 /** The `runner` block of a v2 host (D7): the kind selects the extra fields. */
@@ -815,6 +817,8 @@ export interface OpencodeHostRunnerModel {
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
   readonly gateSlot?: GateSlotSection;
+  /** Absent means `false` (required). */
+  readonly optional?: boolean;
 }
 
 /** An agy runner of the model; the mode decides the agy argv (D7). */
@@ -826,6 +830,8 @@ export interface AgyHostRunnerModel {
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
   readonly gateSlot?: GateSlotSection;
+  /** Absent means `false` (required). */
+  readonly optional?: boolean;
   readonly agyMode: 'edit-only' | 'full';
   readonly agyAcknowledgement?: AgyAcknowledgement;
 }

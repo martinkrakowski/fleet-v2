@@ -100,6 +100,23 @@ function ownDataValue(record: object, key: string): unknown {
 }
 
 /**
+ * True when `key` is an own accessor property of `record`. The getter is never
+ * run; a descriptor that cannot be read counts as an accessor, so the caller
+ * refuses it instead of treating the field as absent.
+ */
+function isOwnAccessor(record: object, key: string): boolean {
+  try {
+    if (!Object.hasOwn(record, key)) {
+      return false;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    return descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Copy one own data property by descriptor, never by assignment: an own
  * `"__proto__"` data property assigned onto a fresh `{}` triggers the
  * inherited setter and is dropped, so a key the unknown-root-key check must
@@ -165,6 +182,8 @@ export interface OpencodeHostRunnerDraft {
   readonly capabilities?: RunnerCapabilityDeclaration;
   /** The host-wide gate-slot throttle the host already declares (KF-30b). */
   readonly gateSlot?: GateSlotSection;
+  /** True when the runner may be absent without blocking; absent means required. */
+  readonly optional?: boolean;
 }
 
 /** An agy runner as the operator described it; `full` needs its mode typed. */
@@ -181,6 +200,8 @@ export interface AgyHostRunnerDraft {
   readonly capabilities?: RunnerCapabilityDeclaration;
   /** The host-wide gate-slot throttle the host already declares (KF-30b). */
   readonly gateSlot?: GateSlotSection;
+  /** True when the runner may be absent without blocking; absent means required. */
+  readonly optional?: boolean;
 }
 
 /** One drafted runner, discriminated by the kind that selects its fields. */
@@ -300,6 +321,12 @@ function buildHostRunner(
       `${path}.tunnelOffset: must be an integer from 0 to ${MAX_TUNNEL_OFFSET}`,
     );
   }
+  const optional = fields.optional;
+  if (isOwnAccessor(input as object, 'optional')) {
+    errors.push(`${path}.optional: must be a plain data property`);
+  } else if (optional !== undefined && typeof optional !== 'boolean') {
+    errors.push(`${path}.optional: must be a boolean`);
+  }
   const rawAuthFile = fields.authFile;
   const authFile =
     typeof rawAuthFile === 'string' && isAbsolute(rawAuthFile)
@@ -327,6 +354,7 @@ function buildHostRunner(
     ...(fields.gateSlot !== undefined
       ? { gateSlot: fields.gateSlot as GateSlotSection }
       : {}),
+    ...(typeof optional === 'boolean' ? { optional } : {}),
   };
   if (fields.kind === 'agy') {
     return {
@@ -720,6 +748,16 @@ function mergeDraftedHost(
 
   const container = drafted.container ?? readGuardedString(guardedContainer);
   const tunnelOffset = draftedTunnelOffset ?? readGuardedNumber(guardedTunnelOffset);
+  // A drafted runner that omits `optional` keeps the existing boolean.
+  const draftedOptional =
+    guardedDraftedRunner === undefined
+      ? undefined
+      : readGuardedBoolean(ownDataValue(guardedDraftedRunner, 'optional'));
+  const optional =
+    draftedOptional ??
+    (guardedRunner === undefined
+      ? undefined
+      : readGuardedBoolean(ownDataValue(guardedRunner, 'optional')));
 
   let roleAliases: Partial<Record<HostRole, string>> | undefined;
   if (drafted.roleAliases !== undefined) {
@@ -753,11 +791,12 @@ function mergeDraftedHost(
     ...drafted,
     ...(container !== undefined ? { container } : {}),
     ...(roleAliases !== undefined ? { roleAliases } : {}),
-    ...(drafted.runner !== undefined && tunnelOffset !== undefined
+    ...(drafted.runner !== undefined && (tunnelOffset !== undefined || optional !== undefined)
       ? {
           runner: {
             ...(guardedDraftedRunner ?? {}),
-            tunnelOffset,
+            ...(tunnelOffset !== undefined ? { tunnelOffset } : {}),
+            ...(optional !== undefined ? { optional } : {}),
           } as HostSection['runner'],
         }
       : {}),
@@ -770,6 +809,10 @@ function mergeDraftedHost(
  */
 function readGuardedString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+function readGuardedBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 function readGuardedNumber(value: unknown): number | undefined {

@@ -1322,6 +1322,31 @@ function parseRunnerTunnelOffset(
   return value;
 }
 
+/**
+ * The optional `hosts.<name>.runner.optional` flag: absent means required.
+ * Read without running a getter; an accessor or a non-boolean is refused.
+ */
+function parseRunnerOptional(
+  runner: JsonObject,
+  runnerPath: string,
+  errors: string[],
+): boolean | undefined {
+  const fieldPath = `${runnerPath}.optional`;
+  const field = readOptionalDataField(runner, 'optional');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  if (typeof field.value !== 'boolean') {
+    errors.push(`${fieldPath}: must be a boolean`);
+    return undefined;
+  }
+  return field.value;
+}
+
 function parseHostRunner(
   runner: JsonObject,
   runnerPath: string,
@@ -1364,6 +1389,7 @@ function parseHostRunner(
     errors,
   );
   const gateSlot = parseGateSlot(runner, runnerPath, errors);
+  const optional = parseRunnerOptional(runner, runnerPath, errors);
   let agyMode: 'edit-only' | 'full' | undefined;
   let agyAcknowledgement:
     { textVersion: string; acceptedAt: string } | undefined;
@@ -1409,6 +1435,7 @@ function parseHostRunner(
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(maxLanes !== undefined ? { maxLanes } : {}),
     ...(gateSlot !== undefined ? { gateSlot } : {}),
+    ...(optional !== undefined ? { optional } : {}),
   };
   if (kind === 'agy') {
     if (agyMode === undefined) {

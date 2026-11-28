@@ -162,6 +162,13 @@ describe('an accessor `read` on a port is refused without being invoked', () => 
     expect(applied).toBe(0);
   });
 
+  it('killall halt: no read method keeps not-halted, but an explicit read: undefined halts', async () => {
+    // Guard: both shapes answer `undefined` to a plain `.read`; only the
+    // found flag tells them apart.
+    await expect(isKillallHalted({} as never, types.isProxy)).resolves.toBe(false);
+    await expect(isKillallHalted({ read: undefined } as never, types.isProxy)).resolves.toBe(true);
+  });
+
   it('class-style and plain data-property read methods still work', async () => {
     class Adapter {
       async read(): Promise<{ state: 'clear' }> {
@@ -173,7 +180,8 @@ describe('an accessor `read` on a port is refused without being invoked', () => 
   });
 
   it('readDataProperty reports a missing key as an ok undefined and a deep chain as refused', () => {
-    expect(readDataProperty({}, 'read', types.isProxy)).toEqual({ ok: true, value: undefined });
+    expect(readDataProperty({}, 'read', types.isProxy)).toEqual({ ok: true, value: undefined, found: false });
+    expect(readDataProperty({ read: undefined }, 'read', types.isProxy)).toEqual({ ok: true, value: undefined, found: true });
     let deep: object = {};
     for (let i = 0; i < 40; i += 1) {
       deep = Object.create(deep) as object;

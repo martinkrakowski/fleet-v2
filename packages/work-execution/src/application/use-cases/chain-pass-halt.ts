@@ -52,7 +52,7 @@ function readExactPortSnapshot(
  * fail-closed verdict.
  */
 type PortMethodRead =
-  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: true; readonly value: unknown; readonly found: boolean }
   | { readonly ok: false };
 
 /**
@@ -158,7 +158,9 @@ export async function isKillallHalted(
     return true;
   }
   if (method.value === undefined) {
-    return false;
+    // Only a port with NO `read` anywhere keeps the not-halted behaviour; an
+    // explicit `read: undefined` is a present-but-invalid method and halts.
+    return method.found ? true : false;
   }
   if (typeof method.value !== 'function') {
     return true;

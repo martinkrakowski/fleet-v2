@@ -672,15 +672,16 @@ describe('orchestrator CLI', () => {
 
       // The poll-record save conflicts twice (saves 3 and 4); registration, heartbeat and retire save normally.
       let saves = 0;
+      const fresh = new OrchestratorSessionRepositoryAdapter({ stateDir: join(stateDir, 'conflict') });
       const conflicting = {
-        list: sessions.list.bind(sessions),
-        get: sessions.get.bind(sessions),
+        list: fresh.list.bind(fresh),
+        get: fresh.get.bind(fresh),
         save: async (record: OrchestratorSessionRecord, expected: number) => {
           saves += 1;
           if (saves === 3 || saves === 4) {
             throw new OrchestratorSessionRevisionConflictError(record.orchestratorId, expected + 1, 'conflict');
           }
-          return sessions.save(record, expected);
+          return fresh.save(record, expected);
         },
       };
       saves = 0;
@@ -690,7 +691,8 @@ describe('orchestrator CLI', () => {
       );
       expect(conflicted.code).toBe(1);
       expect(JSON.parse(conflicted.stdout)).toMatchObject({ outcome: 'refused', orchestratorId: ORCH_ID });
-      expect(saves).toBeGreaterThanOrEqual(5);
+      expect(saves).toBe(5);
+      expect((await fresh.get(ORCH_ID))?.session.status).toBe('retired');
     });
   });
 

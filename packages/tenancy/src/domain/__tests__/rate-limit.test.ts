@@ -5,6 +5,8 @@
 
 import { readFileSync } from "node:fs";
 
+import { isProxy } from "node:util/types";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -16,6 +18,15 @@ import {
 } from "../rate-limit.js";
 
 const SOURCE = readFileSync(new URL("../rate-limit.ts", import.meta.url), "utf8");
+
+/**
+ * The trusted runtime detector the infrastructure caller injects; every
+ * decision call in these tests supplies it explicitly, because the decider
+ * refuses an omitted detector rather than defaulting to a detector that
+ * detects nothing.
+ */
+const decide = (input: unknown, detector?: unknown): RateLimitDecision =>
+  decideRateLimit(input, (detector ?? isProxy) as never);
 
 const ORG = "org-alpha";
 const START = "2026-11-26T12:00:00.000Z";
@@ -84,7 +95,7 @@ describe("rate-limit module purity", () => {
 
 describe("decideRateLimit allowed path", () => {
   it("allows requests under the limit and increments count", () => {
-    const result = decideRateLimit(baseInput({ count: 2, limit: 5 }));
+    const result = decide(baseInput({ count: 2, limit: 5 }));
     expect(result).toEqual({
       outcome: "allowed",
       count: 3,
@@ -93,7 +104,7 @@ describe("decideRateLimit allowed path", () => {
   });
 
   it("allows the limit-th request when count equals limit - 1", () => {
-    const result = decideRateLimit(baseInput({ count: 4, limit: 5 }));
+    const result = decide(baseInput({ count: 4, limit: 5 }));
     expect(result).toEqual({
       outcome: "allowed",
       count: 5,
@@ -102,7 +113,7 @@ describe("decideRateLimit allowed path", () => {
   });
 
   it("rolls over to count 1 in an aligned window when nowIso is exactly at start + length", () => {
-    const result = decideRateLimit(baseInput({ count: 5, limit: 5, nowIso: NEXT_WINDOW }));
+    const result = decide(baseInput({ count: 5, limit: 5, nowIso: NEXT_WINDOW }));
     expect(result).toEqual({
       outcome: "allowed",
       count: 1,
@@ -113,7 +124,7 @@ describe("decideRateLimit allowed path", () => {
   it("rolls over across a long idle gap to the floor-aligned window boundary", () => {
     // START + 3600s = 60 windows of 60s each: the aligned window starts
     // exactly at 13:00:00.000Z even though nowIso lands mid-window.
-    const result = decideRateLimit(
+    const result = decide(
       baseInput({ count: 5, limit: 5, nowIso: "2026-11-26T13:00:10.000Z" }),
     );
     expect(result).toEqual({
@@ -124,8 +135,8 @@ describe("decideRateLimit allowed path", () => {
   });
 
   it("keeps decisions for different organizations independent", () => {
-    const a = decideRateLimit(baseInput({ organizationId: "org-one", count: 5, limit: 5 }));
-    const b = decideRateLimit(baseInput({ organizationId: "org-two", count: 5, limit: 5 }));
+    const a = decide(baseInput({ organizationId: "org-one", count: 5, limit: 5 }));
+    const b = decide(baseInput({ organizationId: "org-two", count: 5, limit: 5 }));
     expect(refusedReason(a)).toBe("rate-limited");
     expect(refusedReason(b)).toBe("rate-limited");
     if (
@@ -139,19 +150,19 @@ describe("decideRateLimit allowed path", () => {
     expect(a.auditRow.organizationId).toBe("org-one");
     expect(b.auditRow.organizationId).toBe("org-two");
     expect(a.auditRow).not.toEqual(b.auditRow);
-    const fresh = decideRateLimit(baseInput({ organizationId: "org-one", count: 0, limit: 5 }));
+    const fresh = decide(baseInput({ organizationId: "org-one", count: 0, limit: 5 }));
     expect(fresh.outcome).toBe("allowed");
   });
 
   it("supports both api and webhook buckets", () => {
     for (const bucket of RATE_LIMIT_BUCKETS) {
-      const result = decideRateLimit(baseInput({ bucket, count: 0, limit: 1 }));
+      const result = decide(baseInput({ bucket, count: 0, limit: 1 }));
       expect(result).toEqual({
         outcome: "allowed",
         count: 1,
         window: { startIso: START, lengthMs: LENGTH_MS },
       });
-      const blocked = decideRateLimit(baseInput({ bucket, count: 1, limit: 1 }));
+      const blocked = decide(baseInput({ bucket, count: 1, limit: 1 }));
       expect(refusedReason(blocked)).toBe("rate-limited");
     }
   });
@@ -159,7 +170,7 @@ describe("decideRateLimit allowed path", () => {
 
 describe("decideRateLimit refusals", () => {
   it("refuses over-limit requests with rate-limited, exact retryAfterMs, and auditRow", () => {
-    const result = decideRateLimit(baseInput({ count: 5, limit: 5, nowIso: IN_WINDOW }));
+    const result = decide(baseInput({ count: 5, limit: 5, nowIso: IN_WINDOW }));
     expect(result).toEqual({
       outcome: "refused",
       reason: "rate-limited",
@@ -170,7 +181,7 @@ describe("decideRateLimit refusals", () => {
 
   it("computes retryAfterMs as remaining milliseconds until the active window end", () => {
     const now = "2026-11-26T12:00:59.250Z";
-    const result = decideRateLimit(baseInput({ count: 9, limit: 5, nowIso: now }));
+    const result = decide(baseInput({ count: 9, limit: 5, nowIso: now }));
     if (result.outcome !== "refused" || result.reason !== "rate-limited") {
       throw new Error("expected rate-limited");
     }
@@ -178,7 +189,7 @@ describe("decideRateLimit refusals", () => {
   });
 
   it("refuses when limit is 0 with rate-limited and auditRow", () => {
-    const result = decideRateLimit(baseInput({ count: 0, limit: 0 }));
+    const result = decide(baseInput({ count: 0, limit: 0 }));
     expect(result).toEqual({
       outcome: "refused",
       reason: "rate-limited",
@@ -189,7 +200,7 @@ describe("decideRateLimit refusals", () => {
 
   it("refuses in-window count above limit with rate-limited and retryAfterMs, and resets on rollover", () => {
     // A limit reduction leaves count above the new limit mid-window.
-    const reduced = decideRateLimit(baseInput({ count: 9, limit: 5, nowIso: IN_WINDOW }));
+    const reduced = decide(baseInput({ count: 9, limit: 5, nowIso: IN_WINDOW }));
     expect(refusedReason(reduced)).toBe("rate-limited");
     if (reduced.outcome !== "refused" || reduced.reason !== "rate-limited") {
       throw new Error("unreachable");
@@ -198,7 +209,7 @@ describe("decideRateLimit refusals", () => {
     expect(reduced.auditRow.limit).toBe(5);
     // At rollover the carried count resets, so the request is allowed again
     // (limit > 0 here).
-    const rolled = decideRateLimit(baseInput({ count: 9, limit: 5, nowIso: NEXT_WINDOW }));
+    const rolled = decide(baseInput({ count: 9, limit: 5, nowIso: NEXT_WINDOW }));
     expect(rolled).toEqual({
       outcome: "allowed",
       count: 1,
@@ -207,8 +218,24 @@ describe("decideRateLimit refusals", () => {
   });
 
   it("refuses a non-function isProxy detector with invalid-input", () => {
-    const result = decideRateLimit(baseInput(), 42 as never);
+    const result = decide(baseInput(), 42 as never);
     expect(result).toEqual({ outcome: "refused", reason: "invalid-input" });
+  });
+
+  it("refuses an omitted isProxy detector with invalid-input", () => {
+    // No always-false fallback: without a trusted detector a transparent
+    // Proxy could pass the snapshot, so omission is refused outright.
+    expect(decideRateLimit(baseInput())).toEqual({
+      outcome: "refused",
+      reason: "invalid-input",
+    });
+  });
+
+  it("refuses a transparent Proxy as valid-looking input through the injected detector", () => {
+    // With the real runtime detector a transparent Proxy over valid data
+    // must still be refused by snapshotPlainData, never snapshotted.
+    const transparent = new Proxy(baseInput(), {});
+    expect(decide(transparent)).toEqual({ outcome: "refused", reason: "invalid-input" });
   });
 
   it("refuses hostile outer input shapes (null, undefined, primitives, arrays, holes, array-like, getter, Proxy, prototype-polluting keys) without invoking getters", () => {
@@ -237,7 +264,7 @@ describe("decideRateLimit refusals", () => {
     withPrototypeKey.prototype = "polluted";
     inputs.push(withPrototypeKey);
     for (const input of inputs) {
-      const result = decideRateLimit(input);
+      const result = decide(input);
       expect(result).toEqual({ outcome: "refused", reason: "invalid-input" });
     }
   });
@@ -245,11 +272,11 @@ describe("decideRateLimit refusals", () => {
   it("refuses invalid organizationId, bucket, or nowIso with invalid-input", () => {
     const invalidOrgIds = [null, 42, "", "ORG", "org_", "a".repeat(64), "-leading", "__proto__"];
     for (const organizationId of invalidOrgIds) {
-      expect(refusedReason(decideRateLimit(baseInput({ organizationId })))).toBe("invalid-input");
+      expect(refusedReason(decide(baseInput({ organizationId })))).toBe("invalid-input");
     }
     const invalidBuckets = [null, 42, "", "jobs", "API", "__proto__"];
     for (const bucket of invalidBuckets) {
-      expect(refusedReason(decideRateLimit(baseInput({ bucket })))).toBe("invalid-input");
+      expect(refusedReason(decide(baseInput({ bucket })))).toBe("invalid-input");
     }
     const invalidNowIsos = [
       null,
@@ -261,7 +288,7 @@ describe("decideRateLimit refusals", () => {
       "2026-02-31T00:00:00.000Z",
     ];
     for (const nowIso of invalidNowIsos) {
-      expect(refusedReason(decideRateLimit(baseInput({ nowIso })))).toBe("invalid-input");
+      expect(refusedReason(decide(baseInput({ nowIso })))).toBe("invalid-input");
     }
   });
 
@@ -277,16 +304,16 @@ describe("decideRateLimit refusals", () => {
       null,
     ];
     for (const limit of invalidNumbers) {
-      expect(refusedReason(decideRateLimit(baseInput({ limit })))).toBe("invalid-input");
+      expect(refusedReason(decide(baseInput({ limit })))).toBe("invalid-input");
     }
     for (const count of invalidNumbers) {
-      expect(refusedReason(decideRateLimit(baseInput({ count })))).toBe("invalid-input");
+      expect(refusedReason(decide(baseInput({ count })))).toBe("invalid-input");
     }
     expect(
-      refusedReason(decideRateLimit(baseInput({ limit: MAX_RATE_LIMIT + 1 }))),
+      refusedReason(decide(baseInput({ limit: MAX_RATE_LIMIT + 1 }))),
     ).toBe("invalid-input");
     expect(
-      decideRateLimit(baseInput({ limit: MAX_RATE_LIMIT, count: 0 })).outcome,
+      decide(baseInput({ limit: MAX_RATE_LIMIT, count: 0 })).outcome,
     ).toBe("allowed");
   });
 
@@ -313,7 +340,7 @@ describe("decideRateLimit refusals", () => {
       { startIso: START, lengthMs: Number.MAX_SAFE_INTEGER + 1 },
     ];
     for (const window of invalidWindows) {
-      expect(refusedReason(decideRateLimit(baseInput({ window })))).toBe("invalid-window");
+      expect(refusedReason(decide(baseInput({ window })))).toBe("invalid-window");
     }
     // A getter inside window must never run, and the refusal stays inside
     // the window path.
@@ -323,12 +350,12 @@ describe("decideRateLimit refusals", () => {
       { get() { throw new Error("getter must never run"); }, enumerable: true },
     );
     expect(
-      refusedReason(decideRateLimit(baseInput({ window: hostileWindow }))),
+      refusedReason(decide(baseInput({ window: hostileWindow }))),
     ).toBe("invalid-window");
     // A missing `window` key on the root input is an invalid-window.
     const missingWindow = baseInput();
     delete missingWindow.window;
-    expect(refusedReason(decideRateLimit(missingWindow))).toBe("invalid-window");
+    expect(refusedReason(decide(missingWindow))).toBe("invalid-window");
     // A window with a prototype-polluting key is an invalid-window.
     const pollutingWindow = baseInput({ window: { startIso: START, lengthMs: LENGTH_MS } });
     Object.defineProperty(pollutingWindow.window as object, "constructor", {
@@ -336,24 +363,24 @@ describe("decideRateLimit refusals", () => {
       enumerable: true,
     });
     expect(
-      refusedReason(decideRateLimit(pollutingWindow)),
+      refusedReason(decide(pollutingWindow)),
     ).toBe("invalid-window");
   });
 
   it("refuses nowIso strictly before window.startIso with clock-before-window", () => {
-    const result = decideRateLimit(baseInput({ nowIso: "2026-11-26T11:59:59.999Z" }));
+    const result = decide(baseInput({ nowIso: "2026-11-26T11:59:59.999Z" }));
     expect(result).toEqual({ outcome: "refused", reason: "clock-before-window" });
   });
 
   it("never echoes rejected input values in any refusal result", () => {
     const secret = "super-secret-rejected-value";
     const results: RateLimitDecision[] = [
-      decideRateLimit(null),
-      decideRateLimit(baseInput({ organizationId: "BAD-ORG!" })),
-      decideRateLimit(baseInput({ bucket: secret })),
-      decideRateLimit(baseInput({ nowIso: secret })),
-      decideRateLimit(baseInput({ window: { startIso: secret, lengthMs: LENGTH_MS } })),
-      decideRateLimit(throwingProxy()),
+      decide(null),
+      decide(baseInput({ organizationId: "BAD-ORG!" })),
+      decide(baseInput({ bucket: secret })),
+      decide(baseInput({ nowIso: secret })),
+      decide(baseInput({ window: { startIso: secret, lengthMs: LENGTH_MS } })),
+      decide(throwingProxy()),
     ];
     for (let i = 0; i < results.length; i += 1) {
       const result = results[i]!;

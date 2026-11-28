@@ -9,8 +9,11 @@
  * most 8 own keys, strings capped at `MAX_STRING_LENGTH`) so no getter and
  * no Proxy `get` trap ever runs; a snapshot refusal is mapped to a typed
  * refusal path (`invalid-window` inside `window`, otherwise
- * `invalid-input`). A non-function `isProxy` detector is refused with
- * `invalid-input`. Extra unknown or prototype-polluting own keys are
+ * `invalid-input`). A non-function or omitted `isProxy` detector is
+ * refused with `invalid-input` — a trusted runtime detector (the
+ * infrastructure caller passes `node:util` `types.isProxy`) is required so
+ * a transparent Proxy can never pass the snapshot unnoticed. Extra
+ * unknown or prototype-polluting own keys are
  * refused through `checkSnapshotKeys`. Nothing is ever thrown and no
  * rejected value is ever echoed into a refusal.
  *
@@ -91,9 +94,6 @@ const WINDOW_ALLOWED_KEYS: ReadonlySet<string> = new Set(["startIso", "lengthMs"
  */
 const MAX_ISO_INSTANT_MS = 253402300799999;
 
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
-
 /**
  * The bounds for the one bounded snapshot of the input: one root object of
  * 6 keys plus one nested `window` object of 2 keys (9 expected nodes), with
@@ -116,8 +116,8 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
  * Decide one per-tenant request against a fixed window aligned by the floor
  * of elapsed windows. Order of checks:
  *
- * 1. validate the injected `isProxy` detector (a non-function is
- *    `invalid-input`);
+ * 1. validate the injected `isProxy` detector (an omitted or non-function
+ *    detector is `invalid-input` — a trusted detector is required);
  * 2. snapshot the input once — any snapshot refusal inside `window` is
  *    `invalid-window`, any other is `invalid-input`;
  * 3. key checks and field validation (`invalid-window` for the window,
@@ -133,11 +133,12 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
  */
 export function decideRateLimit(input: unknown, isProxy?: IsProxy): RateLimitDecision {
   const INVALID: RateLimitDecision = { outcome: "refused", reason: "invalid-input" };
-  const detector = isProxy === undefined ? NO_DETECTOR : isProxy;
-  if (typeof detector !== "function") {
+  // A trusted detector is required: with no detector a transparent Proxy
+  // would pass the snapshot, so an omitted detector is refused outright.
+  if (isProxy === undefined || typeof isProxy !== "function") {
     return INVALID;
   }
-  const snapshot = snapshotPlainData(input, detector, SNAPSHOT_LIMITS);
+  const snapshot = snapshotPlainData(input, isProxy, SNAPSHOT_LIMITS);
   if (!snapshot.ok) {
     if (snapshot.path === "window" || (snapshot.path !== null && snapshot.path.startsWith("window."))) {
       return { outcome: "refused", reason: "invalid-window" };

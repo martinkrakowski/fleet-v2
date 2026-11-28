@@ -110,7 +110,7 @@ function isOwnAccessor(record: object, key: string): boolean {
       return false;
     }
     const descriptor = Object.getOwnPropertyDescriptor(record, key);
-    return descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined;
+    return descriptor === undefined || 'get' in descriptor || 'set' in descriptor;
   } catch {
     return true;
   }

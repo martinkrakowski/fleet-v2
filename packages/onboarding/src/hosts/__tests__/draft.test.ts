@@ -223,6 +223,13 @@ describe('draftHost', () => {
         return true;
       },
     });
+    const undefinedGetter = { kind: 'opencode', port: 4166 };
+    Object.defineProperty(undefinedGetter, 'optional', { enumerable: true, get: undefined, set: undefined });
+    const bare = draftHost(sshInput({ runner: undefinedGetter as never }));
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) {
+      expect(bare.errors).toEqual(['hosts.lanehost.runner.optional: must be a plain data property']);
+    }
     const refused = draftHost(sshInput({ runner: runner as never }));
     expect(refused.ok).toBe(false);
     if (!refused.ok) {

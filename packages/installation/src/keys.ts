@@ -189,6 +189,7 @@ export const HOST_RUNNER_KEYS: readonly string[] = freezeKeys<OpencodeHostRunner
   'capabilities',
   'maxLanes',
   'gateSlot',
+  'optional',
 ]);
 
 /** The agy-only runner fields; unknown keys on an opencode runner (D7). */
@@ -203,6 +204,7 @@ export const AGY_HOST_RUNNER_KEYS: readonly string[] = freezeKeys<AgyHostRunnerS
   'capabilities',
   'maxLanes',
   'gateSlot',
+  'optional',
   'agyMode',
   'agyAcknowledgement',
 ]);

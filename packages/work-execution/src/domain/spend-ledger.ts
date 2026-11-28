@@ -17,7 +17,12 @@ import { billingOf, containsSecretShape, type SeatBilling } from '@fleet/shared'
 
 import type { AttemptRecord, AttemptUsageRecord, RunnerKind } from './execution-records.js';
 import { LANE_USAGE_LOG_COST_BASES, type LaneUsageLogCostBasis } from './lane-usage-log.js';
-import { isCalendarDateTime, readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
+import {
+  isCalendarDateTime,
+  readBoundedDenseArray,
+  readExactPlainRecord,
+  snapshotPlainDataRecord,
+} from './plain-record-reads.js';
 import { isTelemetryModelId } from './run-telemetry-attributes.js';
 import { SEAT_PLAN_ROLES, type SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 
@@ -179,6 +184,11 @@ export function readSpendLedgerRow(value: unknown): SpendLedgerRowResult {
     if (!isOptionalIdentifier(seatId) || !isIdentifier(provider) || !isTelemetryModelId(model)) {
       return { ok: false, reason: 'invalid-row' };
     }
+    // A row books to the provider its model names: a mismatch would attribute the spend to
+    // another provider's budget, so it is refused rather than trusted.
+    if (provider !== providerOfModel(model)) {
+      return { ok: false, reason: 'invalid-row' };
+    }
     if (!isValidMonth(month) || !isCanonicalIso(recordedAtIso) || monthKeyOf(recordedAtIso) !== month) {
       return { ok: false, reason: 'invalid-row' };
     }
@@ -221,6 +231,14 @@ export function readSpendLedgerRow(value: unknown): SpendLedgerRowResult {
   }
 }
 
+/** A nested optional record: `null` when absent, its plain-data snapshot, or `'hostile'`. */
+function optionalSnapshot(value: unknown): Record<string, unknown> | null | 'hostile' {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return snapshotPlainDataRecord(value) ?? 'hostile';
+}
+
 /**
  * The spend row for a collected attempt: built from the same attempt facts
  * `buildLaneUsageLogRow` reads — the attempt and work-order ids, the run id,
@@ -240,8 +258,10 @@ export function buildSpendLedgerRow(input: {
     if (typeof input !== 'object' || input === null || !isCanonicalIso(input.nowIso)) {
       return null;
     }
-    const attempt = input.attempt;
-    if (typeof attempt !== 'object' || attempt === null) {
+    // Every record read here goes through `snapshotPlainDataRecord`: a getter, a Proxy that
+    // throws or a non-plain object is refused without running an accessor.
+    const attempt = snapshotPlainDataRecord(input.attempt);
+    if (attempt === null) {
       return null;
     }
     const { id, workOrderId } = attempt;
@@ -252,27 +272,27 @@ export function buildSpendLedgerRow(input: {
     if (runIdField !== null && !isIdentifier(runIdField)) {
       return null;
     }
-    const seatSelection = (
-      attempt as { seatSelection?: { seatId?: unknown; role?: unknown; tool?: unknown } | null }
-    ).seatSelection ?? null;
-    const seatSelectionRecord =
-      seatSelection !== null && typeof seatSelection === 'object' && !Array.isArray(seatSelection)
-        ? (seatSelection as { seatId?: unknown; role?: unknown; tool?: unknown })
-        : null;
+    const seatSelectionRecord = optionalSnapshot(attempt.seatSelection);
+    if (seatSelectionRecord === 'hostile') {
+      return null;
+    }
     const seatId = isOptionalIdentifier(seatSelectionRecord?.seatId)
       ? (seatSelectionRecord?.seatId as string | null)
       : null;
     const seatRole = isEnum(seatSelectionRecord?.role, SEAT_PLAN_ROLES)
       ? (seatSelectionRecord?.role as SeatPlanRole)
       : null;
-    const runnerRecord = (attempt as { runner?: { kind?: unknown } | null }).runner;
+    const runnerRecord = optionalSnapshot(attempt.runner);
+    if (runnerRecord === 'hostile') {
+      return null;
+    }
     const runnerKind = isEnum(runnerRecord?.kind, ['opencode', 'agy'] as const)
       ? (runnerRecord?.kind as RunnerKind)
       : null;
     const billing = billingOf(runnerKind ?? seatSelectionRecord?.tool);
 
-    const usage = (attempt as { usage?: AttemptUsageRecord | null }).usage ?? null;
-    if (usage === null || typeof usage !== 'object' || Array.isArray(usage)) {
+    const usage = snapshotPlainDataRecord(attempt.usage) as Partial<AttemptUsageRecord> | null;
+    if (usage === null) {
       return null;
     }
     const model = isTelemetryModelId(usage.model) ? usage.model : null;
@@ -456,6 +476,47 @@ function finishSeatGroup(group: SpendGroup): SeatSpendEntry {
   };
 }
 
+/** Adds `from`'s total into `into` (overflow carries over). */
+function mergeAccumulator(into: SumAccumulator, from: SumAccumulator): void {
+  if (from.overflow) {
+    into.overflow = true;
+  }
+  if (from.seen) {
+    accumulate(into, from.value);
+  }
+}
+
+/**
+ * Folds the groups beyond `max` entries into a single `other` group, in place; returns whether
+ * anything was folded. The kept groups are the first `max - 1` by key order.
+ */
+function foldGroups(
+  groups: Map<string, SpendGroup>,
+  max: number,
+  otherProvider: string,
+  otherSeatId: string | null,
+): boolean {
+  if (groups.size <= max) {
+    return false;
+  }
+  const keys = [...groups.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const other = newSpendGroup(otherProvider, otherSeatId);
+  for (const key of keys.slice(max - 1)) {
+    const group = groups.get(key) as SpendGroup;
+    groups.delete(key);
+    other.rowCount += group.rowCount;
+    mergeAccumulator(other.tokensInput, group.tokensInput);
+    mergeAccumulator(other.tokensOutput, group.tokensOutput);
+    mergeAccumulator(other.tokensReasoning, group.tokensReasoning);
+    mergeAccumulator(other.tokensCacheRead, group.tokensCacheRead);
+    mergeAccumulator(other.tokensCacheWrite, group.tokensCacheWrite);
+    mergeAccumulator(other.spentUsd, group.spentUsd);
+    mergeAccumulator(other.planEstimateUsd, group.planEstimateUsd);
+  }
+  groups.set('\u0000other', other);
+  return true;
+}
+
 /**
  * Group one month's `SpendLedgerRow` values into per-provider and
  * per-`(provider, seatId)` totals. Pure: no wall clock, no randomness, no
@@ -479,8 +540,6 @@ export function summariseSpendMonth(rows: readonly unknown[], month: string): Sp
     }
     const providers = new Map<string, SpendGroup>();
     const seats = new Map<string, SpendGroup>();
-    let providersTruncated = false;
-    let seatsTruncated = false;
     let rowCount = 0;
     let unknownCostRows = 0;
     for (const item of dense.array) {
@@ -495,16 +554,8 @@ export function summariseSpendMonth(rows: readonly unknown[], month: string): Sp
       rowCount += 1;
       let group = providers.get(row.provider);
       if (group === undefined) {
-        if (providers.size >= SPEND_LEDGER_MAX_PROVIDERS) {
-          // Fold further providers into the explicit `"other"` bucket rather
-          // than growing the summary without bound.
-          providersTruncated = true;
-          group = providers.get('other') ?? newSpendGroup('other', null);
-          providers.set('other', group);
-        } else {
-          group = newSpendGroup(row.provider, null);
-          providers.set(row.provider, group);
-        }
+        group = newSpendGroup(row.provider, null);
+        providers.set(row.provider, group);
       }
       group.rowCount += 1;
       accumulate(group.tokensInput, row.tokensInput);
@@ -525,14 +576,8 @@ export function summariseSpendMonth(rows: readonly unknown[], month: string): Sp
         const seatKey = `${row.provider}\u0000${row.seatId}`;
         let seatGroup = seats.get(seatKey);
         if (seatGroup === undefined) {
-          if (seats.size >= SPEND_LEDGER_MAX_SEATS) {
-            seatsTruncated = true;
-            seatGroup = seats.get('other') ?? newSpendGroup('other', 'other');
-            seats.set('other', seatGroup);
-          } else {
-            seatGroup = newSpendGroup(row.provider, row.seatId);
-            seats.set(seatKey, seatGroup);
-          }
+          seatGroup = newSpendGroup(row.provider, row.seatId);
+          seats.set(seatKey, seatGroup);
         }
         seatGroup.rowCount += 1;
         accumulate(seatGroup.tokensInput, row.tokensInput);
@@ -545,6 +590,11 @@ export function summariseSpendMonth(rows: readonly unknown[], month: string): Sp
         }
       }
     }
+    // Bound the summary: past the cap, the groups that sort last by name fold into one `"other"`
+    // bucket, which itself counts toward the cap (so at most MAX entries, never MAX + 1). Folding
+    // after the pass, in name order, keeps the result independent of row order.
+    const providersTruncated = foldGroups(providers, SPEND_LEDGER_MAX_PROVIDERS, 'other', null);
+    const seatsTruncated = foldGroups(seats, SPEND_LEDGER_MAX_SEATS, 'other', 'other');
     for (const group of [...providers.values(), ...seats.values()]) {
       if (
         group.tokensInput.overflow || group.tokensOutput.overflow ||
@@ -655,8 +705,26 @@ export function decideProviderBudget(input: {
     if (typeof summary !== 'object' || summary === null || !summary.ok) {
       return { allowed: false, reason: 'budget-unknown' };
     }
-    const entry = summary.summary.providers.find((candidate) => candidate.provider === budget.budget.provider);
-    const spent = entry === undefined || entry.spentUsd === null ? 0 : entry.spentUsd;
+    // The summary is re-checked, not trusted: a malformed entry (a non-array list, an entry that
+    // is not an object, a spend that is negative, non-finite or not a number) is `budget-unknown`.
+    const providers: unknown = summary.summary.providers;
+    if (!Array.isArray(providers) || !isValidMonth(summary.summary.month)) {
+      return { allowed: false, reason: 'budget-unknown' };
+    }
+    let spent = 0;
+    for (const candidate of providers as unknown[]) {
+      if (typeof candidate !== 'object' || candidate === null) {
+        return { allowed: false, reason: 'budget-unknown' };
+      }
+      const entry = candidate as { provider?: unknown; spentUsd?: unknown };
+      if (entry.provider !== budget.budget.provider) {
+        continue;
+      }
+      if (entry.spentUsd !== null && !isNonNegativeNumber(entry.spentUsd)) {
+        return { allowed: false, reason: 'budget-unknown' };
+      }
+      spent += entry.spentUsd === null ? 0 : entry.spentUsd;
+    }
     return spent >= budget.budget.monthlyUsd
       ? { allowed: false, reason: 'budget-exhausted' }
       : { allowed: true };

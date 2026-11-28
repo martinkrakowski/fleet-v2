@@ -11,6 +11,7 @@ import {
   SPEND_LEDGER_ROW_KEYS,
   summariseSpendMonth,
   type SpendLedgerRow,
+  type SpendMonthSummaryResult,
 } from '../spend-ledger.js';
 
 const NOW_ISO = '2026-11-25T09:00:00.000Z';
@@ -164,6 +165,30 @@ describe('buildSpendLedgerRow', () => {
     ).toBeNull();
   });
 
+  it('buildSpendLedgerRow refuses getter-backed attempt, seat selection, runner and usage without running a getter', () => {
+    let getterCalls = 0;
+    const spy = (): unknown => {
+      getterCalls += 1;
+      return undefined;
+    };
+    const withGetter = (target: Record<string, unknown>, key: string): Record<string, unknown> => {
+      Object.defineProperty(target, key, { enumerable: true, get: spy });
+      return target;
+    };
+    const base = attempt() as unknown as Record<string, unknown>;
+    expect(buildSpendLedgerRow({ attempt: withGetter({ ...base }, 'id') as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    expect(buildSpendLedgerRow({ attempt: withGetter({ ...base }, 'usage') as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    const seat = withGetter({ ...(base.seatSelection as Record<string, unknown>) }, 'seatId');
+    expect(buildSpendLedgerRow({ attempt: { ...base, seatSelection: seat } as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    const runner = withGetter({ kind: 'opencode' }, 'kind');
+    expect(buildSpendLedgerRow({ attempt: { ...base, runner } as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    const usage = withGetter({ ...(base.usage as Record<string, unknown>) }, 'costUsd');
+    expect(buildSpendLedgerRow({ attempt: { ...base, usage } as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    expect(getterCalls).toBe(0);
+    // The same attempt without a getter builds, so the refusals above are about the getters.
+    expect(buildSpendLedgerRow({ attempt: attempt(), nowIso: NOW_ISO })).not.toBeNull();
+  });
+
   it('buildSpendLedgerRow returns null on an invalid attempt or a non-canonical nowIso', () => {
     expect(buildSpendLedgerRow({ attempt: attempt({ id: 'bad id' }), nowIso: NOW_ISO })).toBeNull();
     expect(buildSpendLedgerRow({ attempt: attempt(), nowIso: '2026-11-25T09:00:00Z' })).toBeNull();
@@ -212,6 +237,14 @@ describe('readSpendLedgerRow', () => {
     }
     expect(readSpendLedgerRow(getterOnly).ok).toBe(false);
     expect(instrumented).toBe(0);
+  });
+
+  it('readSpendLedgerRow refuses a row whose provider is not the provider its model names', () => {
+    const good = row();
+    expect(good.provider).toBe('openrouter');
+    expect(readSpendLedgerRow({ ...good, provider: 'other-valid-id' }).ok).toBe(false);
+    expect(readSpendLedgerRow({ ...good, provider: 'unknown' }).ok).toBe(false);
+    expect(readSpendLedgerRow({ ...good, model: 'anthropic/claude' }).ok).toBe(false);
   });
 
   it('readSpendLedgerRow refuses a negative cost', () => {
@@ -300,11 +333,10 @@ describe('summariseSpendMonth', () => {
     expect(summary.summary.providers[0]?.spentUsd).toBeNull();
   });
 
-  it('summariseSpendMonth refuses non-arrays, sparse arrays, Proxies, and invalid rows', () => {
+  it('summariseSpendMonth refuses non-arrays, sparse arrays, throwing Proxies, and invalid rows', () => {
     expect(summariseSpendMonth(null as unknown as unknown[], '2026-11').ok).toBe(false);
     expect(summariseSpendMonth(undefined as unknown as unknown[], '2026-11').ok).toBe(false);
     expect(summariseSpendMonth({ length: 1 } as unknown as unknown[], '2026-11').ok).toBe(false);
-    expect(summariseSpendMonth(new Proxy([], {}) as unknown as unknown[], '2026-11').ok).toBe(true);
     const trapped = new Proxy([row()], {
       getOwnPropertyDescriptor() {
         throw new Error('trap');
@@ -316,6 +348,50 @@ describe('summariseSpendMonth', () => {
     expect(summariseSpendMonth(sparse, '2026-11')).toEqual({ ok: false, reason: 'invalid-rows-array' });
     expect(summariseSpendMonth([42], '2026-11')).toEqual({ ok: false, reason: 'invalid-row' });
     expect(summariseSpendMonth([{ ...row(), extra: 1 }], '2026-11')).toEqual({ ok: false, reason: 'invalid-row' });
+  });
+
+  it('summariseSpendMonth reads a transparent Proxy around a valid array exactly like the array itself', () => {
+    // The shared dense-array reader asks the target's own reflection and never consults a `get`
+    // trap, so a non-throwing Proxy is neither refused nor able to change the answer: the summary
+    // equals the one for the plain array. A Proxy whose reflection throws is refused (above).
+    const plain = [row({ attempt: { id: 'a1' }, costUsd: 0.25 })];
+    expect(summariseSpendMonth(new Proxy([...plain], {}) as unknown as unknown[], '2026-11'))
+      .toEqual(summariseSpendMonth(plain, '2026-11'));
+  });
+
+  it('summariseSpendMonth keeps at most 64 providers, folding the rest into other without losing spend', () => {
+    const names = Array.from({ length: 70 }, (_, index) => `prov${String(index).padStart(2, '0')}`);
+    const rows = names.map((name, index) =>
+      row({ attempt: { id: `a${index}`, usage: { model: `${name}/m`, costUsd: 1 } }, provider: name, model: `${name}/m`, costUsd: 1 }),
+    );
+    const summary = summariseSpendMonth(rows, '2026-11');
+    if (!summary.ok) throw new Error('expected a readable summary');
+    expect(summary.summary.providers).toHaveLength(64);
+    expect(summary.summary.providersTruncated).toBe(true);
+    const other = summary.summary.providers.find((entry) => entry.provider === 'other');
+    expect(other?.rowCount).toBe(7);
+    expect(other?.spentUsd).toBe(7);
+    expect(summary.summary.providers.reduce((sum, entry) => sum + (entry.spentUsd ?? 0), 0)).toBe(70);
+    const exactly64 = summariseSpendMonth(rows.slice(0, 64), '2026-11');
+    if (!exactly64.ok) throw new Error('expected a readable summary');
+    expect(exactly64.summary.providers).toHaveLength(64);
+    expect(exactly64.summary.providersTruncated).toBe(false);
+    expect(exactly64.summary.providers.some((entry) => entry.provider === 'other')).toBe(false);
+  });
+
+  it('summariseSpendMonth keeps at most 256 seats, folding the rest into other', () => {
+    const rows = Array.from({ length: 300 }, (_, index) =>
+      row({ attempt: { id: `a${index}`, seatSelection: { role: 'first-pass', seatIndex: 0, seatId: `seat${index}`, model: MODEL, tool: 'opencode', variant: null, agent: null } }, costUsd: 1 }),
+    );
+    const summary = summariseSpendMonth(rows, '2026-11');
+    if (!summary.ok) throw new Error('expected a readable summary');
+    expect(summary.summary.seats).toHaveLength(256);
+    expect(summary.summary.seatsTruncated).toBe(true);
+    expect(summary.summary.seats.reduce((sum, entry) => sum + (entry.spentUsd ?? 0), 0)).toBe(300);
+    const exactly256 = summariseSpendMonth(rows.slice(0, 256), '2026-11');
+    if (!exactly256.ok) throw new Error('expected a readable summary');
+    expect(exactly256.summary.seats).toHaveLength(256);
+    expect(exactly256.summary.seatsTruncated).toBe(false);
   });
 
   it('summariseSpendMonth refuses an invalid month', () => {
@@ -399,6 +475,37 @@ describe('decideProviderBudget', () => {
     expect(
       decideProviderBudget({ budget: 42, summary: summariseSpendMonth([], '2026-11') }),
     ).toEqual({ allowed: false, reason: 'budget-unknown' });
+  });
+
+  it('decideProviderBudget returns budget-unknown for a malformed summary that claims ok', () => {
+    const budget = { provider: 'openrouter', monthlyUsd: 1 };
+    const good = summariseSpendMonth([row({ attempt: { id: 'a1' }, costUsd: 0.25 })], '2026-11');
+    if (!good.ok) throw new Error('expected a readable summary');
+    const entry = good.summary.providers[0];
+    const forge = (providers: unknown, month: unknown = '2026-11'): SpendMonthSummaryResult =>
+      ({ ok: true, summary: { ...good.summary, month, providers } }) as unknown as SpendMonthSummaryResult;
+    const unknown = { allowed: false, reason: 'budget-unknown' };
+    expect(decideProviderBudget({ budget, summary: forge([{ ...entry, spentUsd: -5 }]) })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forge([{ ...entry, spentUsd: Number.NaN }]) })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forge([{ ...entry, spentUsd: '0.1' }]) })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forge('openrouter') })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forge([null]) })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forge([entry], 'not-a-month') })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: { ok: true } as unknown as SpendMonthSummaryResult })).toEqual(unknown);
+    // The unforged summary is allowed, so the refusals above are about the malformed shapes.
+    expect(decideProviderBudget({ budget, summary: good })).toEqual({ allowed: true });
+  });
+
+  it('decideProviderBudget adds every entry that names the provider, including a folded other bucket', () => {
+    const budget = { provider: 'other', monthlyUsd: 1 };
+    const good = summariseSpendMonth([row({ attempt: { id: 'a1' }, costUsd: 0.25 })], '2026-11');
+    if (!good.ok) throw new Error('expected a readable summary');
+    const base = good.summary.providers[0];
+    const forged = {
+      ok: true,
+      summary: { ...good.summary, providers: [{ ...base, provider: 'other', spentUsd: 0.6 }, { ...base, provider: 'other', spentUsd: 0.5 }] },
+    } as unknown as SpendMonthSummaryResult;
+    expect(decideProviderBudget({ budget, summary: forged })).toEqual({ allowed: false, reason: 'budget-exhausted' });
   });
 
   it('decideProviderBudget allows a provider with no rows in the month', () => {

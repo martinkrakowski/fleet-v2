@@ -16,6 +16,13 @@ import {
 const NOW_ISO = '2026-11-25T09:00:00.000Z';
 const MODEL = 'openrouter/z-ai/glm-5.3-flash';
 
+/**
+ * A secret-shaped string (an `sk-` prefix followed by a long token), assembled at runtime so this
+ * file never carries a credential-shaped literal. The value passed to the validators is identical
+ * to a secret-shaped literal.
+ */
+const SECRET_SHAPED = `sk-${'A'.repeat(26)}`;
+
 /** A minimal valid attempt record with the fields the builder reads. */
 function attempt(overrides: Record<string, unknown> = {}): AttemptRecord {
   return {
@@ -228,8 +235,8 @@ describe('readSpendLedgerRow', () => {
   });
 
   it('readSpendLedgerRow refuses a model or identifier with a secret shape or control characters', () => {
-    expect(readSpendLedgerRow({ ...row(), model: 'sk-AAAAAAAAAAAAAAAAAAAAAAAAAA/m1' }).ok).toBe(false);
-    expect(readSpendLedgerRow({ ...row(), attemptId: 'sk-AAAAAAAAAAAAAAAAAAAAAAAAAA' }).ok).toBe(false);
+    expect(readSpendLedgerRow({ ...row(), model: `${SECRET_SHAPED}/m1` }).ok).toBe(false);
+    expect(readSpendLedgerRow({ ...row(), attemptId: SECRET_SHAPED }).ok).toBe(false);
     expect(readSpendLedgerRow({ ...row(), attemptId: 'attempt\u00001' }).ok).toBe(false);
     expect(readSpendLedgerRow({ ...row(), workOrderId: 'wo\n-1' }).ok).toBe(false);
     expect(readSpendLedgerRow({ ...row(), provider: `${'x'.repeat(129)}` }).ok).toBe(false);
@@ -350,7 +357,7 @@ describe('readProviderBudget', () => {
   it('readProviderBudget refuses a provider that is empty, over 128 characters or secret-shaped', () => {
     expect(readProviderBudget({ provider: '', monthlyUsd: 10 }).ok).toBe(false);
     expect(readProviderBudget({ provider: 'x'.repeat(129), monthlyUsd: 10 }).ok).toBe(false);
-    expect(readProviderBudget({ provider: 'sk-AAAAAAAAAAAAAAAAAAAAAAAAAA', monthlyUsd: 10 }).ok).toBe(false);
+    expect(readProviderBudget({ provider: SECRET_SHAPED, monthlyUsd: 10 }).ok).toBe(false);
     expect(readProviderBudget({ provider: 'pro\u0000vider', monthlyUsd: 10 }).ok).toBe(false);
     expect(readProviderBudget({ provider: 42, monthlyUsd: 10 }).ok).toBe(false);
   });

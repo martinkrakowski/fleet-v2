@@ -902,7 +902,11 @@ describe('uncertain outcomes (UN1)', () => {
     const bogusKey = `${RUN_ID}/r1/frobnicate/0`;
     const read = readLaneRunJournalEntry(result(bogusKey, 'uncertain'));
     expect(read.ok).toBe(false);
-    expect(prepareLaneRunJournalAppend([intent(bogusKey)], result(bogusKey, 'uncertain')).ok).toBe(false);
+    expect(prepareLaneRunJournalAppend([intent(bogusKey)], result(bogusKey, 'uncertain'))).toEqual({
+      ok: false,
+      reason: 'invalid-entry',
+      detail: expect.any(String),
+    });
   });
 
   it('an uncertain result followed by a reconciled result is accepted and a result after the final one is refused', () => {

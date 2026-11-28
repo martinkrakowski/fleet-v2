@@ -51,7 +51,7 @@ describe('the injected Proxy detector is required and consulted', () => {
         seen.push(value);
         return true;
       };
-      await expect(isTrainStepBlocked({ [key]: deps[key] }, true, flag)).resolves.toBe(true);
+      await expect(isTrainStepBlocked({ [key]: deps[key] }, false, flag)).resolves.toBe(true);
       expect(seen[0]).toBe(deps[key]);
     }
   });

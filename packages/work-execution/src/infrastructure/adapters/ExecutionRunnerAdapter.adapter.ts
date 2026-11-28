@@ -409,8 +409,9 @@ const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
  * Session ids the runner's `--status` output actually lists: only lines
  * after the `ocm-run: running in <dir>:` header count, and each must be a
  * bare session id. A `ses_…` inside the directory path never counts. The
- * scan is cost-bounded: at most `MAX_STATUS_LINES` lines after the header
- * are scanned and at most `MAX_LISTED_SESSIONS` ids are collected.
+ * scan is `scanStatusText`, which walks the output by index and is
+ * cost-bounded: at most `MAX_STATUS_LINES` lines are examined in total and at
+ * most `MAX_LISTED_SESSIONS` ids are collected.
  */
 const MAX_STATUS_LINES = 1024;
 const MAX_LISTED_SESSIONS = 1024;
@@ -419,17 +420,7 @@ const MAX_LISTED_SESSIONS = 1024;
 const SESSION_ID_MAX_LENGTH = 128;
 
 function statusSessionIds(stdout: string): string[] {
-  const lines = stdout.split('\n');
-  const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
-  if (headerIndex === -1) return [];
-  const ids = new Set<string>();
-  const afterHeader = lines.slice(headerIndex + 1, headerIndex + 1 + MAX_STATUS_LINES);
-  for (const rawLine of afterHeader) {
-    if (ids.size >= MAX_LISTED_SESSIONS) break;
-    const line = rawLine.trim();
-    if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) ids.add(line);
-  }
-  return [...ids];
+  return scanStatusText(stdout).ids;
 }
 
 /**
@@ -449,10 +440,11 @@ function scanStatusText(stdout: string): { header: boolean; ids: string[]; trunc
     scanned += 1;
     const newline = stdout.indexOf('\n', position);
     const end = newline === -1 ? stdout.length : newline;
-    const line = stdout.slice(position, end).trim();
+    const rawLine = stdout.slice(position, end);
+    const line = rawLine.trim();
     position = end + 1;
     if (!header) {
-      if (STATUS_HEADER_PATTERN.test(line)) header = true;
+      if (STATUS_HEADER_PATTERN.test(rawLine)) header = true;
       continue;
     }
     if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) {

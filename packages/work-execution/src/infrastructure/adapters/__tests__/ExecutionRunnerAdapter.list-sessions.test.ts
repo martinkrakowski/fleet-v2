@@ -249,6 +249,14 @@ describe('ExecutionRunnerAdapter listSessions status text scan bound', () => {
     );
   });
 
+  it('exit 3 text output of a million header-less lines refuses at the scan bound instead of scanning it all', async () => {
+    const stdout = '\n'.repeat(1_000_000);
+    const { runner } = scriptedRunner([{ exitCode: 3, stdout, stderr: '' }]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exceeds the scan bound'),
+    );
+  });
+
   it('exit 0 text output exactly at the line bound with no session ids is still an idle listing', async () => {
     const stdout = `${header}${'\n'.repeat(1022)}`;
     const { runner } = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);

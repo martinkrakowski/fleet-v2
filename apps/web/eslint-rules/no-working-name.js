@@ -193,9 +193,8 @@ export function loadForbiddenNames(options, snapshot = snapshotPlainData) {
     if (parsed === null || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean' || !parsed.ok) {
       return [];
     }
-    const env = parsed.value.env === undefined
-      ? process.env.FLEET_WEB_FORBIDDEN_NAMES
-      : parsed.value.env;
+    // `env` is validated to be a string when present, so `??` only substitutes for an absent option.
+    const env = parsed.value.env ?? process.env.FLEET_WEB_FORBIDDEN_NAMES;
     if (typeof env === 'string') {
       // The same bound as an oversized file: refuse rather than parse.
       return Buffer.byteLength(env, 'utf8') > MAX_FILE_BYTES ? [] : parseNames(env, ',');

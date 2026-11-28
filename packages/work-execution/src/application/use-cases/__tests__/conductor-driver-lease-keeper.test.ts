@@ -21,6 +21,7 @@ import type {
   LeaseRenewRequest,
 } from '../../../domain/lane-run-lease.js';
 import type { ConductorDriverLeaseResult } from '../../ports/out/ConductorDriverLeasePort.out-port.js';
+import type { FenceRefusal } from '../../../domain/fence-token.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
@@ -112,6 +113,11 @@ class AutoDriverLeasePort implements ConductorDriverLeasePort {
     this.trace.push('check');
     return Promise.resolve(null);
   }
+
+  verifyFence(): Promise<FenceRefusal | null> {
+    this.trace.push('verifyFence');
+    return Promise.resolve(null);
+  }
 }
 
 /** A deferred fake: each acquire/renew blocks until `resolveNext`. */
@@ -146,6 +152,11 @@ class BlockingDriverLeasePort implements ConductorDriverLeasePort {
 
   check(_request: LeaseHoldRequest): Promise<LeaseRefusal | null> {
     this.events.push('check');
+    return Promise.resolve(null);
+  }
+
+  verifyFence(): Promise<FenceRefusal | null> {
+    this.events.push('verifyFence');
     return Promise.resolve(null);
   }
 

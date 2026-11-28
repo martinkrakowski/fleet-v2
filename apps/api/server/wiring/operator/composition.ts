@@ -51,6 +51,7 @@ import {
   ReadProjectAttentionUseCase,
   ReconcileOrchestratorRequestUseCase,
   RecordAuthorizationConsumptionUseCase,
+  RecordOwnerItemUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterOrchestratorSessionUseCase,
@@ -78,6 +79,7 @@ export interface OperatorComposition {
   resolveOwnerItem: ResolveOwnerItemUseCase;
   checkOwnerDecision: CheckOwnerDecisionUseCase;
   recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
+  recordOwnerItem: RecordOwnerItemUseCase;
   readProjectAttention: ReadProjectAttentionUseCase;
   inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;
   sendFleetRelay: SendFleetRelayUseCase;
@@ -133,6 +135,7 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     resolveOwnerItem: new ResolveOwnerItemUseCase(),
     checkOwnerDecision: new CheckOwnerDecisionUseCase(),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase(),
+    recordOwnerItem: new RecordOwnerItemUseCase(),
     readProjectAttention: new ReadProjectAttentionUseCase(),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase(),
     sendFleetRelay: new SendFleetRelayUseCase(),
@@ -313,6 +316,11 @@ export function createConfiguredOperatorComposition(
       decisionTransport,
     }),
     readProjectAttention: new ReadProjectAttentionUseCase({ attentionPort }),
+    recordOwnerItem: new RecordOwnerItemUseCase({
+      itemRepo: ownerItemRepo,
+      clock: systemClock,
+      ids: { newItemId: () => newUlid() },
+    }),
     inspectOutstandingCoordination: new InspectOutstandingCoordinationUseCase({
       requestRepo,
       publicationPort,

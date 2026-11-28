@@ -9,7 +9,7 @@
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { head12Of, parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_ONE_WAY_STEPS } from './lane-run-records.js';
-import { readBoundedDenseArray, readExactPlainRecord } from './plain-record-reads.js';
+import { readBoundedDenseArray, readExactPlainRecord, snapshotPlainDataRecord } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { divergenceDetailsOf, type ShadowDivergenceDetails, type ShadowDivergenceDiagnosticItem } from './shadow-day-merge-set.js';
 import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
@@ -177,7 +177,7 @@ type JournalKind = ShadowConformanceJournalEntry['kind'];
 /** A rule's verdict: conforming, a code, or an unjudgeable `unknown-<reason>`. */
 type RuleVerdict = ShadowNonconformanceCode | `unknown-${string}` | null;
 
-interface RuleContext {
+export interface RuleContext {
   readonly headMoves: readonly ShadowShellHeadMove[];
   readonly headMovesIncompleteFor: readonly number[];
   /** Built once so rule 1 stays linear in the capped head-move list. */
@@ -226,7 +226,7 @@ type Selection =
   | { readonly kind: 'ok'; readonly runs: readonly MergedRun[] };
 
 /** Deduped runs, or a conflict that must not be judged. */
-type DedupedRuns =
+export type DedupedRuns =
   | { readonly kind: 'unknown'; readonly reason: 'duplicate-run-conflict' }
   | { readonly kind: 'ok'; readonly runs: readonly ShadowConformanceRun[] };
 
@@ -424,7 +424,7 @@ function selectMergedRuns(parsed: ParsedInput): Selection {
  * pair's `reviewReceipts` and `journal`, each capped by
  * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`.
  */
-function dedupeRunsByRunId(runs: readonly ShadowConformanceRun[]): DedupedRuns {
+export function dedupeRunsByRunId(runs: readonly ShadowConformanceRun[]): DedupedRuns {
   const byRunId = new Map<string, ShadowConformanceRun>();
   for (const run of runs) {
     const existing = byRunId.get(run.runId);
@@ -1085,7 +1085,7 @@ function readTier(value: unknown): 1 | 2 | null {
   return null;
 }
 
-function readPullRequest(value: unknown): number | null {
+export function readPullRequest(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return null;
   return value;
 }
@@ -1192,4 +1192,227 @@ function emptyByCode(): Record<ShadowNonconformanceCode, number> {
     'stray-one-way-action': 0,
   };
   return byCode;
+}
+
+// SR3 cut-over support: pre-grouped per-run S6 evaluation, a detailed
+// run-record reader and the day-break tally. These reuse the rules, the
+// grouping and the readers above verbatim; none of the existing S1, S4 or
+// S6 verdict logic changes.
+
+/**
+ * The rule context a single run's S6 evaluation reads, with `headMoves`
+ * grouped by pull request exactly once (O(M), M <=
+ * `SHADOW_CONFORMANCE_MAX_SHELL_FACTS`) so per-run evaluation never rescans
+ * the whole list.
+ */
+export interface ShadowRunConformanceContext {
+  readonly ruleContext: RuleContext;
+}
+
+/**
+ * Builds the per-run S6 context for one day: validates `day` with the same
+ * reader the day evaluator uses, then groups `headMoves` ONCE and builds the
+ * incomplete set once. Null when `day` is not a real UTC calendar day.
+ * Cost: O(M + I) over the capped `headMoves` and `headMovesIncompleteFor`.
+ */
+export function createShadowRunConformanceContext(
+  day: string,
+  headMoves: readonly ShadowShellHeadMove[],
+  headMovesIncompleteFor: readonly number[],
+): ShadowRunConformanceContext | null {
+  if (readDay(day) === null) return null;
+  const ruleContext: RuleContext = {
+    headMoves,
+    headMovesIncompleteFor,
+    headMovesByPullRequest: groupHeadMoves(headMoves),
+    incompletePullRequests: new Set(headMovesIncompleteFor),
+    ...windowBounds(day),
+  };
+  return { ruleContext };
+}
+
+/** One run's S6 verdict against one merge, without any aggregate floor. */
+export type ShadowRunS6Verdict =
+  | { readonly kind: 'conforming' }
+  | { readonly kind: 'nonconforming'; readonly code: ShadowNonconformanceCode }
+  | { readonly kind: 'unknown'; readonly reason: string };
+
+/**
+ * Evaluates one run against one merge under the pre-grouped context: the
+ * same rules 1-6 as the day evaluator, in the same order, with NO aggregate
+ * minimum-run floor — a single run is judged on its own rules only. Cost:
+ * the rules' own bounded cost, linear in one capped list per rule.
+ */
+export function evaluateRunS6WithContext(
+  run: ShadowConformanceRun,
+  merge: ShadowShellMerge,
+  context: ShadowRunConformanceContext,
+): ShadowRunS6Verdict {
+  const verdict = firstVerdict(run, merge, context.ruleContext);
+  if (verdict === null) return { kind: 'conforming' };
+  if (isUnknownVerdict(verdict)) return { kind: 'unknown', reason: unknownReasonOf(verdict) };
+  return { kind: 'nonconforming', code: verdict };
+}
+
+/** One shell-recorded head move, or null when out of shape. Thin typed wrapper over the module reader. */
+export function readShadowHeadMove(raw: unknown): ShadowShellHeadMove | null {
+  return readHeadMove(raw);
+}
+
+/**
+ * One conducted run read with the failure reason kept: the read distinguishes
+ * an absent or unknown `tier`, an unreadable `journal` and missing or
+ * malformed `reviewReceipts` from every other structural fault.
+ */
+export type ShadowRunReadResult =
+  | { readonly ok: true; readonly run: ShadowConformanceRun }
+  | { readonly ok: false; readonly reason: 'invalid-tier' | 'unreadable-journal' | 'missing-review-receipts' | 'invalid-input' };
+
+/** True when the snapshot carried an own enumerable `constructor` or `prototype` key. Cost: constant. */
+function hasPollutingOwnKey(record: Record<string, unknown>): boolean {
+  return Object.hasOwn(record, 'constructor') || Object.hasOwn(record, 'prototype');
+}
+
+/** True when the snapshot's own keys are exactly `keys`, each once. Cost: O(K) in the snapshot's own key count. */
+function hasExactOwnKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Object.keys(record);
+  if (own.length !== keys.length) return false;
+  for (const key of own) {
+    if (!keys.includes(key)) return false;
+  }
+  return true;
+}
+
+/**
+ * Reads one conducted run from untrusted data through
+ * `snapshotPlainDataRecord` (which already refuses `__proto__`; `constructor`
+ * and `prototype` own keys are refused here), so no getter ever runs and a
+ * revoked or throwing Proxy becomes a typed refusal. The first structural
+ * fault decides the reason, in this order: `tier` absent or unknown ->
+ * `invalid-tier`; `reviewReceipts` absent or unreadable ->
+ * `missing-review-receipts`; `journal` absent or unreadable ->
+ * `unreadable-journal`; any other missing, extra or malformed key ->
+ * `invalid-input`. Cost: linear in the capped run record.
+ */
+export function readShadowConformanceRunDetailed(raw: unknown): ShadowRunReadResult {
+  try {
+    const record = snapshotPlainDataRecord(raw);
+    if (record === null || hasPollutingOwnKey(record)) return { ok: false, reason: 'invalid-input' };
+    for (const key of Object.keys(record)) {
+      if (!RUN_KEYS.includes(key)) return { ok: false, reason: 'invalid-input' };
+    }
+    for (const required of RUN_KEYS) {
+      if (Object.hasOwn(record, required)) continue;
+      if (required === 'tier') return { ok: false, reason: 'invalid-tier' };
+      if (required === 'reviewReceipts') return { ok: false, reason: 'missing-review-receipts' };
+      if (required === 'journal') return { ok: false, reason: 'unreadable-journal' };
+      return { ok: false, reason: 'invalid-input' };
+    }
+    const tier = readTier(record.tier);
+    if (tier === null) return { ok: false, reason: 'invalid-tier' };
+    const reviewReceipts = readCapped(record.reviewReceipts, SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN, readReceipt);
+    if (reviewReceipts === null) return { ok: false, reason: 'missing-review-receipts' };
+    const journal = readCapped(record.journal, SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN, readJournalEntry);
+    if (journal === null) return { ok: false, reason: 'unreadable-journal' };
+    const runId = readRunId(record.runId);
+    const pullRequest = readPullRequest(record.pullRequest);
+    const headOid = readHeadOid(record.headOid);
+    if (runId === null || pullRequest === null || headOid === null) return { ok: false, reason: 'invalid-input' };
+    return { ok: true, run: { runId, tier, pullRequest, headOid, reviewReceipts, journal } };
+  } catch {
+    // A revoked Proxy, or a reflection trap that throws, must become a typed refusal.
+    return { ok: false, reason: 'invalid-input' };
+  }
+}
+
+/** The per-criterion break counts of one shadow day, or a typed refusal. */
+export type BreaksForDayResult =
+  | {
+      readonly ok: true;
+      readonly s1Divergences: number;
+      readonly s6Nonconforming: number;
+      readonly s4FalsePasses: number;
+      readonly total: number;
+    }
+  | { readonly ok: false; readonly reason: 'invalid-input' | 's1-unknown' | 's6-unknown' | 's4-unknown' | 's4-truncated' };
+
+const BREAKS_INPUT_KEYS: readonly string[] = ['s1', 's6', 's4'];
+
+/** A non-negative safe integer. Cost: constant. */
+function isNonNegativeCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** One criterion part of a `breaksForDay` snapshot: its status and its count field. */
+interface BreaksPartRead {
+  readonly status: 'pass' | 'fail';
+  readonly count: number;
+}
+
+type BreaksRefusal = Extract<BreaksForDayResult, { readonly ok: false }>;
+
+/**
+ * One criterion part: `status` `'pass'`/`'fail'`, `'unknown'` mapped to the
+ * part's own unknown refusal, anything else invalid; the count field a
+ * non-negative safe integer. Cost: constant.
+ */
+function readBreaksPart(
+  part: Record<string, unknown>,
+  unknownReason: 's1-unknown' | 's6-unknown' | 's4-unknown',
+  countKey: string,
+): BreaksPartRead | BreaksRefusal {
+  if (part.status === 'unknown') return { ok: false, reason: unknownReason };
+  if (part.status !== 'pass' && part.status !== 'fail') return { ok: false, reason: 'invalid-input' };
+  if (!isNonNegativeCount(part[countKey])) return { ok: false, reason: 'invalid-input' };
+  return { status: part.status, count: part[countKey] };
+}
+
+/**
+ * Sums the day's S1 divergences, S6 nonconforming runs and S4 false passes
+ * from three already-evaluated criterion results. The input is read through
+ * `snapshotPlainDataRecord` (which already refuses `__proto__`; `constructor`
+ * and `prototype` own keys are refused here), so no getter ever runs and a
+ * revoked or throwing Proxy becomes a typed refusal. Each part must carry
+ * `status` `'pass'` or `'fail'` (an `'unknown'` status is its own typed
+ * refusal) and a non-negative safe-integer count; S4's `truncated` must be a
+ * boolean and `true` is refused as `s4-truncated`. Cost: constant — the
+ * three parts are read field by field, nothing scales with any list.
+ */
+export function breaksForDay(input: unknown): BreaksForDayResult {
+  try {
+    return judgeBreaksForDay(input);
+  } catch {
+    // A revoked Proxy, or a reflection trap that throws, must become a typed refusal.
+    return { ok: false, reason: 'invalid-input' };
+  }
+}
+
+function judgeBreaksForDay(input: unknown): BreaksForDayResult {
+  const snapshot = snapshotPlainDataRecord(input);
+  if (snapshot === null || hasPollutingOwnKey(snapshot) || !hasExactOwnKeys(snapshot, BREAKS_INPUT_KEYS)) {
+    return { ok: false, reason: 'invalid-input' };
+  }
+  const s1 = snapshotPlainDataRecord(snapshot.s1);
+  const s6 = snapshotPlainDataRecord(snapshot.s6);
+  const s4 = snapshotPlainDataRecord(snapshot.s4);
+  if (s1 === null || s6 === null || s4 === null || hasPollutingOwnKey(s1) || hasPollutingOwnKey(s6) || hasPollutingOwnKey(s4)) {
+    return { ok: false, reason: 'invalid-input' };
+  }
+  const s1Read = readBreaksPart(s1, 's1-unknown', 'divergences');
+  if ('ok' in s1Read) return s1Read;
+  const s6Read = readBreaksPart(s6, 's6-unknown', 'nonconformingOnDay');
+  if ('ok' in s6Read) return s6Read;
+  if (typeof s4.truncated !== 'boolean') return { ok: false, reason: 'invalid-input' };
+  if (s4.truncated) return { ok: false, reason: 's4-truncated' };
+  const s4Read = readBreaksPart(s4, 's4-unknown', 'falsePasses');
+  if ('ok' in s4Read) return s4Read;
+  const total = s1Read.count + s6Read.count + s4Read.count;
+  if (!Number.isSafeInteger(total)) return { ok: false, reason: 'invalid-input' };
+  return Object.freeze({
+    ok: true,
+    s1Divergences: s1Read.count,
+    s6Nonconforming: s6Read.count,
+    s4FalsePasses: s4Read.count,
+    total,
+  });
 }

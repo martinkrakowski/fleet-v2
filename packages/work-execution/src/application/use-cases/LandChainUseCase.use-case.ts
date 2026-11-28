@@ -29,6 +29,7 @@ import type { ChainRecord } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import { isRequiredPassHalted } from './chain-pass-halt.js';
+import type { IsProxy } from '@fleet/shared';
 import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
@@ -232,6 +233,8 @@ export interface LandChainDependencies {
   readonly computeDigest: (text: string) => string;
   /** The operator kill switch: re-read before applying (plan §3.7); never read on a dry run. */
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** The trusted Proxy detector (`types.isProxy`). Required: no neutral default. */
+  readonly isProxy: IsProxy;
 }
 
 /** The answer of one deadline-guarded outbound call: the deadline fail, the mapped throw fail, or the value. */
@@ -310,7 +313,7 @@ export class LandChainUseCase implements LandChainPort {
     if (command.dryRun) {
       return null;
     }
-    return (await isRequiredPassHalted(this.deps.halt)) ? refused('halted') : null;
+    return (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) ? refused('halted') : null;
   }
 
   /** The apply-phase `halted` refusal with a read-only progress report; never throws, never writes. */
@@ -815,7 +818,7 @@ export class LandChainUseCase implements LandChainPort {
 
     // The kill switch is re-read immediately before the premerge status: a
     // halt raised while the integration PR was opened still stops this post.
-    if (await isRequiredPassHalted(this.deps.halt)) {
+    if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
       return this.haltedInApply(command, key, facts.tip, pullRequestNumber, false);
     }
 
@@ -851,7 +854,7 @@ export class LandChainUseCase implements LandChainPort {
     // The halt is re-read immediately before this one-way action: a halt
     // raised after the earlier pre-apply check still refuses the open or
     // adopt, and an unreadable halt answer refuses it too.
-    if (await isRequiredPassHalted(this.deps.halt)) {
+    if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
       return { ok: false, fail: await this.haltedInApply(command, key, facts.tip, mode === 'adopt' ? open.value[0].number : null, false) };
     }
     const opened = await this.guarded(
@@ -917,7 +920,7 @@ export class LandChainUseCase implements LandChainPort {
     }
     // The intent append above takes a lock and does disk I/O: the halt is read again after it, with
     // nothing awaited between this read and the post. The intent stays; a resume finds it and posts.
-    const haltedAfterIntent = await isRequiredPassHalted(this.deps.halt);
+    const haltedAfterIntent = await isRequiredPassHalted(this.deps.halt, this.deps.isProxy);
     if (haltedAfterIntent) {
       return this.haltedInApply(command, key, facts.tip, pullRequestNumber, false);
     }
@@ -1008,7 +1011,7 @@ export class LandChainUseCase implements LandChainPort {
     }
     // The kill switch is re-read immediately before the enqueue: a halt raised
     // while the mark was recorded still stops this one-way queue write.
-    if (await isRequiredPassHalted(this.deps.halt)) {
+    if (await isRequiredPassHalted(this.deps.halt, this.deps.isProxy)) {
       return this.haltedInApply(command, key, facts.tip, pullRequestNumber, true);
     }
     const enqueued = await this.guarded(

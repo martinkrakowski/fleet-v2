@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // EV1b: `premergePosterLogin` flows from the resolved installation merge policy through
 // `MergePolicyAdapter` and `toDaemonRepositoryRefs` into `RunMergePassUseCase`.
 import { describe, expect, it } from 'vitest';
@@ -121,6 +122,7 @@ describe('MergePolicyAdapter + toDaemonRepositoryRefs forward premergePosterLogi
 /** Minimal daemon-tick ports: a clear clock, an empty queue and one completed merge pass. */
 function tickDeps(): RunDaemonTickDependencies {
   return {
+    isProxy: types.isProxy,
     pause: { read: async () => ({ state: 'clear', record: null }) },
     halt: { read: async () => ({ state: 'clear', record: null }) },
     status: {
@@ -287,7 +289,7 @@ async function runEndToEndPass(
   const [ref] = toDaemonRepositoryRefs(answer);
   const entry = makeEntry(ref.repoDigest);
   const journal = new LaneRunJournalAdapter();
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: {
       async listMergeEntries() {
         return [entry];

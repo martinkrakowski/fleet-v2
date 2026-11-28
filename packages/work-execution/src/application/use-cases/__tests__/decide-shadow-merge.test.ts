@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // S1U1: DecideShadowMergeUseCase journals, for ONE (pullRequest, headOid)
 // pair, the shadow merge decision RunMergePassUseCase would reach: keyed
 // dry-run intents and results on the merge-pr key, no queue writes, no CLI.
@@ -218,7 +219,7 @@ function makeHarness(input: {
     listForKey: (key: string) => journal.listForKey(key),
     listForKeyPrefix: (keyPrefix: string) => journal.listForKeyPrefix(keyPrefix),
   };
-  const useCase = new DecideShadowMergeUseCase({
+  const useCase = new DecideShadowMergeUseCase({ isProxy: types.isProxy,
     forgeRead: forge,
     verification: verificationFake,
     journal: wrapped,

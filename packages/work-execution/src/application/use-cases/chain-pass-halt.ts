@@ -1,27 +1,99 @@
+import { snapshotPlainData } from '@fleet/shared';
+import type { IsProxy } from '@fleet/shared';
 import { readConductorHaltRecord } from '../../domain/conductor-halt.js';
+import { readDataProperty, readExactPlainRecord } from '../../domain/plain-record-reads.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import type { KillallHaltMarkerPort } from '../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
+
+interface SnapshotLimits {
+  readonly maxDepth: number;
+  readonly maxKeys: number;
+  readonly maxArrayLength: number;
+  readonly maxNodes: number;
+  readonly maxStringLength: number;
+}
+
+/** The snapshot bounds of one killall/conductor port answer (KA3-1): a small
+ * plain record, never an array, never a long string. */
+export const KILLALL_READ_SNAPSHOT_LIMITS: SnapshotLimits = Object.freeze({
+  maxDepth: 4,
+  maxKeys: 8,
+  maxArrayLength: 0,
+  maxNodes: 32,
+  maxStringLength: 128,
+});
+
+/**
+ * One bounded, getter-free snapshot of a port answer. `snapshotPlainData`
+ * runs the injected `isProxy` detector before any reflection and refuses
+ * every accessor, symbol key, array, non-plain prototype and over-bound node
+ * without running a getter or a Proxy trap; `readExactPlainRecord` then
+ * demands exactly the expected keys. Cost: bounded by
+ * `KILLALL_READ_SNAPSHOT_LIMITS` plus one exact-key pass over the keys named
+ * here. A refusal is `null`, never a propagated error.
+ */
+function readExactPortSnapshot(
+  raw: unknown,
+  keys: readonly string[],
+  isProxy: IsProxy,
+): Record<string, unknown> | null {
+  const snap = snapshotPlainData(raw, isProxy, KILLALL_READ_SNAPSHOT_LIMITS);
+  if (!snap.ok) {
+    return null;
+  }
+  return readExactPlainRecord(snap.value, keys);
+}
+
+/**
+ * The result of reading a port's `read` method: `ok: true` carries the method
+ * (possibly `undefined` when the port has none); `ok: false` is a refused
+ * port (a Proxy or a throwing lookup), which every caller maps to its
+ * fail-closed verdict.
+ */
+type PortMethodRead =
+  | { readonly ok: true; readonly value: unknown; readonly found: boolean }
+  | { readonly ok: false };
+
+/**
+ * One read of a port's `read` method, through the domain's data-property
+ * reader: the port and every object on its prototype chain are shown to the
+ * injected `isProxy` detector before any reflection, an accessor `read` is
+ * refused without being invoked, and a throwing lookup is a refusal. A port
+ * with no `read` anywhere reads `ok: true, value: undefined`. Cost: bounded by
+ * `readDataProperty` (one detector call and descriptor read per chain link).
+ */
+function readPortMethod(port: object, isProxy: IsProxy): PortMethodRead {
+  return readDataProperty(port, 'read', isProxy);
+}
 
 /**
  * The fail-closed halt read shared by the chain passes (plan §3.7): an absent
- * dependency is not halted; a provided port without `read`, a throw, and any
- * answer that is not an object with `state: 'clear'` — or whose record does
- * not agree with that tag — read as halted.
+ * or null dependency is not halted (and never throws on `null`); a provided
+ * port without `read`, a throw, and any answer that is not a plain record
+ * with exactly `state: 'clear'` and `record: null` — or whose record does not
+ * agree with that tag — read as halted.
  */
-export async function isChainPassHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
-  if (halt === undefined) {
-    // An absent dependency keeps today's behaviour: not halted.
+export async function isChainPassHalted(
+  halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
+  isProxy: IsProxy,
+): Promise<boolean> {
+  if (halt === undefined || halt === null) {
+    // An absent dependency keeps today's behaviour: not halted, never thrown on.
     return false;
   }
-  if (typeof halt.read !== 'function') {
+  // The port object itself is untrusted: a Proxy is refused by the detector
+  // before any trap runs; a refused read fails closed.
+  const method = readPortMethod(halt, isProxy);
+  if (!method.ok || typeof method.value !== 'function') {
     return true;
   }
   try {
-    const state = await halt.read();
-    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
-      return true;
-    }
-    const tag = (state as { readonly state?: unknown }).state;
-    if (tag !== 'clear') {
+    // `read` is a prototype method: call it against the port so `this` is the
+    // adapter, never an undefined receiver.
+    const state = await (method.value as (this: object) => unknown).call(halt);
+    const exact = readExactPortSnapshot(state, ['state', 'record'], isProxy);
+    if (exact === null || exact.state !== 'clear') {
       return true;
     }
     // `clear` is believed only when its record agrees: absent (null), or a
@@ -29,14 +101,10 @@ export async function isChainPassHalted(halt?: Pick<ConductorHaltPort, 'read'>):
     // version, `halted` and a zoned `changedAtIso` must all be present and
     // valid. Anything else — a getter, a missing or invalid field, `halted:
     // true` — fails closed.
-    const record = (state as { readonly record?: unknown }).record;
-    if (record === null) {
+    if (exact.record === null) {
       return false;
     }
-    if (typeof record !== 'object' || Array.isArray(record)) {
-      return true;
-    }
-    const read = readConductorHaltRecord(record);
+    const read = readConductorHaltRecord(exact.record);
     return !(read.ok && read.record.halted === false);
   } catch {
     return true;
@@ -51,13 +119,112 @@ export async function isChainPassHalted(halt?: Pick<ConductorHaltPort, 'read'>):
  */
 export async function isRequiredPassHalted(
   halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
+  isProxy: IsProxy,
 ): Promise<boolean> {
   if (halt === undefined || halt === null) {
     return true;
   }
   try {
-    return await isChainPassHalted(halt);
+    return await isChainPassHalted(halt, isProxy);
   } catch {
     return true;
   }
+}
+
+/**
+ * The killall halt marker read (KA3-1, fail closed): an absent dependency and
+ * an absent `read` method are the NOT-halted cases (they keep today's
+ * behaviour); an explicit `null` port, a non-callable `read`, a throw, and
+ * every answer that is not exactly `{ state: 'clear' }` read as halted.
+ * Cost: O(1) shape checks plus one bounded `readExactPortSnapshot` per call.
+ */
+export async function isKillallHalted(
+  killallHalt: Pick<KillallHaltMarkerPort, 'read'> | null | undefined,
+  isProxy: IsProxy,
+): Promise<boolean> {
+  if (killallHalt === undefined) {
+    return false;
+  }
+  if (killallHalt === null) {
+    return true;
+  }
+  // The port object itself is untrusted: a Proxy is refused by the detector
+  // before any reflection (a lying trap that hides `read` and reports a null
+  // prototype must never read as an absent method); an absent `read` (none
+  // anywhere on the prototype chain) keeps the not-halted behaviour; a
+  // refused walk, a non-callable value and a throw fail closed.
+  const method = readPortMethod(killallHalt, isProxy);
+  if (!method.ok) {
+    return true;
+  }
+  if (method.value === undefined) {
+    // Only a port with NO `read` anywhere keeps the not-halted behaviour; an
+    // explicit `read: undefined` is a present-but-invalid method and halts.
+    return method.found;
+  }
+  if (typeof method.value !== 'function') {
+    return true;
+  }
+  try {
+    const answer = await (method.value as (this: object) => unknown).call(killallHalt);
+    const exact = readExactPortSnapshot(answer, ['state'], isProxy);
+    return !(exact !== null && exact.state === 'clear');
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The killall train-pause read (KA3-1, fail closed): an absent dependency is
+ * not paused; a `null` port, a non-callable `read`, a throw, and every answer
+ * that is not exactly `{ status: 'clear' }` read as paused.
+ * Cost: O(1) shape checks plus one bounded `readExactPortSnapshot` per call.
+ */
+export async function isKillallTrainPaused(
+  killallTrainPause: Pick<KillallTrainPausePort, 'read'> | null | undefined,
+  isProxy: IsProxy,
+): Promise<boolean> {
+  if (killallTrainPause === undefined) {
+    return false;
+  }
+  if (killallTrainPause === null) {
+    return true;
+  }
+  // The port object itself is untrusted: mirror the halt read's detector;
+  // a refused read, an absent or non-callable `read` all fail closed.
+  const method = readPortMethod(killallTrainPause, isProxy);
+  if (!method.ok || typeof method.value !== 'function') {
+    return true;
+  }
+  try {
+    const answer = await (method.value as (this: object) => unknown).call(killallTrainPause);
+    const exact = readExactPortSnapshot(answer, ['status'], isProxy);
+    return !(exact !== null && exact.status === 'clear');
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The combined fail-closed train-step guard (KA3-1): the conductor halt (as
+ * the required pass reads it when `requireConductorHalt` is true, as the
+ * optional chain pass reads it when false), the killall halt marker and the
+ * killall train pause. Any halted or paused read blocks the step.
+ */
+export async function isTrainStepBlocked(
+  deps: {
+    readonly halt?: Pick<ConductorHaltPort, 'read'> | null;
+    readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+    readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
+  },
+  requireConductorHalt: boolean,
+  isProxy: IsProxy,
+): Promise<boolean> {
+  return (
+    (requireConductorHalt
+      ? await isRequiredPassHalted(deps.halt, isProxy)
+      : await isChainPassHalted(deps.halt, isProxy)) ||
+    (await isKillallHalted(deps.killallHalt, isProxy)) ||
+    (await isKillallTrainPaused(deps.killallTrainPause, isProxy))
+  );
 }

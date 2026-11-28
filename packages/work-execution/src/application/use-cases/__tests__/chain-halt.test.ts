@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // OG-15: the chain operations gate on the conductor halt, fail closed.
 import { describe, expect, it } from 'vitest';
 
@@ -209,7 +210,7 @@ describe('RefreshChainsUseCase halt gating', () => {
     const repo = repoFake({ list: records, read: { status: 'ok', record: records[0]! } });
     const forge = forgeFake({ onAction: options.onAction });
     const attention = attentionFake();
-    const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention, now: () => NOW, mode: options.mode ?? 'live', halt: options.halt ?? clearHalt });
+    const useCase = new RefreshChainsUseCase({ isProxy: types.isProxy, chains: repo, forge, attention, now: () => NOW, mode: options.mode ?? 'live', halt: options.halt ?? clearHalt });
     return { repo, forge, attention, useCase };
   }
 
@@ -261,7 +262,7 @@ describe('RefreshChainsUseCase halt gating', () => {
     for (const missing of [undefined, null]) {
       const repo = repoFake({ list: [makeRecord()], read: { status: 'ok', record: makeRecord() } });
       const forge = forgeFake();
-      const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention: attentionFake(), now: () => NOW, mode: 'live', halt: missing as never });
+      const useCase = new RefreshChainsUseCase({ isProxy: types.isProxy, chains: repo, forge, attention: attentionFake(), now: () => NOW, mode: 'live', halt: missing as never });
 
       const result = await useCase.runRefreshChains(refreshCommand);
 
@@ -408,7 +409,7 @@ describe('StartChainUseCase halt gating', () => {
   function makeStart(options: { halt?: Pick<ConductorHaltPort, 'read'>; onAction?: () => void; read?: ChainRecordRead } = {}) {
     const repo = repoFake({ read: options.read });
     const forge = forgeFake({ onAction: options.onAction });
-    const useCase = new StartChainUseCase({ chains: repo, forge, halt: options.halt ?? clearHalt });
+    const useCase = new StartChainUseCase({ isProxy: types.isProxy, chains: repo, forge, halt: options.halt ?? clearHalt });
     return { repo, forge, useCase };
   }
 
@@ -473,7 +474,7 @@ describe('StartChainUseCase halt gating', () => {
   it('StartChainUseCase runs normally when halt is absent', async () => {
     const repo = repoFake();
     const forge = forgeFake();
-    const useCase = new StartChainUseCase({ chains: repo, forge });
+    const useCase = new StartChainUseCase({ isProxy: types.isProxy, chains: repo, forge });
 
     const result = await useCase.startChain(makeStartCommand() as never);
 
@@ -504,7 +505,7 @@ describe('SweepChainsUseCase halt gating', () => {
   function makeSweep(options: { halt?: Pick<ConductorHaltPort, 'read'>; onAction?: () => void; list?: readonly ChainRecord[] } = {}) {
     const repo = repoFake({ list: options.list ?? [landedRecord] });
     const forge = forgeFake({ onAction: options.onAction });
-    const useCase = new SweepChainsUseCase({ chains: repo, forge, now: () => NOW, halt: options.halt ?? clearHalt });
+    const useCase = new SweepChainsUseCase({ isProxy: types.isProxy, chains: repo, forge, now: () => NOW, halt: options.halt ?? clearHalt });
     return { repo, forge, useCase };
   }
 
@@ -561,7 +562,7 @@ describe('SweepChainsUseCase halt gating', () => {
   it('SweepChainsUseCase runs normally when halt is absent', async () => {
     const repo = repoFake({ list: [landedRecord] });
     const forge = forgeFake();
-    const useCase = new SweepChainsUseCase({ chains: repo, forge, now: () => NOW });
+    const useCase = new SweepChainsUseCase({ isProxy: types.isProxy, chains: repo, forge, now: () => NOW });
 
     const result = await useCase.runSweepChains(sweepCommand);
 

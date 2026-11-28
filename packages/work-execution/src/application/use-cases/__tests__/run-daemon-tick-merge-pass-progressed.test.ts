@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // FY04: pin today's `progressed` behaviour of the daemon merge-pass job.
 //
 // Where `progressed` is read today (file names only, from
@@ -214,6 +215,7 @@ function makeHarness(
   }
   const now = overrides.nowFn ?? (() => overrides.now ?? NOW);
   const deps: RunDaemonTickDependencies = {
+    isProxy: types.isProxy,
     pause,
     halt,
     status,
@@ -524,7 +526,7 @@ describe('merge-pass job progressed through RunDaemonTickUseCase.runTick', () =>
     const mergePass = new FakeMergePass();
     mergePass.result = { outcome: 'completed', reasonCode: null, entries: [noActionEntry()] };
     const status = new FakeStatus();
-    const useCase = new RunDaemonTickUseCase({
+    const useCase = new RunDaemonTickUseCase({ isProxy: types.isProxy,
       pause: new FakePause(),
       halt: new FakeHalt(),
       status,

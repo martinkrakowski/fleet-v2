@@ -221,6 +221,12 @@ async function enqueueEntry(
   let refusalToken: string | null = null;
   try {
     if (typeof answer === 'object' && answer !== null && answer.outcome === 'refused') {
+      // A transient halt waits (never a final result): the run resumes when
+      // the halt is lifted, so `halted` is mapped before the terminal refusal
+      // tokens and never journalled through `appendFinal`.
+      if (answer.reason === 'halted') {
+        return WAIT;
+      }
       refusalToken = typeof answer.reason === 'string' && ENQUEUE_REFUSAL_TOKENS.includes(answer.reason) ? answer.reason : 'unknown';
     }
   } catch {

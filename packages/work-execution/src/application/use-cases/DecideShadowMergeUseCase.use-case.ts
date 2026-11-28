@@ -10,6 +10,7 @@
  * queue writes, no CLI, no live action.
  */
 
+import type { IsProxy } from '@fleet/shared';
 import type {
   DecideShadowMergePort,
   DecideShadowMergeRequest,
@@ -55,6 +56,8 @@ export interface DecideShadowMergeDependencies {
   readonly verification: MergeVerificationPort;
   readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey' | 'listForKeyPrefix'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** The trusted Proxy detector, passed through to the inner merge pass. Required: no neutral default. */
+  readonly isProxy: IsProxy;
   /** Read-only peek at the real merge queue, for the base partition's head. */
   readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
   readonly newUlid: () => string;
@@ -243,6 +246,7 @@ export class DecideShadowMergeUseCase implements DecideShadowMergePort {
       verification: this.deps.verification,
       journal: this.deps.journal,
       halt: this.deps.halt,
+      isProxy: this.deps.isProxy,
       newUlid: this.deps.newUlid,
       nowIso: this.deps.nowIso,
     });

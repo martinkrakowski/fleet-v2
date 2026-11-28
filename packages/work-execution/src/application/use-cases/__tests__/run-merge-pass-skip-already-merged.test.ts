@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // MP1: a shadow merge pass skips entries whose current head already has a
 // journaled `would-already-merged` dry-run, and fails open otherwise.
 // MP2: it also skips a head whose `would-supersede` dry-run is journaled
@@ -252,7 +253,7 @@ function makeHarness(input: {
   const prefix: PrefixCounter = { calls: 0 };
   const forge = forgeReadFake(input.forgeResult ?? retroForge());
   let minted = 0;
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: queueOf(input.records),
     queueWriter: input.queueWriter,
     forgeRead: forge,

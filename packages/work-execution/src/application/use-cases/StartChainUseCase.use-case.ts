@@ -30,6 +30,7 @@ import type {
 import { START_CHAIN_REASONS } from '../ports/in/StartChainPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
 import { isChainPassHalted } from './chain-pass-halt.js';
+import type { IsProxy } from '@fleet/shared';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -123,6 +124,8 @@ export class StartChainUseCase implements StartChainPort {
        * write and before any forge call.
        */
       readonly halt?: Pick<ConductorHaltPort, 'read'>;
+      /** The trusted Proxy detector (`types.isProxy`, bound in infrastructure). Required: no neutral default exists, so a Proxy port cannot read as clear. */
+      readonly isProxy: IsProxy;
     },
   ) {}
 
@@ -178,7 +181,7 @@ export class StartChainUseCase implements StartChainPort {
   }
 
   private async startFresh(command: ValidCommand): Promise<StartChainDecision> {
-    if (await isChainPassHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt, this.deps.isProxy)) {
       // Refused before the intent write and before any forge call; the halt is
       // read once here, never again after a forge action was sent.
       return refused('halted');
@@ -208,7 +211,7 @@ export class StartChainUseCase implements StartChainPort {
 
   /** The same key found at `intent-recorded`: a crash or an ambiguous answer left it open; read before any write. */
   private async recover(command: ValidCommand, record: ChainRecord): Promise<StartChainDecision> {
-    if (await isChainPassHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt, this.deps.isProxy)) {
       // Refused before the branch-head read and before any forge call; an
       // already-sent forge action is never rolled back (see settleFromHead).
       return refused('halted', record);

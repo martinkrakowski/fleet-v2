@@ -4,6 +4,7 @@
  * composition root.
  */
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 import { join } from 'node:path';
 
 import { withFileLock, writeJsonAtomically } from '../file-store.js';
@@ -21,6 +22,7 @@ import {
   CancelPreparedAttemptUseCase,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  ConductorHaltAdapter,
   CutoverJournalAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
@@ -44,6 +46,8 @@ import {
   SyncPlanDecisionsUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  KillallHaltMarkerAdapter,
+  KillallTrainPauseAdapter,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
   MergeRecordRepositoryAdapter,
@@ -589,7 +593,26 @@ export function composeExecution(input: ComposeExecutionInput) {
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
   const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
-  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
+  // KA3-1: the enqueue guard's halt and pause reads. Durable state gets
+  // read-only handles (a CLI enqueue never quarantines or rewrites the
+  // markers); without a durable state directory they stay in-memory.
+  const enqueueDurable = stateDir !== undefined && stateDir.trim().length > 0;
+  const conductorHalt = enqueueDurable
+    ? new ConductorHaltAdapter({ stateDir, readOnly: true })
+    : new ConductorHaltAdapter();
+  const killallHalt = enqueueDurable
+    ? new KillallHaltMarkerAdapter({ stateDir, readOnly: true })
+    : new KillallHaltMarkerAdapter();
+  const killallTrainPause = enqueueDurable
+    ? new KillallTrainPauseAdapter({ stateDir, readOnly: true })
+    : new KillallTrainPauseAdapter();
+  const enqueueMerge = new EnqueueMergeUseCase({
+    queue: mergeQueueRepository,
+    halt: conductorHalt,
+    killallHalt,
+    killallTrainPause,
+    isProxy: types.isProxy,
+  });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
   const legacyTrainState = new LegacyTrainStateReadAdapter();
   // GR1b: the shadow-intake journal is built here, inside composeExecution,

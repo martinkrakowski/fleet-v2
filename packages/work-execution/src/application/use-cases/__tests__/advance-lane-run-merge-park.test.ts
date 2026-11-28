@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 /**
  * Unit tests for K6-7 and KS7b: the conductor's `act merge-enqueue` through
  * `EnqueueMergePort` and its reconcile through `ListMergeQueuePort` (KS7b replaced the
@@ -1205,7 +1206,7 @@ describe('AdvanceLaneRunUseCase merge-enqueue (KS7b)', () => {
     // The real adapter checks deadlines against the wall clock; the harness's clock is fixed in 2026-10, so
     // the wrappers move only the deadline to the wall clock and pass everything else through.
     const future = () => new Date(Date.now() + 60_000).toISOString();
-    const real = new EnqueueMergeUseCase({ queue });
+    const real = new EnqueueMergeUseCase({ isProxy: types.isProxy, queue });
     const deps: AdvanceLaneRunDependencies = {
       ...harness.deps,
       enqueueMerge: { enqueue: (request) => real.enqueue({ ...request, deadlineIso: future() }) },

@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // DT9c: entry records, successors, audit fields and keyed notifications of the shadow merge pass.
 import { describe, expect, it } from 'vitest';
 
@@ -125,7 +126,7 @@ async function harness(options: {
   } as ConductorHaltPort;
   const notifier = options.notifier === 'none' ? undefined : (options.notifier ?? new FakeNotifier());
   let counter = 1000;
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue,
     queueWriter: options.writer === 'none' ? undefined : (options.writer ?? queue),
     notifier,
@@ -346,7 +347,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
     expect(notifier.delivered.size).toBe(1);
     expect((await h.list())[0].state).toBe('queued');
 
-    const healed = new RunMergePassUseCase({
+    const healed = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: h.queue, queueWriter: h.queue, notifier,
       forgeRead: { async readForgeMerge() { return closedForge; }, isConfigured: () => true },
       verification: { async readVerification() { return { outcome: 'unknown', reasonCode: 'x' }; }, async runVerification() { throw new Error('never'); } } as unknown as MergeVerificationPort,
@@ -404,7 +405,7 @@ describe('RunMergePassUseCase (DT9c): hostile input and bounds', () => {
   it('a queue that answers a non-list, a huge list or a sparse list is handled', async () => {
     const h = await harness({ forge: greenForge });
     const usecase = (answer: unknown) =>
-      new RunMergePassUseCase({
+      new RunMergePassUseCase({ isProxy: types.isProxy,
         queue: { async listMergeEntries() { return answer as never; } },
         forgeRead: { async readForgeMerge() { return greenForge; }, isConfigured: () => true },
         verification: { async readVerification() { return { outcome: 'unknown', reasonCode: 'x' }; }, async runVerification() { throw new Error('never'); } } as unknown as MergeVerificationPort,

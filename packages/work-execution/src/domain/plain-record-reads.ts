@@ -280,3 +280,53 @@ export function findInheritedPropertyDescriptor(
   }
   return undefined;
 }
+
+/** The longest prototype chain `readDataProperty` walks before it refuses. */
+const MAX_PROTOTYPE_WALK = 16;
+
+/** The outcome of `readDataProperty`: `ok: false` is a refusal (never an error). */
+export type DataPropertyRead =
+  | { readonly ok: true; readonly value: unknown; readonly found: boolean }
+  | { readonly ok: false };
+
+/**
+ * Read `key` from an object (and its prototype chain) as a DATA property, so
+ * an accessor is never invoked: the first object on the chain that owns `key`
+ * decides, and an accessor there, a Proxy anywhere on the chain or as the found
+ * value (asked of the injected `isProxy` before any reflection touches it), a chain longer than
+ * `MAX_PROTOTYPE_WALK` and a throwing reflection are all refusals. A key owned
+ * by nothing on the chain is `{ ok: true, value: undefined, found: false }`; a key
+ * that is present with the value `undefined` is `found: true`. Pure: the
+ * detector is injected (production: `types.isProxy`). Cost: at most
+ * `MAX_PROTOTYPE_WALK` detector calls and descriptor reads.
+ */
+export function readDataProperty(
+  target: object,
+  key: string,
+  isProxy: (value: unknown) => boolean,
+): DataPropertyRead {
+  try {
+    let current: object | null = target;
+    for (let depth = 0; current !== null; depth += 1) {
+      if (depth >= MAX_PROTOTYPE_WALK || isProxy(current) !== false) {
+        return { ok: false };
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) {
+        if (descriptor.get !== undefined || descriptor.set !== undefined) {
+          return { ok: false };
+        }
+        // A Proxy-valued method (a callable Proxy runs its `apply` trap when
+        // called) is as untrusted as a Proxy port.
+        if (isProxy(descriptor.value) !== false) {
+          return { ok: false };
+        }
+        return { ok: true, value: descriptor.value, found: true };
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+    return { ok: true, value: undefined, found: false };
+  } catch {
+    return { ok: false };
+  }
+}

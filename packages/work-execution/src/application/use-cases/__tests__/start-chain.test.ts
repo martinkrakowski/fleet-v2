@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { describe, expect, it } from 'vitest';
 
 import { createChainRecord } from '../../../domain/chain-records.js';
@@ -98,7 +99,7 @@ function harness(script: Script = {}) {
       return script.head ?? { outcome: 'not-found' };
     },
   };
-  return { useCase: new StartChainUseCase({ chains, forge }), calls, outcomes, creates };
+  return { useCase: new StartChainUseCase({ isProxy: types.isProxy, chains, forge }), calls, outcomes, creates };
 }
 
 describe('StartChainUseCase validation', () => {

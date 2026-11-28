@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // Lane CO10: LandChainUseCase — the adversarial parser, the read phase, the
 // keyed intent + compare-and-set landing mark, the post-mark re-check with
 // withdrawal, and the enqueue. Every fake below is in-memory.
@@ -332,6 +333,7 @@ function makeWorld(overrides: Overrides = {}): World {
   const mergeBranchHead = overrides.mergeBranchHead ?? { outcome: 'found' as const, headSha: TIP };
 
   const deps: LandChainDependencies = {
+    isProxy: types.isProxy,
     chains: {
       readChain: async () => readChainFn(),
     } as unknown as LandChainDependencies['chains'],

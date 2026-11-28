@@ -36,7 +36,10 @@ import type {
 } from '../../ports/out/MergeForgeActionPort.out-port.js';
 import type { ForgeMergeReadPort, ReadForgeMergeResult } from '../../ports/out/ForgeMergeReadPort.out-port.js';
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
-import { isRequiredPassHalted } from '../chain-pass-halt.js';
+import { isTrainStepBlocked } from '../chain-pass-halt.js';
+import type { KillallHaltMarkerPort } from '../../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../../ports/out/KillallTrainPausePort.out-port.js';
+import type { IsProxy } from '@fleet/shared';
 
 export type MergeLiveActionKind = 'merge-pr' | 'update-branch' | 'post-status';
 
@@ -77,6 +80,12 @@ export interface MergeLiveActionDependencies {
   readonly mintId: () => string;
   /** The operator kill switch: re-read before every live forge action (plan §3.7). */
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** The killall halt marker, re-read with the conductor halt at both guards; absent reads as not halted. */
+  readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+  /** The killall train pause, re-read with the conductor halt at both guards; absent reads as not paused. */
+  readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
+  /** The trusted Proxy detector (`types.isProxy`). Required: no neutral default. */
+  readonly isProxy: IsProxy;
 }
 
 export interface MergeLivePostStatus {
@@ -742,7 +751,7 @@ async function actLive(
 
   // The halt is re-read after the intent append (which takes a lock and does disk I/O) and directly
   // before the forge call: nothing is awaited between this read and the call.
-  const haltedAfterIntent = await isRequiredPassHalted(deps.halt);
+  const haltedAfterIntent = await isTrainStepBlocked(deps, true, deps.isProxy);
   const forgeResult = haltedAfterIntent ? null : await performForgeAction(deps, forgeRequest);
 
   let journalOutcome: LaneRunJournalOutcome;
@@ -835,7 +844,7 @@ export async function performMergeLiveAction(
     return actShadow(deps, valid, valid.shadowReason);
   }
   // Every live forge kind is one-way: the kill switch gates it, fail closed.
-  if (await isRequiredPassHalted(deps.halt)) {
+  if (await isTrainStepBlocked(deps, true, deps.isProxy)) {
     return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'halted' };
   }
   return actLive(deps, valid);

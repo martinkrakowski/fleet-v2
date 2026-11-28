@@ -31,6 +31,8 @@ import type { MergeNotificationPort } from '../ports/out/MergeNotificationPort.o
 import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import type { KillallHaltMarkerPort } from '../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
 import type {
   MergeContextFact,
   MergeStepDecision,
@@ -40,7 +42,8 @@ import { decideMergeStep, isMergedHeadRetroMergeEligible, premergeLoginsMatch } 
 import { computeCallBudget } from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
-import { isRequiredPassHalted } from './chain-pass-halt.js';
+import type { IsProxy } from '@fleet/shared';
+import { isTrainStepBlocked } from './chain-pass-halt.js';
 import { readJournaledWouldAlreadyMerged, withoutJournaledAlreadyMerged } from './shadow-merge-skip.js';
 import {
   findMergeQueueHead,
@@ -86,6 +89,13 @@ export interface RunMergePassDependencies {
   readonly verification: MergeVerificationPort;
   readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey' | 'listForKeyPrefix'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
+  /** KA3-1: the killall halt marker; absent reads as not halted. */
+  readonly killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+  /** KA3-1: the killall train pause; absent reads as not paused. */
+  readonly killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
+  /** The trusted Proxy detector (`types.isProxy`, bound in
+   * infrastructure); a Proxy port is refused before its traps run. */
+  readonly isProxy: IsProxy;
   readonly newUlid: () => string;   // a fresh ULID per journal entry
   readonly nowIso: () => string;    // the pass clock, read fresh
   /**
@@ -515,9 +525,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
       if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
         return { outcome: 'budget-exhausted', reasonCode: null, entries };
       }
-      // The kill switch, re-read before every entry; an unreadable read is a
-      // halt (fail closed).
-      const halted = await isRequiredPassHalted(this.deps.halt);
+      // The kill switches, re-read before every entry: the conductor halt,
+      // the killall halt marker and the killall train pause; an unreadable
+      // read is a halt (fail closed).
+      const halted = await isTrainStepBlocked(this.deps, true, this.deps.isProxy);
       try {
         entries.push(await this.actOnEntry(request, entry, head, halted, repoRecords));
       } catch (error) {

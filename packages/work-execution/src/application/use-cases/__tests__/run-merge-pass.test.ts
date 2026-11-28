@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // DT9a: the shadow merge pass — one repository, keyed dry-run journal, no forge write.
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -17,6 +18,8 @@ import type {
 } from '../../ports/out/MergeVerificationPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
+import type { KillallHaltMarkerPort } from '../../ports/out/KillallHaltMarkerPort.out-port.js';
+import type { KillallTrainPausePort } from '../../ports/out/KillallTrainPausePort.out-port.js';
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type { MergeNotificationPort } from '../../ports/out/MergeNotificationPort.out-port.js';
 import type { MergeVetoPort } from '../../ports/out/MergeVetoPort.out-port.js';
@@ -176,13 +179,15 @@ function makeUseCase(
     notifier?: Pick<MergeNotificationPort, 'notifyMergeEvent'>;
     vetoState?: Pick<MergeVetoStatePort, 'readMergeVetoState'>;
     vetoAdvice?: Pick<MergeVetoPort, 'adviseMergeVeto'>;
+    killallHalt?: Pick<KillallHaltMarkerPort, 'read'> | null;
+    killallTrainPause?: Pick<KillallTrainPausePort, 'read'> | null;
   } = {},
 ): { useCase: RunMergePassUseCase; deps: Deps; request: RunMergePassRequest } {
   const journal = new LaneRunJournalAdapter();
   const forgeRead = forgeReadFake(forgeResult);
   const verification = verificationFake();
   let ulid = 0;
-  const useCase = new RunMergePassUseCase({
+  const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
     queue: queueFake(records),
     forgeRead,
     verification,
@@ -635,7 +640,7 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     const forgeRead = forgeReadFake(greenForge);
     const verification = verificationFake();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead,
       verification,
@@ -797,7 +802,7 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
 
   it('reads a missing halt dependency as halted', async () => {
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead: forgeReadFake(greenForge),
       verification: verificationFake(),
@@ -877,7 +882,7 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
   ): { useCase: RunMergePassUseCase; journal: LaneRunJournalAdapter; request: RunMergePassRequest } {
     const journal = new LaneRunJournalAdapter();
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: fixture.queue,
       forgeRead: forgeReadFake(forgeResult),
       verification: verificationFake(),
@@ -986,7 +991,7 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
       },
     };
     let ulid = 0;
-    const useCase = new RunMergePassUseCase({
+    const useCase = new RunMergePassUseCase({ isProxy: types.isProxy,
       queue: queueFake([makeEntry()]),
       forgeRead: forgeReadFake(greenForge),
       verification: verification as unknown as MergeVerificationPort & { calls: number },
@@ -1301,5 +1306,58 @@ describe('RunMergePassUseCase live queue head after the shadow skip (S1U6)', () 
     expect(byId.get(first.entryId)).toBe('macos-unknown');
     expect(byId.get(second.entryId)).toBe('not-queue-head');
     expect(await f.deps.journal.listForKey(`merge/${DIGEST}/2/${HEAD12}/merge-pr`)).toHaveLength(0);
+  });
+});
+
+describe('RunMergePassUseCase killall halt and train-pause guards (KA3-1)', () => {
+  const killallClear = {
+    read: async () => ({ state: 'clear' }),
+  } as unknown as Pick<KillallHaltMarkerPort, 'read'>;
+  const pauseClear = {
+    read: async () => ({ status: 'clear' }),
+  } as unknown as Pick<KillallTrainPausePort, 'read'>;
+
+  it('treats pass as halted when killallHalt is halted even if conductor halt is clear', async () => {
+    // Guard: `isTrainStepBlocked(this.deps, true)` includes the killall
+    // marker arm; the entry's per-entry halt re-read answers 'halted' without
+    // consulting the forge read, so the pass records no journal entry.
+    const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, {}, haltFake, {
+      killallHalt: { read: async () => ({ state: 'halted' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
+      killallTrainPause: pauseClear,
+    });
+    const result = await useCase.runMergePass(request);
+    expect(result.outcome).toBe('completed');
+    expect(result.entries[0].reasonCode).toBe('halted');
+    expect(await deps.journal.listForKey(`merge/${DIGEST}/2/${HEAD12}/merge-pr`)).toHaveLength(0);
+  });
+
+  it('treats pass as halted when killallHalt is unreadable even if conductor halt is clear', async () => {
+    // Guard: `isKillallHalted` fails closed on an 'unreadable' marker.
+    const { useCase, request } = makeUseCase([makeEntry()], greenForge, {}, haltFake, {
+      killallHalt: { read: async () => ({ state: 'unreadable' }) } as unknown as Pick<KillallHaltMarkerPort, 'read'>,
+      killallTrainPause: pauseClear,
+    });
+    const result = await useCase.runMergePass(request);
+    expect(result.entries[0].reasonCode).toBe('halted');
+  });
+
+  it('treats pass as halted when killallTrainPause is paused even if conductor halt is clear', async () => {
+    // Guard: the killall train-pause arm blocks the pass like a halt.
+    const { useCase, request } = makeUseCase([makeEntry()], greenForge, {}, haltFake, {
+      killallHalt: killallClear,
+      killallTrainPause: { read: async () => ({ status: 'paused' }) } as unknown as Pick<KillallTrainPausePort, 'read'>,
+    });
+    const result = await useCase.runMergePass(request);
+    expect(result.entries[0].reasonCode).toBe('halted');
+  });
+
+  it('treats pass as halted when killallTrainPause is unreadable even if conductor halt is clear', async () => {
+    // Guard: `isKillallTrainPaused` fails closed on an 'unreadable' pause.
+    const { useCase, request } = makeUseCase([makeEntry()], greenForge, {}, haltFake, {
+      killallHalt: killallClear,
+      killallTrainPause: { read: async () => ({ status: 'unreadable' }) } as unknown as Pick<KillallTrainPausePort, 'read'>,
+    });
+    const result = await useCase.runMergePass(request);
+    expect(result.entries[0].reasonCode).toBe('halted');
   });
 });

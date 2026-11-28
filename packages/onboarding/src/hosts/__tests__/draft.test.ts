@@ -188,6 +188,56 @@ describe('draftHost', () => {
     }
   });
 
+  it('accepts runner.optional true and false and carries it onto the drafted runner (IH1a)', () => {
+    for (const kind of ['opencode', 'agy'] as const) {
+      for (const optional of [true, false]) {
+        const runner: HostRunnerDraft =
+          kind === 'agy'
+            ? { kind, port: 4166, agyMode: 'edit-only', optional }
+            : { kind, port: 4166, optional };
+        const result = draftHost(sshInput({ runner }));
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+          expect(result.draft.host.runner?.optional).toBe(optional);
+        }
+      }
+    }
+  });
+
+  it('refuses a non-boolean runner.optional and an accessor on it without running the getter (IH1a)', () => {
+    for (const bad of ['true', 1, null, {}]) {
+      const result = draftHost(
+        sshInput({ runner: { kind: 'opencode', port: 4166, optional: bad } as never }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.errors).toEqual(['hosts.lanehost.runner.optional: must be a boolean']);
+      }
+    }
+    let getterRan = false;
+    const runner = { kind: 'opencode', port: 4166 };
+    Object.defineProperty(runner, 'optional', {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return true;
+      },
+    });
+    const undefinedGetter = { kind: 'opencode', port: 4166 };
+    Object.defineProperty(undefinedGetter, 'optional', { enumerable: true, get: undefined, set: undefined });
+    const bare = draftHost(sshInput({ runner: undefinedGetter as never }));
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) {
+      expect(bare.errors).toEqual(['hosts.lanehost.runner.optional: must be a plain data property']);
+    }
+    const refused = draftHost(sshInput({ runner: runner as never }));
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) {
+      expect(refused.errors).toEqual(['hosts.lanehost.runner.optional: must be a plain data property']);
+    }
+    expect(getterRan).toBe(false);
+  });
+
   it('refuses a runner port outside 1..65535', () => {
     const result = draftHost(
       sshInput({ runner: { kind: 'opencode', port: 0 } }),
@@ -598,6 +648,32 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
         roles: ['lane-runner'],
         runner: { kind: 'opencode', port: 46000, tunnelOffset: 1 },
       });
+    }
+  });
+
+  it('preserves an existing runner.optional on edit when the draft omits it, and lets the draft override it (IH1a)', () => {
+    const existing = {
+      ...hereExisting,
+      runner: { kind: 'opencode', port: 46000, tunnelOffset: 1, optional: true },
+    };
+    const kept = applyHostDraft(hereFile(existing), hereDraft, 'edit');
+    expect(kept.ok).toBe(true);
+    if (kept.ok) {
+      expect(kept.candidate.hosts.here?.runner).toEqual({
+        kind: 'opencode',
+        port: 46000,
+        tunnelOffset: 1,
+        optional: true,
+      });
+    }
+    const overridden = applyHostDraft(
+      hereFile(existing),
+      { name: 'here', host: { ...hereDraft.host, runner: { kind: 'opencode', port: 46000, optional: false } } },
+      'edit',
+    );
+    expect(overridden.ok).toBe(true);
+    if (overridden.ok) {
+      expect(overridden.candidate.hosts.here?.runner?.optional).toBe(false);
     }
   });
 

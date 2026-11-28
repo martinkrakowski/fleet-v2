@@ -159,6 +159,28 @@ export type AbortWorktreeRunResult =
   | { readonly outcome: 'refused'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
+/**
+ * A read-only session listing addressed to a worktree directory rather than
+ * to a recorded session id. The runner record, when given, must match the
+ * adapter's own configuration before any command runs.
+ */
+export interface ListRunnerSessionsRef {
+  readonly worktreePath?: string;
+  readonly runner?: AttemptRunnerRecord | null;
+}
+
+/** Why a session listing could not be read: the runner was unreachable or its output was unreadable. */
+export type ListRunnerSessionsError = 'unreachable' | 'unreadable';
+
+/**
+ * The session ids a runner reports for a worktree directory, or a typed
+ * refusal. Every failure fails closed: an unknown state is never success and
+ * never an empty list.
+ */
+export type ListRunnerSessionsResult =
+  | { readonly ok: true; readonly sessions: readonly string[] }
+  | { readonly ok: false; readonly error: ListRunnerSessionsError; readonly reason: string };
+
 export interface ExecutionRunnerPort {
   /** Capabilities this runner can actually enforce, declared before dispatch. */
   describeCapabilities(): RunnerIsolationCapabilities;
@@ -186,4 +208,10 @@ export interface ExecutionRunnerPort {
    * A missing method means "cannot tell".
    */
   abortWorktreeRun?(request: AbortWorktreeRunRequest): Promise<AbortWorktreeRunResult>;
+
+  /**
+   * Optional: list the session ids a runner reports for a worktree
+   * directory. A missing method means "cannot tell".
+   */
+  listSessions?(ref?: ListRunnerSessionsRef): Promise<ListRunnerSessionsResult>;
 }

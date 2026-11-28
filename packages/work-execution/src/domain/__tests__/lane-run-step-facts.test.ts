@@ -1,14 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildLaneRunStepKey, laneRunPremergeKey } from '../lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunMergeEnqueueKey, laneRunPremergeKey } from '../lane-run-keys.js';
 import type { LaneRunKeyResult } from '../lane-run-keys.js';
-import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN, laneRunJournalPendingIntent } from '../lane-run-journal.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN, laneRunJournalPendingIntent, prepareLaneRunJournalAppend } from '../lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import {
   LANE_RUN_INTENT_ABANDONED_REASON_CODE,
   LANE_RUN_RESULT_REASON_CODES,
   laneRunAttemptDispatchResult,
   laneRunAttemptPlacement,
+  laneRunCiFailureRecorded,
   laneRunConductEntry,
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
@@ -18,6 +19,7 @@ import {
   laneRunFixRoundGateDriven,
   laneRunGateUnknown,
   laneRunIntentEntry,
+  laneRunMergeEnqueueFact,
   laneRunParkedConductCount,
   laneRunPremergePost,
   laneRunRecordedSeatAdvance,
@@ -1021,5 +1023,77 @@ describe('planGateFailedRetry', () => {
     expect(planGateFailedRetry(failedEntries(), RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 1 });
     // A failed base run plus two failed retries stays under the cap of three.
     expect(planGateFailedRetry(failedEntries({ retries: [1, 2] }), RUN_ID, 0)).toMatchObject({ kind: 'mint', retry: 3 });
+  });
+});
+
+describe('uncertain results read like ambiguous ones (UN1)', () => {
+  const premergeKey = mustBuild(laneRunPremergeKey(RUN_ID, 0, HEAD));
+  const enqueueKey = mustBuild(laneRunMergeEnqueueKey(RUN_ID, 0, HEAD));
+  const gateKey = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const ciKey = keyOf({ round: 0, step: 'ci', seatIndex: 0, head12: HEAD });
+  const collectKey = keyOf({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1 });
+
+  it('an uncertain premerge result is read as no recorded premerge post', () => {
+    expect(laneRunPremergePost([intent(premergeKey), result(premergeKey, 'uncertain', 'unobservable')], RUN_ID, HEAD)).toBe('none');
+    expect(laneRunPremergePost([intent(premergeKey), result(premergeKey, 'ambiguous', 'forge-ambiguous')], RUN_ID, HEAD)).toBe('none');
+    expect(laneRunPremergePost([intent(premergeKey), result(premergeKey, 'completed', 'premerge-success')], RUN_ID, HEAD)).toBe('success');
+  });
+
+  it('an uncertain merge-enqueue result is read as not enqueued', () => {
+    expect(laneRunMergeEnqueueFact([intent(enqueueKey), result(enqueueKey, 'uncertain', 'unobservable')], RUN_ID, 0, HEAD)).toBe('none');
+    expect(laneRunMergeEnqueueFact([intent(enqueueKey), result(enqueueKey, 'ambiguous', 'forge-ambiguous')], RUN_ID, 0, HEAD)).toBe('none');
+    expect(laneRunMergeEnqueueFact([intent(enqueueKey), result(enqueueKey, 'completed', 'merged')], RUN_ID, 0, HEAD)).toBe('merged');
+  });
+
+  it('an uncertain result is not read as a refused step', () => {
+    const uncertain = [intent(collectKey), result(collectKey, 'uncertain', 'unobservable')];
+    expect(laneRunRefusedStep(uncertain, RUN_ID, 0)).toBeNull();
+    const refused = [intent(collectKey), result(collectKey, 'refused', 'collect-refused')];
+    expect(laneRunRefusedStep(refused, RUN_ID, 0)).toBe('collect');
+  });
+
+  it('an uncertain result is not read as a recorded CI failure', () => {
+    const uncertain = [intent(ciKey), result(ciKey, 'uncertain', 'unobservable')];
+    expect(laneRunCiFailureRecorded(uncertain, RUN_ID, 0, HEAD)).toBe(false);
+    const failed = [intent(ciKey), result(ciKey, 'completed', 'ci-failed')];
+    expect(laneRunCiFailureRecorded(failed, RUN_ID, 0, HEAD)).toBe(true);
+  });
+
+  it('finalResultOf treats an uncertain result like an ambiguous one', () => {
+    const uncertain = [intent(gateKey), result(gateKey, 'uncertain', 'gate-unknown')];
+    expect(laneRunGateFact(uncertain, RUN_ID, HEAD)).toBe('pending');
+    const ambiguous = [intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')];
+    expect(laneRunGateFact(ambiguous, RUN_ID, HEAD)).toBe('pending');
+    const settled = [...uncertain, result(gateKey, 'completed', 'gate-passed')];
+    expect(laneRunGateFact(settled, RUN_ID, HEAD)).toBe('passed');
+  });
+
+  it('finalSnapshotResultOf treats an uncertain result like an ambiguous one', () => {
+    const uncertain = [intent(gateKey), result(gateKey, 'uncertain', 'gate-unknown')];
+    expect(planGateFailedRetry(uncertain, RUN_ID, 0)).toEqual({ kind: 'none' });
+    const ambiguous = [intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')];
+    expect(planGateFailedRetry(ambiguous, RUN_ID, 0)).toEqual({ kind: 'none' });
+    const settled = [...uncertain, result(gateKey, 'refused', 'gate-failed')];
+    expect(planGateFailedRetry(settled, RUN_ID, 0).kind).toBe('mint');
+  });
+
+  it('planGateFailedRetry treats an uncertain result like an ambiguous one', () => {
+    // Upstream, the append decision refuses an uncertain result on a gate intent.
+    expect(prepareLaneRunJournalAppend([intent(gateKey)], result(gateKey, 'uncertain', 'gate-unknown'))).toEqual({
+      ok: false,
+      reason: 'invalid-entry',
+      detail: expect.any(String),
+    });
+    // If one is passed directly, it reads like `ambiguous`: no retry mints.
+    expect(planGateFailedRetry([intent(gateKey), result(gateKey, 'uncertain', 'gate-unknown')], RUN_ID, 0)).toEqual({ kind: 'none' });
+    expect(planGateFailedRetry([intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')], RUN_ID, 0)).toEqual({ kind: 'none' });
+  });
+
+  it('laneRunGateFailed treats an uncertain result like an ambiguous one', () => {
+    expect(prepareLaneRunJournalAppend([intent(gateKey)], result(gateKey, 'uncertain', 'gate-unknown')).ok).toBe(false);
+    expect(laneRunGateFailed([intent(gateKey), result(gateKey, 'uncertain', 'gate-unknown')], RUN_ID, HEAD)).toBeNull();
+    expect(laneRunGateFailed([intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')], RUN_ID, HEAD)).toBeNull();
+    const failed = [intent(gateKey), result(gateKey, 'refused', 'gate-failed')];
+    expect(laneRunGateFailed(failed, RUN_ID, HEAD)).toEqual({ retry: 0, failedCount: 1 });
   });
 });

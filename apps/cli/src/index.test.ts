@@ -627,5 +627,36 @@ describe('CLI installation wiring', () => {
       expect(help.stdout.join('')).not.toContain('the shell never writes');
     });
   });
+  describe('orchestrator group', () => {
+    it('prints the orchestrator help with exit 0 before loading any installation, and lists the group in the main help', async () => {
+      const invalidFilePath = join(tempDir, 'invalid-fleet.json');
+      writeFileSync(invalidFilePath, JSON.stringify({ schemaVersion: 1, UNKNOWN_KEY: 'foo' }));
+      process.env.FLEET_INSTALLATION_FILE = invalidFilePath;
+      const helped = createMockIo();
+      expect(await runCli(['orchestrator', '--help'], helped.io)).toBe(0);
+      expect(helped.stdout.join('')).toContain('fleet-v2 orchestrator status');
+      expect(helped.stderr.join('')).toBe('');
+
+      delete process.env.FLEET_INSTALLATION_FILE;
+      const main = createMockIo();
+      expect(await runCli(['help'], main.io, createFleetCliRuntime({ stateDir: tempDir }))).toBe(0);
+      expect(main.stdout.join('')).toContain('orchestrator attach|status|pending');
+    });
+
+    it('routes orchestrator status to the injected runtime and answers an unknown subcommand with exit 2', async () => {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const status = createMockIo();
+      expect(await runCli(['orchestrator', 'status'], status.io, runtime)).toBe(0);
+      expect(JSON.parse(status.stdout.join(''))).toEqual({ outcome: 'ok', sessions: [] });
+
+      const pending = createMockIo();
+      expect(await runCli(['orchestrator', 'pending', '--format', 'hook'], pending.io, runtime)).toBe(0);
+      expect(pending.stdout.join('')).toBe('');
+
+      const unknown = createMockIo();
+      expect(await runCli(['orchestrator', 'bogus'], unknown.io, runtime)).toBe(2);
+      expect(unknown.stdout.join('')).toBe('');
+    });
+  });
 });
 

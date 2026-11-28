@@ -42,7 +42,7 @@ describe('the injected Proxy detector is required and consulted', () => {
   });
 
   it('isTrainStepBlocked passes the detector to every read', async () => {
-    const deps = { halt: clearHaltPort(), killallHalt: clearMarkerPort(), killallTrainPause: clearPausePort() };
+    const deps = { halt: clearHaltPort() as never, killallHalt: clearMarkerPort() as never, killallTrainPause: clearPausePort() as never };
     await expect(isTrainStepBlocked(deps, true, types.isProxy)).resolves.toBe(false);
     const seen = new Set<unknown>();
     const flagAll = (value: unknown): boolean => {

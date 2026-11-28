@@ -15,7 +15,7 @@ const SOURCE = readFileSync(new URL('../operator-access.ts', import.meta.url), '
 
 const GRANTED = '2026-11-26T12:00:00.000Z';
 const EXPIRES = '2026-11-26T14:00:00.000Z';
-const SECRET_REASON = 'ticket-4711-private-reason';
+const SECRET_REASON = 'op-test-1';
 
 function grant(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

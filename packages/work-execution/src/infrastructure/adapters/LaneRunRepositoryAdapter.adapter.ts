@@ -110,6 +110,12 @@ function copy(record: LaneRunRecord): LaneRunRecord {
     runPolicyRevision: record.runPolicyRevision,
     ...(record.branchName === undefined ? {} : { branchName: record.branchName }),
     ...(record.baseBranch === undefined ? {} : { baseBranch: record.baseBranch }),
+    ...(record.reviewTransportRetry === undefined
+      ? {}
+      : {
+          reviewTransportRetry:
+            record.reviewTransportRetry === null ? null : { ...record.reviewTransportRetry },
+        }),
     schemaVersion: LANE_RUN_STORE_VERSION_POLICY.writerVersion,
   };
 }

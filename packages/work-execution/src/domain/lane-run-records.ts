@@ -10,7 +10,8 @@
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
-import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+import { INITIAL_RECORD_SCHEMA_VERSION, isPlainRecordObject } from './record-schema-version.js';
+import { snapshotPlainDataRecord } from './plain-record-reads.js';
 import type { LaneRunParkFindingView } from './park-findings-view.js';
 import { copyParkFindings } from './park-findings-view.js';
 import type { LaneRunParkClass } from './park-class.js';
@@ -236,4 +237,69 @@ export interface LaneRunRecord {
   readonly provenance?: LaneRunProvenance;
   /** Record schema version on disk (Q5a, D6); absent reads as 1. */
   readonly schemaVersion?: number;
+  /**
+   * The parked review step's transport-retry state (AB-TP4A): which review step
+   * failed for transport, at which head12, how many retries so far and when the
+   * next one may run. Absent on records written before AB-TP4A; `null` once the
+   * run has left the park.
+   */
+  readonly reviewTransportRetry?: LaneRunReviewRetryRecord | null;
+}
+
+/** The review steps a transport retry can park (AB-TP4A): the review-kind keys. */
+export const LANE_RUN_REVIEW_RETRY_STEPS = ['brief-check', 'code-review', 'pre-merge'] as const;
+export type LaneRunReviewRetryStep = (typeof LANE_RUN_REVIEW_RETRY_STEPS)[number];
+
+/** The per-step transport-retry state carried while the run stays parked. */
+export interface LaneRunReviewRetryRecord {
+  readonly step: LaneRunReviewRetryStep;
+  readonly head12: string;
+  readonly count: number;
+  readonly nextRetryAtIso: string;
+}
+
+/**
+ * Pure reader for the parked review step's transport-retry count (AB-TP4A).
+ * Never runs a getter and never throws: the record and its `reviewTransportRetry`
+ * value are read through `snapshotPlainDataRecord` (own enumerable data
+ * properties only) inside a catch, the same boundary codec as `LaneRun.create`.
+ * Returns `0` when the record, the retry state or the requested step/head12 does
+ * not match; the count itself is only trusted when it is a non-negative safe
+ * integer <= 100.
+ */
+export function reviewTransportRetryCountOf(
+  record: unknown,
+  step?: LaneRunReviewRetryStep,
+  head12?: string,
+): number {
+  try {
+    if (!isPlainRecordObject(record)) {
+      return 0;
+    }
+    const recordSnapshot = snapshotPlainDataRecord(record);
+    if (recordSnapshot === null) {
+      return 0;
+    }
+    const retry: unknown = recordSnapshot.reviewTransportRetry;
+    if (retry === undefined || retry === null) {
+      return 0;
+    }
+    const retrySnapshot = snapshotPlainDataRecord(retry);
+    if (retrySnapshot === null) {
+      return 0;
+    }
+    const count: unknown = retrySnapshot.count;
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0 || count > 100) {
+      return 0;
+    }
+    if (step !== undefined && retrySnapshot.step !== step) {
+      return 0;
+    }
+    if (head12 !== undefined && retrySnapshot.head12 !== head12) {
+      return 0;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
 }

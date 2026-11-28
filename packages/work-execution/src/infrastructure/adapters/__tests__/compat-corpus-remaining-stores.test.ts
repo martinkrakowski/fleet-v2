@@ -256,7 +256,15 @@ describe.each(REMAINING_STORES)('$basename accepts its pre-schemaVersion fixture
         const plans = raw as readonly Record<string, unknown>[];
         expect(plans).toHaveLength(1);
         expectNoSchemaVersionKey(plans[0]);
-        expect(plans[0]).toStrictEqual(fixtureRecords[0]);
+        // PV1: the reader materialises the optional `featureSet` as null and each
+        // lane's optional `rollupOf` as false; every other byte of the legacy
+        // record is returned as stored, and the file itself is checked unchanged below.
+        const legacyPlan = fixtureRecords[0];
+        expect(plans[0]).toStrictEqual({
+          ...legacyPlan,
+          featureSet: null,
+          lanes: (legacyPlan.lanes as Record<string, unknown>[]).map((lane) => ({ ...lane, rollupOf: false })),
+        });
       } else {
         const result = raw as { outcome: unknown; plan?: Record<string, unknown> };
         expect(result.outcome).toBe('found');

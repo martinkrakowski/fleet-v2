@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import * as barrel from '../index.js';
 import { LanePlan } from '../entities/LanePlan.js';
 import { PlannedLane } from '../entities/PlannedLane.js';
 import type { LanePlanRecord, LanePlanSidecar } from '../lane-plan-records.js';
@@ -487,8 +488,7 @@ describe('LanePlan featureSet and PlannedLane rollupOf (PV1)', () => {
     expect(PlannedLane.create({ ...base, extra: 1 }).success).toBe(false);
   });
 
-  it('exposes the PV1 runtime exports from the package domain barrel', async () => {
-    const barrel = await import('../index.js');
+  it('exposes the PV1 runtime exports from the package domain barrel', () => {
     expect(barrel.PLAN_FEATURE_SET_ID_PATTERN).toBeInstanceOf(RegExp);
     expect(barrel.LANE_PLAN_LIMITS.featureSetTitleBytes).toBe(120);
     expect(typeof barrel.parseLanePlanSidecar).toBe('function');

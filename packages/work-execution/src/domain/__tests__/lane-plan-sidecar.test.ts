@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import * as barrel from '../index.js';
 import {
   canonicalLanePlanSidecarJson,
   parseLanePlanSidecar,
@@ -665,8 +666,7 @@ describe('featureSet and rollupOf (PV1)', () => {
     expect(getterCalls).toBe(0);
   });
 
-  it('exposes the PV1 runtime exports from the package domain barrel', async () => {
-    const barrel = await import('../index.js');
+  it('exposes the PV1 runtime exports from the package domain barrel', () => {
     expect(barrel.PLAN_FEATURE_SET_ID_PATTERN.test('feature-1')).toBe(true);
     expect(barrel.PLAN_FEATURE_SET_ID_PATTERN.test('bad/id')).toBe(false);
     expect(barrel.LANE_PLAN_LIMITS.featureSetTitleBytes).toBe(120);

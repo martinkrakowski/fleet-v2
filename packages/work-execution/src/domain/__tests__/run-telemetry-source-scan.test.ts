@@ -112,6 +112,21 @@ describe('scanSpanForSourceText detector gate', () => {
       });
     }
   });
+
+  it('refuses an omitted (undefined) isProxy detector with invalid-detector instead of a no-op detector', () => {
+    // The detector is a required parameter: omitting it must never install a
+    // default detector that claims every value is not a Proxy, because such a
+    // Proxy would then run its reflection traps during the snapshot.
+    expect(
+      scanSpanForSourceText(cleanPlainSpan(), MARKERS, undefined as unknown as typeof isProxy),
+    ).toEqual({ ok: false, reason: 'invalid-detector' });
+    // The same span passes once a trusted detector is supplied, so the refusal
+    // above is the detector gate, not the span shape.
+    expect(scanSpanForSourceText(cleanPlainSpan(), MARKERS, isProxy)).toEqual({
+      ok: true,
+      checkedAttributes: 1,
+    });
+  });
 });
 
 describe('scanSpanForSourceText markers', () => {

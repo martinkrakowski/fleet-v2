@@ -27,8 +27,8 @@ import {
 
 const NOW = '2026-11-27T12:00:00.000Z';
 const ORCH_ID = 'orch-01FIXTUREAAAAAAAAAAAAAAAAA';
-const REQUEST_A = '01FIXTUREREQUESTAAAAAAAAAA';
-const REQUEST_B = '01FIXTUREREQUESTBBBBBBBBBB';
+const REQUEST_A = '01H8XGJWBWBAQ4Z2D5FN0DTQ7A';
+const REQUEST_B = '01H8XGJWBWBAQ4Z2D5FN0DTQ7B';
 
 function createIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];

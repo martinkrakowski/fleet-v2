@@ -278,14 +278,17 @@ function readSpanAttributes(
 
 /**
  * The pure span scan: never throws, never echoes a rejected value, key,
- * marker or path. The outer catch maps any unexpected throw to
- * `invalid-span` (a revoked or lying Proxy that throws anywhere along the
- * read path is the accepted residual).
+ * marker or path. `isProxy` is a required, trusted detector (production:
+ * `types.isProxy`); it is never defaulted, because a default
+ * "everything is not a Proxy" detector would let a hostile Proxy run its
+ * reflection traps during the snapshot. The outer catch maps any unexpected
+ * throw to `invalid-span` (a revoked or lying Proxy that throws anywhere
+ * along the read path is the accepted residual).
  */
 export function scanSpanForSourceText(
   span: unknown,
   markers: unknown,
-  isProxy: IsProxy = () => false,
+  isProxy: IsProxy,
 ): SpanSourceScanResult {
   try {
     if (typeof isProxy !== 'function') {

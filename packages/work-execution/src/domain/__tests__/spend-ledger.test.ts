@@ -1,18 +1,29 @@
+import { types } from 'node:util';
+
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord } from '../execution-records.js';
+import * as ledger from '../spend-ledger.js';
 import {
-  buildSpendLedgerRow,
-  decideProviderBudget,
   monthKeyOf,
   providerOfModel,
-  readProviderBudget,
-  readSpendLedgerRow,
   SPEND_LEDGER_ROW_KEYS,
-  summariseSpendMonth,
   type SpendLedgerRow,
   type SpendMonthSummaryResult,
 } from '../spend-ledger.js';
+
+/** The runtime's own Proxy detector, injected exactly as infrastructure would. */
+const isProxy = (value: unknown): boolean => types.isProxy(value);
+
+// The domain readers take the detector as a REQUIRED argument; these wrappers inject the real one.
+const readSpendLedgerRow = (value: unknown) => ledger.readSpendLedgerRow(value, isProxy);
+const buildSpendLedgerRow = (input: { attempt: AttemptRecord; runId?: string | null; nowIso: string }) =>
+  ledger.buildSpendLedgerRow({ ...input, isProxy });
+const summariseSpendMonth = (rows: readonly unknown[], month: string) =>
+  ledger.summariseSpendMonth(rows, month, isProxy);
+const readProviderBudget = (value: unknown) => ledger.readProviderBudget(value, isProxy);
+const decideProviderBudget = (input: { budget: unknown; summary: SpendMonthSummaryResult }) =>
+  ledger.decideProviderBudget({ ...input, isProxy });
 
 const NOW_ISO = '2026-11-25T09:00:00.000Z';
 const MODEL = 'openrouter/z-ai/glm-5.3-flash';
@@ -333,10 +344,15 @@ describe('summariseSpendMonth', () => {
     expect(summary.summary.providers[0]?.spentUsd).toBeNull();
   });
 
-  it('summariseSpendMonth refuses non-arrays, sparse arrays, throwing Proxies, and invalid rows', () => {
+  it('summariseSpendMonth refuses non-arrays, sparse arrays, Proxies, and invalid rows', () => {
     expect(summariseSpendMonth(null as unknown as unknown[], '2026-11').ok).toBe(false);
     expect(summariseSpendMonth(undefined as unknown as unknown[], '2026-11').ok).toBe(false);
     expect(summariseSpendMonth({ length: 1 } as unknown as unknown[], '2026-11').ok).toBe(false);
+    expect(summariseSpendMonth(new Proxy([row()], {}) as unknown as unknown[], '2026-11')).toEqual({
+      ok: false,
+      reason: 'invalid-rows-array',
+    });
+    expect(summariseSpendMonth([new Proxy({ ...row() }, {})], '2026-11')).toEqual({ ok: false, reason: 'invalid-row' });
     const trapped = new Proxy([row()], {
       getOwnPropertyDescriptor() {
         throw new Error('trap');
@@ -350,13 +366,27 @@ describe('summariseSpendMonth', () => {
     expect(summariseSpendMonth([{ ...row(), extra: 1 }], '2026-11')).toEqual({ ok: false, reason: 'invalid-row' });
   });
 
-  it('summariseSpendMonth reads a transparent Proxy around a valid array exactly like the array itself', () => {
-    // The shared dense-array reader asks the target's own reflection and never consults a `get`
-    // trap, so a non-throwing Proxy is neither refused nor able to change the answer: the summary
-    // equals the one for the plain array. A Proxy whose reflection throws is refused (above).
-    const plain = [row({ attempt: { id: 'a1' }, costUsd: 0.25 })];
-    expect(summariseSpendMonth(new Proxy([...plain], {}) as unknown as unknown[], '2026-11'))
-      .toEqual(summariseSpendMonth(plain, '2026-11'));
+  it('every reader refuses a transparent Proxy, and a missing, throwing or lying detector fails closed', () => {
+    const good = row();
+    expect(readSpendLedgerRow(new Proxy({ ...good }, {})).ok).toBe(false);
+    expect(readProviderBudget(new Proxy({ provider: 'openrouter', monthlyUsd: 1 }, {})).ok).toBe(false);
+    expect(buildSpendLedgerRow({ attempt: new Proxy(attempt(), {}) as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    const nested = attempt() as unknown as Record<string, unknown>;
+    expect(buildSpendLedgerRow({ attempt: { ...nested, usage: new Proxy({ ...(nested.usage as object) }, {}) } as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    expect(buildSpendLedgerRow({ attempt: { ...nested, seatSelection: new Proxy({ ...(nested.seatSelection as object) }, {}) } as unknown as AttemptRecord, nowIso: NOW_ISO })).toBeNull();
+    // With the real detector the same plain inputs are accepted, so the refusals are about the Proxies.
+    expect(readSpendLedgerRow({ ...good }).ok).toBe(true);
+    expect(readProviderBudget({ provider: 'openrouter', monthlyUsd: 1 }).ok).toBe(true);
+    expect(buildSpendLedgerRow({ attempt: attempt(), nowIso: NOW_ISO })).not.toBeNull();
+    // A detector that is absent, throws or reports true for everything refuses everything.
+    const detectors: unknown[] = [undefined, null, 'no', () => { throw new Error('boom'); }, () => true];
+    for (const detector of detectors) {
+      expect(ledger.readSpendLedgerRow({ ...good }, detector as never).ok).toBe(false);
+      expect(ledger.readProviderBudget({ provider: 'openrouter', monthlyUsd: 1 }, detector as never).ok).toBe(false);
+      expect(ledger.summariseSpendMonth([good], '2026-11', detector as never)).toEqual({ ok: false, reason: 'invalid-rows-array' });
+      expect(ledger.buildSpendLedgerRow({ attempt: attempt(), nowIso: NOW_ISO, isProxy: detector as never })).toBeNull();
+      expect(ledger.decideProviderBudget({ budget: { provider: 'openrouter', monthlyUsd: 1 }, summary: summariseSpendMonth([good], '2026-11'), isProxy: detector as never })).toEqual({ allowed: false, reason: 'budget-unknown' });
+    }
   });
 
   it('summariseSpendMonth keeps at most 64 providers, folding the rest into other without losing spend', () => {
@@ -494,6 +524,57 @@ describe('decideProviderBudget', () => {
     expect(decideProviderBudget({ budget, summary: { ok: true } as unknown as SpendMonthSummaryResult })).toEqual(unknown);
     // The unforged summary is allowed, so the refusals above are about the malformed shapes.
     expect(decideProviderBudget({ budget, summary: good })).toEqual({ allowed: true });
+  });
+
+  it('decideProviderBudget refuses an ok summary that lacks the rest of the summary shape', () => {
+    const budget = { provider: 'openrouter', monthlyUsd: 1 };
+    const unknown = { allowed: false, reason: 'budget-unknown' };
+    const minimal = { ok: true, summary: { month: '2026-11', providers: [] } } as unknown as SpendMonthSummaryResult;
+    expect(decideProviderBudget({ budget, summary: minimal })).toEqual(unknown);
+    const good = summariseSpendMonth([row({ attempt: { id: 'a1' }, costUsd: 0.25 })], '2026-11');
+    if (!good.ok) throw new Error('expected a readable summary');
+    const { seats: _seats, ...withoutSeats } = good.summary;
+    expect(decideProviderBudget({ budget, summary: { ok: true, summary: withoutSeats } as unknown as SpendMonthSummaryResult })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: { ok: true, summary: { ...good.summary, extra: 1 } } as unknown as SpendMonthSummaryResult })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: { ok: true, summary: { ...good.summary, rowCount: -1 } } as unknown as SpendMonthSummaryResult })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: good })).toEqual({ allowed: true });
+  });
+
+  it('decideProviderBudget never runs a getter on the summary and refuses a Proxy summary', () => {
+    const budget = { provider: 'openrouter', monthlyUsd: 1 };
+    const good = summariseSpendMonth([row({ attempt: { id: 'a1' }, costUsd: 0.25 })], '2026-11');
+    if (!good.ok) throw new Error('expected a readable summary');
+    let getterCalls = 0;
+    const entry = good.summary.providers[0] as unknown as Record<string, unknown>;
+    const getterEntry = { ...entry };
+    Object.defineProperty(getterEntry, 'spentUsd', { enumerable: true, get() { getterCalls += 1; return 0; } });
+    const forgedWith = (providers: unknown): SpendMonthSummaryResult =>
+      ({ ok: true, summary: { ...good.summary, providers } }) as unknown as SpendMonthSummaryResult;
+    const unknown = { allowed: false, reason: 'budget-unknown' };
+    expect(decideProviderBudget({ budget, summary: forgedWith([getterEntry]) })).toEqual(unknown);
+    const getterProviders: Record<string, unknown> = { ok: true };
+    Object.defineProperty(getterProviders, 'summary', { enumerable: true, get() { getterCalls += 1; return good.summary; } });
+    expect(decideProviderBudget({ budget, summary: getterProviders as unknown as SpendMonthSummaryResult })).toEqual(unknown);
+    expect(getterCalls).toBe(0);
+    expect(decideProviderBudget({ budget, summary: new Proxy(good, {}) as SpendMonthSummaryResult })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forgedWith(new Proxy([entry], {})) })).toEqual(unknown);
+    expect(decideProviderBudget({ budget, summary: forgedWith([new Proxy({ ...entry }, {})]) })).toEqual(unknown);
+  });
+
+  it('decideProviderBudget refuses to allow a provider that may sit inside a truncated other bucket', () => {
+    const names = Array.from({ length: 70 }, (_, index) => `prov${String(index).padStart(2, '0')}`);
+    const rows = names.map((name, index) =>
+      row({ attempt: { id: `a${index}`, usage: { model: `${name}/m`, costUsd: 5 } }, provider: name, model: `${name}/m`, costUsd: 5 }),
+    );
+    const summary = summariseSpendMonth(rows, '2026-11');
+    if (!summary.ok) throw new Error('expected a readable summary');
+    expect(summary.summary.providersTruncated).toBe(true);
+    // prov69 sorts last, so its spend sits in the folded bucket and has no entry of its own.
+    expect(summary.summary.providers.some((entry) => entry.provider === 'prov69')).toBe(false);
+    expect(decideProviderBudget({ budget: { provider: 'prov69', monthlyUsd: 1 }, summary })).toEqual({ allowed: false, reason: 'budget-unknown' });
+    // A provider that kept its own entry is still decided from it.
+    expect(decideProviderBudget({ budget: { provider: 'prov00', monthlyUsd: 1 }, summary })).toEqual({ allowed: false, reason: 'budget-exhausted' });
+    expect(decideProviderBudget({ budget: { provider: 'prov00', monthlyUsd: 50 }, summary })).toEqual({ allowed: true });
   });
 
   it('decideProviderBudget adds every entry that names the provider, including a folded other bucket', () => {

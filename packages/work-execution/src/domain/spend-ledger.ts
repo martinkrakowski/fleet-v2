@@ -13,7 +13,7 @@
  * row.
  */
 
-import { billingOf, containsSecretShape, type SeatBilling } from '@fleet/shared';
+import { billingOf, containsSecretShape, type IsProxy, type SeatBilling } from '@fleet/shared';
 
 import type { AttemptRecord, AttemptUsageRecord, RunnerKind } from './execution-records.js';
 import { LANE_USAGE_LOG_COST_BASES, type LaneUsageLogCostBasis } from './lane-usage-log.js';
@@ -58,6 +58,21 @@ export interface SpendLedgerRow {
   readonly costUsd: number | null;
   readonly costBasis: LaneUsageLogCostBasis;
   readonly recordedAtIso: string;
+}
+
+/**
+ * True when the value must be refused as a Proxy: the injected detector says so, throws, or is
+ * not a function at all (a missing detector fails closed). The detector is a REQUIRED parameter of
+ * every reader here, never defaulted: in production it is the runtime's `types.isProxy`, passed in
+ * by infrastructure so this module imports no runtime-specific specifier. It runs BEFORE any
+ * reflection, so no Proxy trap runs on a detected value.
+ */
+function refusedAsProxy(value: unknown, isProxy: IsProxy): boolean {
+  try {
+    return typeof isProxy !== 'function' || isProxy(value) !== false;
+  } catch {
+    return true;
+  }
 }
 
 /** The canonical instant shape every timestamp field must carry. */
@@ -155,8 +170,8 @@ function costBasisOf(billing: SeatBilling, costUsd: number | null): LaneUsageLog
 }
 
 /**
- * The row a stored line holds: read through `readExactPlainRecord`, so no
- * getter ever runs and a missing or extra key refuses. `{ ok: false,
+ * The row a stored line holds: a detected Proxy is refused first, then the row is read through
+ * `readExactPlainRecord`, so no getter ever runs and a missing or extra key refuses. `{ ok: false,
  * reason: 'invalid-row' }` on anything that is not exactly a row — a
  * non-object, an array, a hostile object, a secret-shaped or
  * control-character string, an over-long identifier, a negative or
@@ -167,8 +182,11 @@ export type SpendLedgerRowResult =
   | { readonly ok: true; readonly row: SpendLedgerRow }
   | { readonly ok: false; readonly reason: 'invalid-row' };
 
-export function readSpendLedgerRow(value: unknown): SpendLedgerRowResult {
+export function readSpendLedgerRow(value: unknown, isProxy: IsProxy): SpendLedgerRowResult {
   try {
+    if (refusedAsProxy(value, isProxy)) {
+      return { ok: false, reason: 'invalid-row' };
+    }
     const record = readExactPlainRecord(value, SPEND_LEDGER_ROW_KEYS);
     if (record === null) {
       return { ok: false, reason: 'invalid-row' };
@@ -232,11 +250,16 @@ export function readSpendLedgerRow(value: unknown): SpendLedgerRowResult {
 }
 
 /** A nested optional record: `null` when absent, its plain-data snapshot, or `'hostile'`. */
-function optionalSnapshot(value: unknown): Record<string, unknown> | null | 'hostile' {
+function optionalSnapshot(value: unknown, isProxy: IsProxy): Record<string, unknown> | null | 'hostile' {
   if (value === undefined || value === null) {
     return null;
   }
-  return snapshotPlainDataRecord(value) ?? 'hostile';
+  return proxyFreeSnapshot(value, isProxy) ?? 'hostile';
+}
+
+/** The plain-data snapshot of a value the detector does not flag as a Proxy; null otherwise. */
+function proxyFreeSnapshot(value: unknown, isProxy: IsProxy): Record<string, unknown> | null {
+  return refusedAsProxy(value, isProxy) ? null : snapshotPlainDataRecord(value);
 }
 
 /**
@@ -253,14 +276,16 @@ export function buildSpendLedgerRow(input: {
   attempt: AttemptRecord;
   runId?: string | null;
   nowIso: string;
+  isProxy: IsProxy;
 }): SpendLedgerRow | null {
   try {
     if (typeof input !== 'object' || input === null || !isCanonicalIso(input.nowIso)) {
       return null;
     }
+    const isProxy = input.isProxy;
     // Every record read here goes through `snapshotPlainDataRecord`: a getter, a Proxy that
     // throws or a non-plain object is refused without running an accessor.
-    const attempt = snapshotPlainDataRecord(input.attempt);
+    const attempt = proxyFreeSnapshot(input.attempt, isProxy);
     if (attempt === null) {
       return null;
     }
@@ -272,7 +297,7 @@ export function buildSpendLedgerRow(input: {
     if (runIdField !== null && !isIdentifier(runIdField)) {
       return null;
     }
-    const seatSelectionRecord = optionalSnapshot(attempt.seatSelection);
+    const seatSelectionRecord = optionalSnapshot(attempt.seatSelection, isProxy);
     if (seatSelectionRecord === 'hostile') {
       return null;
     }
@@ -282,7 +307,7 @@ export function buildSpendLedgerRow(input: {
     const seatRole = isEnum(seatSelectionRecord?.role, SEAT_PLAN_ROLES)
       ? (seatSelectionRecord?.role as SeatPlanRole)
       : null;
-    const runnerRecord = optionalSnapshot(attempt.runner);
+    const runnerRecord = optionalSnapshot(attempt.runner, isProxy);
     if (runnerRecord === 'hostile') {
       return null;
     }
@@ -291,7 +316,7 @@ export function buildSpendLedgerRow(input: {
       : null;
     const billing = billingOf(runnerKind ?? seatSelectionRecord?.tool);
 
-    const usage = snapshotPlainDataRecord(attempt.usage) as Partial<AttemptUsageRecord> | null;
+    const usage = proxyFreeSnapshot(attempt.usage, isProxy) as Partial<AttemptUsageRecord> | null;
     if (usage === null) {
       return null;
     }
@@ -529,10 +554,17 @@ function foldGroups(
  * memory for the groups. Every failure returns a typed result; the function
  * never throws and never returns a partial sum.
  */
-export function summariseSpendMonth(rows: readonly unknown[], month: string): SpendMonthSummaryResult {
+export function summariseSpendMonth(
+  rows: readonly unknown[],
+  month: string,
+  isProxy: IsProxy,
+): SpendMonthSummaryResult {
   try {
     if (!isValidMonth(month)) {
       return { ok: false, reason: 'invalid-month' };
+    }
+    if (refusedAsProxy(rows, isProxy)) {
+      return { ok: false, reason: 'invalid-rows-array' };
     }
     const dense = readBoundedDenseArray(rows, SPEND_LEDGER_MAX_ROWS);
     if (dense === null) {
@@ -543,7 +575,7 @@ export function summariseSpendMonth(rows: readonly unknown[], month: string): Sp
     let rowCount = 0;
     let unknownCostRows = 0;
     for (const item of dense.array) {
-      const read = readSpendLedgerRow(item);
+      const read = readSpendLedgerRow(item, isProxy);
       if (!read.ok) {
         return { ok: false, reason: 'invalid-row' };
       }
@@ -651,8 +683,11 @@ export type ProviderBudgetResult =
  * `provider`, or a `monthlyUsd` that is not a finite positive number. Never
  * throws.
  */
-export function readProviderBudget(value: unknown): ProviderBudgetResult {
+export function readProviderBudget(value: unknown, isProxy: IsProxy): ProviderBudgetResult {
   try {
+    if (refusedAsProxy(value, isProxy)) {
+      return { ok: false, reason: 'invalid-budget' };
+    }
     const record = readExactPlainRecord(value, ['provider', 'monthlyUsd']);
     if (record === null) {
       return { ok: false, reason: 'invalid-budget' };
@@ -674,6 +709,86 @@ export type ProviderBudgetDecision =
   | { readonly allowed: true }
   | { readonly allowed: false; readonly reason: 'budget-exhausted' | 'budget-unknown' };
 
+const SPEND_TOKENS_KEYS = ['input', 'output', 'reasoning', 'cacheRead', 'cacheWrite'] as const;
+const SPEND_PROVIDER_ENTRY_KEYS = ['provider', 'rowCount', 'tokens', 'spentUsd', 'planEstimateUsd'] as const;
+const SPEND_SEAT_ENTRY_KEYS = ['provider', 'seatId', 'rowCount', 'tokens', 'spentUsd'] as const;
+const SPEND_SUMMARY_KEYS = [
+  'month', 'rowCount', 'providers', 'seats', 'providersTruncated', 'seatsTruncated', 'unknownCostRows',
+] as const;
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function readSpendTokens(value: unknown, isProxy: IsProxy): boolean {
+  if (refusedAsProxy(value, isProxy)) {
+    return false;
+  }
+  const tokens = readExactPlainRecord(value, SPEND_TOKENS_KEYS);
+  return tokens !== null && SPEND_TOKENS_KEYS.every((key) => isOptionalNonNegativeNumber(tokens[key]));
+}
+
+/**
+ * A summary this module did not just build is re-read in full before a budget trusts it: a
+ * Proxy anywhere, a getter, a missing or extra key, a non-array list, a count that is not a
+ * non-negative integer or a spend that is negative, non-finite or not a number refuses the whole
+ * summary. Returns the provider entries' `(provider, spentUsd)` and the truncation flag, or null.
+ */
+function readSpendSummaryForBudget(
+  value: unknown,
+  isProxy: IsProxy,
+): { providers: readonly { provider: string; spentUsd: number | null }[]; providersTruncated: boolean } | null {
+  if (refusedAsProxy(value, isProxy)) {
+    return null;
+  }
+  const summary = readExactPlainRecord(value, SPEND_SUMMARY_KEYS);
+  if (summary === null) {
+    return null;
+  }
+  if (
+    !isValidMonth(summary.month) || !isCount(summary.rowCount) || !isCount(summary.unknownCostRows) ||
+    typeof summary.providersTruncated !== 'boolean' || typeof summary.seatsTruncated !== 'boolean'
+  ) {
+    return null;
+  }
+  if (refusedAsProxy(summary.providers, isProxy) || refusedAsProxy(summary.seats, isProxy)) {
+    return null;
+  }
+  const providers = readBoundedDenseArray(summary.providers, SPEND_LEDGER_MAX_PROVIDERS);
+  const seats = readBoundedDenseArray(summary.seats, SPEND_LEDGER_MAX_SEATS);
+  if (providers === null || seats === null) {
+    return null;
+  }
+  const entries: { provider: string; spentUsd: number | null }[] = [];
+  for (const item of providers.array) {
+    if (refusedAsProxy(item, isProxy)) {
+      return null;
+    }
+    const entry = readExactPlainRecord(item, SPEND_PROVIDER_ENTRY_KEYS);
+    if (
+      entry === null || !isIdentifier(entry.provider) || !isCount(entry.rowCount) ||
+      !readSpendTokens(entry.tokens, isProxy) || !isOptionalNonNegativeNumber(entry.spentUsd) ||
+      !isOptionalNonNegativeNumber(entry.planEstimateUsd)
+    ) {
+      return null;
+    }
+    entries.push({ provider: entry.provider, spentUsd: entry.spentUsd });
+  }
+  for (const item of seats.array) {
+    if (refusedAsProxy(item, isProxy)) {
+      return null;
+    }
+    const seat = readExactPlainRecord(item, SPEND_SEAT_ENTRY_KEYS);
+    if (
+      seat === null || !isIdentifier(seat.provider) || !isIdentifier(seat.seatId) || !isCount(seat.rowCount) ||
+      !readSpendTokens(seat.tokens, isProxy) || !isOptionalNonNegativeNumber(seat.spentUsd)
+    ) {
+      return null;
+    }
+  }
+  return { providers: entries, providersTruncated: summary.providersTruncated };
+}
+
 /**
  * The pure spend-cap verdict for one provider against one month's summary.
  *
@@ -683,52 +798,57 @@ export type ProviderBudgetDecision =
  * boundary, before a first pass starts.
  *
  * Allowed only while `spentUsd < monthlyUsd` (strictly below): a spend that
- * equals the cap is `budget-exhausted`. A summary that is not an `ok` result,
- * or a budget that fails `readProviderBudget`, is `budget-unknown`: the
- * decision never guesses on unreadable input. A provider with no rows in the
- * month has spent `0` and is allowed (a budget is a positive number). Never
- * throws.
+ * equals the cap is `budget-exhausted`. A summary that is not an `ok` result
+ * or fails the full re-read above, a budget that fails `readProviderBudget`,
+ * or a summary whose provider list was truncated without naming the budget's
+ * provider (its spend may sit inside the folded `other` bucket) is
+ * `budget-unknown`: the decision never guesses on unreadable input. A
+ * provider with no rows in an untruncated month has spent `0` and is
+ * allowed (a budget is a positive number). Every entry naming the provider
+ * counts, so a real provider called `other` adds the folded bucket's spend.
+ * Never throws; the detector is required and never defaulted.
  */
 export function decideProviderBudget(input: {
   budget: unknown;
   summary: SpendMonthSummaryResult;
+  isProxy: IsProxy;
 }): ProviderBudgetDecision {
+  const unknown: ProviderBudgetDecision = { allowed: false, reason: 'budget-unknown' };
   try {
     if (typeof input !== 'object' || input === null) {
-      return { allowed: false, reason: 'budget-unknown' };
+      return unknown;
     }
-    const budget = readProviderBudget(input.budget);
+    const isProxy = input.isProxy;
+    const budget = readProviderBudget(input.budget, isProxy);
     if (!budget.ok) {
-      return { allowed: false, reason: 'budget-unknown' };
+      return unknown;
     }
-    const summary = input.summary;
-    if (typeof summary !== 'object' || summary === null || !summary.ok) {
-      return { allowed: false, reason: 'budget-unknown' };
+    if (refusedAsProxy(input.summary, isProxy)) {
+      return unknown;
     }
-    // The summary is re-checked, not trusted: a malformed entry (a non-array list, an entry that
-    // is not an object, a spend that is negative, non-finite or not a number) is `budget-unknown`.
-    const providers: unknown = summary.summary.providers;
-    if (!Array.isArray(providers) || !isValidMonth(summary.summary.month)) {
-      return { allowed: false, reason: 'budget-unknown' };
+    const result = readExactPlainRecord(input.summary, ['ok', 'summary']);
+    if (result === null || result.ok !== true) {
+      return unknown;
+    }
+    const summary = readSpendSummaryForBudget(result.summary, isProxy);
+    if (summary === null) {
+      return unknown;
+    }
+    const matching = summary.providers.filter((entry) => entry.provider === budget.budget.provider);
+    if (matching.length === 0 && summary.providersTruncated) {
+      return unknown;
     }
     let spent = 0;
-    for (const candidate of providers as unknown[]) {
-      if (typeof candidate !== 'object' || candidate === null) {
-        return { allowed: false, reason: 'budget-unknown' };
-      }
-      const entry = candidate as { provider?: unknown; spentUsd?: unknown };
-      if (entry.provider !== budget.budget.provider) {
-        continue;
-      }
-      if (entry.spentUsd !== null && !isNonNegativeNumber(entry.spentUsd)) {
-        return { allowed: false, reason: 'budget-unknown' };
-      }
+    for (const entry of matching) {
       spent += entry.spentUsd === null ? 0 : entry.spentUsd;
+    }
+    if (!Number.isFinite(spent)) {
+      return unknown;
     }
     return spent >= budget.budget.monthlyUsd
       ? { allowed: false, reason: 'budget-exhausted' }
       : { allowed: true };
   } catch {
-    return { allowed: false, reason: 'budget-unknown' };
+    return unknown;
   }
 }

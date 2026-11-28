@@ -68,6 +68,7 @@ const EXPECTED_KEYS = [
   'agent.name',
   'fleet.seat.tool',
   'fleet.seat.billing',
+  'fleet.seat.label_digest',
   'llm.invocation_parameters',
   'llm.model_name',
   'llm.provider',
@@ -87,7 +88,7 @@ const EXPECTED_KEYS = [
 ] as const;
 
 describe('RUN_TELEMETRY_ATTRIBUTES', () => {
-  it('has exactly the 55 allow-listed keys in plan order', () => {
+  it('has exactly the 56 allow-listed keys in plan order', () => {
     expect(Object.keys(RUN_TELEMETRY_ATTRIBUTES)).toEqual([...EXPECTED_KEYS]);
   });
 

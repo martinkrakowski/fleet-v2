@@ -1,4 +1,5 @@
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
+import { findInheritedPropertyDescriptor } from '../../domain/plain-record-reads.js';
 import { LANE_RUN_TERMINAL_STATES, type LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
@@ -69,16 +70,12 @@ function requireMethod(port: unknown, name: string, label: string): (...args: ne
   if (port === null || typeof port !== 'object') {
     throw new TypeError(`${label} must be an object with a ${name} function`);
   }
-  let current: object | null = port;
-  for (let depth = 0; current !== null && depth < MAX_PROTOTYPE_DEPTH; depth++) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, name);
-    if (descriptor !== undefined) {
-      if (!('value' in descriptor) || typeof descriptor.value !== 'function') {
-        throw new TypeError(`${label} must have a plain ${name} function, not an accessor`);
-      }
-      return descriptor.value as (...args: never[]) => unknown;
+  const found = findInheritedPropertyDescriptor(port, name, MAX_PROTOTYPE_DEPTH);
+  if (found !== undefined) {
+    if (!('value' in found.descriptor) || typeof found.descriptor.value !== 'function') {
+      throw new TypeError(`${label} must have a plain ${name} function, not an accessor`);
     }
-    current = Object.getPrototypeOf(current) as object | null;
+    return found.descriptor.value as (...args: never[]) => unknown;
   }
   throw new TypeError(`${label} must be an object with a ${name} function`);
 }

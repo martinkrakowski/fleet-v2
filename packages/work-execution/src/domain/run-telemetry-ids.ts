@@ -39,7 +39,7 @@ export const TELEMETRY_HASH_INPUT_MAX_LENGTH = 1024;
 export type TelemetryHmac = (message: string) => Uint8Array;
 
 /** The `<kind>` of a digest's hash input (plan §3.2). A prior attempt uses `attempt`. */
-export const TELEMETRY_DIGEST_KINDS = ['work-order', 'attempt', 'project'] as const;
+export const TELEMETRY_DIGEST_KINDS = ['work-order', 'attempt', 'project', 'seat-label'] as const;
 export type TelemetryDigestKind = (typeof TELEMETRY_DIGEST_KINDS)[number];
 
 declare const HASH_INPUT_BRAND: unique symbol;
@@ -208,6 +208,19 @@ export function attemptTraceRoot(attemptId: TelemetryHashInput): TelemetryTraceR
   }
 }
 
+/** `seat-call/<callId>` for one plan-billed seat call; callId is a minted opaque id, hash input only. */
+export function seatCallTraceRoot(callId: TelemetryHashInput): TelemetryTraceRoot | null {
+  try {
+    const text = readText(HASH_INPUT_TEXT, callId);
+    if (text === null) {
+      return null;
+    }
+    return mint(TRACE_ROOT_TEXT, identityText('seat-call', text));
+  } catch {
+    return null;
+  }
+}
+
 /** First 16 bytes (32 hex) of HMAC-SHA256(salt, 'fleet-telemetry/v1/trace/' + root), all-zero rule applied. */
 export function telemetryTraceId(hmac: TelemetryHmac, root: TelemetryTraceRoot): string | null {
   try {
@@ -255,6 +268,11 @@ export function telemetrySpanId(
 /** `root`: the root span of a conducted run. */
 export function runRootIdentity(): TelemetrySpanIdentity {
   return mint(SPAN_IDENTITY_TEXT, identityText('root'));
+}
+
+/** `seat-call`: the single root span of a seat-call trace. */
+export function seatCallRootIdentity(): TelemetrySpanIdentity {
+  return mint(SPAN_IDENTITY_TEXT, identityText('seat-call'));
 }
 
 /** `attempt/<attemptId>`: the attempt AGENT span (both trace kinds) and the root of a hand-run trace. */

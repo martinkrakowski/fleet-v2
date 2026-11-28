@@ -55,6 +55,7 @@ async function runWithdraw(
     undefined,
     undefined,
     undefined,
+    undefined,
     options,
   );
   return { exitCode, stdout: stdout.join(''), stderr: stderr.join('') };

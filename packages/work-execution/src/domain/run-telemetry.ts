@@ -25,7 +25,7 @@ import type { TelemetryAttributeValue, TelemetrySpanKind } from './run-telemetry
 export const TELEMETRY_SPAN_NAMES = [
   'lane-run', 'round', 'prepare', 'dispatch', 'attempt', 'usage', 'collect', 'reconcile', 'stop', 'gate',
   'brief-check', 'code-review', 'pre-merge', 'review', 'accept', 'open-pr', 'push', 'merge', 'ci', 'ci-wait',
-  'park', 'stop-request',
+  'park', 'stop-request', 'seat-call',
 ] as const;
 export type TelemetrySpanName = (typeof TELEMETRY_SPAN_NAMES)[number];
 
@@ -93,6 +93,15 @@ function isZonedTime(value: unknown): boolean {
     return false;
   }
   return isCalendarDateTime(value) && Number.isFinite(Date.parse(value));
+}
+
+/** True for a zoned ISO-8601 string naming a real calendar instant (the span time rule); never throws. */
+export function isTelemetryZonedInstant(value: unknown): value is string {
+  try {
+    return isZonedTime(value);
+  } catch {
+    return false;
+  }
 }
 
 /**

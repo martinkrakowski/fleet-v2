@@ -91,6 +91,7 @@ export * from "./slo-calculators.js";
 export * from "./slo-report.js";
 export * from "./snapshot-publishers.js";
 export * from "./snapshot-sections.js";
+export * from "./spend-cap-admission.js";
 export * from "./stall-attention.js";
 export * from "./stall-rules.js";
 export * from "./start-incomplete-fact.js";

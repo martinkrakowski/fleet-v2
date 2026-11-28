@@ -36,6 +36,14 @@ function envelope(
   return { grant: grant(grantOverrides), organizationId: 'org-a', nowIso, ...overrides };
 }
 
+/** A three-slot array whose middle slot is a hole. */
+function holey(value: unknown): unknown[] {
+  const out: unknown[] = new Array(3);
+  out[0] = value;
+  out[2] = value;
+  return out;
+}
+
 const decide = (input: unknown) => decideOperatorAccess(input, isProxy);
 const parse = (raw: unknown) => parseOperatorAccessGrant(raw, isProxy);
 
@@ -92,7 +100,7 @@ function hostileValues(valid: Record<string, unknown>): Array<[string, unknown]>
     ['number', 5],
     ['string', 'text'],
     ['array', [valid]],
-    ['hole', [valid, , valid]],
+    ['hole', holey(valid)],
     ['array-like', { ...valid, length: 5 }],
     ['non-plain prototype', Object.create({ inherited: 1 })],
     ['class instance', new (class Hostile {})()],
@@ -329,7 +337,7 @@ describe('decideOperatorAccess', () => {
     const withProto = { ...valid };
     Object.defineProperty(withProto, '__proto__', { value: 1, enumerable: true });
     expectRefused(decide(withProto), 'invalid-input');
-    const sparse = [valid, , valid];
+    const sparse = holey(valid);
     expectRefused(decide(sparse), 'invalid-input');
   });
 
@@ -354,7 +362,7 @@ describe('decideOperatorAccess', () => {
       7,
       'text',
       [grant()],
-      [grant(), , grant()],
+      holey(grant()),
       { ...grant(), length: 5 },
       Object.create({ inherited: 1 }),
       getterGrant,

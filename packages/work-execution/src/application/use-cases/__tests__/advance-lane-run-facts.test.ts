@@ -665,6 +665,36 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     expect(after?.parked).toBeNull();
     expect(after?.parkCount).toBe(0);
   });
+
+  it('test 11a: a no-capacity admit forwards blockedBy with overlaps and unreadable on the waiting result', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    const blockedBy = {
+      runIds: ['run-blocker-1'],
+      attemptIds: ['attempt-blocker-1'],
+      unreadable: ['wo-unreadable-1'],
+      overlaps: [{ kind: 'run' as const, id: 'run-blocker-1', path: 'packages/a/src' }],
+    };
+    harness.setAdmissionAnswer({ outcome: 'no-capacity', blockedBy });
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'admission', blockedBy });
+    const after = await harness.runRepo.get(RUN_ID);
+    expect(after?.parked).toBeNull();
+  });
+
+  it('test 11b: a bare no-capacity admit omits blockedBy', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setAdmissionAnswer({ outcome: 'no-capacity' });
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'admission' });
+    expect(Object.hasOwn(result, 'blockedBy')).toBe(false);
+  });
+
+  it('test 11c: an admitted answer never carries blockedBy', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setAdmissionAnswer({ outcome: 'admitted' });
+    const result = await advance(harness);
+    expect(Object.hasOwn(result, 'blockedBy')).toBe(false);
+  });
 });
 
 describe('collectionFactOf headUnchanged (KF-21c)', () => {

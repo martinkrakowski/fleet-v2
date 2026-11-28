@@ -510,6 +510,9 @@ export async function performAdmissionWait(ctx: AdvanceStepContext,
     if (admission.outcome === 'refused') {
       return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
     }
+    if (admission.outcome === 'no-capacity' && admission.blockedBy !== undefined) {
+      return { outcome: 'waiting', reason: 'admission', blockedBy: admission.blockedBy };
+    }
   }
   return { outcome: 'waiting', reason: 'admission' };
 }

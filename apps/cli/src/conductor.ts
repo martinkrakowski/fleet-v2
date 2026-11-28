@@ -759,6 +759,16 @@ async function startCommand(
     await raiseStartIncompleteAttention(runtime, brief, result, nowIsoOf(options), io);
     return 1;
   }
+  if (result.outcome === 'no-capacity') {
+    const blocked = safeOwnDataValue(result, 'blockedBy').value;
+    const sanitized = sanitizeAdmissionBlockersForOutput(blocked);
+    io.stdout(`${JSON.stringify(sanitized === undefined ? { outcome: 'no-capacity' } : { outcome: 'no-capacity', blockedBy: sanitized })}\n`);
+    const line = formatAdmissionNoCapacityLog(blocked);
+    if (line !== null) {
+      io.stderr(`conductor start: ${line}\n`);
+    }
+    return 1;
+  }
   io.stdout(`${JSON.stringify(result)}\n`);
   // start's own outcome table: started completes; refused, no-capacity and
   // incomplete (handled above) exit 1.
@@ -796,6 +806,337 @@ function ownDataValue(source: object, key: string): { readonly present: boolean;
     return { present: false };
   }
   return { present: true, value: descriptor.value };
+}
+
+/** The blockers an admission refusal names (the shape `StartLaneRunResult` carries on `no-capacity`). */
+type LaneRunAdmissionBlockers = NonNullable<Extract<StartLaneRunResult, { readonly outcome: 'no-capacity' }>['blockedBy']>;
+
+/** `ownDataValue` that never throws: a throwing or revoked-Proxy descriptor trap reads as absent. */
+function safeOwnDataValue(source: object, key: string): { readonly present: boolean; readonly value?: unknown } {
+  try {
+    return ownDataValue(source, key);
+  } catch {
+    return { present: false };
+  }
+}
+
+/** `Array.isArray` that never throws: a revoked Proxy is not an array. */
+function safeIsArray(value: unknown): value is readonly unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+/** An array's length; `null` when reading it throws or it is not a non-negative finite integer. */
+function safeArrayLength(value: readonly unknown[]): number | null {
+  try {
+    const length: unknown = value.length;
+    return typeof length === 'number' && Number.isInteger(length) && length >= 0 ? length : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The longest raw string any blocker value is allowed to reach a regex or a scan (before any processing). */
+const ADMISSION_BLOCKER_RAW_MAX_CHARS = 4096;
+/** The longest displayed blocker or unreadable id, in characters. */
+const ADMISSION_BLOCKER_ID_MAX_CHARS = 120;
+/** The longest displayed owned path, in characters. */
+const ADMISSION_BLOCKER_PATH_MAX_CHARS = 240;
+/** The most blockers (and unreadable work orders) one log line names. */
+const ADMISSION_BLOCKER_LOG_LIMIT = 5;
+/** The most array entries one blocker list is read through. */
+const ADMISSION_BLOCKER_ARRAY_SCAN_LIMIT = 10_000;
+
+const REDACTED = '[REDACTED]';
+
+/** Provider-shaped credential prefixes, anchored so ordinary words such as `task-queue` do not match. */
+const CREDENTIAL_TOKEN_PATTERN =
+  /(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{8,}|xox[baprs]-[A-Za-z0-9-]{4,})/;
+/** Header, key block, URL userinfo and `name=value` assignment shapes. */
+const CREDENTIAL_SHAPE_PATTERN =
+  /bearer\s+\S{6,}|-----begin [a-z ]*private key-----|[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@|(?:token|secret|password|passwd|api[_-]?key)\s*[=:]\s*\S+/i;
+
+/** True when `text` is shaped like a credential. Pure. */
+function looksLikeCredential(text: string): boolean {
+  return CREDENTIAL_TOKEN_PATTERN.test(text) || CREDENTIAL_SHAPE_PATTERN.test(text);
+}
+
+function isCsiFinal(code: number): boolean {
+  return code >= 0x40 && code <= 0x7e;
+}
+
+/**
+ * Removes terminal control: CSI (`ESC [` and C1 `0x9b`) and OSC (`ESC ]`, ended by BEL or ST) sequences,
+ * any other escape pair, and every remaining C0, DEL and C1 control character. Line breaks go too, so the
+ * result is a single line. Linear in the input, with no regex.
+ */
+function stripTerminalControl(text: string): string {
+  let out = '';
+  const chars = Array.from(text);
+  let i = 0;
+  while (i < chars.length) {
+    const code = chars[i].codePointAt(0) ?? 0;
+    if (code === 0x1b || code === 0x9b || code === 0x9d) {
+      const next = code === 0x1b ? (chars[i + 1]?.codePointAt(0) ?? -1) : code === 0x9b ? 0x5b : 0x5d;
+      i += code === 0x1b ? 2 : 1;
+      if (next === 0x5b) {
+        while (i < chars.length && !isCsiFinal(chars[i].codePointAt(0) ?? 0)) {
+          i += 1;
+        }
+        i += 1;
+      } else if (next === 0x5d) {
+        while (i < chars.length) {
+          const c = chars[i].codePointAt(0) ?? 0;
+          if (c === 0x07 || c === 0x9c) {
+            i += 1;
+            break;
+          }
+          if (c === 0x1b && chars[i + 1] === '\\') {
+            i += 2;
+            break;
+          }
+          i += 1;
+        }
+      }
+      continue;
+    }
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      i += 1;
+      continue;
+    }
+    out += chars[i];
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * One blocker string made safe to emit: sliced to the raw cap before any processing, stripped of terminal
+ * control, and replaced whole by `[REDACTED]` when it (before or after stripping) is credential-shaped.
+ */
+function sanitizeBlockerText(value: string): string {
+  const raw = value.slice(0, ADMISSION_BLOCKER_RAW_MAX_CHARS);
+  const stripped = stripTerminalControl(raw);
+  return looksLikeCredential(raw) || looksLikeCredential(stripped) ? REDACTED : stripped;
+}
+
+function boundText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+interface BlockerStrings {
+  /** The field's full array length (never capped by the scan limit); 0 when absent or unreadable. */
+  readonly length: number;
+  /** The raw string entries found in the first `ADMISSION_BLOCKER_ARRAY_SCAN_LIMIT` slots, in order. */
+  readonly strings: readonly string[];
+}
+
+/** One untrusted list field of `blockedBy`: its full length and its string entries, read without a getter or a throw. */
+function readBlockerStrings(source: object, key: string): BlockerStrings | null {
+  const field = safeOwnDataValue(source, key);
+  if (!field.present || !safeIsArray(field.value)) {
+    return null;
+  }
+  const length = safeArrayLength(field.value);
+  if (length === null) {
+    return null;
+  }
+  const strings: string[] = [];
+  const scan = Math.min(length, ADMISSION_BLOCKER_ARRAY_SCAN_LIMIT);
+  for (let index = 0; index < scan; index += 1) {
+    const entry = safeOwnDataValue(field.value, String(index));
+    if (entry.present && typeof entry.value === 'string') {
+      strings.push(entry.value);
+    }
+  }
+  return { length, strings };
+}
+
+interface BlockerOverlapRead {
+  readonly kind: 'run' | 'attempt';
+  readonly id: string;
+  readonly path: string;
+}
+
+/** The `overlaps` field: only well-formed entries, scanned up to the limit, each read by data property. */
+function readBlockerOverlaps(source: object): readonly BlockerOverlapRead[] | null {
+  const field = safeOwnDataValue(source, 'overlaps');
+  if (!field.present || !safeIsArray(field.value)) {
+    return null;
+  }
+  const length = safeArrayLength(field.value);
+  if (length === null) {
+    return null;
+  }
+  const overlaps: BlockerOverlapRead[] = [];
+  const scan = Math.min(length, ADMISSION_BLOCKER_ARRAY_SCAN_LIMIT);
+  for (let index = 0; index < scan; index += 1) {
+    const entry = safeOwnDataValue(field.value, String(index));
+    if (!entry.present || typeof entry.value !== 'object' || entry.value === null || safeIsArray(entry.value)) {
+      continue;
+    }
+    const kind = safeOwnDataValue(entry.value, 'kind');
+    const id = safeOwnDataValue(entry.value, 'id');
+    const path = safeOwnDataValue(entry.value, 'path');
+    if ((kind.value === 'run' || kind.value === 'attempt') && typeof id.value === 'string' && typeof path.value === 'string') {
+      overlaps.push({ kind: kind.value, id: id.value, path: path.value });
+    }
+  }
+  return overlaps;
+}
+
+/** `blockedBy` as an object; `null` for a non-object, an array or a revoked Proxy (whose prototype read throws). */
+function blockersObject(blockedBy: unknown): object | null {
+  if (blockedBy === null || typeof blockedBy !== 'object' || safeIsArray(blockedBy)) {
+    return null;
+  }
+  try {
+    Object.getPrototypeOf(blockedBy);
+  } catch {
+    return null;
+  }
+  return blockedBy;
+}
+
+/**
+ * The `blockedBy` of an admission refusal made safe for stdout JSON: every string sliced, stripped of terminal
+ * control and credential-redacted (ordinary ids and paths are unchanged), lists read up to 10_000 entries,
+ * malformed entries dropped. `undefined` for anything that is not an object. Never throws, never runs a getter.
+ */
+export function sanitizeAdmissionBlockersForOutput(blockedBy: unknown): LaneRunAdmissionBlockers | undefined {
+  const source = blockersObject(blockedBy);
+  if (source === null) {
+    return undefined;
+  }
+  const clean = (key: string): readonly string[] | null =>
+    readBlockerStrings(source, key)?.strings.map(sanitizeBlockerText) ?? null;
+  const overlaps = readBlockerOverlaps(source);
+  const unreadable = clean('unreadable');
+  return {
+    runIds: clean('runIds') ?? [],
+    attemptIds: clean('attemptIds') ?? [],
+    ...(unreadable === null ? {} : { unreadable }),
+    ...(overlaps === null
+      ? {}
+      : {
+          overlaps: overlaps.map((overlap) => ({
+            kind: overlap.kind,
+            id: sanitizeBlockerText(overlap.id),
+            path: sanitizeBlockerText(overlap.path),
+          })),
+        }),
+  };
+}
+
+/** A pass result whose `waiting admission` steps carry sanitized `blockedBy` (or none), for stdout JSON. */
+function withSanitizedAdmissionBlockers(result: RunConductorPassResult): RunConductorPassResult {
+  if (result.outcome !== 'completed') {
+    return result;
+  }
+  return {
+    ...result,
+    runs: result.runs.map((report) =>
+      report.outcome !== 'advanced'
+        ? report
+        : {
+            ...report,
+            steps: report.steps.map((step) => {
+              if (step.outcome !== 'waiting' || step.reason !== 'admission') {
+                return step;
+              }
+              const blocked = safeOwnDataValue(step, 'blockedBy');
+              if (!blocked.present) {
+                // A fresh object, never the original: an own accessor on `blockedBy` reads as absent here
+                // and must not reach JSON.stringify.
+                return { outcome: 'waiting' as const, reason: 'admission' as const };
+              }
+              const sanitized = sanitizeAdmissionBlockersForOutput(blocked.value);
+              return sanitized === undefined
+                ? { outcome: 'waiting' as const, reason: 'admission' as const }
+                : { outcome: 'waiting' as const, reason: 'admission' as const, blockedBy: sanitized };
+            }),
+          },
+    ),
+  };
+}
+
+/** One stderr line per advanced run whose last step waits on admission, naming its blockers. */
+function logAdmissionWaits(io: CliIo, result: RunConductorPassResult): void {
+  if (result.outcome !== 'completed') {
+    return;
+  }
+  for (const report of result.runs) {
+    if (report.outcome !== 'advanced') {
+      continue;
+    }
+    const step = report.steps[report.steps.length - 1];
+    if (step === undefined || step.outcome !== 'waiting' || step.reason !== 'admission') {
+      continue;
+    }
+    const line = formatAdmissionNoCapacityLog(safeOwnDataValue(step, 'blockedBy').value);
+    if (line !== null) {
+      io.stderr(`conductor run: ${boundText(sanitizeBlockerText(report.runId), ADMISSION_BLOCKER_ID_MAX_CHARS)} ${line}\n`);
+    }
+  }
+}
+
+/**
+ * The one stderr line for an admission refusal: how many runs and reservations block, the first five by id with
+ * the first overlapping owned path of each, `+N more` from the full array lengths, and the unreadable work orders
+ * on their own. Single line, bounded, credential-redacted, with terminal control stripped. `null` when nothing
+ * names a blocker or the input is not an object. Never throws.
+ */
+export function formatAdmissionNoCapacityLog(blockedBy: unknown): string | null {
+  try {
+    const source = blockersObject(blockedBy);
+    if (source === null) {
+      return null;
+    }
+    const runs = readBlockerStrings(source, 'runIds');
+    const attempts = readBlockerStrings(source, 'attemptIds');
+    const unreadable = readBlockerStrings(source, 'unreadable');
+    const runCount = runs?.length ?? 0;
+    const attemptCount = attempts?.length ?? 0;
+    const unreadableCount = unreadable?.length ?? 0;
+    if (runCount === 0 && attemptCount === 0 && unreadableCount === 0) {
+      return null;
+    }
+    const overlaps = readBlockerOverlaps(source) ?? [];
+    const candidates: Array<{ readonly kind: 'run' | 'attempt'; readonly id: string }> = [
+      ...(runs?.strings ?? []).map((id) => ({ kind: 'run' as const, id })),
+      ...(attempts?.strings ?? []).map((id) => ({ kind: 'attempt' as const, id })),
+    ].slice(0, ADMISSION_BLOCKER_LOG_LIMIT);
+    const shown = candidates.map((candidate) => {
+      const id = boundText(sanitizeBlockerText(candidate.id), ADMISSION_BLOCKER_ID_MAX_CHARS);
+      const overlap = overlaps.find((entry) => entry.kind === candidate.kind && entry.id === candidate.id);
+      return overlap === undefined
+        ? id
+        : `${id} (${boundText(sanitizeBlockerText(overlap.path), ADMISSION_BLOCKER_PATH_MAX_CHARS)})`;
+    });
+    const total = runCount + attemptCount;
+    let line = `blocked by ${runCount} run(s) and ${attemptCount} reservation(s)`;
+    if (shown.length > 0) {
+      line += `: ${shown.join(', ')}`;
+    }
+    if (total > ADMISSION_BLOCKER_LOG_LIMIT) {
+      line += `, +${total - shown.length} more`;
+    }
+    if (unreadableCount > 0) {
+      const ids = (unreadable?.strings ?? [])
+        .slice(0, ADMISSION_BLOCKER_LOG_LIMIT)
+        .map((id) => boundText(sanitizeBlockerText(id), ADMISSION_BLOCKER_ID_MAX_CHARS));
+      line += `; unreadable work order: ${ids.join(', ')}`;
+      if (unreadableCount > ADMISSION_BLOCKER_LOG_LIMIT) {
+        line += `, +${unreadableCount - ids.length} more`;
+      }
+    }
+    return line;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1325,7 +1666,8 @@ async function runCommand(
       heartbeatDuringPass: beatNow,
       nextBeatDelayMs,
       eachPass: async (pass, result, nowIso) => {
-        io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+        io.stdout(`${JSON.stringify({ pass, ...withSanitizedAdmissionBlockers(result) })}\n`);
+        logAdmissionWaits(io, result);
         if (result.outcome === 'refused') {
           return { stop: true, exitCode: 1 };
         }

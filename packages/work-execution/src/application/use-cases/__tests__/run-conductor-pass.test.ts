@@ -527,6 +527,7 @@ describe('RunConductorPassUseCase per-step lease renewal', () => {
       },
       release: (request) => driverLease.release(request),
       check: (request) => driverLease.check(request),
+      verifyFence: (token, nowIso) => driverLease.verifyFence(token, nowIso),
     };
     const repo = fx.repo;
     const wrappedRepo = {
@@ -2404,6 +2405,10 @@ describe('ConductorDriverLeaseKeeper loss latch and expiry monotonicity (KF-34b)
         portCalls += 1;
         throw new Error('storage exploded');
       },
+      verifyFence: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
     };
     const keeper = new ConductorDriverLeaseKeeper({ driverLease, holderId: HOLDER, now: () => NOW });
     await expect(keeper.renew()).rejects.toThrow('storage exploded');
@@ -2426,6 +2431,7 @@ describe('ConductorDriverLeaseKeeper loss latch and expiry monotonicity (KF-34b)
       },
       release: (request) => driverLease.release(request),
       check: (request) => driverLease.check(request),
+      verifyFence: (token, nowIso) => driverLease.verifyFence(token, nowIso),
     };
     let current = Date.parse(NOW);
     const keeper = new ConductorDriverLeaseKeeper({

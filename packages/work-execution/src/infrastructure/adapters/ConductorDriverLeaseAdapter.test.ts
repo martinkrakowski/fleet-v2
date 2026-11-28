@@ -111,6 +111,68 @@ describe.each(['memory', 'file'] as const)('ConductorDriverLeaseAdapter (%s)', (
     const refused = results.find((result) => result.outcome === 'refused');
     expect(refused?.outcome === 'refused' && refused.reason).toBe('lease-held');
   });
+
+  it('after a takeover the previous holder\'s token is stale-fence on the driver lease adapter', async () => {
+    await adapter.acquire(ACQUIRE);
+    expect(
+      await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW),
+    ).toBeNull();
+
+    await adapter.acquire({
+      holderId: 'driver-b',
+      observedFence: 1,
+      leaseUntilIso: LAPSE_UNTIL,
+      nowIso: LAPSE_NOW,
+    });
+    // The previous holder's token names fence 1, the lease is now fence 2.
+    expect(
+      await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, LAPSE_NOW),
+    ).toBe('stale-fence');
+    // The new holder's own token verifies.
+    expect(await adapter.verifyFence({ holderId: 'driver-b', fence: 2 }, LAPSE_NOW)).toBeNull();
+  });
+
+  it('after a release the releasing holder\'s token is lease-expired', async () => {
+    await adapter.acquire(ACQUIRE);
+    await adapter.release(HOLD);
+    // The released lease keeps holder and fence but ends at NOW.
+    expect(await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBe(
+      'lease-expired',
+    );
+  });
+
+  it('an unreadable driver lease file refuses no-lease-readable and never ok', async () => {
+    await adapter.acquire(ACQUIRE);
+    if (isFile) {
+      const garbage = '{ not json';
+      const file = path.join(tempDir, 'conductor-driver-lease.json');
+      await fs.writeFile(file, garbage, 'utf8');
+      // Both writable (throws) and read-only (typed error) adapters refuse.
+      expect(await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBe(
+        'no-lease-readable',
+      );
+      // Verification never changes persisted state: the exact bytes stay and
+      // no quarantine copy is made, even though the store is writable.
+      expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+      await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
+      expect(await readonlyAdapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBe(
+        'no-lease-readable',
+      );
+    } else {
+      // In memory the lease is readable: the holder's token verifies; a fresh
+      // adapter with no lease at all is genuinely absent: no-lease.
+      expect(await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBeNull();
+      expect(
+        await new ConductorDriverLeaseAdapter().verifyFence(
+          { holderId: 'driver-example-1', fence: 1 },
+          NOW,
+        ),
+      ).toBe('no-lease');
+    }
+  });
 });
 
 describe('ConductorDriverLeaseAdapter file shape, read-back and quarantine', () => {

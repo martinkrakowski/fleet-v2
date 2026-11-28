@@ -171,6 +171,8 @@ describe('parseOperatorAccessGrant', () => {
       grant({ actor: 'has space' }),
       grant({ actor: 'a'.repeat(129) }),
       grant({ actor: 5 }),
+      grant({ actor: 'operator@example.com\n' }),
+      grant({ organizationId: 'org-a\n' }),
       grant({ organizationId: '' }),
       grant({ organizationId: 'Upper' }),
       grant({ organizationId: 'a'.repeat(64) }),

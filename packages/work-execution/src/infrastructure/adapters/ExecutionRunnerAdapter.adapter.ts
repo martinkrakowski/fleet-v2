@@ -11,14 +11,18 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { promisify, types } from 'node:util';
 
-import { isValidHostName } from '@fleet/shared';
+import { isValidHostName, snapshotPlainData } from '@fleet/shared';
+
+import type { IsProxy } from '@fleet/shared';
 
 import type {
   AbortWorktreeRunRequest,
   AbortWorktreeRunResult,
   ExecutionRunnerPort,
+  ListRunnerSessionsRef,
+  ListRunnerSessionsResult,
   RunnerIsolationCapabilities,
   RunnerSessionRef,
   RunnerSessionStatus,
@@ -404,18 +408,75 @@ const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 /**
  * Session ids the runner's `--status` output actually lists: only lines
  * after the `ocm-run: running in <dir>:` header count, and each must be a
- * bare session id. A `ses_…` inside the directory path never counts.
+ * bare session id. A `ses_…` inside the directory path never counts. The
+ * scan is cost-bounded: at most `MAX_STATUS_LINES` lines after the header
+ * are scanned and at most `MAX_LISTED_SESSIONS` ids are collected.
  */
+const MAX_STATUS_LINES = 1024;
+const MAX_LISTED_SESSIONS = 1024;
+
+/** The session-id shape `--status` text output and the JSON payload must match. */
+const SESSION_ID_MAX_LENGTH = 128;
+
 function statusSessionIds(stdout: string): string[] {
   const lines = stdout.split('\n');
   const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
   if (headerIndex === -1) return [];
   const ids = new Set<string>();
-  for (const rawLine of lines.slice(headerIndex + 1)) {
+  const afterHeader = lines.slice(headerIndex + 1, headerIndex + 1 + MAX_STATUS_LINES);
+  for (const rawLine of afterHeader) {
+    if (ids.size >= MAX_LISTED_SESSIONS) break;
     const line = rawLine.trim();
-    if (SESSION_ID_PATTERN.test(line)) ids.add(line);
+    if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) ids.add(line);
   }
   return [...ids];
+}
+
+/**
+ * Pure parse of an untrusted `--status` JSON payload into a session listing.
+ * Untrusted values are read only through `snapshotPlainData` (the injected
+ * `isProxy` detector runs before any reflection, so no Proxy trap or getter
+ * ever executes); the accepted shapes are an array of session-id strings or
+ * a plain record whose own `sessions` property holds one. Anything else,
+ * including an invalid id, a hole, an accessor, or a Proxy, is a typed
+ * `unreadable` refusal, never success and never an empty list.
+ */
+export function parseListSessionsPayload(
+  value: unknown,
+  isProxy: IsProxy,
+): ListRunnerSessionsResult {
+  const snapshot = snapshotPlainData(value, isProxy);
+  if (!snapshot.ok) {
+    return {
+      ok: false,
+      error: 'unreadable',
+      reason: `Unreadable runner session payload: ${snapshot.reason}`,
+    };
+  }
+  const data: unknown = snapshot.value;
+  const rawSessions: unknown =
+    Array.isArray(data) ? data : isPlainRecord(data) ? data['sessions'] : undefined;
+  if (!Array.isArray(rawSessions)) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session payload is not a session list' };
+  }
+  // `snapshotPlainData` bounds the array at `maxArrayLength` (1024) before
+  // this loop; the loop cost is still bounded explicitly.
+  if (rawSessions.length > 1024) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session list exceeds its bound' };
+  }
+  const sessions: string[] = [];
+  for (const rawId of rawSessions) {
+    if (
+      typeof rawId !== 'string'
+      || rawId === ''
+      || rawId.length > SESSION_ID_MAX_LENGTH
+      || !SESSION_ID_PATTERN.test(rawId)
+    ) {
+      return { ok: false, error: 'unreadable', reason: 'Runner session payload holds an invalid session id' };
+    }
+    sessions.push(rawId);
+  }
+  return { ok: true, sessions };
 }
 
 /** A runner output line that reports the runner aborted a session. */
@@ -1105,6 +1166,127 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       outcome: 'still-running',
       reason: result.stderr || result.stdout || 'Abort did not confirm termination',
     };
+  }
+
+  /**
+   * A read-only listing of the session ids a runner reports for a worktree
+   * directory: the same recorded-runner guards as the other worktree
+   * commands, then `ocm-run --status --dir`. Exit 0 means idle (an empty
+   * list, or a JSON payload the pure parser accepts); exit 3 means running,
+   * reported as JSON or as `--status` text. Every other outcome — a failed
+   * guard, a thrown or timed-out subprocess, exit 1, exit 2, an unexpected
+   * exit code, or a malformed payload — fails closed as `unreachable` or
+   * `unreadable`, never as success and never as an empty list.
+   */
+  async listSessions(ref?: ListRunnerSessionsRef): Promise<ListRunnerSessionsResult> {
+    // Untrusted ref values are read only through the snapshot: a Proxy trap
+    // or a getter on it never executes.
+    let refData: unknown;
+    if (ref !== undefined) {
+      const snapRef = snapshotPlainData(ref, types.isProxy);
+      if (!snapRef.ok) {
+        return { ok: false, error: 'unreadable', reason: `Unreadable runner session ref: ${snapRef.reason}` };
+      }
+      refData = snapRef.value;
+    }
+    const refRecord = isPlainRecord(refData) ? refData : {};
+    const worktreePathRaw: unknown = refRecord['worktreePath'];
+    if (typeof worktreePathRaw !== 'string' || worktreePathRaw.trim() === '') {
+      return { ok: false, error: 'unreadable', reason: 'Missing or invalid worktreePath' };
+    }
+    const worktreePath: string = worktreePathRaw;
+    const runnerRaw: unknown = refRecord['runner'];
+
+    // The same host/port guards as resolveRecordedRunner: refuse an unsafe
+    // configured host, refuse an unsafe recorded host, and require the
+    // configured port and host to equal the recorded ones when a runner is
+    // given. In v2 mode a missing configured port is a refusal.
+    const configuredPort = this.configuredRemotePort();
+    const configuredHost = this.configuredRemoteHost();
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return { ok: false, error: 'unreadable', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+    let remotePort: number | undefined = configuredPort;
+    if (isPlainRecord(runnerRaw)) {
+      const recordedPort: unknown = runnerRaw['remotePort'];
+      const recordedHost: unknown = runnerRaw['host'];
+      if (typeof recordedPort !== 'number' || !Number.isInteger(recordedPort)) {
+        return { ok: false, error: 'unreadable', reason: 'Attempt has no recorded runner port' };
+      }
+      if (typeof recordedHost === 'string' && !isSafeSshHost(recordedHost)) {
+        return { ok: false, error: 'unreadable', reason: `Unsafe recorded runner host: ${recordedHost}` };
+      }
+      if (
+        configuredPort !== recordedPort ||
+        (configuredHost ?? null) !== (typeof recordedHost === 'string' ? recordedHost : null)
+      ) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: 'Configured runner port or host differs from recorded runner',
+        };
+      }
+      remotePort = recordedPort;
+    } else if (this.host() !== undefined && configuredPort === undefined) {
+      return { ok: false, error: 'unreadable', reason: 'Attempt has no recorded runner port' };
+    }
+
+    let result: SubprocessResult;
+    try {
+      result = await this.run(
+        this.binPath(),
+        ['--status', '--dir', worktreePath],
+        this.remotePortEnv(remotePort, undefined),
+        { timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS },
+      );
+    } catch (error) {
+      return { ok: false, error: 'unreachable', reason: `Status command failed: ${String(error)}` };
+    }
+
+    // The subprocess result itself is untrusted: snapshot it before reading
+    // any property, so a getter or Proxy trap on it never executes.
+    const snapResult = snapshotPlainData(result, types.isProxy);
+    if (!snapResult.ok) {
+      return { ok: false, error: 'unreadable', reason: `Unreadable runner status output: ${snapResult.reason}` };
+    }
+    const snapData: unknown = snapResult.value;
+    if (!isPlainRecord(snapData)) {
+      return { ok: false, error: 'unreadable', reason: 'Unreadable runner status output shape' };
+    }
+    const exitCodeRaw: unknown = snapData['exitCode'];
+    const stdoutRaw: unknown = snapData['stdout'];
+    if (typeof exitCodeRaw !== 'number' || !Number.isInteger(exitCodeRaw) || typeof stdoutRaw !== 'string') {
+      return { ok: false, error: 'unreadable', reason: 'Unreadable runner status output shape' };
+    }
+    const stdout: string = stdoutRaw;
+    const trimmed = stdout.trim();
+
+    if (exitCodeRaw === 1) {
+      return { ok: false, error: 'unreachable', reason: 'Runner status failed: server unreachable' };
+    }
+    if (exitCodeRaw === 2) {
+      return { ok: false, error: 'unreadable', reason: 'Runner status usage error (exit 2)' };
+    }
+    if (exitCodeRaw === 0 || exitCodeRaw === 3) {
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return { ok: false, error: 'unreadable', reason: 'Runner status stdout is not valid JSON' };
+        }
+        return parseListSessionsPayload(parsed, types.isProxy);
+      }
+      if (exitCodeRaw === 0) {
+        return { ok: true, sessions: [] };
+      }
+      const ids = statusSessionIds(stdout);
+      if (ids.length === 0) {
+        return { ok: false, error: 'unreadable', reason: 'Runner status exit 3 listed no valid session ids' };
+      }
+      return { ok: true, sessions: ids };
+    }
+    return { ok: false, error: 'unreadable', reason: `Runner status exited ${exitCodeRaw}` };
   }
 
   private binPath(): string {

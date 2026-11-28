@@ -66,7 +66,7 @@ function requestRecord(overrides: Record<string, unknown> = {}): Record<string, 
     target: { attemptId: 'attempt-fixture-1' },
     requestedBy: { via: 'web', sessionId: 'web-session-1' },
     createdAtIso: '2026-11-27T11:55:00.000Z',
-    expiresAtIso: '2026-11-27T13:00:00.000Z',
+    expiresAtIso: '2026-11-27T12:10:00.000Z',
     updatedAtIso: '2026-11-27T11:55:00.000Z',
     state: 'queued',
     fence: 0,
@@ -322,7 +322,7 @@ describe('orchestrator CLI', () => {
   describe('pending', () => {
     it('lists queued non-expired requests as data and drops expired and non-queued ones', async () => {
       await seedRequest();
-      await seedRequest({ requestId: REQUEST_B, expiresAtIso: '2026-11-27T11:59:00.000Z', createdAtIso: '2026-11-27T11:50:00.000Z', updatedAtIso: '2026-11-27T11:50:00.000Z' });
+      await seedRequest({ requestId: REQUEST_B, expiresAtIso: '2026-11-27T11:59:00.000Z', createdAtIso: '2026-11-27T11:45:00.000Z', updatedAtIso: '2026-11-27T11:45:00.000Z' });
       const result = await run(['pending'], realRuntime());
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({

@@ -190,7 +190,7 @@ function readNamesFile(filePath) {
 export function loadForbiddenNames(options, snapshot = snapshotPlainData) {
   try {
     const parsed = readForbiddenNameOptions(options, snapshot);
-    if (parsed === null || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean' || !parsed.ok) {
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.ok !== 'boolean' || !parsed.ok) {
       return [];
     }
     // `env` is validated to be a string when present, so `??` only substitutes for an absent option.

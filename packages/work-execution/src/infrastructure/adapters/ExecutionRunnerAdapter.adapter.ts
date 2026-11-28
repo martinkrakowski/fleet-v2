@@ -432,6 +432,11 @@ function statusSessionIds(stdout: string): string[] {
   return [...ids];
 }
 
+/** Whether `--status` text output carries the runner's status header line. */
+function hasStatusHeader(stdout: string): boolean {
+  return stdout.split('\n').some((line) => STATUS_HEADER_PATTERN.test(line));
+}
+
 /**
  * Pure parse of an untrusted `--status` JSON payload into a session listing.
  * Untrusted values are read only through `snapshotPlainData` (the injected
@@ -1303,9 +1308,54 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         } catch {
           return { ok: false, error: 'unreadable', reason: 'Runner status stdout is not valid JSON' };
         }
-        return parseListSessionsPayload(parsed, types.isProxy);
+        const parsedResult = parseListSessionsPayload(parsed, types.isProxy);
+        if (!parsedResult.ok) return parsedResult;
+        // The parsed payload must agree with the exit code, or the runner's
+        // state is contradictory and the read fails closed: exit 0 means no
+        // running session, exit 3 means at least one.
+        if (exitCodeRaw === 0 && parsedResult.sessions.length > 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 but its JSON payload lists sessions',
+          };
+        }
+        if (exitCodeRaw === 3 && parsedResult.sessions.length === 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 3 but its JSON payload lists no sessions',
+          };
+        }
+        return parsedResult;
       }
       if (exitCodeRaw === 0) {
+        // Exit 0 with text output is only an idle listing when the output
+        // actually looks like `--status` text (a header line followed by
+        // session ids). Anything else — arbitrary garbage, an empty string —
+        // is a malformed or unexpected status output and fails closed rather
+        // than hiding a running session behind a "success" with no sessions.
+        const ids = statusSessionIds(stdout);
+        // Exit 0 means idle: real `--status` text output carries the header
+        // and lists no sessions. Listing ids under exit 0 is as contradictory
+        // as a JSON list would be, and output without the header — arbitrary
+        // garbage, an empty string — is unexpected status output. Both fail
+        // closed rather than hiding a running session behind a "success" with
+        // no sessions.
+        if (ids.length > 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 but its text output lists sessions',
+          };
+        }
+        if (!hasStatusHeader(stdout)) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 with unrecognised text output',
+          };
+        }
         return { ok: true, sessions: [] };
       }
       const ids = statusSessionIds(stdout);

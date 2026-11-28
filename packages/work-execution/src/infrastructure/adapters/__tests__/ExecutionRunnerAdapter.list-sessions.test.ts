@@ -161,8 +161,8 @@ describe('ExecutionRunnerAdapter listSessions refusals', () => {
 });
 
 describe('ExecutionRunnerAdapter listSessions valid responses', () => {
-  it('exit 0 returns empty sessions and exit 3 returns parsed session ids', async () => {
-    const idle = scriptedRunner([{ exitCode: 0, stdout: 'nothing running', stderr: '' }]);
+  it('exit 0 with idle status text returns empty sessions and exit 3 returns parsed session ids', async () => {
+    const idle = scriptedRunner([{ exitCode: 0, stdout: `ocm-run: running in ${worktree}:\n`, stderr: '' }]);
     expect(await adapterWith(idle.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
       ok: true,
       sessions: [],
@@ -185,12 +185,48 @@ describe('ExecutionRunnerAdapter listSessions valid responses', () => {
     });
   });
 
-  it('exit 0 with a JSON session payload parses through the pure helper', async () => {
-    const { runner } = scriptedRunner([{ exitCode: 0, stdout: '{"sessions":["ses_idle0"]}', stderr: '' }]);
+  it('exit 0 with an empty JSON session payload parses through the pure helper', async () => {
+    const { runner } = scriptedRunner([{ exitCode: 0, stdout: '{"sessions":[]}', stderr: '' }]);
     expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
       ok: true,
-      sessions: ['ses_idle0'],
+      sessions: [],
     });
+  });
+});
+
+describe('ExecutionRunnerAdapter listSessions exit-code cross-checks', () => {
+  it('exit 0 with unrecognised text output fails closed instead of an empty success', async () => {
+    for (const stdout of ['garbage', '', 'ses_running0\nocm-run: started elsewhere']) {
+      const { runner } = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
+      expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+        refused('unrecognised text output'),
+      );
+    }
+  });
+
+  it('exit 0 whose JSON payload lists sessions fails closed as contradictory', async () => {
+    const { runner } = scriptedRunner([{ exitCode: 0, stdout: '{"sessions":["ses_conflict0"]}', stderr: '' }]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exited 0 but its JSON payload lists sessions'),
+    );
+  });
+
+  it('exit 0 whose text output lists session ids fails closed as contradictory', async () => {
+    const { runner } = scriptedRunner([
+      { exitCode: 0, stdout: `ocm-run: running in ${worktree}:\nses_conflict1`, stderr: '' },
+    ]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exited 0 but its text output lists sessions'),
+    );
+  });
+
+  it('exit 3 whose JSON payload lists no sessions fails closed as contradictory', async () => {
+    for (const stdout of ['{"sessions":[]}', '[]']) {
+      const { runner } = scriptedRunner([{ exitCode: 3, stdout, stderr: '' }]);
+      expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+        refused('exited 3 but its JSON payload lists no sessions|not a session list'),
+      );
+    }
   });
 });
 

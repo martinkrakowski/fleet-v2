@@ -294,19 +294,24 @@ function readSelected(
   return readEvents(snapshot.value);
 }
 
+/** JSON text with the two JSON-legal line separators written as escapes, so it is one line. */
+function toOneLine(json: string): string {
+  return json.replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029');
+}
+
 /** One event as a single JSON line with a fixed key order and the line separators escaped. */
 function serializeEvent(event: AuthorityOrgEvent): string {
-  return JSON.stringify({
-    eventId: event.eventId,
-    kind: event.kind,
-    actor: event.actor,
-    organizationId: event.organizationId,
-    atIso: event.atIso,
-    beforeRevision: event.beforeRevision,
-    afterRevision: event.afterRevision,
-  })
-    .replaceAll('\u2028', '\\u2028')
-    .replaceAll('\u2029', '\\u2029');
+  return toOneLine(
+    JSON.stringify({
+      eventId: event.eventId,
+      kind: event.kind,
+      actor: event.actor,
+      organizationId: event.organizationId,
+      atIso: event.atIso,
+      beforeRevision: event.beforeRevision,
+      afterRevision: event.afterRevision,
+    }),
+  );
 }
 
 /**
@@ -317,9 +322,9 @@ function serializeEvent(event: AuthorityOrgEvent): string {
 function expectedLinePrefix(event: AuthorityOrgEvent, organizationId: string): string {
   // The default organisation's events carry `null`; any other carries the requested id.
   const organizationJson = event.organizationId === null ? 'null' : JSON.stringify(organizationId);
-  return (
+  return toOneLine(
     `{"eventId":${JSON.stringify(event.eventId)},"kind":${JSON.stringify(event.kind)},` +
-    `"actor":${JSON.stringify(event.actor)},"organizationId":${organizationJson},`
+      `"actor":${JSON.stringify(event.actor)},"organizationId":${organizationJson},`,
   );
 }
 

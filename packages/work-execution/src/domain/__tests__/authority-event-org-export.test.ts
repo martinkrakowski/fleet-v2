@@ -27,6 +27,11 @@ function req(events: unknown, overrides: Record<string, unknown> = {}) {
   return { events, organizationId: 'org-a', afterCursor: null, limit: 1000, ...overrides };
 }
 
+/** A copy of `record` without `key` (an absent key, not an own undefined). */
+function omit(record: Record<string, unknown>, key: string): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(record).filter(([name]) => name !== key));
+}
+
 function run(input: unknown, selector?: AuthorityOrgEventSelector) {
   return exportAuthorityEventsForOrg(input, isProxy, selector);
 }
@@ -209,10 +214,10 @@ describe('exportAuthorityEventsForOrg refusals', () => {
   });
 
   it('refuses missing or extra keys and an own undefined property as invalid-input', () => {
-    const { limit: _limit, ...missingLimit } = req([ev('a1', 'org-a')]);
+    const missingLimit = omit(req([ev('a1', 'org-a')]), 'limit');
     expectRefusal(run(missingLimit), 'invalid-input');
     expectRefusal(run({ ...req([ev('a1', 'org-a')]), extra: 1 }), 'invalid-input');
-    const { actor: _actor, ...missingActor } = ev('a1', 'org-a');
+    const missingActor = omit(ev('a1', 'org-a'), 'actor');
     expectRefusal(run(req([missingActor])), 'invalid-input');
     expectRefusal(run(req([ev('a1', 'org-a', { extra: 1 })])), 'invalid-input');
     expectRefusal(run(req([ev('a1', 'org-a', { beforeRevision: undefined })])), 'invalid-input');

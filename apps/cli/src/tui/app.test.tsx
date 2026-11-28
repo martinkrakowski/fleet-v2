@@ -19,4 +19,19 @@ describe('TuiApp', () => {
     expect(output).toContain('row two');
     expect(output).toContain('n next screen   p prev screen   r re-read   q quit');
   });
+
+  it('renders input lines in place of rows', () => {
+    const output = renderToString(
+      <TuiApp
+        title="Questions"
+        rows={['plain row']}
+        inputLines={['> q-1  Pick one']}
+        readAtIso="2026-11-03T10:04:00.000Z"
+        onAction={() => {}}
+        onRawInput={() => {}}
+      />,
+    );
+    expect(output).toContain('> q-1  Pick one');
+    expect(output).not.toContain('plain row');
+  });
 });

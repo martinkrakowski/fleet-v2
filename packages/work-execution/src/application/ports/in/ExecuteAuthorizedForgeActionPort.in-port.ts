@@ -15,6 +15,15 @@ export interface ExecuteAuthorizedForgeActionRequest {
   readonly expectedHeadSha: string;
   readonly authorizationGrantId: string;
   /**
+   * U6: only for `post-status`. The reviewed head this status was carried from
+   * after a verified clean base merge moved the PR head to `expectedHeadSha`;
+   * the attempt's collected head must equal it (the moved-head check runs
+   * against it instead of `expectedHeadSha`), and owner decisions resolve at
+   * it. The conductor sets it only after `qualifyBaseMergeCarry` returned a
+   * carry; the HTTP entry point never forwards it.
+   */
+  readonly carriedFromHeadSha?: string;
+  /**
    * A known pull-request number (WB5b): forwarded to the forge for PR
    * actions and used to resolve the merge's (repository, number) without
    * parsing journal text. Must be a positive integer when present.

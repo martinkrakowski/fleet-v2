@@ -22,6 +22,8 @@ import {
   RunConductorPassUseCase,
   StartLaneRunUseCase,
   sha256HexDigest,
+  GitMirrorReceiptCarryEvidenceAdapter,
+  mergeQueueRepositoryDigest,
   type AttemptRepositoryAdapter,
   type ConductorDriverLeaseAdapter,
   type ConductorHaltAdapter,
@@ -175,6 +177,29 @@ function forgeRepositoryOf(
   return { owner: forge.owner, repo: forge.repo };
 }
 
+/**
+ * U6: the receipt-carry evidence wiring: the read-only bare-mirror adapter under
+ * the installation's state directory and the repository digest naming the
+ * mirror. Empty (no carry; the hold keeps waiting) without a state directory or
+ * a forge repository.
+ */
+function carryWiringOf(
+  runtime: FleetCliRuntime,
+  stateDir: string | undefined,
+): {
+  readonly receiptCarryEvidence?: GitMirrorReceiptCarryEvidenceAdapter;
+  readonly repositoryDigest?: string;
+} {
+  const repository = forgeRepositoryOf(runtime.installation);
+  if (stateDir === undefined || repository === undefined) {
+    return {};
+  }
+  return {
+    receiptCarryEvidence: new GitMirrorReceiptCarryEvidenceAdapter({ stateDir }),
+    repositoryDigest: mergeQueueRepositoryDigest(repository),
+  };
+}
+
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
   options: { readonly maxActiveRuns: number; readonly passConcurrency?: number; readonly stateDir?: string },
@@ -256,6 +281,10 @@ export function buildLiveConductorDriver(
     // GD2: the runtime's evidence archive — the fix handover reads failed
     // gate output tails from it.
     evidenceArchive: runtime.evidence.evidenceArchive,
+    // U6: the read-only mirror evidence that lets a Tier 2 premerge release
+    // carry across a clean base merge. Both need the installation's state
+    // directory and forge repository; absent either, the hold keeps waiting.
+    ...carryWiringOf(runtime, options.stateDir),
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,

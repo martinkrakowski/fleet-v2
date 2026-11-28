@@ -582,5 +582,50 @@ describe('CLI installation wiring', () => {
       expect(parsed).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
     });
   });
+
+  describe('tui environment wiring', () => {
+    it('forwards FLEET_API_URL and the injected token and thread id into the tui and documents interactive writes', async () => {
+      process.env.FLEET_API_URL = 'http://api.test';
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const requests: Array<{ url: string; authorization: string }> = [];
+      const fetchImpl = (async (url: string, init: RequestInit) => {
+        requests.push({ url: String(url), authorization: String((init.headers as Record<string, string>).authorization) });
+        return { status: 200, text: async () => JSON.stringify({ code: 'OK', result: { requests: [] } }) } as unknown as Response;
+      }) as unknown as typeof fetch;
+      let props: { onAction: (action: string) => void } | null = null;
+      let finish: () => void = () => {};
+      const done = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const { io } = createMockIo();
+      const run = runCli(['tui'], io, runtime, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+        interactive: true,
+        fetchImpl,
+        token: 'env-token',
+        threadId: 'th-env',
+        render: (tree) => {
+          props = tree.props as { onAction: (action: string) => void };
+          return {
+            waitUntilExit: () => done,
+            rerender: (next) => {
+              props = next.props as { onAction: (action: string) => void };
+            },
+            unmount: () => finish(),
+          };
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      (props as unknown as { onAction: (action: string) => void }).onAction('prev');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finish();
+      expect(await run).toBe(0);
+      expect(requests).toEqual([{ url: 'http://api.test/v1/threads/th-env/permissions?state=pending', authorization: 'Bearer env-token' }]);
+
+      const help = createMockIo();
+      await runCli(['help'], help.io, runtime);
+      expect(help.stdout.join('')).toContain('tui [--thread-id <id>]');
+      expect(help.stdout.join('')).not.toContain('the shell never writes');
+    });
+  });
 });
 

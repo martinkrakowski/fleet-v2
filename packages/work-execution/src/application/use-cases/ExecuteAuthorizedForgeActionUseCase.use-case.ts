@@ -379,6 +379,16 @@ function requestSnapshotRefusal(snapshot: Record<string, unknown>): string | nul
       return `${field} must be plain text`;
     }
   }
+  const carriedFromHeadSha = snapshot["carriedFromHeadSha"];
+  if (
+    carriedFromHeadSha !== undefined &&
+    (snapshot["kind"] !== "post-status" ||
+      typeof carriedFromHeadSha !== "string" ||
+      !EXPECTED_HEAD_SHA_PATTERN.test(carriedFromHeadSha) ||
+      carriedFromHeadSha === expectedHeadSha)
+  ) {
+    return "carriedFromHeadSha is only valid for post-status and must be a different 40-character lowercase sha";
+  }
   const pullRequestNumber = snapshot["pullRequestNumber"];
   if (
     pullRequestNumber !== undefined &&
@@ -588,7 +598,10 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
 
     // A moved head invalidates the readiness the action was authorised on.
-    if (attempt.artifacts?.headCommit !== request.expectedHeadSha) {
+    // U6: a `post-status` carried across a verified base merge names the
+    // reviewed head it was carried from; the attempt must still be there.
+    const readinessHeadSha = request.carriedFromHeadSha ?? request.expectedHeadSha;
+    if (attempt.artifacts?.headCommit !== readinessHeadSha) {
       return {
         outcome: "refused",
         reason: "Moved head: attempt headCommit does not match expectedHeadSha",
@@ -1056,7 +1069,8 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
     // The HTTP entry point copies every own data property and drops
     // `authorizedBy` so a body can never label a merge as a policy merge
-    // (A8). Values are read through their own descriptors, so no getter ever
+    // (A8), and `carriedFromHeadSha` (U6) so a body can never move the
+    // moved-head check off the attempt's own head. Values are read through their own descriptors, so no getter ever
     // runs; accessor and non-enumerable keys are skipped, not invoked.
     const snapshot: Record<string, unknown> = {};
     try {
@@ -1064,6 +1078,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         if (
           typeof key !== "string" ||
           key === "authorizedBy" ||
+          key === "carriedFromHeadSha" ||
           key === "__proto__"
         ) {
           continue;
@@ -1596,7 +1611,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       try {
         decision = await ownerDecisionPort.resolveOwnerDecision({
           decisionReference: reference,
-          candidateHeadSha: request.expectedHeadSha,
+          candidateHeadSha: request.carriedFromHeadSha ?? request.expectedHeadSha,
         });
       } catch (error: unknown) {
         blockers.push(

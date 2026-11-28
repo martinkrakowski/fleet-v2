@@ -43,6 +43,7 @@ import { seatsCommand, type SeatsCliOptions } from './seats.js';
 import { policyCommand, type PolicyCliOptions } from './policy.js';
 import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
+import { planCommand, planHelpOnly, type PlanCliOptions } from './plan.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
@@ -67,13 +68,13 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { ownerKeyCommand } from './commands/owner-key.js';
 import { questionsCommands } from './commands/questions.js';
-import { ownerItemsCommands } from './commands/owner-items.js';
+import { ownerItemsCommands, withdrawOwnerItem, type OwnerItemsCliOptions } from './commands/owner-items.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { laneCommand } from './commands/lane.js';
-import { tuiCommand } from './tui/command.js';
+import { tuiCommand, type TuiCommandOptions } from './tui/command.js';
 
 export { resolveRunnerSettings };
 
@@ -740,7 +741,7 @@ it reports what the stored plan would do and mutates nothing; --apply
 --grant <id> applies one wave, with --save-inputs and --adopt-inputs as JSON
 arrays of per-lane facts and --now / --deadline as ISO instants.
 
-The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+The tui group opens the shared terminal shell: Runs is read in-process from the local state stores; Questions and Permissions read and, after an explicit confirmation, answer two-way questions and give permission verdicts over /v1 when FLEET_API_URL is set. Run 'fleet-v2 tui --help'.
 
 The lane group runs the lane diff check over one worktree (read-only, findings
 carry path, line and rule name only): lane diff-check <worktree>
@@ -776,7 +777,7 @@ Commands:
   cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex> [--now-iso <iso>] [--deadline-iso <iso>]
   cutover retire --expected-revision <n> --operation-id <id> [--now-iso <iso>] [--deadline-iso <iso>]
   lane diff-check <worktree> --allowed-path-prefixes '<json array>' [--base <value>]
-  tui
+  tui [--thread-id <id>]
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
@@ -789,7 +790,8 @@ Commands:
     (sign-decision --pre-sign --action-scope merge:import-shadow --repository <owner/repo> --project <id> --expires-at <iso> --key <path> --yes pre-signs the standing grant before request-decision)
     (owner-key init --out <path> generates a 0600 Ed25519 owner key file; owner-key public --key <path> derives the public key)
   questions ask|list|show|answer|sync|expire|acknowledge|wait
-  owner-items add|list|resolve
+  owner-items add|list|resolve|withdraw
+  plan import|check|link-pr|declare|brief-check|list
   help | --help
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
@@ -852,6 +854,9 @@ export async function runCli(
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
   daemonOptions?: DaemonCliOptions,
+  tuiOptions?: TuiCommandOptions,
+  planOptions?: PlanCliOptions,
+  ownerItemsOptions?: OwnerItemsCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -957,6 +962,14 @@ export async function runCli(
     if (group === 'coordination' && restArgv[1] === 'owner-key') {
       return await ownerKeyCommand(restArgv.slice(2), io, stateDir);
     }
+    // `plan --help` needs no runtime: answer it before composing one, so a bad
+    // installation cannot turn a help request into a usage error.
+    if (group === 'plan') {
+      const planHelpExit = planHelpOnly(restArgv.slice(1), io);
+      if (planHelpExit !== undefined) {
+        return planHelpExit;
+      }
+    }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
     let activeRuntime: FleetCliRuntime;
@@ -990,6 +1003,11 @@ export async function runCli(
         recordSeatObservation: activeRuntime.execution.recordSeatObservation,
       });
     }
+    // The plan group manages imported lane plans through the composed runtime
+    // (the state-backed pattern); its writes are confirmed like projects'.
+    if (group === 'plan') {
+      return await planCommand(restArgv.slice(1), io, activeRuntime, planOptions ?? {});
+    }
     if (group === 'conductor') {
       return await conductorCommand(restArgv.slice(1), io, activeRuntime, {
         ...conductorOptions,
@@ -1003,7 +1021,20 @@ export async function runCli(
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
     }
     if (group === 'tui') {
-      return await tuiCommand(restArgv.slice(1), io, activeRuntime);
+      return await tuiCommand(restArgv.slice(1), io, activeRuntime, {
+        apiUrl: tuiOptions?.apiUrl ?? process.env.FLEET_API_URL,
+        // The token, session secret and thread id come from the host's own wiring (`tuiOptions`) and
+        // `--thread-id`; reading them from the environment needs `scripts/check-turbo-env.mjs` to
+        // allow-list the names first (a follow-up the lane cannot make: scripts/ is protected).
+        ...(tuiOptions?.token !== undefined ? { token: tuiOptions.token } : {}),
+        ...(tuiOptions?.sessionSecret !== undefined ? { sessionSecret: tuiOptions.sessionSecret } : {}),
+        ...(tuiOptions?.threadId !== undefined ? { threadId: tuiOptions.threadId } : {}),
+        ...(tuiOptions?.interactive !== undefined ? { interactive: tuiOptions.interactive } : {}),
+        ...(tuiOptions?.render !== undefined ? { render: tuiOptions.render } : {}),
+        ...(tuiOptions?.nowIso !== undefined ? { nowIso: tuiOptions.nowIso } : {}),
+        ...(tuiOptions?.fetchImpl !== undefined ? { fetchImpl: tuiOptions.fetchImpl } : {}),
+        ...(tuiOptions?.timeoutMs !== undefined ? { timeoutMs: tuiOptions.timeoutMs } : {}),
+      });
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);
@@ -1038,13 +1069,20 @@ export async function runCli(
       (group === 'knowledge' && subcommand === 'candidates') ||
       (group === 'cutover' && subcommand === 'shadow') ||
       (group === 'forge' && subcommand === 'threads') ||
-      (group === 'owner-items' && subcommand === 'resolve');
+      (group === 'owner-items' && (subcommand === 'resolve' || subcommand === 'withdraw'));
     const payload = parseFlags(rest, {
       allowPositional,
       ...(group === 'owner-items' && subcommand === 'add'
         ? { repeatableKeys: new Set(['ref']) }
         : {}),
     });
+    // `owner-items withdraw` is intercepted before the table handler so it
+    // can receive the `CliIo` and the injected confirm gate directly.
+    if (group === 'owner-items' && subcommand === 'withdraw') {
+      const result = await withdrawOwnerItem(payload, activeRuntime, io, ownerItemsOptions ?? {});
+      io.stdout(`${JSON.stringify(result)}\n`);
+      return exitCodeForResult(result, group, subcommand);
+    }
     const result = await handler(payload, activeRuntime, io);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)
     // print one line per record instead of one JSON document; a refusal

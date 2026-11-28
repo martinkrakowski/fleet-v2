@@ -12,6 +12,7 @@
 
 import type { LaneRunWaitReason } from '../../../domain/lane-run-decider.js';
 import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
+import type { LaneRunAdmissionBlockers } from '../out/LaneRunAdmissionPort.out-port.js';
 import type { LaneRunKeyStep, LaneRunParkReason } from '../../../domain/lane-run-records.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -63,7 +64,9 @@ export type AdvanceLaneRunResult =
   | { readonly outcome: 'entered'; readonly state: LaneRunStateValue }
   | { readonly outcome: 'parked'; readonly reason: LaneRunParkReason; readonly qualifier: string | null }
   | { readonly outcome: 'repaired'; readonly state: LaneRunStateValue }
-  | { readonly outcome: 'waiting'; readonly reason: LaneRunWaitReason }
+  | { readonly outcome: 'waiting'; readonly reason: LaneRunWaitReason;
+      /** On an `admission` wait: the runs and reservations that blocked the admit, when the port named them. */
+      readonly blockedBy?: LaneRunAdmissionBlockers }
   | { readonly outcome: 'done' }
   | { readonly outcome: 'acted'; readonly step: LaneRunKeyStep; readonly key: string;
       readonly result: LaneRunJournalOutcome; readonly reasonCode: LaneRunResultReasonCode | null;

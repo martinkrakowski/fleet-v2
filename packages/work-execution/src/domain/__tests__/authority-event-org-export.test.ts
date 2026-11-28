@@ -102,12 +102,12 @@ describe('exportAuthorityEventsForOrg organisation filtering', () => {
   });
 
   it('escapes U+2028 and U+2029 in serialized lines so no line contains a raw line separator', () => {
-    const result = run(req([ev('a b', 'org-a'), ev('c d', 'org-a', { beforeRevision: 'r ' })]));
+    const result = run(req([ev('a\u2028b', 'org-a'), ev('c\u2029d', 'org-a', { beforeRevision: 'r\u2028' })]));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.lines).toHaveLength(2);
       for (const line of result.lines) {
-        expect(line).not.toMatch(/[  \n\r]/);
+        expect(line).not.toMatch(/[\u2028\u2029\n\r]/);
       }
       expect(result.lines[0]).toContain('a\\u2028b');
       expect(result.lines[1]).toContain('c\\u2029d');

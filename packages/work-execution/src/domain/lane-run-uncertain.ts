@@ -45,11 +45,17 @@ export type InterruptedIntentClassification =
  * does an unavailable observation. A declared key step outside the uncertain
  * set with a valid observation is simply not this classification's business:
  * null. Hostile input (null, primitives, getters, proxies, prototype
- * pollution) refuses with a typed reason, never a pass.
+ * pollution) refuses with a typed reason, never a pass. The input is a flat
+ * `{ step, observation }` record: any extra own key — including the `0` and
+ * `length` of an array-like — refuses with `invalid-input` rather than being
+ * classified, so a hostile `{ step, observation, 0: 'x',
+ * length: Number.MAX_SAFE_INTEGER }` can never read as data.
  *
  * Cost bound: `snapshotPlainDataRecord` runs in O(K) over the own keys of the
  * flat `{ step, observation }` input (its own `Reflect.ownKeys` is bounded
- * there); this function then performs O(1) property lookups on the snapshot.
+ * there); the extra-key check below is `Object.keys` over the snapshot copy,
+ * the same O(K) enumeration the snapshot has already paid, and the rest of
+ * this function performs O(1) property lookups on the snapshot.
  */
 export function classifyInterruptedIntent(input: unknown): InterruptedIntentClassification {
   let snapshot: Record<string, unknown> | null;
@@ -60,6 +66,17 @@ export function classifyInterruptedIntent(input: unknown): InterruptedIntentClas
   }
   if (snapshot === null) {
     return { outcome: 'refused', reason: 'invalid-input' };
+  }
+  // The input must be the flat `{ step, observation }` record. Any other own
+  // key — a canonical array index, an enormous `length`, or any extra data —
+  // marks the input as array-like or padded, and is refused before any value
+  // is classified. `Object.keys` on the null-prototype copy the snapshot
+  // already built is safe: the copy has no getters, no symbols and no
+  // inherited surprises, so this is the same O(K) walk the snapshot paid.
+  for (const key of Object.keys(snapshot)) {
+    if (key !== 'step' && key !== 'observation') {
+      return { outcome: 'refused', reason: 'invalid-input' };
+    }
   }
   const step = snapshot.step;
   const observation = snapshot.observation;

@@ -83,6 +83,23 @@ describe('classifyInterruptedIntent', () => {
     expect(classifyInterruptedIntent(polluted)).toEqual({ outcome: 'refused', reason: 'invalid-input' });
   });
 
+  it('classifyInterruptedIntent refuses an array-like input and an enormous length', () => {
+    // The reviewer's case: an array-like shape must never be classified, no
+    // matter how well-formed its step and observation look.
+    expect(
+      classifyInterruptedIntent({ step: 'push', observation: 'proves-done', 0: 'x', length: Number.MAX_SAFE_INTEGER }),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+    // An enormous `length` alone is array-like shape, not data.
+    expect(classifyInterruptedIntent({ step: 'push', observation: 'proves-done', length: Number.MAX_SAFE_INTEGER })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-input',
+    });
+    // Any extra data key is refused the same way.
+    expect(
+      classifyInterruptedIntent({ step: 'push', observation: 'proves-done', note: 'extra' }),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-input' });
+  });
+
   it('classifyInterruptedIntent refuses an unknown observation value', () => {
     expect(classifyInterruptedIntent({ step: 'push', observation: 'looked-fine' })).toEqual({
       outcome: 'refused',

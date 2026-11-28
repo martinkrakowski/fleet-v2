@@ -3439,3 +3439,69 @@ describe('labelled unparseable-verdict journal details', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });
+
+describe('uncertain pending intents (UN1)', () => {
+  it('the decider parks ambiguous with reasonCode uncertain and never acts on an uncertain push', () => {
+    const facts = baseFacts({
+      state: 'running',
+      attempt: attemptFact({ phase: 'ended' }),
+      pendingIntent: { key: `${RUN_ID}/r0/push/0@${HEAD}`, step: 'push', reconciliation: 'ambiguous', uncertain: true },
+    });
+    const rec = record({});
+    const decision = decide(rec, facts);
+    expect(decision).toEqual({
+      kind: 'park', reason: 'ambiguous', qualifier: 'push', parkedFrom: 'running', reasonCode: 'uncertain',
+    });
+    expect(decision.kind).not.toBe('act');
+  });
+
+  it('the decider never issues a retry key for an uncertain merge-enqueue', () => {
+    const facts = baseFacts({
+      state: 'merging',
+      head12: HEAD,
+      attempt: attemptFact({ phase: 'ended' }),
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`, step: 'merge-enqueue', reconciliation: 'ambiguous', uncertain: true },
+    });
+    const rec = record({});
+    const decision = decide(rec, facts);
+    expect(decision.kind).not.toBe('act');
+    expect(decision).toEqual({
+      kind: 'park', reason: 'ambiguous', qualifier: 'merge-enqueue', parkedFrom: 'merging', reasonCode: 'uncertain',
+    });
+    // Already parked: it waits instead of acting or re-parking.
+    const parked = baseFacts({
+      state: 'parked',
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`, step: 'merge-enqueue', reconciliation: 'ambiguous' },
+    });
+    expect(decide(record({ parked: PARKED_BLOCKER, parkCount: 1 }), parked)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('a plain ambiguous push or merge-enqueue result parks ambiguous without the uncertain reasonCode', () => {
+    for (const [step, state, key] of [
+      ['push', 'running', `${RUN_ID}/r0/push/0@${HEAD}`],
+      ['merge-enqueue', 'merging', `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`],
+    ] as const) {
+      const facts = baseFacts({
+        state,
+        head12: HEAD,
+        attempt: attemptFact({ phase: 'ended' }),
+        pendingIntent: { key, step, reconciliation: 'ambiguous' },
+      });
+      expect(decide(record({}), facts)).toEqual({
+        kind: 'park', reason: 'ambiguous', qualifier: step, parkedFrom: state,
+      });
+    }
+  });
+
+  it('the gate ambiguous path still takes its one automatic retry', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+});

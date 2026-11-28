@@ -733,3 +733,46 @@ describe("watch-stream validation hardening", () => {
     );
   });
 });
+
+describe("private key block context", () => {
+  const BEGIN = "-----" + "BEGIN RSA PRIVATE KEY" + "-----";
+  const END = "-----" + "END RSA PRIVATE KEY" + "-----";
+  const BODY = ["MIIEowIBAAKCAQEAx7" + "Q".repeat(40), "Zm9vYmFyYmF6cXV4" + "R".repeat(40)];
+
+  it("redacts the base64 body lines between a private key header and its END line, across appends and reads", () => {
+    const first = appendWatchLines(emptyWatchBuffer(), ["before", BEGIN, BODY[0]!], 1000, DETECTOR);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = appendWatchLines(first.buffer, [BODY[1]!, END, "after"], 1001, DETECTOR);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const read = readWatchLinesAfter(second.buffer, 0, 1001, DETECTOR);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    const text = read.lines.join("\n");
+    for (const body of BODY) {
+      expect(text).not.toContain(body);
+    }
+    expect(read.lines).toEqual([
+      "before",
+      "-----[REDACTED:private-key-block]-----",
+      "[REDACTED:private-key-body]",
+      "[REDACTED:private-key-body]",
+      END,
+      "after",
+    ]);
+  });
+
+  it("redacts raw body lines of a caller-supplied buffer whose header was never redacted", () => {
+    const raw = {
+      entries: [
+        { seq: 1, text: BEGIN, bytes: BEGIN.length, atMs: 1000 },
+        { seq: 2, text: BODY[0]!, bytes: BODY[0]!.length, atMs: 1000 },
+      ],
+      totalBytes: BEGIN.length + BODY[0]!.length,
+      lastSeq: 2,
+    };
+    const read = readWatchLinesAfter(raw, 1, 1000, DETECTOR);
+    expect(read).toEqual({ ok: true, lines: ["[REDACTED:private-key-body]"], nextCursor: 2 });
+  });
+});

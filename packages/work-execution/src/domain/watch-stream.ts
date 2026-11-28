@@ -273,6 +273,38 @@ export function redactWatchLine(line: unknown): RedactWatchLineResult {
   });
 }
 
+const PEM_BEGIN = /BEGIN [A-Z ]*PRIVATE KEY/;
+const PEM_END = /END [A-Z ]*PRIVATE KEY/;
+const PEM_HEADER_MARKER = '[REDACTED:private-key-block]';
+const PEM_BODY_MARKER = '[REDACTED:private-key-body]';
+
+/**
+ * Redacts one line in the context of the lines before it. The registry rule for a private key
+ * matches only the header, so the base64 body lines that follow would pass a line-by-line scan:
+ * after a header (or its marker, for an already-redacted kept line) every following line is
+ * replaced by a fixed body marker until an END line, which is redacted normally. An unterminated
+ * block therefore redacts the rest of the stream (fail closed). The context is recomputed from
+ * the kept entries on every call, so a header already evicted by the caps is the one case a later
+ * body line is not covered. Cost: `O(1)` regex tests on top of `redactWatchLine`.
+ */
+function redactInPemContext(
+  line: unknown,
+  inPem: boolean,
+): { readonly ok: true; readonly line: string; readonly inPem: boolean } | { readonly ok: false } {
+  if (typeof line !== 'string') {
+    return { ok: false };
+  }
+  if (inPem && !PEM_END.test(line)) {
+    return { ok: true, line: PEM_BODY_MARKER, inPem: true };
+  }
+  const redaction = redactWatchLine(line);
+  if (!redaction.ok) {
+    return { ok: false };
+  }
+  const opens = (PEM_BEGIN.test(line) || line.includes(PEM_HEADER_MARKER)) && !PEM_END.test(line);
+  return { ok: true, line: redaction.line, inPem: opens };
+}
+
 /**
  * Returns a fresh, frozen empty `WatchBuffer`. Cost: `O(1)` allocation and
  * freeze.
@@ -519,14 +551,16 @@ export function appendWatchLines(
   // re-derive its byte size) so the returned buffer never stores a secret.
   const kept: WatchEntry[] = [];
   let totalBytes = 0;
+  let inPem = false;
   for (const entry of bufferRead.buffer.entries) {
     if (entry.atMs < oldestAllowed) {
       continue;
     }
-    const redaction = redactWatchLine(entry.text);
+    const redaction = redactInPemContext(entry.text, inPem);
     if (!redaction.ok) {
       return refusal('invalid-buffer');
     }
+    inPem = redaction.inPem;
     const bytes = new TextEncoder().encode(redaction.line).byteLength;
     kept.push(Object.freeze({ seq: entry.seq, text: redaction.line, bytes, atMs: entry.atMs }));
     totalBytes += bytes;
@@ -541,12 +575,13 @@ export function appendWatchLines(
   let lastSeq = bufferRead.buffer.lastSeq;
   const appended: WatchEntry[] = [];
   for (const text of linesRead.lines) {
-    const redaction = redactWatchLine(text);
+    const redaction = redactInPemContext(text, inPem);
     // Unreachable in practice: readLinesArray already proved every element a
     // string; the guard keeps the type narrow without trusting it blindly.
     if (!redaction.ok) {
       return refusal('non-string-line');
     }
+    inPem = redaction.inPem;
     lastSeq += 1;
     appended.push(
       Object.freeze({
@@ -630,14 +665,19 @@ export function readWatchLinesAfter(
   // the append-time redaction; every line is redacted again on the way out so
   // no unredacted text can leave through this read.
   const lines: string[] = [];
-  for (const entry of kept.slice(cursor - dropped)) {
-    const redaction = redactWatchLine(entry.text);
+  const firstWanted = cursor - dropped;
+  let inPem = false;
+  for (const [index, entry] of kept.entries()) {
+    const redaction = redactInPemContext(entry.text, inPem);
     // Unreachable in practice: readWatchBuffer already proved the text a
     // string; the guard keeps the type narrow without trusting it blindly.
     if (!redaction.ok) {
       return refusal('invalid-buffer');
     }
-    lines.push(redaction.line);
+    inPem = redaction.inPem;
+    if (index >= firstWanted) {
+      lines.push(redaction.line);
+    }
   }
   return Object.freeze({
     ok: true as const,

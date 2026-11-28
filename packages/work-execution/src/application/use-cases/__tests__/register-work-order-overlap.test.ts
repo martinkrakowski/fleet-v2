@@ -76,6 +76,19 @@ function openPr(number: number) {
   return { number, headSha: HEAD, baseRef: 'main' };
 }
 
+/** The structured suggestion for a `<prefix>-<suffix>` id whose suffix is non-numeric: `<suffix>-2`. */
+function suggestedId(workOrderId: string) {
+  const lastDash = workOrderId.lastIndexOf('-');
+  const base = workOrderId.slice(0, lastDash);
+  const prefixEnd = base.lastIndexOf('-');
+  return {
+    outcome: 'suggested' as const,
+    unitPrefix: base.slice(0, prefixEnd),
+    suffix: `${base.slice(prefixEnd + 1)}-${workOrderId.slice(lastDash + 1)}`,
+    workOrderId,
+  };
+}
+
 function setup(deps: Partial<RegisterWorkOrderDependencies> = {}) {
   const workOrderRepo = new WorkOrderRepositoryAdapter();
   const heldWorkOrderRepo = new HeldWorkOrderRepositoryAdapter();
@@ -546,7 +559,7 @@ describe('RegisterWorkOrderUseCase active work-order overlap', () => {
     expect(listed.outcome === 'ok' && listed.records[0]?.heldAtIso).toBe('2026-11-07T10:00:00.000Z');
 
     const mutated = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', taskId: 'task-2' }));
-    expect(mutated).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(mutated).toEqual({ outcome: 'refused', reason: 'held-request-mismatch', suggestion: suggestedId('wo-b-2') });
   });
 
   it('refuses before writing when a failed hold intent is retried with a changed workOrderId or changed request digest (F129)', async () => {
@@ -933,7 +946,7 @@ describe('RegisterWorkOrderUseCase pull request title', () => {
       request({ workOrderId: 'wo-b', pullRequestTitle: 'Second title' }),
     );
     expect(first).toMatchObject({ outcome: 'refused', held: true });
-    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch', suggestion: suggestedId('wo-b-2') });
     const listed = await state.heldWorkOrderRepo.listHeldWorkOrders();
     expect(listed.outcome === 'ok' && listed.records).toHaveLength(1);
     expect(JSON.stringify(first)).not.toContain('First title');
@@ -961,7 +974,7 @@ describe('RegisterWorkOrderUseCase pull request title', () => {
     const second = await state.useCase.registerWorkOrder(
       request({ workOrderId: 'wo-b', pullRequestTitle: 'New title' }),
     );
-    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch', suggestion: suggestedId('wo-b-2') });
   });
 });
 
@@ -1203,6 +1216,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }))).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-b-2'),
     });
     expect(state.saved).toHaveLength(1);
     expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
@@ -1215,6 +1229,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await state.useCase.registerWorkOrder(request())).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
     expect(state.saved).toEqual([]);
@@ -1237,6 +1252,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     await expect(state.useCase.registerWorkOrder(request())).resolves.toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
   });
@@ -1276,6 +1292,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await state.useCase.registerWorkOrder(request())).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(calls.list).toBe(0);
     expect(state.saved).toEqual([]);
@@ -1290,6 +1307,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await noForge.useCase.registerWorkOrder(request())).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(await noForge.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
 
@@ -1300,6 +1318,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await zeroBudget.useCase.registerWorkOrder(request())).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(merged.reads).toEqual([]);
     expect(await zeroBudget.heldWorkOrderRepo.listHeldWorkOrders()).toMatchObject({
@@ -1314,6 +1333,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(await badRepository.useCase.registerWorkOrder(request({ repository: 'not-a-coordinate' }))).toEqual({
       outcome: 'refused',
       reason: 'held-request-mismatch',
+      suggestion: suggestedId('wo-new-2'),
     });
     expect(mergedAgain.reads).toEqual([]);
     expect(await badRepository.heldWorkOrderRepo.listHeldWorkOrders()).toMatchObject({
@@ -1451,7 +1471,7 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     });
     recorded = 0;
     const answer = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
-    expect(answer).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(answer).toEqual({ outcome: 'refused', reason: 'held-request-mismatch', suggestion: suggestedId('wo-b-2') });
     expect(recorded).toBe(1);
     expect(Object.hasOwn(answer, 'supersededHeld')).toBe(false);
   });
@@ -1648,6 +1668,296 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
       expect(listed.outcome === 'ok' && listed.records).toHaveLength(1);
       expect(listed).not.toEqual(before);
       expect(listed.outcome === 'ok' && listed.records[0]).toMatchObject({ blockerId: 'wo-c', stage: 'held' });
+    });
+  });
+});
+
+describe('RegisterWorkOrderUseCase held-request-mismatch suggestion', () => {
+  const UNIT = 'wo-fleet-v2-x';
+  const BASE_ID = `${UNIT}-n27g`;
+
+  let intentCounter = 0;
+  /** A settled held record for `workOrderId` whose blocker is gone-but-unprovable, so a changed request mismatches. */
+  const seedHeld = async (repo: HeldWorkOrderRepositoryPort, workOrderId: string) => {
+    intentCounter += 1;
+    const intentId = `hold-seeded-${intentCounter}`;
+    await repo.recordHoldIntent({
+      version: 1,
+      stage: 'intent',
+      intentId,
+      workOrderId,
+      requestDigest: 'a'.repeat(64),
+      briefRequestRef: null,
+      blockerKind: 'active-work-order',
+      blockerId: 'wo-gone',
+      pathCode: 'path-000000000000',
+      heldAtIso: '2026-11-07T09:00:00.000Z',
+    });
+    await repo.completeHoldIntent({ intentId, workOrderId, requestDigest: 'a'.repeat(64) });
+  };
+
+  const registerTaken = async (state: ReturnType<typeof setup>, workOrderId: string, path: string) => {
+    const result = await state.useCase.registerWorkOrder(request({ workOrderId, ownedPaths: [path] }));
+    expect(result).toMatchObject({ outcome: 'registered' });
+  };
+
+  const unavailable = (reason: string) => ({
+    outcome: 'refused',
+    reason: 'held-request-mismatch',
+    suggestion: { outcome: 'unavailable', reason },
+  });
+
+  const wrapHeld = (
+    inner: HeldWorkOrderRepositoryPort,
+    overrides: Partial<HeldWorkOrderRepositoryPort>,
+  ): HeldWorkOrderRepositoryPort => ({
+    listHeldWorkOrders: () => inner.listHeldWorkOrders(),
+    findByWorkOrderId: (workOrderId) => inner.findByWorkOrderId(workOrderId),
+    findByIntentId: (intentId) => inner.findByIntentId(intentId),
+    recordHoldIntent: (record) => inner.recordHoldIntent(record),
+    completeHoldIntent: (input) => inner.completeHoldIntent(input),
+    deleteHeldWorkOrder: (workOrderId, requestDigest) => inner.deleteHeldWorkOrder(workOrderId, requestDigest),
+    ...overrides,
+  });
+
+  /** A held store whose list answer is `listed` while every lookup stays real. */
+  const stateWithListedHeld = async (workOrderId: string, listed: () => unknown) => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(inner, workOrderId);
+    return setup({ heldWorkOrderRepo: wrapHeld(inner, { listHeldWorkOrders: (async () => listed()) as never }) });
+  };
+
+  /** A work-order store whose suggestion-time (no project) listing answers `listed`; the overlap listing stays real. */
+  const stateWithListedOrders = async (workOrderId: string, listed: (() => unknown) | undefined) => {
+    const inner = new WorkOrderRepositoryAdapter();
+    const heldWorkOrderRepo = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(heldWorkOrderRepo, workOrderId);
+    return setup({
+      heldWorkOrderRepo,
+      workOrderRepo: {
+        findWorkOrderById: (id) => inner.findWorkOrderById(id),
+        saveWorkOrder: (record) => inner.saveWorkOrder(record),
+        listWorkOrdersByProject: (async (projectId?: string) =>
+          projectId === undefined && listed !== undefined
+            ? listed()
+            : projectId === undefined
+              ? undefined
+              : inner.listWorkOrdersByProject(projectId)) as never,
+      },
+    });
+  };
+
+  const mismatch = (state: ReturnType<typeof setup>, workOrderId = BASE_ID) =>
+    state.useCase.registerWorkOrder(request({ workOrderId }));
+
+  it('suggests the next free suffix for wo-fleet-v2-<unit>-<suffix> skipping held and registered ids', async () => {
+    const state = setup();
+    await seedHeld(state.heldWorkOrderRepo, BASE_ID);
+    await registerTaken(state, `${BASE_ID}-2`, 'packages/taken-a');
+    await seedHeld(state.heldWorkOrderRepo, `${BASE_ID}-3`);
+    expect(await mismatch(state)).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+      suggestion: {
+        outcome: 'suggested',
+        unitPrefix: UNIT,
+        suffix: 'n27g-4',
+        workOrderId: `${BASE_ID}-4`,
+      },
+    });
+  });
+
+  it('suggests exact next numeric suffix beyond Number.MAX_SAFE_INTEGER using BigInt', async () => {
+    const digits = '9'.repeat(40);
+    const id = `${UNIT}-${digits}`;
+    const state = setup();
+    await seedHeld(state.heldWorkOrderRepo, id);
+    expect(await mismatch(state, id)).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+      suggestion: {
+        outcome: 'suggested',
+        unitPrefix: UNIT,
+        suffix: `1${'0'.repeat(40)}`,
+        workOrderId: `${UNIT}-1${'0'.repeat(40)}`,
+      },
+    });
+  });
+
+  it('suggests unavailable invalid-work-order-id when workOrderId has no unit-suffix separator', async () => {
+    const state = setup();
+    await seedHeld(state.heldWorkOrderRepo, 'wonoseparator');
+    expect(await mismatch(state, 'wonoseparator')).toEqual(unavailable('invalid-work-order-id'));
+  });
+
+  it('suggests unavailable invalid-work-order-id when candidate suffix forms a secret-shaped id', async () => {
+    const id = ['xox', 'b-', 'a1234567'].join('');
+    const state = setup();
+    await seedHeld(state.heldWorkOrderRepo, id);
+    expect(await mismatch(state, id)).toEqual(unavailable('invalid-work-order-id'));
+  });
+
+  it('refuses secret-shaped workOrderId before suggestion and never echoes the token', async () => {
+    const token = ['gh', 'p_', 'x'.repeat(36)].join('');
+    const state = setup();
+    const result = await mismatch(state, token);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(JSON.stringify(result)).not.toContain(token);
+  });
+
+  it('suggests unavailable held-store-unreadable when listHeldWorkOrders is missing', async () => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(inner, BASE_ID);
+    const state = setup({ heldWorkOrderRepo: wrapHeld(inner, { listHeldWorkOrders: undefined as never }) });
+    expect(await mismatch(state)).toEqual(unavailable('held-store-unreadable'));
+  });
+
+  it.each([
+    ['throws', () => { throw new Error('boom'); }],
+    ['is unreadable', () => ({ outcome: 'unreadable' })],
+    ['has an envelope getter', () => ({ outcome: 'ok', get records() { throw new Error('getter ran'); } })],
+    ['returns a non-array', () => ({ outcome: 'ok', records: { length: 0 } })],
+    ['returns sparse records', () => ({ outcome: 'ok', records: new Array(2) })],
+    ['returns a Proxy envelope whose trap throws', () => new Proxy({}, { ownKeys: () => { throw new Error('trap'); } })],
+  ])('suggests unavailable held-store-unreadable when listHeldWorkOrders %s', async (_label, listed) => {
+    const state = await stateWithListedHeld(BASE_ID, listed);
+    expect(await mismatch(state)).toEqual(unavailable('held-store-unreadable'));
+  });
+
+  it('suggests unavailable held-store-unreadable when listHeldWorkOrders exceeds MAX_HELD_WORK_ORDERS', async () => {
+    const records = Array.from({ length: 1001 }, (_, index) => ({ workOrderId: `${UNIT}-q${index}` }));
+    const state = await stateWithListedHeld(BASE_ID, () => ({ outcome: 'ok', records }));
+    expect(await mismatch(state)).toEqual(unavailable('held-store-unreadable'));
+  });
+
+  it('suggests unavailable held-store-unreadable on null, throwing getter, or Proxy held record without invoking getter', async () => {
+    let getterRan = false;
+    const throwingGetter = {
+      get workOrderId() {
+        getterRan = true;
+        return 'x';
+      },
+    };
+    const proxy = new Proxy({ workOrderId: 'x' }, { getOwnPropertyDescriptor: () => { throw new Error('trap'); } });
+    for (const bad of [null, [], throwingGetter, proxy, { workOrderId: 7 }]) {
+      const state = await stateWithListedHeld(BASE_ID, () => ({ outcome: 'ok', records: [bad] }));
+      expect(await mismatch(state)).toEqual(unavailable('held-store-unreadable'));
+    }
+    expect(getterRan).toBe(false);
+  });
+
+  it('suggests unavailable work-order-store-unreadable when listWorkOrdersByProject is missing', async () => {
+    const inner = new WorkOrderRepositoryAdapter();
+    const heldWorkOrderRepo = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(heldWorkOrderRepo, BASE_ID);
+    let calls = 0;
+    const state = setup({
+      heldWorkOrderRepo,
+      workOrderRepo: {
+        findWorkOrderById: (id: string) => inner.findWorkOrderById(id),
+        saveWorkOrder: (record: WorkOrderRecord) => inner.saveWorkOrder(record),
+        // The overlap path calls this with a project id; the suggestion path never does.
+        get listWorkOrdersByProject() {
+          calls += 1;
+          return calls === 1 ? (p?: string) => inner.listWorkOrdersByProject(p) : undefined;
+        },
+      } as never,
+    });
+    expect(await mismatch(state)).toEqual(unavailable('work-order-store-unreadable'));
+  });
+
+  it('suggests unavailable, never throwing, when a repository method getter throws', async () => {
+    const heldInner = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(heldInner, BASE_ID);
+    let heldReads = 0;
+    const heldGetter = {
+      findByWorkOrderId: (id: string) => heldInner.findByWorkOrderId(id),
+      findByIntentId: (id: string) => heldInner.findByIntentId(id),
+      recordHoldIntent: heldInner.recordHoldIntent.bind(heldInner),
+      completeHoldIntent: heldInner.completeHoldIntent.bind(heldInner),
+      deleteHeldWorkOrder: heldInner.deleteHeldWorkOrder.bind(heldInner),
+      get listHeldWorkOrders() {
+        heldReads += 1;
+        throw new Error('getter ran');
+      },
+    };
+    const heldState = setup({ heldWorkOrderRepo: heldGetter as never });
+    expect(await mismatch(heldState)).toEqual(unavailable('held-store-unreadable'));
+    expect(heldReads).toBeGreaterThan(0);
+
+    const inner = new WorkOrderRepositoryAdapter();
+    const heldWorkOrderRepo = new HeldWorkOrderRepositoryAdapter();
+    await seedHeld(heldWorkOrderRepo, BASE_ID);
+    let orderReads = 0;
+    const orderState = setup({
+      heldWorkOrderRepo,
+      workOrderRepo: {
+        findWorkOrderById: (id: string) => inner.findWorkOrderById(id),
+        saveWorkOrder: (record: WorkOrderRecord) => inner.saveWorkOrder(record),
+        get listWorkOrdersByProject() {
+          orderReads += 1;
+          if (orderReads > 1) throw new Error('getter ran');
+          return (p?: string) => inner.listWorkOrdersByProject(p);
+        },
+      } as never,
+    });
+    expect(await mismatch(orderState)).toEqual(unavailable('work-order-store-unreadable'));
+  });
+
+  it.each([
+    ['throws', () => { throw new Error('boom'); }],
+    ['returns a non-array', () => ({ length: 0 })],
+    ['returns a sparse array', () => new Array(2)],
+  ])('suggests unavailable work-order-store-unreadable when listWorkOrdersByProject %s', async (_label, listed) => {
+    const state = await stateWithListedOrders(BASE_ID, listed);
+    expect(await mismatch(state)).toEqual(unavailable('work-order-store-unreadable'));
+  });
+
+  it('suggests unavailable work-order-store-unreadable when listWorkOrdersByProject exceeds MAX_WORK_ORDERS_FOR_SUGGESTION', async () => {
+    const orders = Array.from({ length: 10_001 }, (_, index) => ({ id: `${UNIT}-q${index}` }));
+    const state = await stateWithListedOrders(BASE_ID, () => orders);
+    expect(await mismatch(state)).toEqual(unavailable('work-order-store-unreadable'));
+  });
+
+  it('suggests unavailable work-order-store-unreadable on null or throwing-getter work-order record without invoking getter', async () => {
+    let getterRan = false;
+    const throwingGetter = {
+      get id() {
+        getterRan = true;
+        return 'x';
+      },
+    };
+    for (const bad of [null, throwingGetter, { id: 7 }]) {
+      const state = await stateWithListedOrders(BASE_ID, () => [bad]);
+      expect(await mismatch(state)).toEqual(unavailable('work-order-store-unreadable'));
+    }
+    expect(getterRan).toBe(false);
+  });
+
+  it('suggests unavailable budget-exhausted when all 64 candidate suffixes are taken', async () => {
+    const taken = Array.from({ length: 64 }, (_, index) => ({ id: `${BASE_ID}-${index + 2}` }));
+    const state = await stateWithListedOrders(BASE_ID, () => taken);
+    expect(await mismatch(state)).toEqual(unavailable('budget-exhausted'));
+    const oneFree = await stateWithListedOrders(BASE_ID, () => taken.slice(0, 63));
+    expect(await mismatch(oneFree)).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+      suggestion: { outcome: 'suggested', unitPrefix: UNIT, suffix: 'n27g-65', workOrderId: `${BASE_ID}-65` },
+    });
+  });
+
+  it('attaches structured suggestion when recordHoldIntent returns held-request-mismatch in holdSteps', async () => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    const state = setup({
+      heldWorkOrderRepo: wrapHeld(inner, {
+        recordHoldIntent: async () => ({ outcome: 'refused', reason: 'held-request-mismatch' }),
+      }),
+    });
+    await registerTaken(state, 'wo-a', 'packages/a/src');
+    expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b' }))).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+      suggestion: { outcome: 'suggested', unitPrefix: 'wo', suffix: 'b-2', workOrderId: 'wo-b-2' },
     });
   });
 });

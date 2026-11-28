@@ -158,7 +158,13 @@ describe('decideDriverLease', () => {
     expect(
       decideDriverLease(Object.assign(Object.create({ inherited: true }), { candidateId: 'driver-a' })),
     ).toEqual(expected);
-    const hostile = JSON.parse('{"__proto__": {}, "candidateId": "driver-a", "nowIso": "' + NOW + '", "lease": null}');
+    // A computed '__proto__' key (no JSON.parse in domain/ tests).
+    const hostile: Record<string, unknown> = {
+      ['__proto__']: {},
+      candidateId: 'driver-a',
+      nowIso: NOW,
+      lease: null,
+    };
     expect(decideDriverLease(hostile)).toEqual(expected);
     // An enumerable getter on an unknown input key is refused without invoking it.
     let getterRan = false;
@@ -194,7 +200,7 @@ describe('decideDriverLease', () => {
     const expected = { outcome: 'refused', reason: 'invalid-candidate-id' };
     const missing = { nowIso: NOW, lease: null };
     expect(decideDriverLease(missing)).toEqual(expected);
-    for (const bad of [null, undefined, 42, '', '   ']) {
+    for (const bad of [null, undefined, 42, '', '   ', ' driver-a ', 'driver-a ', '\tdriver-a']) {
       expect(decideDriverLease(acquireInput(bad as string))).toEqual(expected);
     }
     expect(decideDriverLease(acquireInput('d'.repeat(257)))).toEqual(expected);

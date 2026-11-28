@@ -58,7 +58,8 @@ function compareCodeUnit(a: string, b: string): number {
 
 /** A non-empty trimmed string of at most 256 UTF-8 bytes without a secret shape. */
 function isValidCandidateId(value: unknown): boolean {
-  if (typeof value !== 'string' || value.trim().length === 0) {
+  // The id must already be trimmed: untrimmed ids (e.g. " driver-a ") are refused.
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
     return false;
   }
   if (new TextEncoder().encode(value).byteLength > ID_MAX_BYTES) {

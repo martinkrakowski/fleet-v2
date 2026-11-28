@@ -82,6 +82,7 @@ describe('parseLanePlanSidecar', () => {
       planId: '2026-10-27_example',
       revision: 3,
       doc: 'docs/planning/2026-10-27_example-plan.md',
+      featureSet: null,
       lanes: [
         {
           laneId: 'A1',
@@ -95,6 +96,7 @@ describe('parseLanePlanSidecar', () => {
           status: 'planned',
           brief: null,
           mergedPr: null,
+          rollupOf: false,
         },
         {
           laneId: 'A2',
@@ -112,6 +114,7 @@ describe('parseLanePlanSidecar', () => {
           status: 'planned',
           brief: '.lane/brief-a2.md',
           mergedPr: null,
+          rollupOf: false,
         },
         {
           laneId: 'A3',
@@ -125,6 +128,7 @@ describe('parseLanePlanSidecar', () => {
           status: 'dropped',
           brief: null,
           mergedPr: { repository: 'example-org/example-repo', number: 251 },
+          rollupOf: false,
         },
       ],
       decisions: [{ id: 'D1', question: 'Which store?', default: 'A file store', state: 'open' }],
@@ -487,3 +491,187 @@ function reversedSpelledOut(): unknown {
     schemaVersion: 1,
   };
 }
+
+const PRE_PV1_CANONICAL = '{"schemaVersion":1,"projectId":"example-project","planId":"2026-10-27_example","revision":3,"doc":"docs/planning/2026-10-27_example-plan.md","lanes":[{"laneId":"A1","renamedFrom":null,"scope":"Records","packages":["work-execution"],"sharedFiles":[".architecture/manifest.yaml"],"tier":2,"after":[],"decisions":["D1"],"status":"planned","brief":null,"mergedPr":null},{"laneId":"A2","renamedFrom":"A-two","scope":"Stores","packages":["work-execution"],"sharedFiles":[],"tier":2,"after":[{"projectId":"example-project","planId":"2026-10-27_example","laneId":"A1"},{"projectId":"example-project","planId":"other-plan","laneId":"B1"},{"projectId":"other-project","planId":"third-plan","laneId":"C1"}],"decisions":[],"status":"planned","brief":".lane/brief-a2.md","mergedPr":null},{"laneId":"A3","renamedFrom":null,"scope":"Docs","packages":["docs"],"sharedFiles":[],"tier":0,"after":[],"decisions":[],"status":"dropped","brief":null,"mergedPr":{"repository":"example-org/example-repo","number":251}}],"decisions":[{"id":"D1","question":"Which store?","default":"A file store","state":"open"}],"exclusiveOrder":[{"file":".architecture/manifest.yaml","lanes":["A1","A2"]}]}';
+
+function withFeatureSet(featureSet: unknown): Record<string, unknown> {
+  return { ...cloneValid(), featureSet };
+}
+
+describe('featureSet and rollupOf (PV1)', () => {
+  it('accepts a featureSet and a rollupOf lane and normalises both', () => {
+    const input = withFeatureSet({ id: 'feature-1', title: 'Progress view' });
+    (input.lanes as Record<string, unknown>[])[0].rollupOf = true;
+    (input.lanes as Record<string, unknown>[])[1].rollupOf = false;
+    const result = parseLanePlanSidecar(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sidecar.featureSet).toEqual({ id: 'feature-1', title: 'Progress view' });
+    expect(result.sidecar.lanes.map((lane) => lane.rollupOf)).toEqual([true, false, false]);
+  });
+
+  it('normalises an omitted or null featureSet to null and an omitted rollupOf to false', () => {
+    for (const input of [cloneValid(), withFeatureSet(null)]) {
+      const result = parseLanePlanSidecar(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.sidecar.featureSet).toBeNull();
+      expect(result.sidecar.lanes.every((lane) => lane.rollupOf === false)).toBe(true);
+    }
+  });
+
+  it('keeps the exact pre-PV1 canonical JSON when featureSet and rollupOf are absent, null or false', () => {
+    const explicit = withFeatureSet(null);
+    for (const lane of explicit.lanes as Record<string, unknown>[]) {
+      lane.rollupOf = false;
+    }
+    for (const input of [cloneValid(), explicit]) {
+      const result = parseLanePlanSidecar(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(canonicalLanePlanSidecarJson(result.sidecar)).toBe(PRE_PV1_CANONICAL);
+    }
+  });
+
+  it('emits featureSet right after doc and rollupOf last on a lane, independent of input key order', () => {
+    const input = withFeatureSet({ title: 'Progress view', id: 'feature-1' });
+    (input.lanes as Record<string, unknown>[])[2].rollupOf = true;
+    const result = parseLanePlanSidecar(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const canonical = canonicalLanePlanSidecarJson(result.sidecar);
+    expect(canonical).not.toBe(PRE_PV1_CANONICAL);
+    expect(canonical).toContain(
+      '"doc":"docs/planning/2026-10-27_example-plan.md","featureSet":{"id":"feature-1","title":"Progress view"},"lanes":[',
+    );
+    expect(canonical).toContain('"mergedPr":{"repository":"example-org/example-repo","number":251},"rollupOf":true}');
+    expect(canonical.split('"rollupOf"').length - 1).toBe(1);
+    const reordered = { featureSet: { id: 'feature-1', title: 'Progress view' }, ...input };
+    const again = parseLanePlanSidecar(reordered);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(canonicalLanePlanSidecarJson(again.sidecar)).toBe(canonical);
+  });
+
+  it('a featureSet alone, and a rollupOf alone, each change the canonical JSON', () => {
+    const onlyFeature = parseLanePlanSidecar(withFeatureSet({ id: 'f', title: 'T' }));
+    const onlyRollup = parseLanePlanSidecar(withLane(0, { rollupOf: true }));
+    expect(onlyFeature.ok && onlyRollup.ok).toBe(true);
+    if (!onlyFeature.ok || !onlyRollup.ok) return;
+    expect(canonicalLanePlanSidecarJson(onlyFeature.sidecar)).not.toBe(PRE_PV1_CANONICAL);
+    expect(canonicalLanePlanSidecarJson(onlyRollup.sidecar)).not.toBe(PRE_PV1_CANONICAL);
+  });
+
+  it.each([
+    ['a string', 'x'],
+    ['a number', 123],
+    ['an array', []],
+    ['undefined', undefined],
+    ['a non-plain prototype', Object.create({ id: 'f', title: 'T' })],
+  ])('refuses a featureSet that is %s as not an object', (_name, value) => {
+    expect(refusedErrors(withFeatureSet(value))).toEqual(['sidecar.featureSet: must be an object']);
+  });
+
+  it('refuses featureSet unknown, missing and prototype-polluting keys', () => {
+    expect(refusedErrors(withFeatureSet({ id: 'f', title: 'T', extra: 1 }))).toEqual(['sidecar.featureSet: unknown key']);
+    expect(refusedErrors(withFeatureSet({ id: 'f' }))).toEqual(['sidecar.featureSet.title: required']);
+    expect(refusedErrors(withFeatureSet({ title: 'T' }))).toEqual(['sidecar.featureSet.id: required']);
+    const polluted = JSON.parse('{"id":"f","title":"T","__proto__":{"x":1}}') as unknown;
+    expect(refusedErrors(withFeatureSet(polluted))).toEqual(['sidecar.featureSet: unknown key']);
+    const symbolKeyed: Record<string | symbol, unknown> = { id: 'f', title: 'T' };
+    symbolKeyed[Symbol('s')] = 1;
+    expect(refusedErrors(withFeatureSet(symbolKeyed))).toEqual(['sidecar.featureSet: unknown key']);
+  });
+
+  it('refuses a getter-backed featureSet field and a throwing Proxy without running the accessor', () => {
+    let getterCalls = 0;
+    const withGetter = {
+      get id() {
+        getterCalls += 1;
+        return 'f';
+      },
+      title: 'T',
+    };
+    const getterErrors = refusedErrors(withFeatureSet(withGetter));
+    expect(getterErrors).toEqual(['sidecar.featureSet.id: must be a string']);
+    expect(getterCalls).toBe(0);
+    const proxy = new Proxy({}, { ownKeys() { throw new Error('boom'); } });
+    expect(refusedErrors(withFeatureSet(proxy))).toEqual(['sidecar: input could not be read']);
+    let outerGetterCalls = 0;
+    const outer = cloneValid();
+    Object.defineProperty(outer, 'featureSet', {
+      enumerable: true,
+      get() {
+        outerGetterCalls += 1;
+        return { id: 'f', title: 'T' };
+      },
+    });
+    expect(refusedErrors(outer)).toEqual(['sidecar.featureSet: must be an object']);
+    expect(outerGetterCalls).toBe(0);
+  });
+
+  it.each([
+    [1, 'sidecar.featureSet.id: must be a string'],
+    ['', 'sidecar.featureSet.id: must be a feature set id'],
+    ['-lead', 'sidecar.featureSet.id: must be a feature set id'],
+    ['has/slash', 'sidecar.featureSet.id: must be a feature set id'],
+    ['a'.repeat(65), 'sidecar.featureSet.id: must be a feature set id'],
+    [fakeSecretShape(), 'sidecar.featureSet.id: contains a secret-shaped value and was refused'],
+  ])('refuses featureSet id %j as %s', (id, expected) => {
+    const errors = refusedErrors(withFeatureSet({ id, title: 'T' }));
+    expect(errors).toEqual([expected]);
+    expect(errors.join('')).not.toContain(fakeSecretShape());
+  });
+
+  it.each([
+    [1, 'sidecar.featureSet.title: must be a string'],
+    ['', 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    ['   ', 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    ['x'.repeat(121), 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    ['a\nb', 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    ['a\u0007b', 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    ['a\u202eb', 'sidecar.featureSet.title: must be plain text of at most 120 bytes'],
+    [fakeSecretShape(), 'sidecar.featureSet.title: contains a secret-shaped value and was refused'],
+  ])('refuses featureSet title %j as %s', (title, expected) => {
+    const errors = refusedErrors(withFeatureSet({ id: 'f', title }));
+    expect(errors).toEqual([expected]);
+    expect(errors.join('')).not.toContain(fakeSecretShape());
+  });
+
+  it('accepts a featureSet title of exactly 120 bytes', () => {
+    expect(parseLanePlanSidecar(withFeatureSet({ id: 'f', title: 'x'.repeat(120) })).ok).toBe(true);
+  });
+
+  it.each([['true'], [1], [null], [{}], [undefined]])('refuses rollupOf %j as not a boolean', (rollupOf) => {
+    expect(refusedErrors(withLane(1, { rollupOf }))).toEqual(['lanes[1].rollupOf: must be a boolean']);
+  });
+
+  it('refuses a getter-backed rollupOf without running the accessor', () => {
+    let getterCalls = 0;
+    const lane = {
+      laneId: 'A1',
+      scope: 'Records',
+      packages: ['work-execution'],
+      tier: 2,
+      after: [],
+      get rollupOf() {
+        getterCalls += 1;
+        return true;
+      },
+    };
+    const input = cloneValid();
+    (input.lanes as unknown[])[0] = lane;
+    expect(refusedErrors(input)).toEqual(['lanes[0].rollupOf: must be a boolean']);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('exposes the PV1 runtime exports from the package domain barrel', async () => {
+    const barrel = await import('../index.js');
+    expect(barrel.PLAN_FEATURE_SET_ID_PATTERN.test('feature-1')).toBe(true);
+    expect(barrel.PLAN_FEATURE_SET_ID_PATTERN.test('bad/id')).toBe(false);
+    expect(barrel.LANE_PLAN_LIMITS.featureSetTitleBytes).toBe(120);
+    expect(typeof barrel.parseLanePlanSidecar).toBe('function');
+    expect(typeof barrel.LanePlan.create).toBe('function');
+    expect(typeof barrel.PlannedLane.create).toBe('function');
+  });
+});

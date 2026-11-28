@@ -123,7 +123,9 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
    * FT1: verify a `FenceToken` against the lease of `scope` without writing.
    * This does not use `read(scope)`, because `read` answers an unreadable
    * lease file as an absent one in read-only mode; verify refuses such a file
-   * as `no-lease-readable` instead, and never passes unreadable input.
+   * as `no-lease-readable` instead, and never passes unreadable input. The
+   * read is a peek: even in writable mode it never quarantines, so
+   * verification never changes persisted state.
    */
   async verifyFence(scope: string, token: unknown, nowIso: string): Promise<FenceRefusal | null> {
     try {
@@ -134,7 +136,7 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
       const current =
         target === null
           ? (this.inMemoryLeases.get(scope) ?? null)
-          : await this.readRecord(target, scope);
+          : await this.readRecord(target, scope, 'peek');
       const decision = decideFencedWrite({ current: withoutVersion(current), token, nowIso });
       return decision.ok ? null : decision.reason;
     } catch {
@@ -227,7 +229,19 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     }
   }
 
-  private async readRecord(target: string, expectedScope: string): Promise<DaemonLeaseRecord | null> {
+  /**
+   * Read and validate the record at `target`. `mode: 'store'` (the default) is
+   * the store's own read: in writable mode an unreadable file is quarantined
+   * with its exact bytes and the typed error thrown. `mode: 'peek'` never
+   * touches persisted state in either mode: an unreadable file throws
+   * `StateFileUnreadableReadOnlyError` and keeps no copy.
+   */
+  private async readRecord(
+    target: string,
+    expectedScope: string,
+    mode: 'store' | 'peek' = 'store',
+  ): Promise<DaemonLeaseRecord | null> {
+    const readOnly = mode === 'peek' || this.options?.readOnly === true;
     let buffer: Buffer;
     try {
       buffer = await fs.readFile(target);
@@ -241,21 +255,21 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     try {
       raw = JSON.parse(buffer.toString('utf8'));
     } catch {
-      return rejectUnreadableStateFile(target, 'not valid JSON', buffer, this.options?.readOnly === true);
+      return rejectUnreadableStateFile(target, 'not valid JSON', buffer, readOnly);
     }
     const read = readDaemonLeaseRecord(raw);
     if (!read.ok) {
       if (read.reason === 'unknown-version') {
         throw new StateFileUnknownVersionError(target, 0);
       }
-      return rejectUnreadableStateFile(target, read.error, buffer, this.options?.readOnly === true);
+      return rejectUnreadableStateFile(target, read.error, buffer, readOnly);
     }
     if (read.record.scope !== expectedScope) {
       return rejectUnreadableStateFile(
         target,
         'DaemonLease record scope does not match file path',
         buffer,
-        this.options?.readOnly === true,
+        readOnly,
       );
     }
     return read.record;

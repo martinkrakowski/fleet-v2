@@ -204,12 +204,19 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
   /**
    * FT1: verify a `FenceToken` against the current lease without writing.
    * An unreadable lease file is `no-lease-readable`, never a pass, and never
-   * the absent-lease `no-lease`.
+   * the absent-lease `no-lease`. The read is a peek: even in writable mode it
+   * never quarantines, so verification never changes persisted state.
    */
   async verifyFence(token: unknown, nowIso: string): Promise<FenceRefusal | null> {
     let current: ConductorDriverLeaseRecord | null;
     try {
-      current = await this.read();
+      const target = this.statePath;
+      if (target === null) {
+        const memo = this.inMemoryLease;
+        current = memo === null ? null : { ...memo };
+      } else {
+        current = currentLeaseOf(await this.readRecordsFromDisk(target, 'peek'));
+      }
     } catch {
       return 'no-lease-readable';
     }
@@ -260,7 +267,18 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
     return join(stateDir, name);
   }
 
-  private async readRecordsFromDisk(target: string): Promise<readonly ConductorDriverLeaseRecord[]> {
+  /**
+   * Read the lease records from disk. `mode: 'store'` (the default) is the
+   * store's own read: in writable mode an unreadable file is quarantined with
+   * its exact bytes and the typed error thrown. `mode: 'peek'` never touches
+   * persisted state in either mode: an unreadable file throws
+   * `StateFileUnreadableReadOnlyError` and keeps no copy. Read-only mode never
+   * quarantines and never writes in either mode.
+   */
+  private async readRecordsFromDisk(
+    target: string,
+    mode: 'store' | 'peek' = 'store',
+  ): Promise<readonly ConductorDriverLeaseRecord[]> {
     let buffer: Buffer;
     try {
       if (this.options?.readOnly === true) {
@@ -281,7 +299,12 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
     }
     const inspection = inspectRecordListBytes(buffer, parseConductorDriverLeaseStateRecord);
     if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+      if (mode === 'peek' || this.options?.readOnly === true) {
+        // A peek (verification) never changes persisted state, even when the
+        // store itself is writable: no quarantine copy, no bytes moved.
+        throw new StateFileUnreadableReadOnlyError(target, inspection.detail);
+      }
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, false);
     }
     return inspection.records;
   }

@@ -62,12 +62,16 @@ describe.each(['memory', 'file'] as const)('DaemonLeaseAdapter verifyFence (%s)'
     await adapter.acquire(acquire);
 
     if (isFile) {
-      await fs.writeFile(
-        path.join(tempDir, 'daemon', 'leases', 'notifier.json'),
-        '{ not json',
-        'utf8',
-      );
+      const garbage = '{ not json';
+      const leaseFile = path.join(tempDir, 'daemon', 'leases', 'notifier.json');
+      await fs.writeFile(leaseFile, garbage, 'utf8');
       expect(await adapter.verifyFence('notifier', TOKEN, NOW)).toBe('no-lease-readable');
+      // Verification never changes persisted state: the exact bytes stay and
+      // no quarantine copy is made, even though the store is writable.
+      expect(await fs.readFile(leaseFile, 'utf8')).toBe(garbage);
+      await expect(fs.readdir(path.join(tempDir, 'daemon', 'leases', 'quarantine'))).rejects.toMatchObject(
+        { code: 'ENOENT' },
+      );
       const readonlyAdapter = new DaemonLeaseAdapter({ stateDir: tempDir, readOnly: true });
       expect(await readonlyAdapter.verifyFence('notifier', TOKEN, NOW)).toBe('no-lease-readable');
     } else {

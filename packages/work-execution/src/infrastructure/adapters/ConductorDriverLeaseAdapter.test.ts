@@ -144,11 +144,19 @@ describe.each(['memory', 'file'] as const)('ConductorDriverLeaseAdapter (%s)', (
   it('an unreadable driver lease file refuses no-lease-readable and never ok', async () => {
     await adapter.acquire(ACQUIRE);
     if (isFile) {
-      await fs.writeFile(path.join(tempDir, 'conductor-driver-lease.json'), '{ not json', 'utf8');
+      const garbage = '{ not json';
+      const file = path.join(tempDir, 'conductor-driver-lease.json');
+      await fs.writeFile(file, garbage, 'utf8');
       // Both writable (throws) and read-only (typed error) adapters refuse.
       expect(await adapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBe(
         'no-lease-readable',
       );
+      // Verification never changes persisted state: the exact bytes stay and
+      // no quarantine copy is made, even though the store is writable.
+      expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+      await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
       const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
       expect(await readonlyAdapter.verifyFence({ holderId: 'driver-example-1', fence: 1 }, NOW)).toBe(
         'no-lease-readable',

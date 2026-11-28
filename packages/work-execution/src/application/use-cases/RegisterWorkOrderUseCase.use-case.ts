@@ -30,6 +30,7 @@ import {
 import {
   HOLD_INTENT_ID_PATTERN,
   ID_TOKEN_PATTERN,
+  MAX_HELD_WORK_ORDERS,
   MAX_OPEN_PRS_FOR_OVERLAP_CHECK,
   MAX_OWNED_PATHS,
   MAX_PREREQUISITE_WORK_ORDER_IDS,
@@ -48,9 +49,10 @@ import type {
   HeldWorkOrderRequestSnapshot,
   OverlapBlockerKind,
 } from '../../domain/held-work-order.js';
-import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 import type {
+  HeldWorkOrderIdSuggestion,
   RegisterWorkOrderPort,
   RegisterWorkOrderRequest,
   RegisterWorkOrderResult,
@@ -173,8 +175,54 @@ interface HoldProgress {
   replacementMayExist: boolean;
 }
 
+const MAX_SUFFIX_CANDIDATES = 64;
+const MAX_WORK_ORDERS_FOR_SUGGESTION = 10_000;
+const MAX_SUGGESTED_ID_LENGTH = 128;
+
+/** `snapshotPlainDataRecord` that maps a throwing Proxy trap to null. */
+function safeSnapshotPlainDataRecord(value: unknown): Record<string, unknown> | null {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
+/** Splits `<unitPrefix>-<suffix>` at the last dash; null when not splittable. O(1): length-bounded first. */
+function parseUnitPrefixAndSuffix(
+  workOrderId: string,
+): { readonly unitPrefix: string; readonly currentSuffix: string } | null {
+  if (
+    typeof workOrderId !== 'string' ||
+    workOrderId.length > MAX_SUGGESTED_ID_LENGTH ||
+    !ID_TOKEN_PATTERN.test(workOrderId) ||
+    containsAnySecretPattern(workOrderId)
+  ) {
+    return null;
+  }
+  const lastDash = workOrderId.lastIndexOf('-');
+  if (lastDash <= 0 || lastDash === workOrderId.length - 1) {
+    return null;
+  }
+  return {
+    unitPrefix: workOrderId.slice(0, lastDash),
+    currentSuffix: workOrderId.slice(lastDash + 1),
+  };
+}
+
+/** The candidate suffix `step` after `currentSuffix`: exact BigInt for numeric suffixes, else `<suffix>-<step+1>`. */
+function candidateSuffixAt(currentSuffix: string, step: number): string {
+  if (/^(?:0|[1-9][0-9]*)$/.test(currentSuffix)) {
+    return (BigInt(currentSuffix) + BigInt(step)).toString();
+  }
+  return `${currentSuffix}-${step + 1}`;
+}
+
 function recordRefusalAnswer(
-  reason: Extract<RecordHoldIntentResult, { readonly outcome: 'refused' }>['reason'],
+  reason: Exclude<
+    Extract<RecordHoldIntentResult, { readonly outcome: 'refused' }>['reason'],
+    'held-request-mismatch'
+  >,
 ): RegisterWorkOrderResult {
   if (reason === 'invalid-record') {
     return INVALID_REQUEST;
@@ -709,6 +757,84 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     return { refusal: null, heldRecord: null, staleRecord: null };
   }
 
+  /** Next free id suffix for the same unit across held and registered ids. Never throws. */
+  private async buildHeldMismatchSuggestion(workOrderId: string): Promise<HeldWorkOrderIdSuggestion> {
+    const parsed = parseUnitPrefixAndSuffix(workOrderId);
+    if (parsed === null) {
+      return { outcome: 'unavailable', reason: 'invalid-work-order-id' };
+    }
+    const heldUnreadable: HeldWorkOrderIdSuggestion = {
+      outcome: 'unavailable',
+      reason: 'held-store-unreadable',
+    };
+    const ordersUnreadable: HeldWorkOrderIdSuggestion = {
+      outcome: 'unavailable',
+      reason: 'work-order-store-unreadable',
+    };
+    const takenIds = new Set<string>();
+    try {
+      // Every property read on a repository sits inside the guard: a getter or Proxy may throw.
+      const heldRepo = this.deps?.heldWorkOrderRepo;
+      if (heldRepo === undefined || typeof heldRepo.listHeldWorkOrders !== 'function') {
+        return heldUnreadable;
+      }
+      const envelope = safeSnapshotPlainDataRecord(await heldRepo.listHeldWorkOrders());
+      if (envelope === null || envelope.outcome !== 'ok') {
+        return heldUnreadable;
+      }
+      const dense = readBoundedDenseArray(envelope.records, MAX_HELD_WORK_ORDERS);
+      if (dense === null) {
+        return heldUnreadable;
+      }
+      for (const entry of dense.array) {
+        const snapshot = safeSnapshotPlainDataRecord(entry);
+        if (snapshot === null || typeof snapshot.workOrderId !== 'string') {
+          return heldUnreadable;
+        }
+        takenIds.add(snapshot.workOrderId);
+      }
+    } catch {
+      return heldUnreadable;
+    }
+    try {
+      const workOrderRepo = this.deps?.workOrderRepo;
+      if (workOrderRepo === undefined || typeof workOrderRepo.listWorkOrdersByProject !== 'function') {
+        return ordersUnreadable;
+      }
+      const dense = readBoundedDenseArray(
+        await workOrderRepo.listWorkOrdersByProject(),
+        MAX_WORK_ORDERS_FOR_SUGGESTION,
+      );
+      if (dense === null) {
+        return ordersUnreadable;
+      }
+      for (const entry of dense.array) {
+        const snapshot = safeSnapshotPlainDataRecord(entry);
+        if (snapshot === null || typeof snapshot.id !== 'string') {
+          return ordersUnreadable;
+        }
+        takenIds.add(snapshot.id);
+      }
+    } catch {
+      return ordersUnreadable;
+    }
+    for (let step = 1; step <= MAX_SUFFIX_CANDIDATES; step += 1) {
+      const suffix = candidateSuffixAt(parsed.currentSuffix, step);
+      const candidateId = `${parsed.unitPrefix}-${suffix}`;
+      if (
+        candidateId.length > MAX_SUGGESTED_ID_LENGTH ||
+        !ID_TOKEN_PATTERN.test(candidateId) ||
+        containsAnySecretPattern(candidateId)
+      ) {
+        return { outcome: 'unavailable', reason: 'invalid-work-order-id' };
+      }
+      if (!takenIds.has(candidateId)) {
+        return { outcome: 'suggested', unitPrefix: parsed.unitPrefix, suffix, workOrderId: candidateId };
+      }
+    }
+    return { outcome: 'unavailable', reason: 'budget-exhausted' };
+  }
+
   private async resolveSameWorkOrderHeldRecord(
     record: HeldWorkOrderRecord,
     context: Omit<OverlapContext, 'staleRecord'>,
@@ -734,7 +860,11 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       };
     }
     return {
-      refusal: { outcome: 'refused', reason: 'held-request-mismatch' },
+      refusal: {
+        outcome: 'refused',
+        reason: 'held-request-mismatch',
+        suggestion: await this.buildHeldMismatchSuggestion(context.workOrderId),
+      },
       heldRecord: null,
       staleRecord: null,
     };
@@ -1044,6 +1174,16 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const recorded = await heldRepo.recordHoldIntent(record);
     if (recorded.outcome === 'refused') {
       progress.replacementMayExist = false;
+      if (recorded.reason === 'held-request-mismatch') {
+        return {
+          ok: false,
+          answer: {
+            outcome: 'refused',
+            reason: 'held-request-mismatch',
+            suggestion: await this.buildHeldMismatchSuggestion(context.workOrderId),
+          },
+        };
+      }
       return { ok: false, answer: recordRefusalAnswer(recorded.reason) };
     }
     if (recorded.outcome !== 'recorded' && recorded.outcome !== 'already-held') {

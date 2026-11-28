@@ -102,13 +102,38 @@ export type RegisterWorkOrderResult =
         | 'overlap-unknown'
         | 'invalid-request'
         | 'invalid-pull-request-title'
-        | 'held-request-mismatch'
         | 'intent-digest-mismatch'
         | 'store-unavailable'
         | 'malformed-profile'
         | 'unsupported-profile-base';
     }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: 'held-request-mismatch';
+      readonly suggestion: HeldWorkOrderIdSuggestion;
+    }
   | { readonly outcome: 'rejected'; readonly reason: string };
+
+/** Why no next-free work-order id suffix could be proposed. */
+export type HeldWorkOrderIdSuggestionReason =
+  | 'invalid-work-order-id'
+  | 'held-store-unreadable'
+  | 'work-order-store-unreadable'
+  | 'budget-exhausted';
+
+/**
+ * A structured hint on a `held-request-mismatch` refusal: the next free
+ * `<unitPrefix>-<suffix>` work-order id, or a typed reason none could be
+ * determined. Never a guess: an unreadable store yields `unavailable`.
+ */
+export type HeldWorkOrderIdSuggestion =
+  | {
+      readonly outcome: 'suggested';
+      readonly unitPrefix: string;
+      readonly suffix: string;
+      readonly workOrderId: string;
+    }
+  | { readonly outcome: 'unavailable'; readonly reason: HeldWorkOrderIdSuggestionReason };
 
 export interface SupersededHeldWorkOrder {
   readonly requestDigest: string;

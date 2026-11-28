@@ -219,7 +219,11 @@ describe('work-order held (PT1ca)', () => {
 
     const mutated = await register(runtime, 'wo-held-1', 'packages/example-held', ['--brief-request-ref', 'brief-req-02', '--now-iso', T1]);
     expect(mutated.code).toBe(1);
-    expect(JSON.parse(mutated.out)).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(JSON.parse(mutated.out)).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+      suggestion: { outcome: 'suggested', unitPrefix: 'wo-held', suffix: '2', workOrderId: 'wo-held-2' },
+    });
   });
 
   it('holds an active-work-order overlap and lists it with its blocker', async () => {

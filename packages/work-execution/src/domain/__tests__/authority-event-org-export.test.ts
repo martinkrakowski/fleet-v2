@@ -156,7 +156,7 @@ describe('exportAuthorityEventsForOrg refusals', () => {
     expectRefusal(run(req([[]])), 'invalid-input');
   });
 
-  it('refuses Proxy, getter without invoking it, and sparse hole inputs as invalid-input', () => {
+  it('refuses Proxy inputs and getters without invoking the getter as invalid-input', () => {
     let getterRan = false;
     const withGetter = req([ev('a1', 'org-a')]);
     Object.defineProperty(withGetter, 'limit', {
@@ -397,7 +397,7 @@ describe('exportAuthorityEventsForOrg leak guard', () => {
 });
 
 describe('exportAuthorityEventsForOrg line length', () => {
-  it('exports the largest valid event whose serialized line exceeds 3000 UTF-8 bytes and stays under 4096', () => {
+  it('exports an event with every free-text field at the 128-character cap whose serialized line exceeds 3000 UTF-8 bytes and stays under 4096', () => {
     const lone = '\ud800'.repeat(128);
     const result = run(
       req([ev(lone, 'org-a', { beforeRevision: lone, afterRevision: lone })], { organizationId: 'org-a' }),

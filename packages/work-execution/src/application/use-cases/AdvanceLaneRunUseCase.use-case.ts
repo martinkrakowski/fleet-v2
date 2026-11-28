@@ -57,6 +57,7 @@ import type { ExecuteAuthorizedForgeActionPort } from '../ports/in/ExecuteAuthor
 import type { CollectAttemptArtifactsPort } from '../ports/in/CollectAttemptArtifactsPort.in-port.js';
 import type { CommitEditOnlyAttemptPort } from '../ports/in/CommitEditOnlyAttemptPort.in-port.js';
 import type { EvaluateAttemptGatePort } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
+import type { ReceiptCarryEvidencePort } from '../ports/out/ReceiptCarryEvidencePort.out-port.js';
 import type { EvidenceArchivePort } from '@fleet/evidence-and-acceptance';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
@@ -226,6 +227,14 @@ export interface AdvanceLaneRunDependencies {
    * tail and keeps the predicate name and exit code.
    */
   readonly evidenceArchive?: EvidenceArchivePort;
+  /**
+   * U6: the git evidence that lets a Tier 2 premerge release carry across a
+   * base-merge head move (read-only bare mirror); absent → such a move keeps
+   * waiting `premerge-pending`, as before.
+   */
+  readonly receiptCarryEvidence?: ReceiptCarryEvidencePort;
+  /** U6: the 12-hex digest naming the bare mirror of the forge repository; absent → no carry. */
+  readonly repositoryDigest?: string;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */

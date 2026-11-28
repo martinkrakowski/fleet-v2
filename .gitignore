@@ -52,6 +52,7 @@ yarn-error.log*
 /.fleet/
 /.lane/
 /installation/
+apps/web/.forbidden-names
 SYNC-MIGRATION-REPORT.md
 
 # Agent briefs and lane scaffolding

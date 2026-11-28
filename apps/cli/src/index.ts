@@ -48,6 +48,12 @@ import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js'
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
+import {
+  orchestratorCommand,
+  orchestratorHelpRequested,
+  ORCHESTRATOR_HELP,
+  type OrchestratorCliOptions,
+} from './orchestrator.js';
 import { killallCommand, type KillallCliOptions } from './commands/killall.js';
 import { reportCommand, type ReportCliOptions } from './report.js';
 import {
@@ -717,6 +723,10 @@ The telemetry group exports run telemetry spans (a run, a work order or a
 time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
+The orchestrator group registers an orchestrator session (attach), lists the
+sessions (status) and lists queued web requests as data (pending). Run
+'fleet-v2 orchestrator --help'.
+
 The killall group stops every running lane, pauses the merge train and sets the
 killall halt marker; --lift clears the pause then the marker. Run
 'fleet-v2 killall --help'.
@@ -762,6 +772,7 @@ Commands:
   conductor status|halt|stop|resume|start|run
   daemon tick|status|pause|resume
   telemetry export|status
+  orchestrator attach|status|pending
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]
@@ -857,6 +868,7 @@ export async function runCli(
   tuiOptions?: TuiCommandOptions,
   planOptions?: PlanCliOptions,
   ownerItemsOptions?: OwnerItemsCliOptions,
+  orchestratorOptions?: OrchestratorCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -913,6 +925,11 @@ export async function runCli(
       (isHelpToken(restArgv[1]) || (restArgv.length === 3 && isHelpToken(restArgv[2])))
     ) {
       io.stdout(`${QUESTIONS_HELP}\n`);
+      return 0;
+    }
+    // The orchestrator group answers help before anything is loaded.
+    if (group === 'orchestrator' && orchestratorHelpRequested(restArgv.slice(1))) {
+      io.stdout(`${ORCHESTRATOR_HELP}\n`);
       return 0;
     }
     // `killall` halts active lane workers and pauses the train directly
@@ -1016,6 +1033,9 @@ export async function runCli(
     }
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
+    }
+    if (group === 'orchestrator') {
+      return await orchestratorCommand(restArgv.slice(1), io, activeRuntime, { ...orchestratorOptions });
     }
     if (group === 'report') {
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});

@@ -409,9 +409,10 @@ const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
  * Session ids the runner's `--status` output actually lists: only lines
  * after the `ocm-run: running in <dir>:` header count, and each must be a
  * bare session id. A `ses_…` inside the directory path never counts. The
- * scan is `scanStatusText`, which walks the output by index and is
- * cost-bounded: at most `MAX_STATUS_LINES` lines are examined in total and at
- * most `MAX_LISTED_SESSIONS` ids are collected.
+ * scan (`scanStatusText`) walks the output by index and is cost-bounded: at
+ * most `MAX_STATUS_LINES` lines are examined before the header and at most
+ * `MAX_STATUS_LINES` after it, and at most `MAX_LISTED_SESSIONS` ids are
+ * collected. Output past either bound is reported as truncated.
  */
 const MAX_STATUS_LINES = 1024;
 const MAX_LISTED_SESSIONS = 1024;
@@ -419,8 +420,13 @@ const MAX_LISTED_SESSIONS = 1024;
 /** The session-id shape `--status` text output and the JSON payload must match. */
 const SESSION_ID_MAX_LENGTH = 128;
 
-function statusSessionIds(stdout: string): string[] {
-  return scanStatusText(stdout).ids;
+/** A thrown value as text, never throwing itself: a hostile `toString` or Proxy trap reads as a fixed word. */
+function describeThrown(error: unknown): string {
+  try {
+    return String(error);
+  } catch {
+    return 'unprintable error';
+  }
 }
 
 /**
@@ -436,6 +442,8 @@ function scanStatusText(stdout: string): { header: boolean; ids: string[]; trunc
   let position = 0;
   let scanned = 0;
   while (position < stdout.length) {
+    // The line budget applies before the header (the search for it) and again
+    // after it (the listing), so a listing is never short-changed by noise.
     if (scanned >= MAX_STATUS_LINES) return { header, ids: [...ids], truncated: true };
     scanned += 1;
     const newline = stdout.indexOf('\n', position);
@@ -444,7 +452,10 @@ function scanStatusText(stdout: string): { header: boolean; ids: string[]; trunc
     const line = rawLine.trim();
     position = end + 1;
     if (!header) {
-      if (STATUS_HEADER_PATTERN.test(rawLine)) header = true;
+      if (STATUS_HEADER_PATTERN.test(rawLine)) {
+        header = true;
+        scanned = 0;
+      }
       continue;
     }
     if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) {
@@ -854,7 +865,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { ids: [], reason: `status command failed: ${String(error)}` };
     }
     if (result.exitCode === 3) {
-      const ids = statusSessionIds(result.stdout);
+      const scan = scanStatusText(result.stdout);
+      if (scan.truncated) {
+        return { ids: [], reason: 'status exit 3 output exceeds the scan bound' };
+      }
+      const ids = scan.ids;
       if (ids.length === 1) {
         return { ids, reason: 'status listed one session' };
       }
@@ -1163,7 +1178,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { state: 'idle' };
     }
     if (result.exitCode === 3) {
-      const ids = statusSessionIds(result.stdout);
+      const scan = scanStatusText(result.stdout);
+      if (scan.truncated) {
+        return { state: 'unknown', reason: 'status exit 3 output exceeds the scan bound' };
+      }
+      const ids = scan.ids;
       if (ids.length === 1) {
         return { state: 'running', sessionId: ids[0] };
       }
@@ -1291,7 +1310,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         { timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS },
       );
     } catch (error) {
-      return { ok: false, error: 'unreachable', reason: `Status command failed: ${String(error)}` };
+      return { ok: false, error: 'unreachable', reason: `Status command failed: ${describeThrown(error)}` };
     }
 
     // The subprocess result itself is untrusted: snapshot it before reading

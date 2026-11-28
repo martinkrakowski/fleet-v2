@@ -257,13 +257,29 @@ describe('ExecutionRunnerAdapter listSessions status text scan bound', () => {
     );
   });
 
-  it('exit 0 text output exactly at the line bound with no session ids is still an idle listing', async () => {
-    const stdout = `${header}${'\n'.repeat(1022)}`;
-    const { runner } = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
-    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
+  it('exit 0 text output with exactly 1,024 lines after the header is an idle listing and 1,025 lines refuse', async () => {
+    const atBound = scriptedRunner([{ exitCode: 0, stdout: `${header}${'\n'.repeat(1024)}`, stderr: '' }]);
+    expect(await adapterWith(atBound.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
       ok: true,
       sessions: [],
     });
+    const pastBound = scriptedRunner([{ exitCode: 0, stdout: `${header}${'\n'.repeat(1025)}`, stderr: '' }]);
+    expect(await adapterWith(pastBound.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exceeds the scan bound'),
+    );
+  });
+
+  it('a thrown value whose toString throws still returns unreachable instead of rejecting', async () => {
+    const hostile = {
+      toString(): string {
+        throw new Error('hostile toString');
+      },
+    };
+    const runner = (): never => {
+      throw hostile;
+    };
+    const result = await adapterWith(runner as never).listSessions({ worktreePath: worktree, runner: runnerRecord });
+    expect(result).toEqual({ ok: false, error: 'unreachable', reason: 'Status command failed: unprintable error' });
   });
 });
 

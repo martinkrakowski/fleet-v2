@@ -72,6 +72,7 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/attempts/:id/cancel-prepared", "operate"],
   ["POST", "/v1/attempts/:id/artifacts", "operate"],
   ["POST", "/v1/attempts/:id/notes", "operate"],
+  ["POST", "/v1/owner-items", "operate"],
   ["POST", "/v1/owner-items/:id/resolution", "operate"],
   ["POST", "/v1/verifications", "operate"],
   ["POST", "/v1/verifications/:id/receipt", "operate"],

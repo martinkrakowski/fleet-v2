@@ -10,6 +10,7 @@ import {
   LANE_PLAN_SIDECAR_SCHEMA_VERSION,
   PLAN_DECISION_ID_PATTERN,
   PLAN_DECISION_STATES,
+  PLAN_FEATURE_SET_ID_PATTERN,
   PLAN_ID_PATTERN,
   PLAN_PACKAGE_PATTERN,
   PLAN_PROJECT_ID_PATTERN,
@@ -26,6 +27,7 @@ import type {
   PlannedLaneTier,
   PlanDecisionSidecar,
   PlanDecisionState,
+  PlanFeatureSet,
   PlanPullRequestRef,
 } from './lane-plan-records.js';
 
@@ -50,6 +52,9 @@ export function canonicalLanePlanSidecarJson(sidecar: LanePlanSidecar): string {
     planId: sidecar.planId,
     revision: sidecar.revision,
     doc: sidecar.doc,
+    ...(sidecar.featureSet === null
+      ? {}
+      : { featureSet: { id: sidecar.featureSet.id, title: sidecar.featureSet.title } }),
     lanes: sidecar.lanes.map((lane) => ({
       laneId: lane.laneId,
       renamedFrom: lane.renamedFrom,
@@ -68,6 +73,7 @@ export function canonicalLanePlanSidecarJson(sidecar: LanePlanSidecar): string {
       mergedPr: lane.mergedPr === null
         ? null
         : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
+      ...(lane.rollupOf && sidecar.featureSet !== null ? { rollupOf: true } : {}),
     })),
     ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
   });
@@ -192,9 +198,10 @@ export function pullRequestRefError(path: string, value: unknown): string | null
 }
 
 const ROOT_REQUIRED_KEYS = ['schemaVersion', 'projectId', 'planId', 'revision', 'doc', 'lanes'];
-const ROOT_OPTIONAL_KEYS = ['decisions', 'exclusiveOrder'];
+const ROOT_OPTIONAL_KEYS = ['decisions', 'exclusiveOrder', 'featureSet'];
+const FEATURE_SET_REQUIRED_KEYS = ['id', 'title'];
 const LANE_REQUIRED_KEYS = ['laneId', 'scope', 'packages', 'tier', 'after'];
-const LANE_OPTIONAL_KEYS = ['renamedFrom', 'sharedFiles', 'decisions', 'status', 'brief', 'mergedPr'];
+const LANE_OPTIONAL_KEYS = ['renamedFrom', 'sharedFiles', 'decisions', 'status', 'brief', 'mergedPr', 'rollupOf'];
 const DECISION_REQUIRED_KEYS = ['id', 'question', 'default', 'state'];
 const EXCLUSIVE_REQUIRED_KEYS = ['file', 'lanes'];
 
@@ -219,6 +226,9 @@ function parseLanePlanSidecarUnchecked(input: unknown): LanePlanSidecarResult {
   if (hasOwn(root, 'doc')) {
     pushPathError(errors, 'sidecar.doc', root.doc);
   }
+  if (hasOwn(root, 'featureSet') && root.featureSet !== null) {
+    checkRootFeatureSet(root.featureSet, errors);
+  }
   if (hasOwn(root, 'lanes')) {
     checkRootLanes(root, errors);
   }
@@ -236,6 +246,20 @@ function parseLanePlanSidecarUnchecked(input: unknown): LanePlanSidecarResult {
     return cappedErrors(errors);
   }
   return { ok: true, sidecar: buildNormalizedSidecar(root) };
+}
+
+/** `sidecar.featureSet`: exactly `{ id, title }`, read through descriptors so no getter runs. */
+function checkRootFeatureSet(value: unknown, errors: string[]): void {
+  const featureSet = readSidecarObject(value, FEATURE_SET_REQUIRED_KEYS, [], 'sidecar.featureSet', errors);
+  if (featureSet === null) {
+    return;
+  }
+  if (hasOwn(featureSet, 'id')) {
+    pushIdError(errors, 'sidecar.featureSet.id', featureSet.id, PLAN_FEATURE_SET_ID_PATTERN, 'feature set id');
+  }
+  if (hasOwn(featureSet, 'title')) {
+    pushTextError(errors, 'sidecar.featureSet.title', featureSet.title, LANE_PLAN_LIMITS.featureSetTitleBytes);
+  }
 }
 
 function checkRootLanes(root: Record<string, unknown>, errors: string[]): void {
@@ -396,6 +420,9 @@ function checkLaneShape(
   }
   if (hasOwn(lane, 'mergedPr') && lane.mergedPr !== null) {
     checkMergedPr(base, lane.mergedPr, errors);
+  }
+  if (hasOwn(lane, 'rollupOf') && typeof lane.rollupOf !== 'boolean') {
+    errors.push(`${base}.rollupOf: must be a boolean`);
   }
 }
 
@@ -705,6 +732,7 @@ function collectDecisionIds(root: Record<string, unknown>): Set<string> {
 function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar {
   const projectId = root.projectId as string;
   const planId = root.planId as string;
+  const featureSet = buildNormalizedFeatureSet(root);
   const lanes = (plainArrayCopy(root.lanes) as unknown[]).map((raw) =>
     buildNormalizedLane(raw, projectId, planId),
   );
@@ -720,6 +748,7 @@ function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar 
     planId,
     revision: root.revision as number,
     doc: root.doc as string,
+    featureSet,
     lanes,
     decisions,
     exclusiveOrder,
@@ -752,7 +781,17 @@ function buildNormalizedLane(raw: unknown, projectId: string, planId: string): P
     status: (lane.status === undefined ? 'planned' : lane.status) as PlannedLaneStatus,
     brief: lane.brief === undefined ? null : (lane.brief as string | null),
     mergedPr,
+    rollupOf: lane.rollupOf === true,
   };
+}
+
+/** A fresh `{ id, title }` copy of a validated feature set, or null when absent or null. */
+function buildNormalizedFeatureSet(root: Record<string, unknown>): PlanFeatureSet | null {
+  if (!hasOwn(root, 'featureSet') || root.featureSet === null) {
+    return null;
+  }
+  const featureSet = root.featureSet as Record<string, unknown>;
+  return { id: featureSet.id as string, title: featureSet.title as string };
 }
 
 function buildNormalizedDecision(raw: unknown): PlanDecisionSidecar {

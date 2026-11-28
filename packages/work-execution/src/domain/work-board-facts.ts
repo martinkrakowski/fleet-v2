@@ -14,6 +14,7 @@ import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunParkReason } from './lane-run-records.js';
+import type { PlanFeatureSet } from './lane-plan-records.js';
 import { planTextError } from './lane-plan-sidecar.js';
 
 export const WORK_BOARD_SCHEMA_VERSION = 1 as const;
@@ -68,12 +69,16 @@ export interface BoardPlannedLaneFact {
   readonly after: readonly BoardPlannedLaneRef[];
   readonly decisions: readonly string[];
   readonly brief: string | null;
+  /** True when the lane stands for its feature set's rollup; absent reads as false (PV1). */
+  readonly rollupOf?: boolean;
 }
 
 export interface BoardPlanFact {
   readonly projectId: string;
   readonly planId: string;
   readonly revision: number;
+  /** The plan's feature set; absent reads as null (PV1). */
+  readonly featureSet?: PlanFeatureSet | null;
   /** In plan order. */
   readonly lanes: readonly BoardPlannedLaneFact[];
   readonly decisions: readonly { readonly id: string; readonly state: 'open' | 'decided' }[];

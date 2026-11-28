@@ -32,7 +32,7 @@ import {
   planTextError,
   pullRequestRefError,
 } from '../lane-plan-sidecar.js';
-import { readExactPlainRecord } from '../plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from '../plain-record-reads.js';
 
 export type PlannedLaneResult =
   | { readonly success: true; readonly value: PlannedLane }
@@ -51,6 +51,9 @@ const RECORD_KEYS: readonly string[] = [
   'brief',
   'mergedPr',
 ];
+
+/** `rollupOf` is optional on input so pre-PV1 stored records stay readable; absent reads as false. */
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['rollupOf'];
 
 const AFTER_KEYS: readonly string[] = ['projectId', 'planId', 'laneId'];
 
@@ -134,6 +137,11 @@ export class PlannedLane {
     }
     const mergedPr = mergedPrOrError;
 
+    if (Object.hasOwn(recordInput, 'rollupOf') && typeof recordInput.rollupOf !== 'boolean') {
+      return invalid(`PlannedLane ${path}.rollupOf: must be a boolean`);
+    }
+    const rollupOf = recordInput.rollupOf === true;
+
     const record: PlannedLaneRecord = Object.freeze({
       laneId,
       aliases: Object.freeze([...aliases]),
@@ -146,6 +154,7 @@ export class PlannedLane {
       status,
       brief,
       mergedPr: mergedPr === null ? null : Object.freeze(mergedPr),
+      rollupOf,
     });
     return { success: true, value: new PlannedLane(record) };
   }
@@ -170,6 +179,7 @@ export class PlannedLane {
       mergedPr: this.record.mergedPr === null
         ? null
         : { repository: this.record.mergedPr.repository, number: this.record.mergedPr.number },
+      rollupOf: this.record.rollupOf === true,
     };
   }
 
@@ -180,6 +190,11 @@ export class PlannedLane {
   /** Fresh copy of the aliases (former ids, oldest first). */
   getAliases(): string[] {
     return [...this.record.aliases];
+  }
+
+  /** True when the lane stands for its feature set's rollup. */
+  isRollup(): boolean {
+    return this.record.rollupOf === true;
   }
 
   getStatus(): PlannedLaneStatus {
@@ -209,7 +224,7 @@ function laneRecordSnapshot(input: unknown, path: string): Record<string, unknow
   if (inputPrototype !== Object.prototype && inputPrototype !== null) {
     return `PlannedLane ${path}: must be an object`;
   }
-  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  const recordInput = readPlainRecordWithOptionalKeys(input, RECORD_KEYS, OPTIONAL_RECORD_KEYS);
   if (recordInput === null) {
     return `PlannedLane ${path}: must have exactly its record fields`;
   }

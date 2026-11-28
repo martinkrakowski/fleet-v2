@@ -10,13 +10,15 @@
  * secret-shaped input is refused with a fixed message, never echoed.
  */
 
-import { readExactPlainRecord } from '../plain-record-reads.js';
+import { isPlainRecordObject } from '../record-schema-version.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from '../plain-record-reads.js';
 import {
   CANONICAL_ISO_PATTERN,
   LANE_PLAN_LIMITS,
   LANE_PLAN_RECORD_VERSION,
   PLAN_DECISION_ID_PATTERN,
   PLAN_DECISION_STATES,
+  PLAN_FEATURE_SET_ID_PATTERN,
   PLAN_ID_PATTERN,
   PLAN_PROJECT_ID_PATTERN,
   PLANNED_LANE_ID_PATTERN,
@@ -32,6 +34,7 @@ import type {
   PlannedLaneTier,
   PlanDecisionSidecar,
   PlanDecisionState,
+  PlanFeatureSet,
   PlanPullRequestRef,
 } from '../lane-plan-records.js';
 import {
@@ -58,6 +61,10 @@ const RECORD_KEYS: readonly string[] = [
   'exclusiveOrder',
   'importedAtIso',
 ];
+
+/** `featureSet` is optional on input so pre-PV1 stored records stay readable; absent reads as null. */
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['featureSet'];
+const FEATURE_SET_KEYS: readonly string[] = ['id', 'title'];
 
 const DECISION_KEYS: readonly string[] = ['id', 'question', 'default', 'state'];
 const EXCLUSIVE_KEYS: readonly string[] = ['file', 'lanes'];
@@ -93,6 +100,7 @@ export class LanePlan {
         revision: sidecar.revision,
         digest: meta.digest,
         doc: sidecar.doc,
+        featureSet: sidecar.featureSet === null ? null : { id: sidecar.featureSet.id, title: sidecar.featureSet.title },
         lanes: sidecar.lanes.map((lane) => freshLaneRecord({
           laneId: lane.laneId,
           aliases: lane.renamedFrom === null ? [] : [lane.renamedFrom],
@@ -105,6 +113,7 @@ export class LanePlan {
           status: lane.status,
           brief: lane.brief,
           mergedPr: lane.mergedPr,
+          rollupOf: lane.rollupOf,
         })),
         ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
         importedAtIso: meta.importedAtIso,
@@ -134,6 +143,11 @@ export class LanePlan {
       return invalid(headError);
     }
     const revision = recordInput.revision as number;
+
+    const featureSet = readFeatureSet(recordInput);
+    if (typeof featureSet === 'string') {
+      return invalid(featureSet);
+    }
 
     const lanesRaw = plainArrayCopy(recordInput.lanes);
     const lanesListError = lanesListShapeError(lanesRaw);
@@ -186,6 +200,7 @@ export class LanePlan {
       revision,
       digest: recordInput.digest as string,
       doc: recordInput.doc as string,
+      featureSet: featureSet === null ? null : deepFrozen({ id: featureSet.id, title: featureSet.title }),
       lanes: Object.freeze(lanes.map((lane) => {
         const laneRecord = lane.toRecord();
         deepFreezeValue(laneRecord);
@@ -207,6 +222,9 @@ export class LanePlan {
       revision: this.record.revision,
       digest: this.record.digest,
       doc: this.record.doc,
+      featureSet: this.record.featureSet == null
+        ? null
+        : { id: this.record.featureSet.id, title: this.record.featureSet.title },
       lanes: this.record.lanes.map(freshLaneRecord),
       ...planDecisionAndOrderRecords(this.record.decisions, this.record.exclusiveOrder),
       importedAtIso: this.record.importedAtIso,
@@ -227,6 +245,13 @@ export class LanePlan {
 
   getDigest(): string {
     return this.record.digest;
+  }
+
+  /** A fresh copy of the plan's feature set, or null when the plan has none. */
+  getFeatureSet(): PlanFeatureSet | null {
+    return this.record.featureSet == null
+      ? null
+      : { id: this.record.featureSet.id, title: this.record.featureSet.title };
   }
 
   /** The lane with this current id or alias, or null; a fresh copy. */
@@ -262,11 +287,38 @@ function lanePlanRecordSnapshot(input: unknown): Record<string, unknown> | strin
   if (inputPrototype !== Object.prototype && inputPrototype !== null) {
     return 'LanePlan requires a record';
   }
-  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  const recordInput = readPlainRecordWithOptionalKeys(input, RECORD_KEYS, OPTIONAL_RECORD_KEYS);
   if (recordInput === null) {
     return 'LanePlan must have exactly its record fields';
   }
   return recordInput;
+}
+
+/**
+ * The record's optional feature set: absent or null reads as null; otherwise exactly
+ * `{ id, title }`, read through descriptors so no getter runs. The fixed error or the copy.
+ */
+function readFeatureSet(recordInput: Record<string, unknown>): PlanFeatureSet | null | string {
+  if (!Object.hasOwn(recordInput, 'featureSet') || recordInput.featureSet === null) {
+    return null;
+  }
+  const value = recordInput.featureSet;
+  if (!isPlainRecordObject(value)) {
+    return 'LanePlan featureSet: must be an object';
+  }
+  const snapshot = readExactPlainRecord(value, FEATURE_SET_KEYS);
+  if (snapshot === null) {
+    return 'LanePlan featureSet: must have exactly id and title';
+  }
+  const idError = planIdError('featureSet.id', snapshot.id, PLAN_FEATURE_SET_ID_PATTERN, 'feature set id');
+  if (idError !== null) {
+    return `LanePlan ${idError}`;
+  }
+  const titleError = planTextError('featureSet.title', snapshot.title, LANE_PLAN_LIMITS.featureSetTitleBytes);
+  if (titleError !== null) {
+    return `LanePlan ${titleError}`;
+  }
+  return { id: snapshot.id as string, title: snapshot.title as string };
 }
 
 /** Header field checks (version, ids, revision, digest, doc); the fixed error or null. */
@@ -322,6 +374,7 @@ interface LaneRecordSource {
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
   readonly mergedPr: PlanPullRequestRef | null;
+  readonly rollupOf?: boolean;
 }
 
 /** One fresh lane record; nested lists and references are fresh copies. */
@@ -344,6 +397,7 @@ function freshLaneRecord(lane: LaneRecordSource): PlannedLaneRecord {
     mergedPr: lane.mergedPr === null
       ? null
       : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
+    rollupOf: lane.rollupOf === true,
   };
 }
 

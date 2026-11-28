@@ -44,15 +44,16 @@ describe('the injected Proxy detector is required and consulted', () => {
   it('isTrainStepBlocked passes the detector to every read', async () => {
     const deps = { halt: clearHaltPort() as never, killallHalt: clearMarkerPort() as never, killallTrainPause: clearPausePort() as never };
     await expect(isTrainStepBlocked(deps, true, types.isProxy)).resolves.toBe(false);
-    const seen = new Set<unknown>();
-    const flagAll = (value: unknown): boolean => {
-      seen.add(value);
-      return true;
-    };
-    await expect(isTrainStepBlocked(deps, true, flagAll)).resolves.toBe(true);
-    expect(seen.has(deps.halt)).toBe(true);
-    expect(seen.has(deps.killallHalt)).toBe(true);
-    expect(seen.has(deps.killallTrainPause)).toBe(true);
+    // The guard short-circuits, so each read is probed on its own.
+    for (const key of ['halt', 'killallHalt', 'killallTrainPause'] as const) {
+      const seen: unknown[] = [];
+      const flag = (value: unknown): boolean => {
+        seen.push(value);
+        return true;
+      };
+      await expect(isTrainStepBlocked({ [key]: deps[key] }, true, flag)).resolves.toBe(true);
+      expect(seen[0]).toBe(deps[key]);
+    }
   });
 
   it('the detector cannot be omitted (compile-time)', () => {

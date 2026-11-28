@@ -9,7 +9,11 @@
  * detectable Proxies (via the injected detector, never through reflection
  * traps), sparse arrays, oversized strings and prototype-polluting own keys
  * are each refused with a typed `{ ok: false, reason }` result, never a
- * throw and never a pass. Every input is copied ONCE by `snapshotPlainData`
+ * throw and never a pass. The detector is REQUIRED: an omitted or
+ * non-function detector is refused (`proxy-detector-required`) instead of
+ * failing open, because no pure-domain substitute for the trusted
+ * `types.isProxy` predicate exists and a missed Proxy's reflection traps
+ * could otherwise run and synthesize a valid-looking snapshot. Every input is copied ONCE by `snapshotPlainData`
  * (through its own data descriptors, so no getter and no Proxy `get` trap
  * ever runs and no value can change between check and use); only the frozen
  * snapshot is validated. No rejected value is ever echoed into a refusal.
@@ -88,9 +92,6 @@ export type ForgeInstallationParseRefusalReason =
 export type ParseForgeInstallationRecordResult =
   | { readonly ok: true; readonly record: ForgeInstallationRecord }
   | { readonly ok: false; readonly reason: ForgeInstallationParseRefusalReason };
-
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
 
 /**
  * Map a snapshot refusal path to this module's typed reason. The special
@@ -180,15 +181,19 @@ function parseRepositories(value: unknown):
 
 /**
  * Parse unknown input as a ForgeInstallationRecord; a refused value never
- * throws and is never echoed. The input is snapshotted ONCE with fixed,
- * frozen bounds (depth 2, at most 8 own keys, at most 500 array items, at
- * most 509 nodes, strings capped at 4096 characters), the snapshot's own
- * keys are checked against the 7 allowed keys, and every field is validated
- * on the frozen snapshot only. The returned record and its repositories
- * array are frozen.
+ * throws and is never echoed. The `isProxy` detector is required: an omitted
+ * or non-function detector is refused (`proxy-detector-required`) so the
+ * zero-trap guarantee never degrades to fail-open. The input is snapshotted
+ * ONCE with fixed, frozen bounds (depth 3 — record at depth 0, the
+ * `repositories` array at depth 1, repository strings at depth 2, with one
+ * spare level so every reachable node sits inside the declared budget; at
+ * most 8 own keys, at most 500 array items, at most 509 nodes, strings
+ * capped at 4096 characters), the snapshot's own keys are checked against
+ * the 7 allowed keys, and every field is validated on the frozen snapshot
+ * only. The returned record and its repositories array are frozen.
  *
  * Cost bound: O(m) where m <= 500 is `repositories.length` — one bounded
- * depth-2 snapshot pass of at most 509 nodes, one own-key check over at
+ * depth-3 snapshot pass of at most 509 nodes, one own-key check over at
  * most 8 keys, and one pass over at most 500 repository strings of length
  * at most 200.
  */
@@ -196,12 +201,13 @@ export function parseForgeInstallationRecord(
   raw: unknown,
   isProxy?: IsProxy,
 ): ParseForgeInstallationRecordResult {
-  const detector = isProxy === undefined ? NO_DETECTOR : isProxy;
-  if (typeof detector !== "function") {
+  if (typeof isProxy !== "function") {
+    // Fail closed: without a trusted detector a Proxy's reflection traps
+    // could run during the snapshot and synthesize valid fields.
     return { ok: false, reason: "proxy-detector-required" };
   }
-  const snapshot = snapshotPlainData(raw, detector, {
-    maxDepth: 2,
+  const snapshot = snapshotPlainData(raw, isProxy, {
+    maxDepth: 3,
     maxKeys: ALLOWED_KEYS.size + 1,
     maxArrayLength: MAX_FORGE_INSTALLATION_REPOSITORIES,
     maxNodes: MAX_FORGE_INSTALLATION_REPOSITORIES + 9,

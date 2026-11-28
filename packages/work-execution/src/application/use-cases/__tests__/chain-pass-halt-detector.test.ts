@@ -146,6 +146,22 @@ describe('an accessor `read` on a port is refused without being invoked', () => 
     expect(traps).toBe(0);
   });
 
+  it.each(reads)('%s: a callable Proxy as the read method is refused and its apply trap never runs', async (_name, read) => {
+    // Guard: without an isProxy check on the found value, the Proxy is called
+    // as the method (its apply trap runs) and answers clear.
+    let applied = 0;
+    const answerFor = (name: string): unknown =>
+      name.includes('Killall') && name.includes('Paused') ? { status: 'clear' } : name.includes('Killall') ? { state: 'clear' } : { state: 'clear', record: null };
+    const proxied = new Proxy(async () => answerFor(_name), {
+      apply(target, thisArg, args): unknown {
+        applied += 1;
+        return Reflect.apply(target, thisArg, args);
+      },
+    });
+    await expect(read({ read: proxied }, types.isProxy)).resolves.toBe(true);
+    expect(applied).toBe(0);
+  });
+
   it('class-style and plain data-property read methods still work', async () => {
     class Adapter {
       async read(): Promise<{ state: 'clear' }> {

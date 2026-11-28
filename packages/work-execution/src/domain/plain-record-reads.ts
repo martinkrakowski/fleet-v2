@@ -292,8 +292,8 @@ export type DataPropertyRead =
 /**
  * Read `key` from an object (and its prototype chain) as a DATA property, so
  * an accessor is never invoked: the first object on the chain that owns `key`
- * decides, and an accessor there, a Proxy anywhere on the chain (asked of the
- * injected `isProxy` before any reflection touches it), a chain longer than
+ * decides, and an accessor there, a Proxy anywhere on the chain or as the found
+ * value (asked of the injected `isProxy` before any reflection touches it), a chain longer than
  * `MAX_PROTOTYPE_WALK` and a throwing reflection are all refusals. A key owned
  * by nothing on the chain is `{ ok: true, value: undefined }`. Pure: the
  * detector is injected (production: `types.isProxy`). Cost: at most
@@ -313,6 +313,11 @@ export function readDataProperty(
       const descriptor = Object.getOwnPropertyDescriptor(current, key);
       if (descriptor !== undefined) {
         if (descriptor.get !== undefined || descriptor.set !== undefined) {
+          return { ok: false };
+        }
+        // A Proxy-valued method (a callable Proxy runs its `apply` trap when
+        // called) is as untrusted as a Proxy port.
+        if (isProxy(descriptor.value) !== false) {
           return { ok: false };
         }
         return { ok: true, value: descriptor.value };

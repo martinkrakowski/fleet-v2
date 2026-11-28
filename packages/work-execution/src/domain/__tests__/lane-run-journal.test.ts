@@ -923,10 +923,23 @@ describe('uncertain outcomes (UN1)', () => {
       key: PUSH_KEY,
       step: 'push',
       reconciliation: 'ambiguous',
+      uncertain: true,
     });
     expect(laneRunJournalPendingIntent([intent(MERGE_ENQUEUE_KEY, { runId: RUN_ID }), result(MERGE_ENQUEUE_KEY, 'uncertain', { runId: RUN_ID })], RUN_ID)).toEqual({
       key: MERGE_ENQUEUE_KEY,
       step: 'merge-enqueue',
+      reconciliation: 'ambiguous',
+      uncertain: true,
+    });
+    // A plain ambiguous result carries no uncertain mark, and a later ambiguous result clears it.
+    expect(laneRunJournalPendingIntent([intent(PUSH_KEY), result(PUSH_KEY, 'ambiguous')], RUN_ID)).toEqual({
+      key: PUSH_KEY,
+      step: 'push',
+      reconciliation: 'ambiguous',
+    });
+    expect(laneRunJournalPendingIntent([intent(PUSH_KEY), result(PUSH_KEY, 'uncertain'), result(PUSH_KEY, 'ambiguous')], RUN_ID)).toEqual({
+      key: PUSH_KEY,
+      step: 'push',
       reconciliation: 'ambiguous',
     });
   });

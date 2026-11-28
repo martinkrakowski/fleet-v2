@@ -3445,7 +3445,7 @@ describe('uncertain pending intents (UN1)', () => {
     const facts = baseFacts({
       state: 'running',
       attempt: attemptFact({ phase: 'ended' }),
-      pendingIntent: { key: `${RUN_ID}/r0/push/0@${HEAD}`, step: 'push', reconciliation: 'ambiguous' },
+      pendingIntent: { key: `${RUN_ID}/r0/push/0@${HEAD}`, step: 'push', reconciliation: 'ambiguous', uncertain: true },
     });
     const rec = record({});
     const decision = decide(rec, facts);
@@ -3460,7 +3460,7 @@ describe('uncertain pending intents (UN1)', () => {
       state: 'merging',
       head12: HEAD,
       attempt: attemptFact({ phase: 'ended' }),
-      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`, step: 'merge-enqueue', reconciliation: 'ambiguous' },
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`, step: 'merge-enqueue', reconciliation: 'ambiguous', uncertain: true },
     });
     const rec = record({});
     const decision = decide(rec, facts);
@@ -3474,6 +3474,23 @@ describe('uncertain pending intents (UN1)', () => {
       pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`, step: 'merge-enqueue', reconciliation: 'ambiguous' },
     });
     expect(decide(record({ parked: PARKED_BLOCKER, parkCount: 1 }), parked)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('a plain ambiguous push or merge-enqueue result parks ambiguous without the uncertain reasonCode', () => {
+    for (const [step, state, key] of [
+      ['push', 'running', `${RUN_ID}/r0/push/0@${HEAD}`],
+      ['merge-enqueue', 'merging', `${RUN_ID}/r0/merge-enqueue/0@${HEAD}`],
+    ] as const) {
+      const facts = baseFacts({
+        state,
+        head12: HEAD,
+        attempt: attemptFact({ phase: 'ended' }),
+        pendingIntent: { key, step, reconciliation: 'ambiguous' },
+      });
+      expect(decide(record({}), facts)).toEqual({
+        kind: 'park', reason: 'ambiguous', qualifier: step, parkedFrom: state,
+      });
+    }
   });
 
   it('the gate ambiguous path still takes its one automatic retry', () => {

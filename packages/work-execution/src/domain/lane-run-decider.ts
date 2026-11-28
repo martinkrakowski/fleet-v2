@@ -318,7 +318,7 @@ export interface LaneRunFacts {
   /** `policy.conductor.stopGraceMinutes` (D12, default 45) (K2 / K7). */
   readonly stopGraceMinutes: number;
   /** The run's last keyed intent without a result (§3.5) (K1b; reconcile in K4/K6). */
-  readonly pendingIntent: { readonly key: string; readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous' } | null;
+  readonly pendingIntent: { readonly key: string; readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous'; readonly uncertain?: true } | null;
   /** Capacity, one active run per package, global cap (§3.6) (K3/K4). */
   readonly admission: 'admitted' | 'no-capacity' | 'package-busy' | 'global-cap';
   /** Run usage ≥ `policy.perLaneCostCeiling`; unreadable usage = false (K4). */
@@ -1536,10 +1536,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         }
         return park('ambiguous', 'gate');
       }
-      // UN1: an uncertain intent (interrupted side effect on dispatch, push,
+      // UN1: an uncertain intent (latest result `uncertain` on dispatch, push,
       // merge-enqueue or premerge) extends ambiguous and never retries: the
-      // park carries `reasonCode: 'uncertain'` so the owner sees why.
-      if (isUncertainStep(facts.pendingIntent.step)) {
+      // park carries `reasonCode: 'uncertain'` so the owner sees why. A plain
+      // ambiguous result on the same step keeps the legacy park without it.
+      if (facts.pendingIntent.uncertain === true && isUncertainStep(facts.pendingIntent.step)) {
         return { kind: 'park', reason: 'ambiguous', qualifier: facts.pendingIntent.step, parkedFrom: facts.state, reasonCode: 'uncertain' };
       }
       return park('ambiguous', facts.pendingIntent.step);

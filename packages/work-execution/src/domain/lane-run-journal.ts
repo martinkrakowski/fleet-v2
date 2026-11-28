@@ -39,8 +39,8 @@ export const LANE_RUN_JOURNAL_ENTRY_KINDS = ['intent', 'result', 'conduct'] as c
 export type LaneRunJournalEntryKind = (typeof LANE_RUN_JOURNAL_ENTRY_KINDS)[number];
 
 /**
- * A result's outcome. `ambiguous` is the only non-final outcome: a key may collect any number of
- * `ambiguous` results, then at most one final result, and nothing after it. The request channel
+ * A result's outcome. `ambiguous` and (UN1) `uncertain` are the non-final outcomes: a key may collect any
+ * number of them, then at most one final result, and nothing after it. The request channel
  * (O2c) additionally treats `not-started` as non-final: it does not move the request, so a later
  * final result is still allowed there.
  *
@@ -835,6 +835,11 @@ export interface LaneRunJournalPendingIntent {
   readonly key: string;
   readonly step: LaneRunKeyStep;
   readonly reconciliation: 'unread' | 'ambiguous';
+  /**
+   * UN1: present and `true` only when the key's latest result is `uncertain`, so a consumer can tell an
+   * interrupted side effect from a plain `ambiguous` result. Absent otherwise.
+   */
+  readonly uncertain?: true;
 }
 
 /**
@@ -873,6 +878,7 @@ function pendingStepIntent(
       key: entry.key,
       step: parsed.kind,
       reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+      ...uncertainMark(entries, entry.key),
     };
   }
   if (parsed?.kind !== 'step') {
@@ -885,7 +891,19 @@ function pendingStepIntent(
     key: entry.key,
     step: parsed.step,
     reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+    ...uncertainMark(entries, entry.key),
   };
+}
+
+/** `{ uncertain: true }` when the key's latest result is `uncertain`, else nothing. */
+function uncertainMark(entries: readonly LaneRunJournalEntryRecord[], key: string): { readonly uncertain?: true } {
+  let latest: unknown = null;
+  for (const other of entries) {
+    if (other.kind === 'result' && other.key === key) {
+      latest = other.outcome;
+    }
+  }
+  return latest === 'uncertain' ? { uncertain: true } : {};
 }
 
 function entryHasFinalResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {

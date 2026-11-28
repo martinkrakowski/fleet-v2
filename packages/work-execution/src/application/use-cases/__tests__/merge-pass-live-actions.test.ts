@@ -916,6 +916,40 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(forgeAction.requests).toHaveLength(0);
   });
 
+  it('a killall marker set after the first guard still stops the forge call', async () => {
+    // Guard: the final pre-forge guard re-reads the killall marker. The marker
+    // is clear at the first read and halted at the second, so only a final
+    // guard that reads it stops the merge (conductor halt alone stays clear).
+    let reads = 0;
+    const { forgeAction, deps } = build({
+      killallHalt: {
+        read: async () => {
+          reads += 1;
+          return reads === 1 ? { state: 'clear' } : { state: 'halted' };
+        },
+      } as never,
+    });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(reads).toBe(2);
+    expect(forgeAction.requests).toHaveLength(0);
+    expect(result.outcome).not.toBe('merged');
+  });
+
+  it('a killall train pause set after the first guard still stops the forge call', async () => {
+    let reads = 0;
+    const { forgeAction, deps } = build({
+      killallTrainPause: {
+        read: async () => {
+          reads += 1;
+          return reads === 1 ? { status: 'clear' } : { status: 'paused' };
+        },
+      } as never,
+    });
+    await performMergeLiveAction(deps, makeRequest());
+    expect(reads).toBe(2);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
   it('skips a live merge-pr as halted when the halt read throws', async () => {
     const { journal, forgeAction, deps } = build({
       halt: {

@@ -554,13 +554,24 @@ describe('featureSet and rollupOf (PV1)', () => {
     expect(canonicalLanePlanSidecarJson(again.sidecar)).toBe(canonical);
   });
 
-  it('a featureSet alone, and a rollupOf alone, each change the canonical JSON', () => {
+  it('a featureSet alone changes the canonical JSON, and rollupOf changes it only inside a feature set', () => {
     const onlyFeature = parseLanePlanSidecar(withFeatureSet({ id: 'f', title: 'T' }));
-    const onlyRollup = parseLanePlanSidecar(withLane(0, { rollupOf: true }));
-    expect(onlyFeature.ok && onlyRollup.ok).toBe(true);
-    if (!onlyFeature.ok || !onlyRollup.ok) return;
+    const featureAndRollup = withFeatureSet({ id: 'f', title: 'T' });
+    (featureAndRollup.lanes as Record<string, unknown>[])[0].rollupOf = true;
+    const both = parseLanePlanSidecar(featureAndRollup);
+    expect(onlyFeature.ok && both.ok).toBe(true);
+    if (!onlyFeature.ok || !both.ok) return;
     expect(canonicalLanePlanSidecarJson(onlyFeature.sidecar)).not.toBe(PRE_PV1_CANONICAL);
-    expect(canonicalLanePlanSidecarJson(onlyRollup.sidecar)).not.toBe(PRE_PV1_CANONICAL);
+    expect(canonicalLanePlanSidecarJson(both.sidecar)).not.toBe(canonicalLanePlanSidecarJson(onlyFeature.sidecar));
+  });
+
+  it('a rollupOf lane in a plan with no featureSet normalizes to false and keeps the pre-PV1 canonical JSON', () => {
+    const result = parseLanePlanSidecar(withLane(0, { rollupOf: true }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sidecar.featureSet).toBeNull();
+    expect(result.sidecar.lanes[0].rollupOf).toBe(false);
+    expect(canonicalLanePlanSidecarJson(result.sidecar)).toBe(PRE_PV1_CANONICAL);
   });
 
   it.each([

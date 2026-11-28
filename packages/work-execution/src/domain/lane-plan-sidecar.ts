@@ -732,8 +732,9 @@ function collectDecisionIds(root: Record<string, unknown>): Set<string> {
 function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar {
   const projectId = root.projectId as string;
   const planId = root.planId as string;
+  const featureSet = buildNormalizedFeatureSet(root);
   const lanes = (plainArrayCopy(root.lanes) as unknown[]).map((raw) =>
-    buildNormalizedLane(raw, projectId, planId),
+    buildNormalizedLane(raw, projectId, planId, featureSet !== null),
   );
   const decisions = hasOwn(root, 'decisions')
     ? (plainArrayCopy(root.decisions) as unknown[]).map((raw) => buildNormalizedDecision(raw))
@@ -747,14 +748,23 @@ function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar 
     planId,
     revision: root.revision as number,
     doc: root.doc as string,
-    featureSet: buildNormalizedFeatureSet(root),
+    featureSet,
     lanes,
     decisions,
     exclusiveOrder,
   };
 }
 
-function buildNormalizedLane(raw: unknown, projectId: string, planId: string): PlannedLaneSidecar {
+/**
+ * `rollupOf` only has a meaning inside a feature set: a plan with no feature set normalizes every
+ * lane to `rollupOf: false`, so the normalized sidecar and its canonical JSON never disagree.
+ */
+function buildNormalizedLane(
+  raw: unknown,
+  projectId: string,
+  planId: string,
+  hasFeatureSet: boolean,
+): PlannedLaneSidecar {
   const lane = raw as Record<string, unknown>;
   const after = hasOwn(lane, 'after')
     ? (plainArrayCopy(lane.after) as unknown[]).map(
@@ -780,7 +790,7 @@ function buildNormalizedLane(raw: unknown, projectId: string, planId: string): P
     status: (lane.status === undefined ? 'planned' : lane.status) as PlannedLaneStatus,
     brief: lane.brief === undefined ? null : (lane.brief as string | null),
     mergedPr,
-    rollupOf: lane.rollupOf === true,
+    rollupOf: hasFeatureSet && lane.rollupOf === true,
   };
 }
 

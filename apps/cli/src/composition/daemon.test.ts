@@ -24,6 +24,8 @@ const haltedMarkerBytes = JSON.stringify({
   changedAtIso: NOW,
 });
 
+const pausedMarkerBytes = JSON.stringify({ version: 1, paused: true, requestedAtIso: NOW });
+
 const clearConductorHalt = {
   read: async () => ({ state: 'clear', record: null }),
 };
@@ -99,11 +101,7 @@ describe('composeDaemon killall marker wiring (KA3-1)', () => {
     // marker bytes stay untouched (no quarantine, no rewrite).
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-daemon-ka31-'));
     await fs.writeFile(path.join(stateDir, 'killall-halt.json'), haltedMarkerBytes, 'utf8');
-    await fs.writeFile(
-      path.join(stateDir, 'killall-train-pause.json'),
-      JSON.stringify({ version: 1, paused: true, requestedAtIso: NOW }),
-      'utf8',
-    );
+    await fs.writeFile(path.join(stateDir, 'killall-train-pause.json'), pausedMarkerBytes, 'utf8');
 
     const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
     const composed = composeDaemon(
@@ -158,6 +156,40 @@ describe('composeDaemon killall marker wiring (KA3-1)', () => {
     await expect(composed.killallHalt.set({ halted: false, nowIso: NOW })).rejects.toThrow();
     await expect(composed.killallTrainPause.set({ paused: false, nowIso: NOW })).rejects.toThrow();
     expect(await fs.readFile(path.join(stateDir, 'killall-halt.json'), 'utf8')).toBe(haltedMarkerBytes);
+    expect(await fs.readFile(path.join(stateDir, 'killall-train-pause.json'), 'utf8')).toBe(pausedMarkerBytes);
+  });
+
+  it('composeDaemon durable wiring reads the train-pause marker alone: with no halt marker the pass still reasons halted and the pause file is untouched', async () => {
+    // Guard: the `killallTrainPause` wiring. The halt marker is absent here, so
+    // only a composed pause read can explain the blocked pass.
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-daemon-ka31-pause-'));
+    await fs.writeFile(path.join(stateDir, 'killall-train-pause.json'), pausedMarkerBytes, 'utf8');
+    const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
+    const composed = composeDaemon(makeInput({ stateDir, mergeQueueRepository }));
+    const digest = mergeQueueRepositoryDigest({ owner: 'fleet', repo: 'v2' });
+    const enqueue = await mergeQueueRepository.enqueueMergeEntry({
+      repository: { owner: 'fleet', repo: 'v2' },
+      pullRequest: 1,
+      headOid: 'a'.repeat(40),
+      tier: 0,
+      enqueuedBy: 'cli',
+      runId: null,
+      entryId: '01JB0000000000000000000002',
+      successorEntryId: '01JB0000000000000000000003',
+      enqueuedAtIso: FRESH_NOW,
+      deadlineIso: FRESH_DEADLINE,
+    });
+    expect(enqueue.outcome).toBe('created');
+    const pass = await composed.runMergePass.runMergePass({
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: digest,
+      projectId: 'proj-1',
+      policy: { policyRevision: 'rev-1', shadow: true, unattended: true, updateBranch: false, veto: { mode: 'off' } },
+      deadlineIso: FRESH_DEADLINE,
+    });
+    expect(pass.outcome).toBe('completed');
+    expect(pass.entries[0]?.reasonCode).toBe('halted');
+    expect(await fs.readFile(path.join(stateDir, 'killall-train-pause.json'), 'utf8')).toBe(pausedMarkerBytes);
   });
 
   it('composeDaemon guards readOnly killallHalt and killallTrainPause on stateDir being undefined like statusReadOnly', async () => {

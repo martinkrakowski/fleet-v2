@@ -326,6 +326,8 @@ export async function premergeAttestCommand(
   if (
     fieldOf(reviewSnapshot, 'outcome') !== 'found' ||
     receiptField.kind === 'absent' ||
+    fieldOf(receiptField.value, 'kind') !== 'pre-merge' ||
+    fieldOf(receiptField.value, 'candidateHeadSha') !== headSha ||
     decideConductorReviewOutcome(receiptField.value).outcome !== 'passed'
   ) {
     return refuseRecord(io, { outcome: 'refused', reason: 'review-not-passed', runId });
@@ -388,6 +390,10 @@ export async function premergeAttestCommand(
       return refuseRecord(io, { outcome: 'refused', reason: 'reviewer-unavailable', runId });
     }
     if (isSameModelFamily(underlyingModelFamily(requestedReviewerModel), implementerFamily)) {
+      return refuseRecord(io, { outcome: 'refused', reason: 'reviewer-unavailable', runId });
+    }
+    // The recorded identity must be the one that performed the passed pre-merge review.
+    if (fieldOf(receiptField.value, 'reviewerModel') !== requestedReviewerModel) {
       return refuseRecord(io, { outcome: 'refused', reason: 'reviewer-unavailable', runId });
     }
     reviewerModel = requestedReviewerModel;

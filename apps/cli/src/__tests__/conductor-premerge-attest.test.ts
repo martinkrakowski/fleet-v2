@@ -77,6 +77,8 @@ function attemptRecord(overrides: Record<string, unknown> = {}): Record<string, 
 
 function passedReceipt(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    kind: 'pre-merge',
+    candidateHeadSha: HEAD,
     verdict: 'passed',
     findings: [],
     readOnlyVerified: true,
@@ -269,6 +271,7 @@ describe('conductor premerge attest records the Tier 2 owner receipt', () => {
   it('records requestedReviewerModel when defined and in a different model family from implementerModel', async () => {
     const { runtime, calls } = makeRuntime({
       inspection: { outcome: 'found', assessment: assessmentRecord({ requestedReviewerModel: 'other-provider/qwen-3' }) },
+      preMergeReceipt: passedReceipt({ reviewerModel: 'other-provider/qwen-3' }),
     });
     const { code, io } = await runAttest(runtime, ['--run', RUN_ID, '--yes']);
     expect(code).toBe(0);
@@ -445,5 +448,24 @@ describe('conductor premerge attest refusals (exit 1)', () => {
     expect(code).toBe(1);
     expect(lastOut(io)).toEqual({ outcome: 'refused', reason: 'invalid-record', runId: RUN_ID });
     expect(getterRuns).toBe(0);
+  });
+
+  it('refuses and records nothing when the pre-merge receipt is the wrong kind, for another head, or by a different reviewer than the requested one', async () => {
+    const wrong: readonly { receipt: Record<string, unknown>; requested?: string }[] = [
+      { receipt: passedReceipt({ kind: 'manual' }) },
+      { receipt: passedReceipt({ kind: undefined }) },
+      { receipt: passedReceipt({ candidateHeadSha: 'f'.repeat(40) }) },
+      { receipt: passedReceipt(), requested: 'other-provider/qwen-3' },
+    ];
+    for (const { receipt, requested } of wrong) {
+      const { runtime, calls } = makeRuntime({
+        inspection: { outcome: 'found', assessment: assessmentRecord({ requestedReviewerModel: requested }) },
+        preMergeReceipt: receipt,
+      });
+      const { code, io } = await runAttest(runtime, ['--run', RUN_ID, '--yes']);
+      expect(code).toBe(1);
+      expect(lastOut(io)).toMatchObject({ outcome: 'refused' });
+      expect(calls.recordedReceipts).toHaveLength(0);
+    }
   });
 });

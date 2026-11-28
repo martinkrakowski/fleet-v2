@@ -776,3 +776,36 @@ describe("private key block context", () => {
     expect(read).toEqual({ ok: true, lines: ["[REDACTED:private-key-body]"], nextCursor: 2 });
   });
 });
+
+describe("private key block context survives eviction", () => {
+  const BEGIN = "-----" + "BEGIN PRIVATE KEY" + "-----";
+  const BODY = "MIIEvQIBADANBgkqhkiG9w0B" + "Z".repeat(40);
+
+  it("keeps redacting body lines after the header was evicted by the line cap", () => {
+    const head = appendWatchLines(emptyWatchBuffer(), [BEGIN], 1000, DETECTOR);
+    expect(head.ok).toBe(true);
+    if (!head.ok) return;
+    const filler = Array.from({ length: WATCH_BUFFER_LIMITS.maxLines }, () => BODY);
+    const first = appendWatchLines(head.buffer, filler, 1000, DETECTOR);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.buffer.entries).toHaveLength(WATCH_BUFFER_LIMITS.maxLines);
+    expect(first.buffer.entries.some((entry) => entry.text.includes("REDACTED:private-key-block"))).toBe(false);
+    const second = appendWatchLines(first.buffer, [BODY, "tail"], 1001, DETECTOR);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const texts = second.buffer.entries.map((entry) => entry.text);
+    expect(texts.join("\n")).not.toContain(BODY);
+  });
+
+  it("keeps redacting after the header aged out of the buffer", () => {
+    const first = appendWatchLines(emptyWatchBuffer(), [BEGIN, BODY], 1000, DETECTOR);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const later = 1000 + WATCH_BUFFER_LIMITS.maxAgeMs + 1;
+    const second = appendWatchLines(first.buffer, [BODY], later, DETECTOR);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.buffer.entries.map((entry) => entry.text)).toEqual(["[REDACTED:private-key-body]"]);
+  });
+});

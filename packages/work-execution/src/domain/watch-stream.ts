@@ -284,8 +284,9 @@ const PEM_BODY_MARKER = '[REDACTED:private-key-body]';
  * after a header (or its marker, for an already-redacted kept line) every following line is
  * replaced by a fixed body marker until an END line, which is redacted normally. An unterminated
  * block therefore redacts the rest of the stream (fail closed). The context is recomputed from
- * the kept entries on every call, so a header already evicted by the caps is the one case a later
- * body line is not covered. Cost: `O(1)` regex tests on top of `redactWatchLine`.
+ * every entry of the input buffer on each call, aged-out ones included; a body marker also opens
+ * the context, so a header evicted by the line or byte caps still leaves the retained body markers
+ * that carry it. Cost: `O(1)` regex tests on top of `redactWatchLine`.
  */
 function redactInPemContext(
   line: unknown,
@@ -301,7 +302,8 @@ function redactInPemContext(
   if (!redaction.ok) {
     return { ok: false };
   }
-  const opens = (PEM_BEGIN.test(line) || line.includes(PEM_HEADER_MARKER)) && !PEM_END.test(line);
+  const opens =
+    (PEM_BEGIN.test(line) || line.includes(PEM_HEADER_MARKER) || line === PEM_BODY_MARKER) && !PEM_END.test(line);
   return { ok: true, line: redaction.line, inPem: opens };
 }
 
@@ -553,14 +555,15 @@ export function appendWatchLines(
   let totalBytes = 0;
   let inPem = false;
   for (const entry of bufferRead.buffer.entries) {
-    if (entry.atMs < oldestAllowed) {
-      continue;
-    }
+    // Aged-out entries still advance the private key context; they are just not kept.
     const redaction = redactInPemContext(entry.text, inPem);
     if (!redaction.ok) {
       return refusal('invalid-buffer');
     }
     inPem = redaction.inPem;
+    if (entry.atMs < oldestAllowed) {
+      continue;
+    }
     const bytes = new TextEncoder().encode(redaction.line).byteLength;
     kept.push(Object.freeze({ seq: entry.seq, text: redaction.line, bytes, atMs: entry.atMs }));
     totalBytes += bytes;
@@ -666,8 +669,10 @@ export function readWatchLinesAfter(
   // no unredacted text can leave through this read.
   const lines: string[] = [];
   const firstWanted = cursor - dropped;
+  const keptSet = new Set<WatchEntry>(kept);
   let inPem = false;
-  for (const [index, entry] of kept.entries()) {
+  let keptIndex = 0;
+  for (const entry of bufferRead.buffer.entries) {
     const redaction = redactInPemContext(entry.text, inPem);
     // Unreachable in practice: readWatchBuffer already proved the text a
     // string; the guard keeps the type narrow without trusting it blindly.
@@ -675,8 +680,11 @@ export function readWatchLinesAfter(
       return refusal('invalid-buffer');
     }
     inPem = redaction.inPem;
-    if (index >= firstWanted) {
-      lines.push(redaction.line);
+    if (keptSet.has(entry)) {
+      if (keptIndex >= firstWanted) {
+        lines.push(redaction.line);
+      }
+      keptIndex += 1;
     }
   }
   return Object.freeze({

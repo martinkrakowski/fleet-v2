@@ -6,9 +6,11 @@
  * persistence, no clock read, no randomness, no I/O.
  *
  * Hostile-input rule: `input` is read exactly once through
- * `snapshotPlainData`, which runs the injected `isProxy` detector before any
- * reflection, reads descriptors without invoking getters, and refuses
- * non-plain data with a typed reason. No rejected value is ever echoed.
+ * `snapshotPlainData`, which runs the mandatory injected `isProxy` detector
+ * before any reflection, reads descriptors without invoking getters, and
+ * refuses non-plain data with a typed reason. There is no default detector,
+ * so a Proxy is always refused before its reflection traps can run. No
+ * rejected value is ever echoed.
  */
 
 import { containsSecretShape, snapshotPlainData } from '@fleet/shared';
@@ -124,14 +126,20 @@ function refused(reason: DriverLeaseRefusalReason): DriverLeaseDecision {
 }
 
 /**
- * The takeover decision. `input` is read once through `snapshotPlainData`
- * (O(maxNodes) traversal, O(1) length pre-gate on arrays, O(K) engine bound
- * on `Reflect.ownKeys` per object, O(1) per-id byte check); the decision
- * itself is O(cap) over the competing ids. Neither the input nor any read
- * value is mutated; a getter and a reflection trap never run; no rejected
- * value is echoed. Never throws.
+ * The takeover decision. The `isProxy` detector is mandatory — there is no
+ * default, so a Proxy can never be read through reflection without a trusted
+ * detector refusing it first (the previous default `() => false` let an
+ * `ownKeys` trap run and accept trap-supplied data). `input` is read once
+ * through `snapshotPlainData` (O(maxNodes) traversal, O(1) length pre-gate on
+ * arrays, O(K) engine bound on `Reflect.ownKeys` per object, O(1) per-id byte
+ * check); the decision itself is O(cap) over the competing ids. Neither the
+ * input nor any read value is mutated; a getter and a reflection trap never
+ * run; no rejected value is echoed. Never throws.
  */
-export function decideDriverLease(input: unknown, isProxy: IsProxy = () => false): DriverLeaseDecision {
+export function decideDriverLease(input: unknown, isProxy: IsProxy): DriverLeaseDecision {
+  if (typeof isProxy !== 'function') {
+    return refused('invalid-input');
+  }
   const snapshot = snapshotPlainData(input, isProxy, {
     maxDepth: 2,
     maxKeys: 5,

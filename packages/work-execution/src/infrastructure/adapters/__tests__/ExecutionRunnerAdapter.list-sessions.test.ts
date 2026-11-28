@@ -185,6 +185,33 @@ describe('ExecutionRunnerAdapter listSessions valid responses', () => {
     });
   });
 
+  it("exit 0 with the bundled runner's own idle line returns empty sessions", async () => {
+    // Guard: `bin/ocm-run --status` prints `ocm-run: nothing is running in <dir>
+    // (server: remote port N)` with exit 0 when idle, and no `running in` header.
+    // A header-only check would read every real idle answer as unreadable.
+    const idle = scriptedRunner([
+      { exitCode: 0, stdout: `ocm-run: nothing is running in ${worktree} (server: remote port 4166)\n`, stderr: '' },
+    ]);
+    expect(await adapterWith(idle.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
+      ok: true,
+      sessions: [],
+    });
+  });
+
+  it('the idle line never hides a listed session or excuses an exit 3', async () => {
+    const idleLine = `ocm-run: nothing is running in ${worktree}\n`;
+    const contradictory = scriptedRunner([
+      { exitCode: 0, stdout: `${idleLine}ocm-run: running in ${worktree}:\nses_hidden1\n`, stderr: '' },
+    ]);
+    expect(await adapterWith(contradictory.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('lists sessions'),
+    );
+    const running = scriptedRunner([{ exitCode: 3, stdout: idleLine, stderr: '' }]);
+    expect(await adapterWith(running.runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('no valid session ids'),
+    );
+  });
+
   it('exit 0 with an empty JSON session payload parses through the pure helper', async () => {
     const { runner } = scriptedRunner([{ exitCode: 0, stdout: '{"sessions":[]}', stderr: '' }]);
     expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({

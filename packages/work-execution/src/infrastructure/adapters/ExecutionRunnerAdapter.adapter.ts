@@ -403,6 +403,8 @@ function parseSessionId(stdout: string): string | null {
 }
 
 const STATUS_HEADER_PATTERN = /^ocm-run: running in .*:$/;
+/** The line `bin/ocm-run --status` prints, with exit 0, when nothing is running. */
+const STATUS_IDLE_PATTERN = /^ocm-run: nothing is running in .*$/;
 const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 /**
@@ -436,15 +438,16 @@ function describeThrown(error: unknown): string {
  * that bound the scan reports `truncated`, so a caller never mistakes an
  * incomplete listing for an idle one.
  */
-function scanStatusText(stdout: string): { header: boolean; ids: string[]; truncated: boolean } {
+function scanStatusText(stdout: string): { header: boolean; idle: boolean; ids: string[]; truncated: boolean } {
   const ids = new Set<string>();
   let header = false;
+  let idle = false;
   let position = 0;
   let scanned = 0;
   while (position < stdout.length) {
     // The line budget applies before the header (the search for it) and again
     // after it (the listing), so a listing is never short-changed by noise.
-    if (scanned >= MAX_STATUS_LINES) return { header, ids: [...ids], truncated: true };
+    if (scanned >= MAX_STATUS_LINES) return { header, idle, ids: [...ids], truncated: true };
     scanned += 1;
     const newline = stdout.indexOf('\n', position);
     const end = newline === -1 ? stdout.length : newline;
@@ -455,15 +458,17 @@ function scanStatusText(stdout: string): { header: boolean; ids: string[]; trunc
       if (STATUS_HEADER_PATTERN.test(rawLine)) {
         header = true;
         scanned = 0;
+      } else if (STATUS_IDLE_PATTERN.test(rawLine)) {
+        idle = true;
       }
       continue;
     }
     if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) {
-      if (ids.size >= MAX_LISTED_SESSIONS) return { header, ids: [...ids], truncated: true };
+      if (ids.size >= MAX_LISTED_SESSIONS) return { header, idle, ids: [...ids], truncated: true };
       ids.add(line);
     }
   }
-  return { header, ids: [...ids], truncated: false };
+  return { header, idle, ids: [...ids], truncated: false };
 }
 
 /**
@@ -1377,8 +1382,9 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         };
       }
       if (exitCodeRaw === 0) {
-        // Exit 0 means idle: real `--status` text output carries the header
-        // and lists no sessions. Listing ids under exit 0 is contradictory,
+        // Exit 0 means idle: real `--status` text output is either the
+        // `running in <dir>:` header listing no sessions or the runner's own
+        // `nothing is running in <dir>` line. Listing ids under exit 0 is contradictory,
         // and output without the header (garbage, an empty string) is
         // unexpected status output. Both fail closed rather than hiding a
         // running session behind a success with no sessions.
@@ -1389,7 +1395,7 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
             reason: 'Runner status exited 0 but its text output lists sessions',
           };
         }
-        if (!scan.header) {
+        if (!scan.header && !scan.idle) {
           return {
             ok: false,
             error: 'unreadable',

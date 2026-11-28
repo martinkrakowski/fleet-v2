@@ -198,7 +198,7 @@ describe('draftHost', () => {
         const result = draftHost(sshInput({ runner }));
         expect(result.ok).toBe(true);
         if (result.ok) {
-          expect(result.host.runner?.optional).toBe(optional);
+          expect(result.draft.host.runner?.optional).toBe(optional);
         }
       }
     }

@@ -628,7 +628,7 @@ describe("T3b session exchange", () => {
     expect(replacement).not.toBeNull();
   });
 
-  it("a web-login session mints operate and tail, is refused unmintable scopes, and the shared bearer still presents [\"orchestrate\"] and is refused on the exchange", async () => {
+  it("a web-login session mints operate and tail, is refused unmintable scopes, and the shared bearer still presents [\"orchestrate\"] and is refused on the exchange — shared-bearer coverage is limited to presented scopes and exchange refusal, not route-access restriction", async () => {
     configuredApi();
     const secret = sessionSecret([...WEB_LOGIN_SCOPES], "owner");
 

@@ -12,7 +12,11 @@
  * each refused with a typed result, never a throw and never a pass. The
  * untrusted object is read exactly once, through `snapshotPlainData` from
  * `@fleet/shared`, and its own keys are checked with `checkSnapshotKeys` in
- * O(own keys), one enumeration.
+ * O(own keys), one enumeration. A Proxy is refused only through an
+ * accurately injected `isProxy` detector (in production `node:util`'s
+ * `types.isProxy`); because no pure detector exists in domain code, a
+ * missing detector is itself refused rather than defaulted to one that
+ * detects nothing.
  *
  * Cost bounds:
  * - Snapshots are bounded (`maxDepth`, `maxKeys`, `maxNodes`), so each read
@@ -30,6 +34,7 @@ import { snapshotPlainData, type IsProxy } from "@fleet/shared";
 
 import {
   checkSnapshotKeys,
+  compareZonedIsoInstants,
   isZonedIsoDateTime,
   MAX_STRING_LENGTH,
   ORGANIZATION_ID_PATTERN,
@@ -90,21 +95,20 @@ const INPUT_KEYS: ReadonlySet<string> = new Set([
 
 const REQUIRED_INPUT_KEYS = ["callbackStateDigest", "providerError", "hasCode", "nowIso"] as const;
 
-/** A detector that detects nothing, used when the caller supplies none. */
-const NO_DETECTOR: IsProxy = () => false;
-
 /**
- * Resolve the optional proxy detector: absent means no detection, a
- * supplied non-function is refused. A detector that throws is reported by
- * the snapshot as `detector-threw`. Cost bound: O(1).
+ * Resolve the proxy detector. A detector MUST be injected: domain code is
+ * pure and cannot import a runtime Proxy predicate, and with no detector a
+ * lying-in-wait Proxy would be indistinguishable from a plain object, so
+ * "absent" is refused rather than defaulted to a detector that detects
+ * nothing (a `() => false` default would let `decideOAuthCallback(validProxy)`
+ * run its ownKeys/descriptor traps and pass). A supplied non-function is
+ * refused too. A detector that throws is reported by the snapshot as
+ * `detector-threw`. Cost bound: O(1).
  */
 function resolveDetector(
   isProxy: IsProxy | undefined,
 ): { ok: true; detector: IsProxy } | { ok: false } {
-  if (isProxy === undefined) {
-    return { ok: true, detector: NO_DETECTOR };
-  }
-  if (typeof isProxy !== "function") {
+  if (isProxy === undefined || typeof isProxy !== "function") {
     return { ok: false };
   }
   return { ok: true, detector: isProxy };
@@ -157,10 +161,38 @@ function pendingFieldsValid(record: Record<string, unknown>): boolean {
   if (typeof record.consumed !== "boolean") {
     return false;
   }
+  // The lifetime is compared at full ISO precision: Date.parse keeps only
+  // milliseconds, so `expiresAtIso .0000000Z` and `issuedAtIso .0000009Z`
+  // ten milliseconds apart would truncate to a zero or inflated lifetime.
+  if (compareZonedIsoInstants(record.expiresAtIso, record.issuedAtIso) <= 0) {
+    return false;
+  }
   const issuedMs = Date.parse(record.issuedAtIso);
   const expiresMs = Date.parse(record.expiresAtIso);
   const lifetime = expiresMs - issuedMs;
-  return lifetime > 0 && lifetime <= OAUTH_PENDING_STATE_MAX_TTL_MS;
+  if (lifetime > OAUTH_PENDING_STATE_MAX_TTL_MS) {
+    return false;
+  }
+  if (
+    lifetime === OAUTH_PENDING_STATE_MAX_TTL_MS &&
+    subMillisecondRest(record.expiresAtIso) > subMillisecondRest(record.issuedAtIso)
+  ) {
+    // The truncated lifetime hits the bound exactly while the true lifetime
+    // exceeds it by a sub-millisecond remainder.
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The sub-millisecond digits (fraction digits 4-9) of an ISO-8601 timestamp
+ * that already passed `isZonedIsoDateTime`, as a fixed 6-character string so
+ * two instants below a millisecond compare by value. Cost bound: O(1) — one
+ * bounded regex over a string of at most `MAX_ISO_LENGTH` characters.
+ */
+function subMillisecondRest(iso: string): string {
+  const match = /\.(\d{1,9})/.exec(iso);
+  return (match === null ? "" : match[1]).padEnd(9, "0").slice(3);
 }
 
 type PendingSnapshot =
@@ -212,8 +244,8 @@ function snapshotPendingState(value: unknown, detector: IsProxy): PendingSnapsho
 
 /**
  * Parse and validate a stored pending-state record. Hostile or invalid
- * input — including a non-function or throwing `isProxy` detector — is a
- * typed refusal that echoes nothing. Cost bound: O(1).
+ * input — including an absent, non-function or throwing `isProxy` detector —
+ * is a typed refusal that echoes nothing. Cost bound: O(1).
  */
 export function parseOAuthPendingState(
   raw: unknown,
@@ -263,6 +295,8 @@ function mapSnapshotPath(path: string | null): OAuthCallbackRefusalReason {
 export function decideOAuthCallback(input: unknown, isProxy?: IsProxy): OAuthCallbackDecision {
   const resolved = resolveDetector(isProxy);
   if (!resolved.ok) {
+    // An absent or non-function detector is refused: without an accurate
+    // detector a Proxy would be indistinguishable from a plain object.
     return { outcome: "refused", reason: "invalid-input" };
   }
   const snap = snapshotPlainData(input, resolved.detector, {
@@ -324,11 +358,14 @@ export function decideOAuthCallback(input: unknown, isProxy?: IsProxy): OAuthCal
     return { outcome: "refused", reason: "already-consumed" };
   }
 
-  // 4. The callback must arrive inside [issuedAtIso, expiresAtIso).
-  const nowMs = Date.parse(nowIso);
-  const issuedMs = Date.parse(pending.value.issuedAtIso);
-  const expiresMs = Date.parse(pending.value.expiresAtIso);
-  if (nowMs < issuedMs || nowMs >= expiresMs) {
+  // 4. The callback must arrive inside [issuedAtIso, expiresAtIso). Both
+  //    boundaries compare at full ISO precision: Date.parse keeps only
+  //    milliseconds, so a `nowIso` a fraction of a millisecond before
+  //    issuance would truncate to the issued instant and be accepted.
+  if (
+    compareZonedIsoInstants(nowIso, pending.value.issuedAtIso) < 0 ||
+    compareZonedIsoInstants(nowIso, pending.value.expiresAtIso) >= 0
+  ) {
     return { outcome: "refused", reason: "expired" };
   }
 

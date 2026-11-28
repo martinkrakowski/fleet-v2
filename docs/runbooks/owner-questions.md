@@ -27,7 +27,7 @@ The Q5 design (not yet deployed) adds the web answer flow: **Accept recommendati
 
 ## Answering a one-way question
 
-The question card shows the linked request and the canonical decision details. Sign the decision file outside fleet-v2 at `<state-dir>/decisions/<request-id>.json`, then:
+The question card shows the linked request id and a note that `fleet-v2 questions sync` settles the question once a verified decision exists — nothing more: it does not display the canonical decision bytes, the decision-file path, or the linked request's state. Sign the decision file outside fleet-v2 at `<state-dir>/decisions/<request-id>.json`, then:
 
 ```sh
 fleet-v2 questions sync

@@ -25,6 +25,7 @@ export {
 } from './Button';
 export { Switch, type SwitchProps } from './Switch';
 export { Select, type SelectProps } from './Select';
+export { Textarea, type TextareaProps } from './Textarea';
 export { Accordion, type AccordionProps } from './Accordion';
 export { StatCard, type StatCardProps } from './StatCard';
 export {

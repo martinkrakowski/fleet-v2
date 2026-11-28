@@ -12,6 +12,7 @@ import type {
   LeaseRefusal,
   LeaseRenewRequest,
 } from '../../../domain/lane-run-lease.js';
+import type { FenceRefusal } from '../../../domain/fence-token.js';
 import type { DaemonLeaseRecord } from '../../../domain/daemon-tick.js';
 
 export interface DaemonLeasePort {
@@ -20,6 +21,13 @@ export interface DaemonLeasePort {
   release(request: LeaseHoldRequest & { scope: string }): Promise<DaemonLeaseResult>;
   check(request: LeaseHoldRequest & { scope: string }): Promise<LeaseRefusal | null>;
   read(scope: string): Promise<DaemonLeaseRecord | null>;
+  /**
+   * Verify one `FenceToken` against the lease of `scope` without writing.
+   * `null` when the token names the current, unexpired lease of that scope;
+   * else the typed refusal. An unreadable lease file or an unsafe scope is
+   * `no-lease-readable`, never a pass.
+   */
+  verifyFence(scope: string, token: unknown, nowIso: string): Promise<FenceRefusal | null>;
 }
 
 export type DaemonLeaseResult =

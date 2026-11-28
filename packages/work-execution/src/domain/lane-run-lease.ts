@@ -74,7 +74,7 @@ function idError(field: string, value: unknown): string | null {
   return null;
 }
 
-function isValidHolderId(value: unknown): boolean {
+export function isValidHolderId(value: unknown): boolean {
   return idError('holderId', value) === null;
 }
 
@@ -99,7 +99,7 @@ function withinLeaseWindow(leaseUntilIso: string, nowIso: string): boolean {
 }
 
 /** A safe integer of at least `minimum`: the shared fence rule of every reader. */
-function isFence(value: unknown, minimum: number): boolean {
+export function isFence(value: unknown, minimum: number): boolean {
   return Number.isSafeInteger(value) && (value as number) >= minimum;
 }
 

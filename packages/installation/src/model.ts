@@ -171,6 +171,7 @@ function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunne
     capabilities,
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
     ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
+    ...(runner.optional !== undefined ? { optional: runner.optional } : {}),
   };
   if (runner.kind === 'agy') {
     return {

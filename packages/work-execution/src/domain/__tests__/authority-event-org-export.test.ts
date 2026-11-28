@@ -324,6 +324,27 @@ describe('exportAuthorityEventsForOrg leak guard', () => {
     );
   });
 
+  it('refuses a selector that relabels, rewrites, repeats or invents events as foreign-event-leak and accepts one that only drops or reorders', () => {
+    const events = [ev('a1', 'org-a'), ev('b1', 'org-b'), ev('a2', 'org-a')];
+    const relabelByMutation: AuthorityOrgEventSelector = (all) => {
+      (all[1] as { organizationId: string | null }).organizationId = 'org-a';
+      return [all[1]];
+    };
+    const relabelByCopy: AuthorityOrgEventSelector = (all) => [{ ...all[1], organizationId: 'org-a' }];
+    const rewrite: AuthorityOrgEventSelector = (all) => [{ ...all[0], actor: 'someone-else' }, all[2]];
+    const repeat: AuthorityOrgEventSelector = (all) => [all[0], all[0]];
+    const invent: AuthorityOrgEventSelector = () => [ev('zz', 'org-a')];
+    for (const selector of [relabelByMutation, relabelByCopy, rewrite, repeat, invent]) {
+      expectRefusal(run(req(events), selector), 'foreign-event-leak', ['b1', 'org-b', 'someone-else']);
+    }
+    const reordered: AuthorityOrgEventSelector = (all) => [all[2], all[0]];
+    const result = run(req(events), reordered);
+    expect(result.ok && eventIdsOf(result.lines)).toEqual(['a2', 'a1']);
+    const dropping: AuthorityOrgEventSelector = (all) => [all[2]];
+    const dropped = run(req(events), dropping);
+    expect(dropped.ok && eventIdsOf(dropped.lines)).toEqual(['a2']);
+  });
+
   it('refuses a selector returning a hostile iterator, Proxy, forbidden own array keys, or length exceeding 50_000 as foreign-event-leak in bounded time', () => {
     const events = [ev('a1', 'org-a')];
     let iteratorRan = false;

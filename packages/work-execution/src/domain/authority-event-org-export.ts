@@ -189,7 +189,9 @@ function readEvent(value: unknown): AuthorityOrgEvent | null {
   if (organizationId === undefined || beforeRevision === undefined || afterRevision === undefined) {
     return null;
   }
-  return {
+  // Frozen: an injected selector can neither rewrite an event it was handed nor
+  // relabel a foreign event as the requested organisation's.
+  return Object.freeze({
     eventId,
     kind: kind as AuthorityOrgEventKind,
     actor,
@@ -197,7 +199,7 @@ function readEvent(value: unknown): AuthorityOrgEvent | null {
     atIso,
     beforeRevision,
     afterRevision,
-  };
+  });
 }
 
 /** The organisation an event belongs to; an absent or `null` id is the default one. */
@@ -329,6 +331,30 @@ function expectedLinePrefix(event: AuthorityOrgEvent, organizationId: string): s
 }
 
 /**
+ * `O(n)`: every selected event belongs to the requested organisation, appears
+ * once, and is byte-for-byte the event the log holds under that id. A selector
+ * can reorder or drop events, never add, relabel or repeat one.
+ */
+function isSubsetOfOwn(
+  selected: readonly AuthorityOrgEvent[],
+  organizationId: string,
+  ownLines: ReadonlyMap<string, string>,
+): boolean {
+  const seen = new Set<string>();
+  for (let index = 0; index < selected.length; index += 1) {
+    const event = selected[index];
+    if (organizationOf(event) !== organizationId || seen.has(event.eventId)) {
+      return false;
+    }
+    seen.add(event.eventId);
+    if (ownLines.get(event.eventId) !== serializeEvent(event)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Exports one organisation's authority events, paged by cursor, in log order.
  *
  * Cost: the snapshot is `O(N)` bounded by `maxNodes` and `maxDepth`; validation,
@@ -355,24 +381,23 @@ export function exportAuthorityEventsForOrg(
     if (request === null) {
       return INVALID_INPUT;
     }
+    const own = selectOwnEvents(request.events, request.organizationId);
+    const ownLines = new Map<string, string>();
+    for (let index = 0; index < own.length; index += 1) {
+      if (ownLines.has(own[index].eventId)) {
+        return INVALID_INPUT;
+      }
+      ownLines.set(own[index].eventId, serializeEvent(own[index]));
+    }
     const selected =
       selectForOrg === undefined
-        ? selectOwnEvents(request.events, request.organizationId)
+        ? own
         : readSelected(selectForOrg, request.events, request.organizationId, isProxy);
     if (selected === null) {
       return FOREIGN_LEAK;
     }
-    for (let index = 0; index < selected.length; index += 1) {
-      if (organizationOf(selected[index]) !== request.organizationId) {
-        return FOREIGN_LEAK;
-      }
-    }
-    const seen = new Set<string>();
-    for (let index = 0; index < selected.length; index += 1) {
-      if (seen.has(selected[index].eventId)) {
-        return INVALID_INPUT;
-      }
-      seen.add(selected[index].eventId);
+    if (selectForOrg !== undefined && !isSubsetOfOwn(selected, request.organizationId, ownLines)) {
+      return FOREIGN_LEAK;
     }
     let start = 0;
     if (request.afterCursor !== null) {

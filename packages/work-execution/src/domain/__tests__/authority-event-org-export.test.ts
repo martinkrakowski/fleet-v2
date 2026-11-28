@@ -32,6 +32,14 @@ function omit(record: Record<string, unknown>, key: string): Record<string, unkn
   return Object.fromEntries(Object.entries(record).filter(([name]) => name !== key));
 }
 
+/** A three-slot array whose middle slot is a hole. */
+function sparseArray(): unknown[] {
+  const holey: unknown[] = new Array(3);
+  holey[0] = ev('a1', 'org-a');
+  holey[2] = ev('a2', 'org-a');
+  return holey;
+}
+
 function run(input: unknown, selector?: AuthorityOrgEventSelector) {
   return exportAuthorityEventsForOrg(input, isProxy, selector);
 }
@@ -142,8 +150,7 @@ describe('exportAuthorityEventsForOrg refusals', () => {
     }
     expectRefusal(run(req('not-an-array')), 'invalid-input');
     expectRefusal(run(req({ length: 1, 0: ev('a1', 'org-a') })), 'invalid-input');
-    // eslint-disable-next-line no-sparse-arrays
-    expectRefusal(run(req([ev('a1', 'org-a'), , ev('a2', 'org-a')])), 'invalid-input');
+    expectRefusal(run(req(sparseArray())), 'invalid-input');
     expectRefusal(run(req(new Array(MAX_AUTHORITY_ORG_EXPORT_EVENTS + 1))), 'invalid-input');
     expectRefusal(run(req([null])), 'invalid-input');
     expectRefusal(run(req([[]])), 'invalid-input');
@@ -343,8 +350,7 @@ describe('exportAuthorityEventsForOrg leak guard', () => {
         return ev('a1', 'org-a');
       },
     });
-    // eslint-disable-next-line no-sparse-arrays
-    const sparse: unknown[] = [ev('a1', 'org-a'), , ev('a2', 'org-a')];
+    const sparse = sparseArray();
     const hostile: readonly unknown[] = [
       hostileIterator,
       new Proxy([ev('a1', 'org-a')], {}),

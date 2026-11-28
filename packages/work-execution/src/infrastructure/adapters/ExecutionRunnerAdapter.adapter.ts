@@ -432,9 +432,35 @@ function statusSessionIds(stdout: string): string[] {
   return [...ids];
 }
 
-/** Whether `--status` text output carries the runner's status header line. */
-function hasStatusHeader(stdout: string): boolean {
-  return stdout.split('\n').some((line) => STATUS_HEADER_PATTERN.test(line));
+/**
+ * A complete-or-refuse scan of `--status` text output for `listSessions`.
+ * Lines are walked by index without splitting the whole output, and at most
+ * `MAX_STATUS_LINES` lines are examined in total. When output remains past
+ * that bound the scan reports `truncated`, so a caller never mistakes an
+ * incomplete listing for an idle one.
+ */
+function scanStatusText(stdout: string): { header: boolean; ids: string[]; truncated: boolean } {
+  const ids = new Set<string>();
+  let header = false;
+  let position = 0;
+  let scanned = 0;
+  while (position < stdout.length) {
+    if (scanned >= MAX_STATUS_LINES) return { header, ids: [...ids], truncated: true };
+    scanned += 1;
+    const newline = stdout.indexOf('\n', position);
+    const end = newline === -1 ? stdout.length : newline;
+    const line = stdout.slice(position, end).trim();
+    position = end + 1;
+    if (!header) {
+      if (STATUS_HEADER_PATTERN.test(line)) header = true;
+      continue;
+    }
+    if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) {
+      if (ids.size >= MAX_LISTED_SESSIONS) return { header, ids: [...ids], truncated: true };
+      ids.add(line);
+    }
+  }
+  return { header, ids: [...ids], truncated: false };
 }
 
 /**
@@ -1329,27 +1355,30 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         }
         return parsedResult;
       }
+      // Text output must be a complete `--status` listing: a truncated scan
+      // is never read as idle or as a partial list.
+      const scan = scanStatusText(stdout);
+      if (scan.truncated) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: 'Runner status text output exceeds the scan bound',
+        };
+      }
       if (exitCodeRaw === 0) {
-        // Exit 0 with text output is only an idle listing when the output
-        // actually looks like `--status` text (a header line followed by
-        // session ids). Anything else — arbitrary garbage, an empty string —
-        // is a malformed or unexpected status output and fails closed rather
-        // than hiding a running session behind a "success" with no sessions.
-        const ids = statusSessionIds(stdout);
         // Exit 0 means idle: real `--status` text output carries the header
-        // and lists no sessions. Listing ids under exit 0 is as contradictory
-        // as a JSON list would be, and output without the header — arbitrary
-        // garbage, an empty string — is unexpected status output. Both fail
-        // closed rather than hiding a running session behind a "success" with
-        // no sessions.
-        if (ids.length > 0) {
+        // and lists no sessions. Listing ids under exit 0 is contradictory,
+        // and output without the header (garbage, an empty string) is
+        // unexpected status output. Both fail closed rather than hiding a
+        // running session behind a success with no sessions.
+        if (scan.ids.length > 0) {
           return {
             ok: false,
             error: 'unreadable',
             reason: 'Runner status exited 0 but its text output lists sessions',
           };
         }
-        if (!hasStatusHeader(stdout)) {
+        if (!scan.header) {
           return {
             ok: false,
             error: 'unreadable',
@@ -1358,11 +1387,10 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
         }
         return { ok: true, sessions: [] };
       }
-      const ids = statusSessionIds(stdout);
-      if (ids.length === 0) {
+      if (scan.ids.length === 0) {
         return { ok: false, error: 'unreadable', reason: 'Runner status exit 3 listed no valid session ids' };
       }
-      return { ok: true, sessions: ids };
+      return { ok: true, sessions: scan.ids };
     }
     return { ok: false, error: 'unreadable', reason: `Runner status exited ${exitCodeRaw}` };
   }

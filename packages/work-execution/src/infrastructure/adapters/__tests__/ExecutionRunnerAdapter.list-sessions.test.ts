@@ -230,6 +230,35 @@ describe('ExecutionRunnerAdapter listSessions exit-code cross-checks', () => {
   });
 });
 
+describe('ExecutionRunnerAdapter listSessions status text scan bound', () => {
+  const header = `ocm-run: running in ${worktree}:\n`;
+
+  it('exit 0 text output with a session id hidden past the line bound refuses instead of reporting idle', async () => {
+    const stdout = `${header}${'\n'.repeat(1024)}ses_hidden`;
+    const { runner } = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exceeds the scan bound'),
+    );
+  });
+
+  it('exit 3 text output longer than the line bound refuses instead of returning a partial list', async () => {
+    const stdout = `${header}ses_first\n${'\n'.repeat(1024)}ses_late`;
+    const { runner } = scriptedRunner([{ exitCode: 3, stdout, stderr: '' }]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual(
+      refused('exceeds the scan bound'),
+    );
+  });
+
+  it('exit 0 text output exactly at the line bound with no session ids is still an idle listing', async () => {
+    const stdout = `${header}${'\n'.repeat(1022)}`;
+    const { runner } = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
+    expect(await adapterWith(runner).listSessions({ worktreePath: worktree, runner: runnerRecord })).toEqual({
+      ok: true,
+      sessions: [],
+    });
+  });
+});
+
 describe('parseListSessionsPayload hostile shapes', () => {
   const payloadRefusal = refused('Unreadable runner session payload|not a session list|invalid session id');
   it('refuses null, undefined, non-iterable, array hole, wrong primitive, getter, a Proxy, array-like, enormous length, and prototype-polluting keys as unreadable', () => {

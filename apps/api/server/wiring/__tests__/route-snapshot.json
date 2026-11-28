@@ -267,6 +267,15 @@
   },
   {
     "method": "POST",
+    "path": "/v1/owner-items",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
     "path": "/v1/owner-items/[id]/resolution",
     "envelope": [
       "operationId",

@@ -3,6 +3,7 @@
 export * from "./admission-order.js";
 export * from "./artifact-manifest.js";
 export * from "./attempt-environment.js";
+export * from "./attempt-quota-reaper.js";
 export * from "./authority-event-mapping.js";
 export * from "./auto-merge.js";
 export * from "./base-branch.js";
@@ -76,6 +77,7 @@ export * from "./run-telemetry-redaction.js";
 export * from "./run-telemetry-source-scan.js";
 export * from "./run-telemetry-spans.js";
 export * from "./runner-image-window.js";
+export * from "./scoped-halt.js";
 export * from "./seat-key-mode.js";
 export * from "./seat-selection.js";
 export * from "./shadow-attestations.js";

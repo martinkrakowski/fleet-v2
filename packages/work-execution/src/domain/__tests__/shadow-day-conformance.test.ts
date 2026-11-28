@@ -11,7 +11,11 @@ import {
   SHADOW_CONFORMANCE_MIN_TIER2,
   SHADOW_NONCONFORMANCE_CODES,
   SHADOW_ONE_WAY_STEP_STATES,
+  breaksForDay,
+  createShadowRunConformanceContext,
+  evaluateRunS6WithContext,
   evaluateShadowConductedConformance,
+  readShadowConformanceRunDetailed,
 } from '../shadow-day-conformance.js';
 import type { ShadowNonconformanceCode } from '../shadow-day-conformance.js';
 import { LANE_RUN_STATES } from '../value-objects/LaneRunState.vo.js';
@@ -2381,3 +2385,255 @@ function overCap(cap: number): { readonly list: unknown[]; readonly calls: () =>
   list.length = cap + 1;
   return { list, calls: () => calls };
 }
+
+// --- SR3: cut-over streak primitives ---
+
+function breaksInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    s1: { status: 'fail', divergences: 2 },
+    s6: { status: 'fail', nonconformingOnDay: 1 },
+    s4: { status: 'pass', truncated: false, falsePasses: 0 },
+    ...overrides,
+  };
+}
+
+function polluted(key: string, target: Record<string, unknown>): Record<string, unknown> {
+  Object.defineProperty(target, key, { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+  return target;
+}
+
+function throwsOnOwnKeys(target: object): unknown {
+  return new Proxy(target, {
+    ownKeys() {
+      throw new Error('ownKeys trap');
+    },
+  });
+}
+
+describe('breaksForDay (cut-over break tally)', () => {
+  it('sums s1Divergences, s6Nonconforming and s4FalsePasses into total', () => {
+    expect(breaksForDay(breaksInput())).toEqual({ ok: true, s1Divergences: 2, s6Nonconforming: 1, s4FalsePasses: 0, total: 3 });
+  });
+
+  it('sums an all-pass day to a zero total', () => {
+    const allPass = breaksInput({
+      s1: { status: 'pass', divergences: 0 },
+      s6: { status: 'pass', nonconformingOnDay: 0 },
+      s4: { status: 'pass', truncated: false, falsePasses: 0 },
+    });
+    expect(breaksForDay(allPass)).toEqual({ ok: true, s1Divergences: 0, s6Nonconforming: 0, s4FalsePasses: 0, total: 0 });
+  });
+
+  it('refuses truncated s4 evaluation with s4-truncated', () => {
+    expect(breaksForDay(breaksInput({ s4: { status: 'fail', truncated: true, falsePasses: 3 } }))).toEqual({ ok: false, reason: 's4-truncated' });
+  });
+
+  it('refuses non-boolean s4.truncated with invalid-input', () => {
+    expect(breaksForDay(breaksInput({ s4: { status: 'fail', truncated: 'no', falsePasses: 1 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s4: { status: 'fail', truncated: 0, falsePasses: 1 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s4: { status: 'fail', truncated: null, falsePasses: 1 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses unknown s1 status with s1-unknown', () => {
+    expect(breaksForDay(breaksInput({ s1: { status: 'unknown', divergences: 0 } }))).toEqual({ ok: false, reason: 's1-unknown' });
+  });
+
+  it('refuses unknown s6 status with s6-unknown', () => {
+    expect(breaksForDay(breaksInput({ s6: { status: 'unknown', nonconformingOnDay: 0 } }))).toEqual({ ok: false, reason: 's6-unknown' });
+  });
+
+  it('refuses unknown s4 status with s4-unknown', () => {
+    expect(breaksForDay(breaksInput({ s4: { status: 'unknown', truncated: false, falsePasses: 0 } }))).toEqual({ ok: false, reason: 's4-unknown' });
+  });
+
+  it('refuses a missing part, an extra key and malformed counts with invalid-input', () => {
+    const missingS4: Record<string, unknown> = breaksInput();
+    delete missingS4.s4;
+    expect(breaksForDay(missingS4)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay({ ...breaksInput(), extra: 1 })).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s1: { status: 'fail', divergences: -1 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s6: { status: 'fail', nonconformingOnDay: 1.5 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s4: { status: 'fail', truncated: false } }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(breaksInput({ s1: { status: 'diverged', divergences: 1 } }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses hostile inputs and never runs a getter with invalid-input', () => {
+    for (const hostile of [null, undefined, 5, 'day', true, [], { length: 3, 0: {}, 1: {}, 2: {} }]) {
+      expect(breaksForDay(hostile)).toEqual({ ok: false, reason: 'invalid-input' });
+    }
+    let calls = 0;
+    const getterInput: Record<string, unknown> = {};
+    Object.defineProperty(getterInput, 's1', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return { status: 'pass', divergences: 0 };
+      },
+    });
+    getterInput.s6 = { status: 'pass', nonconformingOnDay: 0 };
+    getterInput.s4 = { status: 'pass', truncated: false, falsePasses: 0 };
+    expect(breaksForDay(getterInput)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(calls).toBe(0);
+  });
+
+  it('refuses revoked and throwing-trap Proxies with invalid-input', () => {
+    const { proxy, revoke } = Proxy.revocable(breaksInput(), {});
+    revoke();
+    expect(breaksForDay(proxy)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(throwsOnOwnKeys(breaksInput()))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses __proto__, constructor and prototype own keys with invalid-input', () => {
+    expect(breaksForDay(polluted('__proto__', breaksInput()))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(polluted('constructor', breaksInput()))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(breaksForDay(polluted('prototype', breaksInput()))).toEqual({ ok: false, reason: 'invalid-input' });
+    const parsed: Record<string, unknown> = JSON.parse(JSON.stringify(breaksInput()));
+    expect(breaksForDay(polluted('constructor', parsed.s1 as Record<string, unknown>))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+});
+
+describe('createShadowRunConformanceContext + evaluateRunS6WithContext (per-run S6)', () => {
+  const AT = iso(DAY, 12);
+
+  function context(input: {
+    readonly day?: string;
+    readonly headMoves?: readonly MoveRecord[];
+    readonly headMovesIncompleteFor?: readonly number[];
+  }): ReturnType<typeof createShadowRunConformanceContext> {
+    return createShadowRunConformanceContext(input.day ?? DAY, input.headMoves ?? [], input.headMovesIncompleteFor ?? []);
+  }
+
+  it('judges a single conforming Tier 1 and a single conforming Tier 2 run as conforming with no aggregate floor', () => {
+    const ready = context({});
+    const tier1 = conforming(1, 1, AT);
+    const tier2 = conforming(2, 2, AT);
+    expect(ready).not.toBeNull();
+    if (ready === null) return;
+    expect(evaluateRunS6WithContext(tier1.run, tier1.merge as MergeRecord, ready)).toEqual({ kind: 'conforming' });
+    expect(evaluateRunS6WithContext(tier2.run, tier2.merge as MergeRecord, ready)).toEqual({ kind: 'conforming' });
+  });
+
+  it('judges a single run nonconforming with each S6 code, never the too-few-conforming-runs floor', () => {
+    const ready = context({});
+    if (ready === null) return;
+    const mergeOf = (fixture: Fixture): MergeRecord => fixture.merge as MergeRecord;
+    const gateBroken = dayBroken(1, (f) => f);
+    const reviewBroken = dayBroken(1, (f) => f);
+    const preMergeBroken = dayBroken(2, (f) => f);
+    const postedLate = dayBroken(1, (f) => f);
+    const cases: readonly [Fixture, ShadowNonconformanceCode][] = [
+      [withoutGate(gateBroken), 'gate-not-passed'],
+      [noCodeReview(reviewBroken), 'code-review-missing'],
+      [noPreMergeReceipt(preMergeBroken), 'pre-merge-missing'],
+      [premergeAt(postedLate, shifted(postedLate.merge?.atIso ?? AT, 1000)), 'premerge-not-posted-before-merge'],
+    ];
+    for (const [fixture, code] of cases) {
+      expect(evaluateRunS6WithContext(fixture.run, mergeOf(fixture), ready)).toEqual({ kind: 'nonconforming', code });
+    }
+    // merged-head-unlinked: the merge head is not the run head and no head move links them.
+    const unlinked = retarget(dayBroken(1, (f) => f), headFor(61));
+    expect(evaluateRunS6WithContext(unlinked.run, mergeOf(unlinked), ready)).toEqual({ kind: 'nonconforming', code: 'merged-head-unlinked' });
+    // stray-one-way-action: an open-pr intent while the state is gating, on a run whose head is linked.
+    const strayKey = oneWayKey(gateBroken.run.runId, 'open-pr', gateBroken.run.headOid, null);
+    const stray = extendJournal(dayBroken(1, (f) => f), [conductAt('gating', iso(DAY, 11)), intentAt(strayKey, iso(DAY, 11))]);
+    expect(evaluateRunS6WithContext(stray.run, mergeOf(stray), ready)).toEqual({ kind: 'nonconforming', code: 'stray-one-way-action' });
+  });
+
+  it('returns unknown with reason head-moves-incomplete for a run whose PR has no linkage path and is listed incomplete', () => {
+    const fixture = retarget(dayBroken(1, (f) => f), headFor(61));
+    const ready = context({ headMovesIncompleteFor: [fixture.run.pullRequest] });
+    if (ready === null) return;
+    expect(evaluateRunS6WithContext(fixture.run, fixture.merge as MergeRecord, ready)).toEqual({
+      kind: 'unknown',
+      reason: 'head-moves-incomplete',
+    });
+  });
+
+  it('links a run to its merge through a same-PR head-move chain under the pre-grouped context', () => {
+    const chain = hopChain(dayBroken(1, (f) => f).run.pullRequest, 3, iso(DAY, 15));
+    const base = retarget(dayBroken(1, (f) => f), chain.end);
+    const ready = context({ headMoves: chain.moves });
+    if (ready === null) return;
+    expect(evaluateRunS6WithContext(base.run, base.merge as MergeRecord, ready)).toEqual({ kind: 'conforming' });
+  });
+
+  it('returns null for a day that is not a real UTC calendar day', () => {
+    expect(createShadowRunConformanceContext('2026-02-30', [], [])).toBeNull();
+    expect(createShadowRunConformanceContext('not-a-day', [], [])).toBeNull();
+  });
+});
+
+describe('readShadowConformanceRunDetailed', () => {
+  const base = conforming(1, 1, iso(DAY, 12)).run;
+
+  function without(key: keyof RunRecord): Record<string, unknown> {
+    const copy: Record<string, unknown> = { ...base };
+    delete copy[key];
+    return copy;
+  }
+
+  function withField(key: string, value: unknown): Record<string, unknown> {
+    return { ...base, [key]: value };
+  }
+
+  it('reads a valid run back with its tier, receipts and journal', () => {
+    expect(readShadowConformanceRunDetailed(base)).toEqual({ ok: true, run: base });
+  });
+
+  it('distinguishes an absent or unknown tier as invalid-tier', () => {
+    expect(readShadowConformanceRunDetailed(without('tier'))).toEqual({ ok: false, reason: 'invalid-tier' });
+    expect(readShadowConformanceRunDetailed(withField('tier', 3))).toEqual({ ok: false, reason: 'invalid-tier' });
+    expect(readShadowConformanceRunDetailed(withField('tier', '1'))).toEqual({ ok: false, reason: 'invalid-tier' });
+    // tier is diagnosed before journal even when both are broken.
+    const both = without('tier');
+    delete both.journal;
+    expect(readShadowConformanceRunDetailed(both)).toEqual({ ok: false, reason: 'invalid-tier' });
+  });
+
+  it('distinguishes a missing or unreadable journal as unreadable-journal', () => {
+    expect(readShadowConformanceRunDetailed(without('journal'))).toEqual({ ok: false, reason: 'unreadable-journal' });
+    expect(readShadowConformanceRunDetailed(withField('journal', [{ kind: 'intent' }]))).toEqual({ ok: false, reason: 'unreadable-journal' });
+    expect(readShadowConformanceRunDetailed(withField('journal', 'not-a-list'))).toEqual({ ok: false, reason: 'unreadable-journal' });
+  });
+
+  it('distinguishes missing or malformed reviewReceipts as missing-review-receipts', () => {
+    expect(readShadowConformanceRunDetailed(without('reviewReceipts'))).toEqual({ ok: false, reason: 'missing-review-receipts' });
+    expect(readShadowConformanceRunDetailed(withField('reviewReceipts', [{ kind: 'code-review' }]))).toEqual({ ok: false, reason: 'missing-review-receipts' });
+  });
+
+  it('refuses a missing identity key and an extra key as invalid-input', () => {
+    expect(readShadowConformanceRunDetailed(without('runId'))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(readShadowConformanceRunDetailed(withField('extra', 1))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses hostile inputs without ever running a getter', () => {
+    for (const hostile of [null, undefined, 7, 'run', [], [base]]) {
+      expect(readShadowConformanceRunDetailed(hostile)).toEqual({ ok: false, reason: 'invalid-input' });
+    }
+    let calls = 0;
+    const getterRun: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(base)) {
+      if (key === 'tier') continue;
+      getterRun[key] = value;
+    }
+    Object.defineProperty(getterRun, 'tier', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return 1;
+      },
+    });
+    expect(readShadowConformanceRunDetailed(getterRun)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(calls).toBe(0);
+    const { proxy, revoke } = Proxy.revocable(base, {});
+    revoke();
+    expect(readShadowConformanceRunDetailed(proxy)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(readShadowConformanceRunDetailed(throwsOnOwnKeys(base))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses __proto__, constructor and prototype own keys as invalid-input', () => {
+    expect(readShadowConformanceRunDetailed(polluted('__proto__', { ...base } as Record<string, unknown>))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(readShadowConformanceRunDetailed(polluted('constructor', { ...base } as Record<string, unknown>))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(readShadowConformanceRunDetailed(polluted('prototype', { ...base } as Record<string, unknown>))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+});

@@ -99,7 +99,7 @@ describe("isWebLoginPath refusals", () => {
 });
 
 describe("web-login constants", () => {
-  it("WEB_LOGIN_SCOPES equals [\"read\", \"message\", \"operate\", \"tail\"] with length 4 and no mutating scopes", () => {
+  it("WEB_LOGIN_SCOPES equals [\"read\", \"message\", \"operate\", \"tail\"] with length 4, no write or admin scopes, but including the mutating operate scope", () => {
     expect([...WEB_LOGIN_SCOPES]).toEqual(["read", "message", "operate", "tail"]);
     expect(WEB_LOGIN_SCOPES).toHaveLength(4);
     expect(WEB_LOGIN_SCOPES).not.toContain("write");

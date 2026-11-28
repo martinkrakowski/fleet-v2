@@ -59,6 +59,7 @@ export * from "./RecordSeatObservationPort.in-port.js";
 export * from "./RecordShadowDayPort.in-port.js";
 export * from "./RefreshChainsPort.in-port.js";
 export * from "./RegisterWorkOrderPort.in-port.js";
+export * from "./ReportSpendPort.in-port.js";
 export * from "./RequestAttemptAcceptancePort.in-port.js";
 export * from "./RequestLaneRunStopPort.in-port.js";
 export * from "./ReserveExecutionCapacityPort.in-port.js";

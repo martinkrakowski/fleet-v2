@@ -64,6 +64,7 @@ export * from "./RecordSeatObservationUseCase.use-case.js";
 export * from "./RecordShadowDayUseCase.use-case.js";
 export * from "./RefreshChainsUseCase.use-case.js";
 export * from "./RegisterWorkOrderUseCase.use-case.js";
+export * from "./ReportSpendUseCase.use-case.js";
 export * from "./RequestAttemptAcceptanceUseCase.use-case.js";
 export * from "./RequestLaneRunStopUseCase.use-case.js";
 export * from "./ReserveExecutionCapacityUseCase.use-case.js";

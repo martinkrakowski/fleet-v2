@@ -1414,6 +1414,68 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     expect(both.code).toBe(2);
   });
 
+  it("hosts show prints runner.optional in its OPTIONAL column: true, false when absent or false, and - without a runner (IH1a)", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const lane = (name: string, port: number, optional?: boolean) => ({
+      transport: "ssh",
+      sshAlias: name,
+      worktreeRoot: path.join(dir, name),
+      roles: ["lane-runner"],
+      runner: {
+        kind: "opencode",
+        port,
+        ...(optional !== undefined ? { optional } : {}),
+      },
+    });
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: { transport: "local", worktreeRoot: path.join(dir, "wt"), roles: ["orchestrator"] },
+        lanea: lane("lanea", 4101, true),
+        laneb: lane("laneb", 4102, false),
+        lanec: lane("lanec", 4103),
+      },
+    });
+    const shown = await runHosts(["show"], file);
+    expect(shown.code).toBe(0);
+    const rows = shown.stdout.trim().split("\n");
+    expect(rows[0].trimEnd().endsWith("OPTIONAL")).toBe(true);
+    const lastCell = (name: string): string | undefined =>
+      rows.find((row) => row.startsWith(name))?.trimEnd().split(/\s+/).pop();
+    expect(lastCell("lanea")).toBe("true");
+    expect(lastCell("laneb")).toBe("false");
+    expect(lastCell("lanec")).toBe("false");
+    expect(lastCell("mac")).toBe("-");
+  });
+
+  it("hosts edit keeps runner.optional true in the written file when only the port changes (IH1a)", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: { transport: "local", worktreeRoot: path.join(dir, "wt"), roles: ["orchestrator"] },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166, optional: true },
+        },
+      },
+    });
+    const edited = await runHosts(["edit", "lanehost", "--port", "4200", "--yes"], file);
+    expect(edited.code).toBe(0);
+    const written = JSON.parse(readFileSync(file, "utf8")) as {
+      hosts: { lanehost: { runner: { port: number; optional?: boolean } } };
+    };
+    expect(written.hosts.lanehost.runner.port).toBe(4200);
+    expect(written.hosts.lanehost.runner.optional).toBe(true);
+  });
+
   it("hosts edit updates container and role-alias over existing host values; the loader bounds tunnel offset to 1", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

@@ -525,6 +525,20 @@ function runnerConfigLines(name: string, host: HostModel): DoctorLine[] {
         ),
       );
     }
+    const optional = host.runner.optional;
+    lines.push(
+      line(
+        'host',
+        name,
+        'runner-optional',
+        'PASS',
+        optional === true
+          ? 'optional (runner.optional true)'
+          : optional === false
+            ? 'required (runner.optional false)'
+            : 'required (runner.optional absent; absent means required)',
+      ),
+    );
   }
   return lines;
 }

@@ -496,6 +496,12 @@ export interface RunnerTunnelTarget {
   readonly hostName: string;
   readonly sshHost: string;
   readonly remotePort: number;
+  /**
+   * IH1b: true when the host's runner block declares `optional: true` — a
+   * failed forward for such a host is reported and skipped, never fatal.
+   * Absent on every non-optional target, so their object shape is unchanged.
+   */
+  readonly optional?: boolean;
 }
 
 /** Keys that must never be read off untrusted records. */
@@ -622,7 +628,12 @@ export function resolveRunnerTunnelTargets(installation?: FleetInstallation): re
     }
     const entry = readHostEntry(host);
     if (entry !== null) {
-      targets.push({ hostName, sshHost: entry.trimmedAlias, remotePort: entry.port });
+      targets.push({
+        hostName,
+        sshHost: entry.trimmedAlias,
+        remotePort: entry.port,
+        ...(entry.optional ? { optional: true } : {}),
+      });
     }
   }
   return targets;
@@ -635,7 +646,11 @@ export function resolveRunnerTunnelTargets(installation?: FleetInstallation): re
  * of escaping. Cost O(1) reads per entry. Returns `null` for every entry that
  * yields no tunnel target.
  */
-function readHostEntry(host: Record<string, unknown>): { readonly trimmedAlias: string; readonly port: number } | null {
+function readHostEntry(host: Record<string, unknown>): {
+  readonly trimmedAlias: string;
+  readonly port: number;
+  readonly optional: boolean;
+} | null {
   try {
     if (
       isAccessor(host, 'roles') ||
@@ -676,7 +691,19 @@ function readHostEntry(host: Record<string, unknown>): { readonly trimmedAlias: 
     if (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 1 || port > 65534) {
       return null;
     }
-    return { trimmedAlias, port };
+    // IH1b: `runner.optional` marks a skippable tunnel. Read through its own
+    // descriptor: an accessor is refused unread, an absent field is simply
+    // false (plain records keep their meaning), and any non-`true` value —
+    // a non-boolean among them — reads as false.
+    const optionalDescriptor = Object.getOwnPropertyDescriptor(runner, 'optional');
+    if (
+      optionalDescriptor !== undefined &&
+      (optionalDescriptor.get !== undefined || optionalDescriptor.set !== undefined)
+    ) {
+      return null;
+    }
+    const optional = optionalDescriptor?.value === true;
+    return { trimmedAlias, port, optional };
   } catch {
     // Any hostile trap on the entry's record refuses the entry, never escapes.
     return null;
@@ -1729,16 +1756,30 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // own forward through the set adapter — including when a `local` host is the
   // selected runner host beside an ssh host. A single ssh host that is the
   // selected one (or v1/absent installations) keeps the single-target adapter.
+  // IH1b: any optional host also composes the set adapter, so its failed
+  // forward is reported and skipped instead of failing the whole start; every
+  // member carries its host key so the reserve can exclude a down tunnel's
+  // host at reservation time.
   const tunnelTargets = resolveRunnerTunnelTargets(options?.installation);
   const runnerTunnel =
     tunnelTargets.length >= 2 ||
-    (tunnelTargets.length === 1 && tunnelTargets[0]!.hostName !== runnerHost?.hostName)
+    (tunnelTargets.length === 1 && tunnelTargets[0]!.hostName !== runnerHost?.hostName) ||
+    tunnelTargets.some((target) => target.optional)
       ? new RunnerTunnelSetAdapter(
           tunnelTargets.map(
-            (target) => new RunnerTunnelAdapter({ sshHost: target.sshHost, remotePort: target.remotePort }),
+            (target) =>
+              new RunnerTunnelAdapter({
+                sshHost: target.sshHost,
+                remotePort: target.remotePort,
+                hostName: target.hostName,
+                ...(target.optional ? { optional: true } : {}),
+              }),
           ),
         )
-      : new RunnerTunnelAdapter(resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort }));
+      : new RunnerTunnelAdapter({
+          ...resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort }),
+          ...(tunnelTargets.length === 1 ? { hostName: tunnelTargets[0]!.hostName } : {}),
+        });
 
   // CO25: the merge-readiness forge read (DT5) behind the same reviewed gh
   // subprocess as the other forge reads. Without forge mode github the

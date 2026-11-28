@@ -34,14 +34,16 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FleetInstallation, HostSection } from '@fleet/installation';
-import type { WorkOrderRecord } from '@fleet/work-execution';
+import type { WorkOrderRecord, AttemptRecord, LaneRunRecord } from '@fleet/work-execution';
 import {
   DispatchAttemptUseCase,
+  LaneRunAdmissionAdapter,
   simpleDeterministicHexDigest,
+  type LaneRunAdmissionAdapterOptions,
   type WorkspacePort,
 } from '@fleet/work-execution';
 
-import { laneRunnerCandidateHosts } from '../conductor-wiring.js';
+import { isTunnelHostUp, laneRunnerCandidateHosts } from '../conductor-wiring.js';
 import {
   createFleetCliRuntime,
   resolveRunnerTunnelTargets,
@@ -366,5 +368,209 @@ describe('MR1D: second runner host registry, capacity and dispatch', () => {
       expect(env.OCM_HOST).toBe('runner-a.example');
       expect(env.OPENCODE_AUTH_FILE).toBe('/run/fleet/runner-a-auth');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// IH1b: a down tunnel host is excluded at reservation only
+// ---------------------------------------------------------------------------
+
+const IH1B_NOW = '2026-11-20T10:00:00.000Z';
+
+/** A work order whose repository is unique, so no two orders overlap. */
+function ih1bWorkOrder(index: number): WorkOrderRecord {
+  return {
+    ...storedWorkOrder(),
+    id: `wo-ih1b-${index}`,
+    repository: `git@example.org:acme/ih1b-${index}.git`,
+  };
+}
+
+describe('IH1b: a down tunnel host is excluded at reservation only', () => {
+  const stateDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of stateDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function compose(installation: FleetInstallation): FleetCliRuntime {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-ih1b-'));
+    stateDirs.push(stateDir);
+    return createFleetCliRuntime({ stateDir, installation });
+  }
+
+  /** The admission adapter over the runtime's real stores, with an optional up-set filter. */
+  function admissionOf(
+    runtime: FleetCliRuntime,
+    isHostUp?: (hostName: string) => boolean,
+  ): LaneRunAdmissionAdapter {
+    let seq = 0;
+    return new LaneRunAdmissionAdapter({
+      reserve: runtime.execution.reserveExecutionCapacity,
+      runRepo: runtime.conductor.laneRunRepository,
+      runJournal: runtime.conductor.laneRunJournal,
+      workOrderRepo: runtime.execution.workOrderRepository,
+      attemptRepo: runtime.execution.attemptRepository,
+      executionJournal: runtime.execution.executionJournal,
+      maxActiveRuns: 8,
+      candidateHosts: laneRunnerCandidateHosts(runtime.installation),
+      newReservationId: () => `res-ih1b-${(seq += 1)}`,
+      ...(isHostUp === undefined ? {} : { isHostUp }),
+    });
+  }
+
+  it('reserves only on the host whose tunnel is up, preserving tie-break and maxLanes there', async () => {
+    const runtime = compose(twoHostInstallation());
+    for (const index of [1, 2, 3]) {
+      await runtime.execution.workOrderRepository.saveWorkOrder(ih1bWorkOrder(index));
+    }
+    // runner-b's tunnel is down; only runner-a may be offered to the reserve.
+    const admission = admissionOf(runtime, (hostName) => hostName !== 'runner-b');
+    const first = await admission.reserveFirst({
+      attemptId: 'ih1b-1',
+      workOrderId: 'wo-ih1b-1',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    });
+    expect(first).toMatchObject({ outcome: 'reserved', hostName: 'runner-a', port: 4166 });
+    const second = await admission.reserveFirst({
+      attemptId: 'ih1b-2',
+      workOrderId: 'wo-ih1b-2',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    });
+    // The up host's own maxLanes (2) is preserved: the second lane still lands there.
+    expect(second).toMatchObject({ outcome: 'reserved', hostName: 'runner-a', port: 4166 });
+    const third = await admission.reserveFirst({
+      attemptId: 'ih1b-3',
+      workOrderId: 'wo-ih1b-3',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    });
+    // runner-a is full and runner-b is down: a wait, never a park.
+    expect(third).toEqual({ outcome: 'no-capacity' });
+  });
+
+  it('reserveFirst answers no-capacity when every candidate host is down', async () => {
+    const runtime = compose(twoHostInstallation());
+    await runtime.execution.workOrderRepository.saveWorkOrder(ih1bWorkOrder(1));
+    const admission = admissionOf(runtime, () => false);
+    const result = await admission.reserveFirst({
+      attemptId: 'ih1b-all-down',
+      workOrderId: 'wo-ih1b-1',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    });
+    expect(result).toEqual({ outcome: 'no-capacity' });
+  });
+
+  it('reserveFirst follows the tunnel up-set through the wiring helper for a single required ssh host', async () => {
+    const runtime = compose(singleHostInstallation());
+    await runtime.execution.workOrderRepository.saveWorkOrder(ih1bWorkOrder(1));
+    const managed = new Set(
+      (laneRunnerCandidateHosts(runtime.installation) ?? [])
+        .filter((host) => host.transport === 'ssh' && host.kind === 'opencode')
+        .map((host) => host.name),
+    );
+    expect([...managed]).toEqual(['runner-a']);
+    const upSet = new Set<string>(['runner-a']);
+    const up = admissionOf(runtime, (hostName) => isTunnelHostUp(hostName, managed, () => upSet));
+    expect(await up.reserveFirst({
+      attemptId: 'ih1b-single-up',
+      workOrderId: 'wo-ih1b-1',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    })).toMatchObject({ outcome: 'reserved', hostName: 'runner-a' });
+
+    const downRuntime = compose(singleHostInstallation());
+    await downRuntime.execution.workOrderRepository.saveWorkOrder(ih1bWorkOrder(1));
+    const emptySet = new Set<string>();
+    const down = admissionOf(downRuntime, (hostName) => isTunnelHostUp(hostName, managed, () => emptySet));
+    expect(await down.reserveFirst({
+      attemptId: 'ih1b-single-down',
+      workOrderId: 'wo-ih1b-1',
+      seatTool: 'opencode',
+      nowIso: IH1B_NOW,
+    })).toEqual({ outcome: 'no-capacity' });
+  });
+
+  it('isTunnelHostUp is unrestricted before the tunnel starts and fails closed on throwing or malformed upHosts', () => {
+    const managed = new Set(['runner-a']);
+    const up = (): (() => ReadonlySet<string> | null) => () => new Set(['runner-a']);
+    expect(isTunnelHostUp('runner-a', managed, up())).toBe(true);
+    // The tunnel has not started (`conductor start`): unrestricted.
+    expect(isTunnelHostUp('runner-a', managed, () => null)).toBe(true);
+    // A port mock without the optional method: unrestricted.
+    expect(isTunnelHostUp('runner-a', managed, undefined)).toBe(true);
+    // A down or malformed up-set fails closed.
+    expect(isTunnelHostUp('runner-a', managed, () => new Set())).toBe(false);
+    expect(isTunnelHostUp('runner-a', managed, (() => 'nope') as unknown as () => ReadonlySet<string> | null)).toBe(false);
+    expect(isTunnelHostUp('runner-a', managed, (): never => { throw new Error('upHosts blew up'); })).toBe(false);
+    // A host that needs no tunnel (local or agy) is never excluded.
+    expect(isTunnelHostUp('here', managed, () => new Set())).toBe(true);
+    expect(isTunnelHostUp('agy-host', managed, () => new Set())).toBe(true);
+  });
+
+  it('admit still admits a pinned attempt even when its host is not in upHosts', async () => {
+    const runtime = compose(twoHostInstallation());
+    const worktreePath = '/srv/fleet/runner-a/pinned-attempt';
+    const run = {
+      runId: 'run-ih1b-1',
+      workOrderId: 'wo-ih1b-1',
+      attemptIds: ['ih1b-pinned'],
+    } as unknown as LaneRunRecord;
+    const attempt = {
+      workOrderId: 'wo-ih1b-1',
+      worktreePath,
+      runner: { hostName: 'runner-a' },
+    } as unknown as AttemptRecord;
+    const reserveCalls: Array<Record<string, unknown>> = [];
+    const reserve = {
+      reserveExecutionCapacity: async (
+        request: { hostId?: string; worktreePath?: string; maxSlots?: number },
+      ) => {
+        reserveCalls.push(request as Record<string, unknown>);
+        return {
+          outcome: 'reserved' as const,
+          reservation: {
+            hostName: request.hostId ?? null,
+            hostKind: 'opencode' as const,
+            worktreePath: request.worktreePath ?? null,
+            transport: 'ssh' as const,
+            sshAlias: 'runner-a.example',
+            port: 4166,
+          },
+        };
+      },
+    } as unknown as LaneRunAdmissionAdapterOptions['reserve'];
+    const options: LaneRunAdmissionAdapterOptions = {
+      reserve,
+      runRepo: { list: async () => [run] },
+      runJournal: { listForRun: async () => [] },
+      workOrderRepo: { findWorkOrderById: async () => ih1bWorkOrder(1) },
+      attemptRepo: { findAttemptById: async () => attempt },
+      executionJournal: {
+        listActiveReservations: async () => [],
+        releaseCapacityReservation: async () => true,
+      },
+      maxActiveRuns: 1,
+      candidateHosts: laneRunnerCandidateHosts(runtime.installation),
+      newReservationId: () => 'res-ih1b-admit',
+      // Every host reads as down, yet the pinned attempt must still admit.
+      isHostUp: () => false,
+    };
+    const admission = new LaneRunAdmissionAdapter(options);
+    const result = await admission.admit({
+      attemptId: 'ih1b-pinned',
+      workOrderId: 'wo-ih1b-1',
+      seatTool: 'opencode',
+      worktreePath,
+      nowIso: IH1B_NOW,
+    });
+    expect(result).toEqual({ outcome: 'admitted' });
+    expect(reserveCalls[0]?.hostId).toBe('runner-a');
+    expect(reserveCalls[0]?.worktreePath).toBe(worktreePath);
   });
 });

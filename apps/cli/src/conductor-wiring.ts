@@ -83,6 +83,40 @@ export function laneRunnerCandidateHosts(
 }
 
 /**
+ * IH1b: whether a host may still be offered to the reserve given the runner
+ * tunnel's up-set. Only a tunnel-managed `ssh` `opencode` host can ever be
+ * excluded by it: a `local` or `agy` host needs no tunnel and is always up.
+ * An absent `upHosts` (a port mock without the method) or a `null` answer
+ * (the tunnel has not started, e.g. `conductor start`) reads as unrestricted;
+ * a throwing call or a non-`Set` answer fails closed, excluding the host.
+ */
+export function isTunnelHostUp(
+  hostName: string,
+  tunnelManagedHosts: ReadonlySet<string>,
+  upHosts?: () => ReadonlySet<string> | null,
+): boolean {
+  if (!tunnelManagedHosts.has(hostName)) {
+    return true;
+  }
+  if (typeof upHosts !== 'function') {
+    return true;
+  }
+  let up: ReadonlySet<string> | null;
+  try {
+    up = upHosts();
+  } catch {
+    return false;
+  }
+  if (up === null) {
+    return true;
+  }
+  if (!(up instanceof Set)) {
+    return false;
+  }
+  return up.has(hostName);
+}
+
+/**
  * VZ5b: the live driver's pass-trace write side. It equals the use-case
  * default (20_000) and is recorded on each completed pass trace; the dry-run
  * driver never sets a passTrace, so a dry-run writes nothing structurally.
@@ -212,6 +246,15 @@ export function buildLiveConductorDriver(
   // installation has no candidate hosts, so `reserveFirst` refuses `no-host`:
   // the conductor needs a v2 installation's lane-runner hosts, because the
   // reserve is the single authority for worktree paths (owner decision K7-D7).
+  const candidateHosts = laneRunnerCandidateHosts(runtime.installation);
+  // IH1b: the hosts the runner tunnel set actually manages — the `ssh`
+  // `opencode` lane-runner hosts. Only these are ever excluded by the
+  // tunnel's up-set; a `local` or `agy` candidate needs no forward.
+  const tunnelManagedHosts = new Set(
+    (candidateHosts ?? [])
+      .filter((host) => host.transport === 'ssh' && host.kind === 'opencode')
+      .map((host) => host.name),
+  );
   const admission = new LaneRunAdmissionAdapter({
     reserve: execution.reserveExecutionCapacity,
     runRepo: conductor.laneRunRepository,
@@ -221,7 +264,15 @@ export function buildLiveConductorDriver(
     executionJournal: execution.executionJournal,
     maxActiveRuns: options.maxActiveRuns,
     profileRead: conductor.profileRead,
-    candidateHosts: laneRunnerCandidateHosts(runtime.installation),
+    candidateHosts,
+    // IH1b: a tunnel-managed `ssh` `opencode` host whose forward is down is
+    // excluded at reservation only; every other host kind is never excluded.
+    isHostUp: (hostName) =>
+      isTunnelHostUp(
+        hostName,
+        tunnelManagedHosts,
+        runtime.runnerTunnel.upHosts?.bind(runtime.runnerTunnel),
+      ),
     forgeRead: execution.forgeRead,
     newReservationId: () => 'res-' + conductor.newUlid(),
   });

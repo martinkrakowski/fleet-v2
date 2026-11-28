@@ -45,9 +45,20 @@ export interface RunnerTunnelPort {
    * (bounded) for it. `onEarlyExit` fires at most once when an owned child
    * exits before `stop`.
    */
-  ensureTunnel(handlers?: { readonly onEarlyExit?: () => void }): Promise<RunnerTunnelStartOutcome>;
+  ensureTunnel(handlers?: {
+    readonly onEarlyExit?: () => void;
+    /** IH1b: names the host key of an optional member whose tunnel failed; the set then skips it. */
+    readonly onOptionalFailed?: (hostName: string) => void;
+  }): Promise<RunnerTunnelStartOutcome>;
   /** Stop the owned child, if any; a tunnel that was never owned is a no-op. */
   stop(): Promise<void>;
+  /**
+   * IH1b: the host names the last `ensureTunnel` left up. `null` before
+   * `ensureTunnel` has run (and when no `hostName` is configured) reads as
+   * "unrestricted" — the tunnel has not started, e.g. `conductor start` — so
+   * the reserve is not narrowed by a state nobody observed yet.
+   */
+  upHosts?(): ReadonlySet<string> | null;
   /**
    * Give up ownership of the forward WITHOUT killing it, so it outlives the
    * driver: detached lanes (`opencode run --attach` through the dial port) keep
@@ -74,6 +85,10 @@ export interface RunnerTunnelOptions {
   readonly waitMs?: number;
   /** Interval between port probes. */
   readonly pollMs?: number;
+  /** IH1b: the installation's host key this forward serves; the set adapter keys `upHosts` by it. */
+  readonly hostName?: string;
+  /** IH1b: a failed optional member is skipped by the set instead of failing the whole start. */
+  readonly optional?: boolean;
 }
 
 const DEFAULT_WAIT_MS = 10_000;
@@ -137,7 +152,13 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly waitMs: number;
   private readonly pollMs: number;
+  /** IH1b: the installation's host key this forward serves; read by the set adapter. */
+  readonly hostName?: string;
+  /** IH1b: whether a failed start of this member is skippable by the set adapter. */
+  readonly optional?: boolean;
   private child: TunnelChild | null = null;
+  /** IH1b: the outcome `ensureTunnel` last decided; `null` before it has run. */
+  private startedOutcome: RunnerTunnelStartOutcome | null = null;
 
   constructor(options: RunnerTunnelOptions = {}) {
     this.sshHost = options.sshHost;
@@ -148,6 +169,8 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;
+    this.hostName = options.hostName;
+    this.optional = options.optional;
   }
 
   /** The dial port, or null when the environment does not name one. */
@@ -186,7 +209,37 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
   }
 
   async ensureTunnel(
-    handlers: { readonly onEarlyExit?: () => void } = {},
+    handlers: {
+      readonly onEarlyExit?: () => void;
+      readonly onOptionalFailed?: (hostName: string) => void;
+    } = {},
+  ): Promise<RunnerTunnelStartOutcome> {
+    const outcome = await this.openTunnel(handlers);
+    this.startedOutcome = outcome;
+    return outcome;
+  }
+
+  /**
+   * IH1b: the host names this member left up. `null` before `ensureTunnel`
+   * ran; the empty set after a failure (a sole ssh host whose tunnel failed
+   * is not up); the member's own host name after any non-failed outcome. An
+   * early exit keeps the name — `ocm-run` reopens its own forward.
+   */
+  upHosts(): ReadonlySet<string> | null {
+    if (this.startedOutcome === null) {
+      return null;
+    }
+    if (this.startedOutcome === 'failed') {
+      return new Set();
+    }
+    return this.hostName !== undefined ? new Set([this.hostName]) : null;
+  }
+
+  private async openTunnel(
+    handlers: {
+      readonly onEarlyExit?: () => void;
+      readonly onOptionalFailed?: (hostName: string) => void;
+    },
   ): Promise<RunnerTunnelStartOutcome> {
     const dial = this.dialPort();
     // No ssh target or no dial port: `ocm-run` handles the route itself
@@ -324,6 +377,8 @@ const MAX_TUNNEL_MEMBERS = 1024;
  */
 export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
   private readonly members: readonly RunnerTunnelAdapter[];
+  /** IH1b: the host names left up by the last `ensureTunnel`; `null` before it ran. */
+  private up: Set<string> | null = null;
 
   constructor(members: readonly RunnerTunnelAdapter[]) {
     // Hostile input, cost O(members.length) capped at 1024: only dense, real
@@ -399,7 +454,10 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
   }
 
   async ensureTunnel(
-    handlers: { readonly onEarlyExit?: () => void } = {},
+    handlers: {
+      readonly onEarlyExit?: () => void;
+      readonly onOptionalFailed?: (hostName: string) => void;
+    } = {},
   ): Promise<RunnerTunnelStartOutcome> {
     if (this.members.length === 0) {
       return 'not-applicable';
@@ -414,29 +472,58 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
       try {
         dial = member.resolvedDialPort();
       } catch {
+        this.up = new Set();
         return 'failed';
       }
       if (dial === null) {
         continue;
       }
       if (seenPorts.has(dial)) {
+        this.up = new Set();
         return 'failed';
       }
       seenPorts.add(dial);
     }
+    // The pre-spawn check passed: the up-set starts empty and grows as the
+    // members open their forwards (IH1b).
+    const up = new Set<string>();
+    this.up = up;
     let opened = 0;
     let listening = 0;
     for (const member of this.members) {
+      // IH1b: an optional member that exits early is dropped from the up-set;
+      // a required member never is (its host stays reported as up — `ocm-run`
+      // reopens its own forward, exactly like the single adapter).
+      const memberHandlers = {
+        onEarlyExit: () => {
+          if (member.optional === true && member.hostName !== undefined) {
+            up.delete(member.hostName);
+          }
+          handlers.onEarlyExit?.();
+        },
+      };
       let outcome: RunnerTunnelStartOutcome;
       try {
-        outcome = await member.ensureTunnel(handlers);
+        outcome = await member.ensureTunnel(memberHandlers);
       } catch {
         outcome = 'failed';
       }
       if (outcome === 'failed') {
+        if (member.optional === true) {
+          // IH1b: an optional member's failure names its host key once and
+          // skips the member; the members already opened keep running.
+          if (member.hostName !== undefined) {
+            handlers.onOptionalFailed?.(member.hostName);
+          }
+          continue;
+        }
         // Best-effort cleanup: no earlier member's child may be orphaned.
+        up.clear();
         await this.stop().catch(() => undefined);
         return 'failed';
+      }
+      if (member.hostName !== undefined) {
+        up.add(member.hostName);
       }
       if (outcome === 'opened') {
         opened += 1;
@@ -454,7 +541,13 @@ export class RunnerTunnelSetAdapter implements RunnerTunnelPort {
     return 'not-applicable';
   }
 
+  /** IH1b: the up-set of the last `ensureTunnel`; `null` before it has run. */
+  upHosts(): ReadonlySet<string> | null {
+    return this.up;
+  }
+
   async stop(): Promise<void> {
+    this.up?.clear();
     await Promise.allSettled(this.members.map((member) => Promise.resolve().then(() => member.stop())));
   }
 

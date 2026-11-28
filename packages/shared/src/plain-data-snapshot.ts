@@ -13,6 +13,18 @@
  * Like `plain-record.ts`, every bound comes from the exported limits, a
  * hostile Proxy trap or a throwing descriptor is a typed refusal (`hostile`),
  * and no input value or over-long key text is ever echoed into a refusal.
+ *
+ * Key-count and key-text bounds apply only after the full own-key list has
+ * been materialised: `snapRecord` calls `Reflect.ownKeys(value)` in full
+ * before `maxKeys` and the per-key length bound are checked, so the
+ * enumeration itself is not bounded by those limits — only what is walked
+ * afterwards. (`snapArray` is different: its `length` bound is checked
+ * before its `Reflect.ownKeys` call.)
+ *
+ * Refusal paths are bounded by `boundPath`: control characters (including
+ * CR, LF, and TAB) are replaced with `?`, and a path longer than
+ * `MAX_REFUSAL_PATH_LENGTH` (256) is truncated to 253 characters plus
+ * `'...'`.
  */
 
 export type IsProxy = (value: unknown) => boolean;
@@ -85,8 +97,24 @@ interface NodeCount {
   nodes: number;
 }
 
+const MAX_REFUSAL_PATH_LENGTH = 256;
+
+/** Sanitizes a refusal path: control characters become `?`, over-long paths
+ * are truncated to keep the result at or under 256 characters. */
+function boundPath(path: string | null): string | null {
+  if (path === null) {
+    return null;
+  }
+  // eslint-disable-next-line no-control-regex -- the sanitizer's job is replacing control characters, not matching text containing them
+  const sanitized = path.replace(/[\u0000-\u001f\u007f]/g, '?');
+  if (sanitized.length > MAX_REFUSAL_PATH_LENGTH) {
+    return `${sanitized.slice(0, MAX_REFUSAL_PATH_LENGTH - 3)}...`;
+  }
+  return sanitized;
+}
+
 function refusal(reason: PlainDataRefusalReason, path: string | null): PlainDataSnapshot {
-  return { ok: false, reason, path };
+  return { ok: false, reason, path: boundPath(path) };
 }
 
 export function snapshotPlainData(
@@ -110,7 +138,7 @@ export function snapshotPlainData(
     const count: NodeCount = { nodes: 0 };
     return snap(value, isProxy, resolvedLimits, 0, null, new Set<object>(), state, count);
   } catch {
-    return { ok: false, reason: 'hostile', path: state.inFlight };
+    return { ok: false, reason: 'hostile', path: boundPath(state.inFlight) };
   }
 }
 
@@ -272,7 +300,7 @@ function snapRecord(
   if (keys.length > limits.maxKeys) {
     return refusal('too-many-keys', path);
   }
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of keys) {
     // `Reflect.ownKeys` yields only string and symbol keys, so a non-string
     // key is a symbol key.

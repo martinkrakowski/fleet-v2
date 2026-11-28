@@ -316,7 +316,7 @@ describe('adversarial corpus', () => {
     }
     expect(Object.isFrozen(protoSnap.value)).toBe(true);
     const protoOut = protoSnap.value as Record<string, unknown>;
-    expect(Object.getPrototypeOf(protoOut)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(protoOut)).toBeNull();
     expect(Reflect.ownKeys(protoOut)).toEqual(['__proto__']);
     const protoDesc = Object.getOwnPropertyDescriptor(protoOut, '__proto__');
     expect(protoDesc).toBeDefined();
@@ -332,7 +332,7 @@ describe('adversarial corpus', () => {
     }
     expect(Object.isFrozen(ctorSnap.value)).toBe(true);
     const ctorOut = ctorSnap.value as Record<string, unknown>;
-    expect(Object.getPrototypeOf(ctorOut)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(ctorOut)).toBeNull();
     expect(Reflect.ownKeys(ctorOut)).toEqual(['constructor']);
     const ctorDesc = Object.getOwnPropertyDescriptor(ctorOut, 'constructor');
     expect(ctorDesc).toBeDefined();
@@ -346,7 +346,7 @@ describe('adversarial corpus', () => {
     }
     expect(Object.isFrozen(arraySnap.value)).toBe(true);
     const arrayOut = arraySnap.value as Record<string, unknown>;
-    expect(Object.getPrototypeOf(arrayOut)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(arrayOut)).toBeNull();
     expect(Reflect.ownKeys(arrayOut)).toEqual(['0', '1', 'length']);
     expect(arrayOut[0]).toBe('a');
     expect(arrayOut[1]).toBe('b');

@@ -35,7 +35,8 @@ export type ReceiptCarryRefusalReason =
   | 'conflict-resolved'
   | 'lane-authored-change'
   | 'ci-red'
-  | 'ci-not-ready';
+  | 'ci-not-ready'
+  | 'too-many-paths';
 
 /** The auditable carry fact: recorded in the run journal on the carried head's premerge intent. */
 export interface PremergeCarry {
@@ -99,6 +100,23 @@ function pathsOf(value: unknown): readonly string[] | null {
   return read.array as readonly string[];
 }
 
+/**
+ * True for a real array whose own `length` data property exceeds the path cap.
+ * One descriptor read (`O(1)`), never a getter; any oddity reads false so the
+ * strict reader below refuses it as `invalid-input`.
+ */
+function isOversizeList(value: unknown): boolean {
+  try {
+    if (!Array.isArray(value)) {
+      return false;
+    }
+    const length = Object.getOwnPropertyDescriptor(value, 'length');
+    return typeof length?.value === 'number' && length.value > RECEIPT_CARRY_MAX_PATHS && length.value < 2 ** 32;
+  } catch {
+    return false;
+  }
+}
+
 function sameSet(left: readonly string[], right: readonly string[]): boolean {
   const a = new Set(left);
   const b = new Set(right);
@@ -130,6 +148,10 @@ export function qualifyBaseMergeCarry(input: unknown): ReceiptCarryResult {
     const keys = Object.keys(snapshot);
     if (keys.length !== INPUT_KEYS.length || !INPUT_KEYS.every((key) => Object.hasOwn(snapshot, key))) {
       return INVALID;
+    }
+    // A PR or lane this wide is a definitive no (a human looks), not a hostile shape.
+    if (isOversizeList(snapshot.prChangedPaths) || isOversizeList(snapshot.laneChangedPaths)) {
+      return refuse('too-many-paths');
     }
     const parentsRead = readBoundedDenseArray(snapshot.newHeadParents, MAX_PARENTS);
     const prPaths = snapshot.prChangedPaths === null ? null : pathsOf(snapshot.prChangedPaths);

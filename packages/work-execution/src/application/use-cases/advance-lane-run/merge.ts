@@ -423,7 +423,7 @@ async function prFactOf(
       containsLaneHead = await containsLaneHeadOf(ancestry, laneHeadSha, read.pullRequest.headSha);
     }
     return {
-      pr: { state: read.pullRequest.state, head12, headSha: read.pullRequest.headSha, containsLaneHead },
+      pr: { state: read.pullRequest.state, head12, headSha: read.pullRequest.headSha, baseRef: read.pullRequest.baseRef, containsLaneHead },
     };
   } catch {
     return { pr: null };

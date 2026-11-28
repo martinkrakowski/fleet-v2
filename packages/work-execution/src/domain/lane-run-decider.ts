@@ -440,6 +440,8 @@ export interface LaneRunFacts {
     readonly head12: string;
     /** The snapshot's full head sha when the forge read carries it; absent reads as unknown (never a match). */
     readonly headSha?: string;
+    /** U6: the forge's base branch of the open PR; absent reads as unknown (a carry never qualifies on it). */
+    readonly baseRef?: string;
     readonly containsLaneHead: boolean;
   } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */

@@ -45,7 +45,7 @@ export async function premergeCarryFactsOf(
   attemptRecords: readonly (AttemptRecord | null)[],
   acceptance: {
     readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
-    readonly pr: { readonly state: string; readonly head12: string; readonly headSha?: string } | null;
+    readonly pr: { readonly state: string; readonly head12: string; readonly headSha?: string; readonly baseRef?: string } | null;
   },
   halted: boolean,
   nowIso: string,
@@ -67,6 +67,11 @@ export async function premergeCarryFactsOf(
     const recorded = laneRunRecordedPremergeCarry(entries, record.runId, pr.head12);
     if (premergeCarryMatches(recorded, laneHead, pr.headSha) && recorded.attemptId === latest.id) {
       return { carry: recorded, refused: false };
+    }
+    // The evidence is computed against the run's own base branch: a PR whose
+    // forge base is anything else (or unknown) is a definitive no, never a carry.
+    if (pr.baseRef !== resolveLaneRunBaseBranch(record)) {
+      return { carry: null, refused: true };
     }
     const port = ctx.deps.receiptCarryEvidence;
     const digest = ctx.deps.repositoryDigest;

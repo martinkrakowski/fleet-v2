@@ -3,7 +3,9 @@
  * GitMirrorReceiptCarryEvidenceAdapter implements ReceiptCarryEvidencePort
  * against the bare mirror at `<stateDir>/mirrors/<repoDigest>.git`, with
  * allow-listed read-only git argv through CommandExecutorPort and `cwd` set to
- * the mirror. Every failure maps to a `null` evidence field, which the pure
+ * the mirror. It changes no ref and no working tree; the one write is the
+ * unreferenced tree object `git merge-tree --write-tree` creates in the
+ * mirror's object store, which `git gc` prunes. Every failure maps to a `null` evidence field, which the pure
  * qualifier reads as "unknown evidence" (the run keeps waiting); nothing here
  * throws or decides a carry.
  */

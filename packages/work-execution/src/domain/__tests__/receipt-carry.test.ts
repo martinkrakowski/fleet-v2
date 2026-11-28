@@ -95,6 +95,15 @@ describe('qualifyBaseMergeCarry', () => {
     expect(receiptCarryRefusalIsTransient('ci-red')).toBe(false);
   });
 
+  it('refuses a PR or lane too wide to qualify as a definitive no, not as hostile input', () => {
+    const wide = Array.from({ length: 5001 }, (_, index) => `src/f${index}.ts`);
+    for (const field of ['prChangedPaths', 'laneChangedPaths']) {
+      const result = qualifyBaseMergeCarry(clean({ [field]: wide }));
+      expect(result).toEqual({ carry: false, reason: 'too-many-paths' });
+      expect(receiptCarryRefusalIsTransient('too-many-paths')).toBe(false);
+    }
+  });
+
   it('refuses hostile input with invalid-input and never throws', () => {
     const getter = clean();
     Object.defineProperty(getter, 'ci', { enumerable: true, get: () => { throw new Error('boom'); } });
@@ -110,7 +119,8 @@ describe('qualifyBaseMergeCarry', () => {
       new Proxy(clean(), { ownKeys: () => { throw new Error('trap'); } }),
       hole,
       clean({ prChangedPaths: { length: 1, 0: 'a' } }),
-      clean({ prChangedPaths: new Array(1_000_000).fill('a') }),
+      clean({ prChangedPaths: { length: 1_000_000_000 } }),
+      clean({ newHeadParents: new Array(1_000_000).fill(REVIEWED) }),
       clean({ reviewedHeadSha: 'A'.repeat(40) }),
       clean({ newHeadSha: 'b'.repeat(39) }),
       clean({ newHeadParents: [REVIEWED, 'zz'] }),

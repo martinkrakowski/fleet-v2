@@ -4,8 +4,8 @@
  * receipt carry across a base-merge head update (plan #1385): the new head's
  * parents, whether its merged-in parent is reachable from the base branch,
  * the clean automatic merge tree versus the new head's tree, and the PR's own
- * changed paths. It reads a bare mirror only; the live checkout is never
- * touched. It decides nothing: `qualifyBaseMergeCarry` does.
+ * changed paths. It reads a bare mirror only (no ref changes; the clean-merge tree it computes is
+ * an unreferenced object); the live checkout is never touched. It decides nothing: `qualifyBaseMergeCarry` does.
  */
 
 /** The evidence question for one PR head move. */

@@ -305,8 +305,8 @@ function serializeEvent(event: AuthorityOrgEvent): string {
     beforeRevision: event.beforeRevision,
     afterRevision: event.afterRevision,
   })
-    .replaceAll(' ', '\\u2028')
-    .replaceAll(' ', '\\u2029');
+    .replaceAll('\u2028', '\\u2028')
+    .replaceAll('\u2029', '\\u2029');
 }
 
 /**

@@ -21,6 +21,7 @@ import {
   orchestratorCommand,
   orchestratorHelpRequested,
   rememberRequestId,
+  snapshotOutcome,
   snapshotSessionRecord,
   type OrchestratorCliOptions,
 } from './orchestrator.js';
@@ -581,15 +582,36 @@ describe('orchestrator CLI', () => {
       expect(await sessions.list()).toEqual([]);
     });
 
-    it('attach writes one stderr line and records no poll when the request store answers unknown', async () => {
+    it('attach writes one stderr line, records no poll and exits 1 when the final poll found the request store unknown', async () => {
       const runtime = runtimeWith({
         orchestratorSessionRepository: sessions,
         orchestratorRequestRepository: { list: async () => ({ outcome: 'unknown', code: 'unreadable' }) },
       });
       const result = await run(['attach', '--kind', 'agy', '--once'], runtime);
+      expect(result.code).toBe(1);
+      expect(result.stderr.trim().split('\n')).toHaveLength(1);
+      expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'unknown', orchestratorId: ORCH_ID });
+      const stored = await sessions.get(ORCH_ID);
+      expect(stored?.session.lastPolledRequestsAtIso).toBeNull();
+      expect(stored?.session.status).toBe('retired');
+    });
+
+    it('attach retries a failed poll next round and exits 0 when a later poll succeeds', async () => {
+      let polls = 0;
+      const runtime = runtimeWith({
+        orchestratorSessionRepository: sessions,
+        orchestratorRequestRepository: {
+          list: async () => {
+            polls += 1;
+            return polls === 1 ? { outcome: 'unknown', code: 'unreadable' } : { outcome: 'ok', requests: [], truncated: false };
+          },
+        },
+      });
+      const result = await run(['attach', '--kind', 'agy', '--max', '60s', '--interval', '30s'], runtime);
       expect(result.code).toBe(0);
       expect(result.stderr.trim().split('\n')).toHaveLength(1);
-      expect((await sessions.get(ORCH_ID))?.session.lastPolledRequestsAtIso).toBeNull();
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'detached', reason: 'max-elapsed' });
+      expect((await sessions.get(ORCH_ID))?.session.lastPolledRequestsAtIso).not.toBeNull();
     });
 
     /** A session repository whose Nth `get` answers with a getter-bearing record. */
@@ -697,6 +719,25 @@ describe('orchestrator CLI', () => {
   });
 
   describe('session snapshots', () => {
+    it('snapshotOutcome refuses an unexpected outcome literal, a non-string code or reason, and an invalid revision', () => {
+      const allowed = ['renewed', 'refused'];
+      expect(snapshotOutcome({ outcome: 'renewed' }, allowed)).toEqual({ outcome: 'renewed' });
+      expect(snapshotOutcome({ outcome: 'refused', reason: 'why', code: 'c' }, allowed)).toEqual({ outcome: 'refused', reason: 'why' });
+      for (const hostile of [
+        { outcome: 'unexpected' },
+        { outcome: 'renewed', code: 7 },
+        { outcome: 'renewed', reason: 7 },
+        { outcome: 'renewed', revision: 0 },
+        { outcome: 'renewed', session: { orchestratorId: 'x' } },
+        { outcome: 'renewed', extra: true },
+        null,
+        'renewed',
+      ]) {
+        expect(() => snapshotOutcome(hostile, allowed)).toThrow(InvalidStoreDataError);
+      }
+    });
+
+
     it('createSnapshottingSessionRepo passes store errors through unchanged and refuses unreadable entries', async () => {
       const conflict = new OrchestratorSessionRevisionConflictError(ORCH_ID, 2, 'conflict');
       const repo = createSnapshottingSessionRepo({

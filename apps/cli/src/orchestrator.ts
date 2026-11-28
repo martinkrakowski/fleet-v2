@@ -293,14 +293,17 @@ interface UseCaseOutcome {
   readonly reason?: string;
 }
 
-/** A use case's outcome object as data: a string `outcome`, and a string `reason` when present. */
-function snapshotOutcome(value: unknown): UseCaseOutcome {
+/** A use case's outcome object as data: one of `allowed` as `outcome`, a string `reason` and `code` when present. */
+export function snapshotOutcome(value: unknown, allowed: readonly string[]): UseCaseOutcome {
   const top = plainRecord(value, ['outcome'], ['reason', 'session', 'revision', 'code']);
-  if (top === null || typeof top.outcome !== 'string') {
+  if (top === null || typeof top.outcome !== 'string' || !allowed.includes(top.outcome)) {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable outcome');
   }
   if (top.reason !== undefined && typeof top.reason !== 'string') {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable reason');
+  }
+  if (top.code !== undefined && typeof top.code !== 'string') {
+    throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable code');
   }
   if (top.revision !== undefined && !isRevision(top.revision)) {
     throw new InvalidStoreDataError('an orchestrator use case answered with an unreadable revision');
@@ -689,6 +692,7 @@ async function attachCommand(
         ATTACH_SCOPES,
         ATTACH_TOKEN_ID,
       ),
+      ['registered', 'refused'],
     );
     if (registered.outcome !== 'registered') {
       printJson(io, { outcome: 'refused', reason: registered.reason ?? 'the session was not registered' });
@@ -734,6 +738,9 @@ async function attachCommand(
 
   const seen = new Set<string>();
   let failure: AttachFailure | null = null;
+  // A failed poll is reported at once and retried next round; it is only an unknown
+  // end state when no later poll succeeded before the session ended.
+  let lastPollFailure: AttachFailure | null = null;
   let endReason = 'stopped';
   const sleep = options.sleep ?? abortableSleep;
   const deadline = maxMs === undefined ? Number.POSITIVE_INFINITY : clockMs() + maxMs;
@@ -749,6 +756,7 @@ async function attachCommand(
       }
       const beat = snapshotOutcome(
         await heartbeat.heartbeatOrchestratorSession({ orchestratorId }, ATTACH_TOKEN_ID),
+        ['renewed', 'not-found', 'not-owner', 'refused'],
       );
       if (beat.outcome !== 'renewed') {
         failure = { outcome: beat.outcome, reason: beat.reason ?? `the heartbeat answered ${beat.outcome}` };
@@ -762,6 +770,7 @@ async function attachCommand(
       }
       if (!polled.ok) {
         io.stderr(`${JSON.stringify({ outcome: polled.outcome, reason: polled.reason })}\n`);
+        lastPollFailure = { outcome: polled.outcome, reason: polled.reason };
       } else {
         const nowMs = clockMs();
         for (const request of polled.requests) {
@@ -778,6 +787,7 @@ async function attachCommand(
           failure = recorded;
           break;
         }
+        lastPollFailure = null;
       }
       if (flags.has('once')) {
         endReason = 'once';
@@ -803,7 +813,10 @@ async function attachCommand(
   }
 
   try {
-    const retired = snapshotOutcome(await retire.retireOrchestratorSession({ orchestratorId }, ATTACH_TOKEN_ID));
+    const retired = snapshotOutcome(
+      await retire.retireOrchestratorSession({ orchestratorId }, ATTACH_TOKEN_ID),
+      ['retired', 'not-found', 'not-owner', 'refused'],
+    );
     if (retired.outcome !== 'retired' && failure === null) {
       failure = { outcome: 'unknown', reason: retired.reason ?? `the retire answered ${retired.outcome}` };
     }
@@ -811,6 +824,7 @@ async function attachCommand(
     printJson(io, { outcome: 'unknown', reason: describeError(error) });
     return 1;
   }
+  if (failure === null && lastPollFailure !== null) failure = lastPollFailure;
   if (failure !== null) {
     printJson(io, { outcome: failure.outcome, orchestratorId, reason: failure.reason });
     return 1;

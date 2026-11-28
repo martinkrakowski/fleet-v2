@@ -125,6 +125,18 @@ describe("owner item create route", () => {
     expect(items[0]?.createdBy).toBe(ACTOR);
   });
 
+  it("defaults omitted refs and blocks to empty arrays on the stored item", async () => {
+    const res = await postWithResolver(
+      () => ({ tokenId: "tok-owner", scopes: ["operate"], actor: ACTOR }),
+      { projectId: "fixture-project", kind: "other", subject: "fixture todo without refs" },
+    );
+    expect(res.status).toBe(200);
+    const items = await storedItems();
+    expect(items).toHaveLength(1);
+    expect(items[0]?.refs).toEqual([]);
+    expect(items[0]?.blocks).toEqual([]);
+  });
+
   it("falls back to the token id when the token carries no actor", async () => {
     const res = await postWithResolver(() => ({ tokenId: "tok-owner", scopes: ["operate"] }), otherBody());
     expect(res.status).toBe(200);

@@ -53,6 +53,8 @@ export interface AcceptanceFacts {
     readonly head12: string;
     /** The snapshot's full head sha, as the forge reported it (fix round 1: the 12-char prefix alone cannot distinguish heads). */
     readonly headSha?: string;
+    /** U6: the forge's base branch of the PR (a carry qualifies only against the run's own base). */
+    readonly baseRef?: string;
     readonly containsLaneHead: boolean;
   } | null;
   readonly merge: MergeFacts;

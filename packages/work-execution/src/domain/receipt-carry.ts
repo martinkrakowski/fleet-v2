@@ -101,17 +101,13 @@ function pathsOf(value: unknown): readonly string[] | null {
 }
 
 /**
- * True for a real array whose own `length` data property exceeds the path cap.
- * One descriptor read (`O(1)`), never a getter; any oddity reads false so the
- * strict reader below refuses it as `invalid-input`.
+ * True for an array whose `length` exceeds the path cap (`O(1)`: one length read,
+ * inside `try/catch`). A Proxy that lies here only turns a shape the strict
+ * reader would refuse anyway into a different refusal; it can never carry.
  */
 function isOversizeList(value: unknown): boolean {
   try {
-    if (!Array.isArray(value)) {
-      return false;
-    }
-    const length = Object.getOwnPropertyDescriptor(value, 'length');
-    return typeof length?.value === 'number' && length.value > RECEIPT_CARRY_MAX_PATHS && length.value < 2 ** 32;
+    return Array.isArray(value) && value.length > RECEIPT_CARRY_MAX_PATHS && value.length < 2 ** 32;
   } catch {
     return false;
   }

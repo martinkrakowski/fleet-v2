@@ -1208,6 +1208,27 @@ describe('reviewTransportRetry record (AB-TP4A)', () => {
     }
   });
 
+  it('save round-trips a changed reviewTransportRetry in memory and file mode and keeps it across a reload', async () => {
+    const leased = { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL };
+    const next: LaneRunReviewRetryRecord = { ...RETRY, count: 2 };
+    const guard = { holderId: HOLDER, fence: 1, nowIso: NOW };
+    const stateDir = mkdtempSync(join(tmpdir(), 'lane-run-retry-save-'));
+    try {
+      for (const repo of [new LaneRunRepositoryAdapter(), new LaneRunRepositoryAdapter({ stateDir })]) {
+        expect(await repo.create(withRetry({ lease: leased }))).toMatchObject({ outcome: 'saved' });
+        const saved = await repo.save({ ...withRetry({ lease: leased }), reviewTransportRetry: next, revision: 2 }, guard);
+        expect(saved).toMatchObject({ outcome: 'saved' });
+        expect((await repo.get(RUN_ID))?.reviewTransportRetry).toEqual(next);
+        const cleared = await repo.save({ ...withRetry({ lease: leased }), reviewTransportRetry: null, revision: 3 }, guard);
+        expect(cleared).toMatchObject({ outcome: 'saved' });
+        expect((await repo.get(RUN_ID))?.reviewTransportRetry).toBeNull();
+      }
+      expect((await new LaneRunRepositoryAdapter({ stateDir }).get(RUN_ID))?.reviewTransportRetry).toBeNull();
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it('reviewTransportRetryCountOf reads 0 when absent or null and the count when present', () => {
     expect(reviewTransportRetryCountOf(withRetry(), 'brief-check', '0123456789ab')).toBe(1);
     expect(reviewTransportRetryCountOf(runRecord())).toBe(0);

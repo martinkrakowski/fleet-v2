@@ -11,14 +11,14 @@ import { join } from "node:path";
  * state directory; the browser posts the code to `POST /sessions/login`
  * (server-side only), which consumes it, removes the code file from the state
  * directory (the spent credential must never remain on disk), and establishes
- * an interactive session scoped to `read` and `message`.
+ * an interactive session scoped to `read`, `message`, `operate`, and `tail`.
  */
 
 export const WEB_LOGIN_PATH = "/sessions/login";
 export const WEB_LOGIN_HEADER = "x-fleet-session-login";
 export const WEB_LOGIN_CODE_FILE = "web-login-code.json"; // inside the state directory
 export const WEB_LOGIN_ACTOR = "owner"; // the fixed actor; owner identity is a later decision (brief §8)
-export const WEB_LOGIN_SCOPES = ["read", "message"] as const;
+export const WEB_LOGIN_SCOPES = ["read", "message", "operate", "tail"] as const;
 export const WEB_LOGIN_CODE_MAX_LENGTH = 128;
 
 let storedCode: string | null = null;

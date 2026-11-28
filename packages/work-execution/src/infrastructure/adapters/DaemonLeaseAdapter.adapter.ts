@@ -26,6 +26,8 @@ import {
   decideLeaseRelease,
   decideLeaseRenew,
 } from '../../domain/lane-run-lease.js';
+import type { FenceRefusal } from '../../domain/fence-token.js';
+import { decideFencedWrite } from '../../domain/fence-token.js';
 import {
   DAEMON_RECORD_VERSION,
   readDaemonLeaseRecord,
@@ -117,6 +119,29 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     return checkLeaseHeld(withoutVersion(current), leaseRequest);
   }
 
+  /**
+   * FT1: verify a `FenceToken` against the lease of `scope` without writing.
+   * This does not use `read(scope)`, because `read` answers an unreadable
+   * lease file as an absent one in read-only mode; verify refuses such a file
+   * as `no-lease-readable` instead, and never passes unreadable input.
+   */
+  async verifyFence(scope: string, token: unknown, nowIso: string): Promise<FenceRefusal | null> {
+    try {
+      // An unsafe or empty scope is refused even in memory mode, where no file
+      // would otherwise be touched.
+      this.assertSafeScope(scope);
+      const target = this.targetFor(scope);
+      const current =
+        target === null
+          ? (this.inMemoryLeases.get(scope) ?? null)
+          : await this.readRecord(target, scope);
+      const decision = decideFencedWrite({ current: withoutVersion(current), token, nowIso });
+      return decision.ok ? null : decision.reason;
+    } catch {
+      return 'no-lease-readable';
+    }
+  }
+
   async read(scope: string): Promise<DaemonLeaseRecord | null> {
     const target = this.targetFor(scope);
     if (target === null) {
@@ -182,6 +207,12 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     if (stateDir === undefined || stateDir.trim().length === 0) {
       return null;
     }
+    this.assertSafeScope(scope);
+    return join(stateDir, 'daemon', 'leases', ...scope.split('/')) + '.json';
+  }
+
+  /** The scope rules: non-empty, at most one `/`, every component safe. Throws on an unsafe scope. */
+  private assertSafeScope(scope: string): void {
     if (scope.trim().length === 0) {
       throw new Error('DaemonLeaseAdapter refuses an empty lease scope');
     }
@@ -194,7 +225,6 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
         throw new Error('DaemonLeaseAdapter refuses an unsafe lease scope');
       }
     }
-    return join(stateDir, 'daemon', 'leases', ...components) + '.json';
   }
 
   private async readRecord(target: string, expectedScope: string): Promise<DaemonLeaseRecord | null> {

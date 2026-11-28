@@ -35,6 +35,8 @@ import type {
   LeaseRefusal,
   LeaseRenewRequest,
 } from '../../domain/lane-run-lease.js';
+import type { FenceRefusal } from '../../domain/fence-token.js';
+import { decideFencedWrite } from '../../domain/fence-token.js';
 import {
   CONDUCTOR_DRIVER_LEASE_RECORD_VERSION,
   checkLeaseHeld,
@@ -197,6 +199,22 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
 
   async check(request: LeaseHoldRequest): Promise<LeaseRefusal | null> {
     return checkLeaseHeld(withoutVersion(await this.read()), request);
+  }
+
+  /**
+   * FT1: verify a `FenceToken` against the current lease without writing.
+   * An unreadable lease file is `no-lease-readable`, never a pass, and never
+   * the absent-lease `no-lease`.
+   */
+  async verifyFence(token: unknown, nowIso: string): Promise<FenceRefusal | null> {
+    let current: ConductorDriverLeaseRecord | null;
+    try {
+      current = await this.read();
+    } catch {
+      return 'no-lease-readable';
+    }
+    const decision = decideFencedWrite({ current: withoutVersion(current), token, nowIso });
+    return decision.ok ? null : decision.reason;
   }
 
   /**

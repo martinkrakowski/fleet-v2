@@ -377,19 +377,21 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
   it('isKillallHalted refuses a Proxy answer via the injected detector including counting and throwing traps', async () => {
     // Guard: the snapshot runs the injected `types.isProxy` detector before
     // any reflection, so even a Proxy whose traps report a plain
-    // `{ state: 'clear' }` never reads as clear and no trap budget is spent.
-    let gets = 0;
+    // `{ state: 'clear' }` never reads as clear and no field is read through a trap.
+    const keysRead: PropertyKey[] = [];
     const counting = new Proxy({ state: 'clear' }, {
       get(target, key, receiver) {
-        gets += 1;
-        if (gets > 2) {
+        keysRead.push(key);
+        if (keysRead.length > 2) {
           throw new Error('trap budget exhausted');
         }
         return Reflect.get(target, key, receiver);
       },
     });
     await expect(isKillallHalted({ read: async () => counting } as never, types.isProxy)).resolves.toBe(true);
-    expect(gets).toBe(0);
+    // The only `get` the engine itself issues is the promise machinery's `then` lookup when an async
+    // read resolves with the Proxy; the snapshot never reads `state` through a trap.
+    expect(keysRead.filter((key) => key !== 'then')).toEqual([]);
 
     const throwing = new Proxy({ state: 'clear' }, {
       get(): never {

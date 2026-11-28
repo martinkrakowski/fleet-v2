@@ -19,8 +19,8 @@ export const SHADOW_MAIN_RECONCILE_MAX_SHELL_MERGED_SHAS = 100_000;
 /** At most this many hand-land shas ride on an evaluation; the count still reports every one of them. */
 export const SHADOW_MAIN_RECONCILE_MAX_REPORTED_SHAS = 50;
 
-/** A day window may not exceed 25 hours: one UTC day plus a DST-hour of slack. */
-export const SHADOW_MAIN_RECONCILE_MAX_WINDOW_MS = 25 * 60 * 60 * 1000;
+/** A day window may not exceed 24 hours: the certification criterion is per UTC day, which is always exactly 24 hours. */
+export const SHADOW_MAIN_RECONCILE_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Why an evaluation refused to count hand-lands at all. */
 export type HandLandRefusalReason =

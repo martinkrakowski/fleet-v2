@@ -259,18 +259,25 @@ describe('evaluateHandLands', () => {
     ).toEqual(INVALID_TIMESTAMP);
   });
 
-  it('refuses an inverted window or a window longer than 25 hours as invalid-window', () => {
+  it('refuses an inverted window or a window longer than 24 hours as invalid-window', () => {
     expect(
       evaluateHandLands(input({ dayStartIso: `${DAY}T12:00:00.000Z`, dayEndIso: `${DAY}T12:00:00.000Z` })),
     ).toEqual(INVALID_WINDOW);
     expect(
       evaluateHandLands(input({ dayStartIso: `${DAY}T12:00:00.000Z`, dayEndIso: `${DAY}T11:00:00.000Z` })),
     ).toEqual(INVALID_WINDOW);
+    // 24h + 1ms: past the cap.
     expect(
-      evaluateHandLands(input({ dayStartIso: `${DAY}T00:00:00.000Z`, dayEndIso: '2026-11-11T01:00:01.000Z' })),
+      evaluateHandLands(input({ dayStartIso: `${DAY}T00:00:00.000Z`, dayEndIso: '2026-11-11T00:00:00.001Z' })),
     ).toEqual(INVALID_WINDOW);
+    // The reviewer's case: a 25-hour window could pull a commit at 00:30Z on
+    // Nov 11 into the Nov 10 count, so it is refused outright.
     expect(
       evaluateHandLands(input({ dayStartIso: `${DAY}T00:00:00.000Z`, dayEndIso: '2026-11-11T01:00:00.000Z' })),
+    ).toEqual(INVALID_WINDOW);
+    // Exactly one UTC day is the accepted maximum.
+    expect(
+      evaluateHandLands(input({ dayStartIso: `${DAY}T00:00:00.000Z`, dayEndIso: '2026-11-11T00:00:00.000Z' })),
     ).toEqual({ ok: true, handLands: 0, handLandShas: [] });
   });
 

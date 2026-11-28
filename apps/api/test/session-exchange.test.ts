@@ -26,6 +26,7 @@ import {
   TOKENS_PER_SESSION_LIMIT,
   validateActor,
 } from "../server/wiring/session-exchange.js";
+import { WEB_LOGIN_SCOPES } from "../server/wiring/web-login.js";
 
 // Nitro auto-imports h3 utilities into the global scope at build time;
 // vitest does not, so stub them globally before loading route modules.
@@ -625,6 +626,89 @@ describe("T3b session exchange", () => {
       scopes: ["read"],
     });
     expect(replacement).not.toBeNull();
+  });
+
+  it("a web-login session mints operate and tail, is refused unmintable scopes, and the shared bearer still presents [\"orchestrate\"] and is refused on the exchange", async () => {
+    configuredApi();
+    const secret = sessionSecret([...WEB_LOGIN_SCOPES], "owner");
+
+    // The web-login session can mint the operate/tail subset and that token
+    // reaches an operate route.
+    const mintRes = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: { [SESSION_EXCHANGE_HEADER]: secret, "content-type": "application/json" },
+      body: JSON.stringify({ scopes: ["operate", "tail"] }),
+    });
+    expect(mintRes.status).toBe(200);
+    const minted = (await mintRes.json()) as { token: string; tokenId: string; scopes: string[] };
+    expect(minted.scopes).toEqual(["operate", "tail"]);
+
+    const stopRes = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${minted.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    expect(stopRes.status).toBe(200);
+    expect(stopHandlerInvoked).toBe(true);
+
+    // The same session cannot mint scopes outside the interactive allowance.
+    for (const scopes of [["verdict"], ["hook"], ["orchestrate"], ["dispatch"], ["not-a-scope"]]) {
+      const refused = await fetch(exchangeUrl(), {
+        method: "POST",
+        headers: { [SESSION_EXCHANGE_HEADER]: secret, "content-type": "application/json" },
+        body: JSON.stringify({ scopes }),
+      });
+      expect(refused.status).toBe(403);
+      expect(await refused.json()).toEqual({ error: "Forbidden: scope requested is not mintable" });
+    }
+
+    // A token minted with only operate/tail is refused on verdict and read routes.
+    const decisionsRes = await fetch(`${baseUrl}/v1/decisions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${minted.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    expect(decisionsRes.status).toBe(403);
+    expect(await decisionsRes.json()).toEqual({ error: "Forbidden: scope required" });
+
+    const questionsRes = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${minted.token}` },
+    });
+    expect(questionsRes.status).toBe(403);
+    expect(await questionsRes.json()).toEqual({ error: "Forbidden: scope required" });
+
+    // The shared bearer still presents exactly ["orchestrate"] and is still
+    // refused on the exchange. Note: security.ts bypasses scope checks for
+    // SHARED_BEARER_TOKEN_ID, so this asserts only the presented scopes and
+    // the exchange refusal — not any route-access restriction.
+    const bearerRes = await fetch(`${baseUrl}/v1/decisions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${VALID_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    expect(bearerRes.status).toBe(200);
+    const bearerBody = await bearerRes.json();
+    expect(bearerBody.presented.scopes).toEqual(["orchestrate"]);
+    expect(bearerBody.presented.scopes).not.toEqual([...WEB_LOGIN_SCOPES]);
+
+    const bearerExchange = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${VALID_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scopes: ["read"] }),
+    });
+    expect(bearerExchange.status).toBe(403);
   });
 
   it("refuses a scoped read token on any path outside /v1 while allowing the shared bearer", async () => {

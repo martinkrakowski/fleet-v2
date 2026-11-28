@@ -8,7 +8,8 @@
  *
  * Hostile-input rule (every public function): the input is read exactly once
  * through `snapshotPlainData`, which refuses null-hostile shapes, accessors
- * (getters never run), Proxies (via the caller-supplied detector), symbol
+ * (getters never run), Proxies (via the caller-supplied trusted detector),
+ * symbol
  * keys, sparse arrays, cycles, oversized strings and non-plain prototypes
  * with a typed refusal. Every snapshot refusal path, a missing required key,
  * an extra or unknown key and a prototype-polluting key
@@ -204,18 +205,20 @@ function hasExactRequiredKeys(snap: Record<string, unknown>): boolean {
  * 6. a disallowed `eventType` is `event-not-allowed`;
  * 7. otherwise the delivery is accepted with a four-field wake record.
  *
- * `isProxy` is a separate positional parameter (never a field of an options
- * object — `snapshotPlainData` refuses function values). When omitted, a
- * detector that reports nothing as a Proxy is used; a non-function value is
- * refused as `invalid-input`. A refusal never echoes `deliveryId` or any
- * rejected value.
+ * `isProxy` is a required, separate positional parameter (never a field of
+ * an options object — `snapshotPlainData` refuses function values). It must
+ * be a trusted, accurate, side-effect-free Proxy detector: with no detector
+ * supplied, a Proxy over otherwise-valid input would be snapshotted as plain
+ * data and could be accepted, and the missed Proxy's reflection traps could
+ * run during snapshotting — so a missing, `undefined` or otherwise
+ * non-function detector is refused as `invalid-input` and no snapshot is
+ * attempted. A refusal never echoes `deliveryId` or any rejected value.
  */
-export function decideWebhookDelivery(input: unknown, isProxy?: IsProxy): WebhookDeliveryDecision {
-  if (isProxy !== undefined && typeof isProxy !== "function") {
+export function decideWebhookDelivery(input: unknown, isProxy: IsProxy): WebhookDeliveryDecision {
+  if (typeof isProxy !== "function") {
     return INVALID;
   }
-  const detector: IsProxy = isProxy ?? (() => false);
-  const snapshot = snapshotPlainData(input, detector, SNAPSHOT_LIMITS);
+  const snapshot = snapshotPlainData(input, isProxy, SNAPSHOT_LIMITS);
   if (!snapshot.ok) {
     return INVALID;
   }

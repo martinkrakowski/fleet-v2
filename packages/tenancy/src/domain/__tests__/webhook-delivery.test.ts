@@ -27,11 +27,18 @@ const baseInput = () => ({
   payloadBytes: 512,
 });
 
+/**
+ * The trusted, accurate, side-effect-free detector the production caller
+ * supplies (in production, the runtime's `types.isProxy`). In these tests it
+ * reports nothing as a Proxy except where a test injects a flagging one.
+ */
+const NO_PROXY = (): boolean => false;
+
 const accept = (overrides: Record<string, unknown> = {}) =>
-  decideWebhookDelivery({ ...baseInput(), ...overrides });
+  decideWebhookDelivery({ ...baseInput(), ...overrides }, NO_PROXY);
 
 const refused = (overrides: Record<string, unknown> = {}) => {
-  const result = decideWebhookDelivery({ ...baseInput(), ...overrides });
+  const result = decideWebhookDelivery({ ...baseInput(), ...overrides }, NO_PROXY);
   if (result.outcome !== "refused") {
     throw new Error("expected refused");
   }
@@ -169,7 +176,7 @@ describe("decideWebhookDelivery", () => {
       })(),
     ];
     for (const hostile of hostileInputs) {
-      const result = decideWebhookDelivery(hostile);
+      const result = decideWebhookDelivery(hostile, NO_PROXY);
       expect(result).toEqual({ outcome: "refused", reason: "invalid-input" });
     }
     for (const isProxy of [42, null, {}, "fn", true]) {
@@ -189,6 +196,24 @@ describe("decideWebhookDelivery", () => {
     // A plain input with the same detector is still refused: the detector
     // flags the root object itself as a Proxy.
     expect(decideWebhookDelivery(baseInput(), () => false).outcome).toBe("accepted");
+  });
+
+  it("refuses input when no isProxy detector is supplied instead of treating Proxies as plain data", () => {
+    // The trusted detector is required: with the detector omitted at the
+    // call site (a JS caller can bypass the type), a Proxy over otherwise
+    // valid input would be snapshotted as plain data and could be accepted,
+    // with its reflection traps free to run during snapshotting.
+    const omitted = (): unknown =>
+      // The omitted-argument shape is exactly what a JS caller produces.
+      (decideWebhookDelivery as unknown as (input: unknown) => unknown)(baseInput());
+    expect(omitted()).toEqual({ outcome: "refused", reason: "invalid-input" });
+    expect(decideWebhookDelivery(baseInput(), undefined as never)).toEqual({
+      outcome: "refused",
+      reason: "invalid-input",
+    });
+    // The same input with a trusted detector is still accepted: only the
+    // missing detector is refused.
+    expect(decideWebhookDelivery(baseInput(), NO_PROXY).outcome).toBe("accepted");
   });
 
   it("refuses malformed deliveryId, organizationId, eventType, timestamps, signatureVerified, and payloadBytes as invalid-input", () => {
@@ -253,7 +278,7 @@ describe("decideWebhookDelivery", () => {
       [""],
       Array.from({ length: MAX_SEEN_DELIVERY_IDS + 1 }, (_, i) => `id-${i}`),
     ]) {
-      const result = decideWebhookDelivery({ ...baseInput(), seenDeliveryIds });
+      const result = decideWebhookDelivery({ ...baseInput(), seenDeliveryIds }, NO_PROXY);
       expect(result).toEqual({ outcome: "refused", reason: "invalid-input" });
     }
   });
@@ -263,7 +288,7 @@ describe("decideWebhookDelivery", () => {
       { length: MAX_SEEN_DELIVERY_IDS },
       (_, i) => `id-${i}`,
     );
-    const result = decideWebhookDelivery({ ...baseInput(), seenDeliveryIds });
+    const result = decideWebhookDelivery({ ...baseInput(), seenDeliveryIds }, NO_PROXY);
     expect(result.outcome).toBe("accepted");
   });
 
@@ -346,8 +371,8 @@ describe("decideWebhookDelivery", () => {
       refused({ deliveryId, seenDeliveryIds: [deliveryId] }),
       refused({ deliveryId, payloadBytes: MAX_WEBHOOK_PAYLOAD_BYTES + 1 }),
       refused({ deliveryId, eventType: "deployment" }),
-      decideWebhookDelivery(null),
-      decideWebhookDelivery(42),
+      decideWebhookDelivery(null, NO_PROXY),
+      decideWebhookDelivery(42, NO_PROXY),
       decideWebhookDelivery(baseInput(), 42 as never),
     ];
     for (const result of results) {

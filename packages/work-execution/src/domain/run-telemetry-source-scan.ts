@@ -247,6 +247,11 @@ function readSpanAttributes(
   span: unknown,
   isProxy: IsProxy,
 ): AttributeRead {
+  // The O(1) Proxy gate runs before any brand check or reflection: a detected
+  // Proxy is refused outright, so its traps can never be invoked.
+  if (isProxy(span)) {
+    return invalidSpan;
+  }
   if (TelemetrySpan.isTelemetrySpan(span)) {
     const snap = snapshotPlainData(span.attributes, isProxy, ATTRIBUTE_LIMITS);
     if (!snap.ok) {

@@ -248,13 +248,13 @@ describe('KA3-1: null-safe chain pass and fail-closed killall reads', () => {
     // Guard: `isChainPassHalted(deps.halt, types.isProxy)` (the false branch) with a null
     // halt plus absent killall reads; every part answers false, so a
     // constant-true or required-pass (null = halted) implementation fails.
-    await expect(isTrainStepBlocked({ halt: null }, false)).resolves.toBe(false);
+    await expect(isTrainStepBlocked({ halt: null }, false, types.isProxy)).resolves.toBe(false);
   });
 
   it('isTrainStepBlocked treats null halt as blocked when requireConductorHalt is true', async () => {
     // Guard: `isRequiredPassHalted(deps.halt, types.isProxy)` (the true branch), whose
     // fail-closed contract answers halted for a null halt.
-    await expect(isTrainStepBlocked({ halt: null }, true)).resolves.toBe(true);
+    await expect(isTrainStepBlocked({ halt: null }, true, types.isProxy)).resolves.toBe(true);
   });
 
   it('isKillallHalted returns false for a clear marker', async () => {

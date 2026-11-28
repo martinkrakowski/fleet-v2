@@ -215,6 +215,7 @@ function makeHarness(
   }
   const now = overrides.nowFn ?? (() => overrides.now ?? NOW);
   const deps: RunDaemonTickDependencies = {
+    isProxy: types.isProxy,
     pause,
     halt,
     status,

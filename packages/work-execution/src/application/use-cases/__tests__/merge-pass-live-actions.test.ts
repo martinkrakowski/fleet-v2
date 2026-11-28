@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // Merge-pass live-action module tests — lane DT9b.
 /**
  * Covers performMergeLiveAction: validation, keying, budget, the
@@ -171,7 +172,7 @@ function build(overrides: Partial<MergeLiveActionDependencies> = {}) {
   const forgeAction = new FakeForgeAction();
   const forgeRead = new FakeForgeRead();
   const mintId = makeUlidMinter();
-  const deps: MergeLiveActionDependencies = { journal, forgeAction, forgeRead, mintId, halt: clearHalt, ...overrides };
+  const deps: MergeLiveActionDependencies = { journal, forgeAction, forgeRead, mintId, halt: clearHalt, isProxy: types.isProxy, ...overrides };
   return { journal, forgeAction, forgeRead, deps };
 }
 
@@ -297,6 +298,7 @@ describe('performMergeLiveAction (DT9b)', () => {
     const mintIds = ['01JB0000000000000000000000', '01JB0000000000000000000001'];
     let next = 0;
     const deps: MergeLiveActionDependencies = {
+      isProxy: types.isProxy,
       journal,
       forgeAction,
       forgeRead: new FakeForgeRead(),

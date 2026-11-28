@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 // DT10a: the daemon tick — the registry, the merge-pass job adapter and the tick itself.
 import { describe, expect, it } from 'vitest';
 
@@ -269,6 +270,7 @@ function makeHarness(overrides: {
   const sleeps: number[] = [];
   let ulidSequence = 0;
   const deps: RunDaemonTickDependencies = {
+    isProxy: types.isProxy,
     pause,
     halt,
     status,

@@ -333,6 +333,7 @@ function makeWorld(overrides: Overrides = {}): World {
   const mergeBranchHead = overrides.mergeBranchHead ?? { outcome: 'found' as const, headSha: TIP };
 
   const deps: LandChainDependencies = {
+    isProxy: types.isProxy,
     chains: {
       readChain: async () => readChainFn(),
     } as unknown as LandChainDependencies['chains'],
@@ -937,7 +938,7 @@ describe('LandChainUseCase halt gate', () => {
 
   it('a missing halt dependency refuses an apply run as halted', async () => {
     const world = makeWorld();
-    const result = await new LandChainUseCase({ isProxy: types.isProxy,
+    const result = await new LandChainUseCase({
       ...world.deps,
       halt: undefined as unknown as LandChainDependencies['halt'],
     }).execute({ ...BASE_COMMAND });

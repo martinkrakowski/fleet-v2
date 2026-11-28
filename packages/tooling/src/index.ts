@@ -5,5 +5,6 @@ export * from './opencode.js';
 export * from './grok.js';
 export * from './agy.js';
 export * from './descriptors.js';
+export * from './availability-claim-guard.js';
 export * from './detect.js';
 export * from './recommend.js';

@@ -1,7 +1,7 @@
 import { builtinModules } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { types } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { snapshotPlainData } from '../plain-data-snapshot.js';
 import type { IsProxy } from '../plain-data-snapshot.js';
 
@@ -534,7 +534,7 @@ describe('snapshotPlainData', () => {
       const ctorDescriptor = Object.getOwnPropertyDescriptor(value, 'constructor');
       expect(ctorDescriptor).toBeDefined();
       expect(ctorDescriptor?.value).toEqual({ own: true });
-      expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+      expect(Object.getPrototypeOf(value)).toBeNull();
       expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     });
 
@@ -588,6 +588,90 @@ describe('snapshotPlainData', () => {
     };
     walk(snap.value);
     expect(visited).toBeGreaterThan(4);
+  });
+
+  it('returns a null-prototype object for a record', () => {
+    const snap = snapshotPlainData({ a: { b: 1 } }, types.isProxy);
+    expect(snap.ok).toBe(true);
+    if (!snap.ok) {
+      return;
+    }
+    const out = snap.value as Record<string, unknown>;
+    expect(Object.getPrototypeOf(out)).toBeNull();
+    const nested = out.a as Record<string, unknown>;
+    expect(Object.getPrototypeOf(nested)).toBeNull();
+    expect(Object.isFrozen(out)).toBe(true);
+  });
+
+  it('a key named hasOwnProperty is a harmless own data property', () => {
+    const input: Record<string, unknown> = {
+      hasOwnProperty: 1,
+      toString: 's',
+      valueOf: true,
+    };
+    const snap = snapshotPlainData(input, types.isProxy);
+    expect(snap.ok).toBe(true);
+    if (!snap.ok) {
+      return;
+    }
+    const out = snap.value as Record<string, unknown>;
+    expect(out.hasOwnProperty).toBe(1);
+    expect(out.toString).toBe('s');
+    expect(out.valueOf).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(out, 'toString')).toBe(true);
+    expect(Object.keys(out)).toEqual(['hasOwnProperty', 'toString', 'valueOf']);
+    expect(Object.getPrototypeOf(out)).toBeNull();
+    expect('hasOwnProperty' in out).toBe(true);
+    expect(out.isPrototypeOf).toBeUndefined();
+  });
+
+  it('refuses an oversized array before enumerating its keys', () => {
+    const arr = new Array(5000);
+    const spy = vi.spyOn(Reflect, 'ownKeys');
+    try {
+      const snap = snapshotPlainData(arr, types.isProxy, { maxArrayLength: 10 });
+      expect(snap).toEqual({
+        ok: false,
+        reason: 'too-many-items',
+        path: null,
+      });
+      expect(spy).not.toHaveBeenCalledWith(arr);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('bounds the error path to 256 characters with no newlines', () => {
+    const longKey = `k${'a'.repeat(2498)}\nn\r${'z'.repeat(2498)}`;
+    const input = {
+      [longKey]: accessorObject(() => {}),
+    };
+    expect(longKey.length).toBe(5000);
+    const snap = snapshotPlainData(input, types.isProxy, { maxStringLength: 10_000 });
+    expect(snap.ok).toBe(false);
+    if (snap.ok) {
+      return;
+    }
+    expect(snap.reason).toBe('accessor');
+    expect(snap.path).not.toBeNull();
+    expect(typeof snap.path).toBe('string');
+    const path = snap.path as string;
+    expect(path.length).toBeLessThanOrEqual(256);
+    expect(/[\r\n]/.test(path)).toBe(false);
+  });
+
+  it('still refuses a Proxy first and fails closed without a detector', () => {
+    const { proxy, trapCount } = createTrapCountingProxy({ a: 1 });
+    const snap = snapshotPlainData(proxy, types.isProxy);
+    expect(snap.ok).toBe(false);
+    if (snap.ok) {
+      return;
+    }
+    expect(snap.reason).toBe('proxy');
+    expect(trapCount()).toBe(0);
+    expect(
+      snapshotPlainData({ a: 1 }, 'not a function' as unknown as IsProxy),
+    ).toEqual({ ok: false, reason: 'detector-threw', path: null });
   });
 
   describe('no-runtime-specifier guard', () => {

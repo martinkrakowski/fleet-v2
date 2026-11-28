@@ -11,14 +11,18 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { promisify, types } from 'node:util';
 
-import { isValidHostName } from '@fleet/shared';
+import { isValidHostName, snapshotPlainData } from '@fleet/shared';
+
+import type { IsProxy } from '@fleet/shared';
 
 import type {
   AbortWorktreeRunRequest,
   AbortWorktreeRunResult,
   ExecutionRunnerPort,
+  ListRunnerSessionsRef,
+  ListRunnerSessionsResult,
   RunnerIsolationCapabilities,
   RunnerSessionRef,
   RunnerSessionStatus,
@@ -399,23 +403,136 @@ function parseSessionId(stdout: string): string | null {
 }
 
 const STATUS_HEADER_PATTERN = /^ocm-run: running in .*:$/;
+/** The line `bin/ocm-run --status` prints, with exit 0, when nothing is running. */
+const STATUS_IDLE_PATTERN = /^ocm-run: nothing is running in .*$/;
 const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 /**
  * Session ids the runner's `--status` output actually lists: only lines
  * after the `ocm-run: running in <dir>:` header count, and each must be a
- * bare session id. A `ses_…` inside the directory path never counts.
+ * bare session id. A `ses_…` inside the directory path never counts. The
+ * scan (`scanStatusText`) walks the output by index and is cost-bounded: at
+ * most `MAX_STATUS_LINES` lines are examined before the header and at most
+ * `MAX_STATUS_LINES` after it, and at most `MAX_LISTED_SESSIONS` ids are
+ * collected. Output past either bound is reported as truncated.
  */
-function statusSessionIds(stdout: string): string[] {
-  const lines = stdout.split('\n');
-  const headerIndex = lines.findIndex((line) => STATUS_HEADER_PATTERN.test(line));
-  if (headerIndex === -1) return [];
-  const ids = new Set<string>();
-  for (const rawLine of lines.slice(headerIndex + 1)) {
-    const line = rawLine.trim();
-    if (SESSION_ID_PATTERN.test(line)) ids.add(line);
+const MAX_STATUS_LINES = 1024;
+const MAX_LISTED_SESSIONS = 1024;
+
+/** The session-id shape `--status` text output and the JSON payload must match. */
+const SESSION_ID_MAX_LENGTH = 128;
+
+/** A thrown value as text, never throwing itself: a hostile `toString` or Proxy trap reads as a fixed word. */
+function describeThrown(error: unknown): string {
+  try {
+    return String(error);
+  } catch {
+    return 'unprintable error';
   }
-  return [...ids];
+}
+
+/**
+ * A complete-or-refuse scan of `--status` text output for `listSessions`.
+ * Lines are walked by index without splitting the whole output, and at most
+ * `MAX_STATUS_LINES` lines are examined in total. When output remains past
+ * that bound the scan reports `truncated`, so a caller never mistakes an
+ * incomplete listing for an idle one.
+ */
+function scanStatusText(stdout: string): { header: boolean; idle: boolean; ids: string[]; truncated: boolean } {
+  const ids = new Set<string>();
+  let header = false;
+  let idle = false;
+  let position = 0;
+  let scanned = 0;
+  while (position < stdout.length) {
+    // The line budget applies before the header (the search for it) and again
+    // after it (the listing), so a listing is never short-changed by noise.
+    if (scanned >= MAX_STATUS_LINES) return { header, idle, ids: [...ids], truncated: true };
+    scanned += 1;
+    const newline = stdout.indexOf('\n', position);
+    const end = newline === -1 ? stdout.length : newline;
+    const rawLine = stdout.slice(position, end);
+    const line = rawLine.trim();
+    position = end + 1;
+    if (!header) {
+      if (STATUS_HEADER_PATTERN.test(rawLine)) {
+        header = true;
+        scanned = 0;
+      } else if (STATUS_IDLE_PATTERN.test(rawLine)) {
+        idle = true;
+      }
+      continue;
+    }
+    if (line.length <= SESSION_ID_MAX_LENGTH && SESSION_ID_PATTERN.test(line)) {
+      if (ids.size >= MAX_LISTED_SESSIONS) return { header, idle, ids: [...ids], truncated: true };
+      ids.add(line);
+    }
+  }
+  return { header, idle, ids: [...ids], truncated: false };
+}
+
+/**
+ * Pure parse of an untrusted `--status` JSON payload into a session listing.
+ * Untrusted values are read only through `snapshotPlainData` (the injected
+ * `isProxy` detector runs before any reflection, so no Proxy trap or getter
+ * ever executes); the accepted shapes are an array of session-id strings or
+ * a plain record whose own `sessions` property holds one. Anything else,
+ * including an invalid id, a hole, an accessor, or a Proxy, is a typed
+ * `unreadable` refusal, never success and never an empty list.
+ */
+export function parseListSessionsPayload(
+  value: unknown,
+  isProxy: IsProxy,
+): ListRunnerSessionsResult {
+  const snapshot = snapshotPlainData(value, isProxy);
+  if (!snapshot.ok) {
+    return {
+      ok: false,
+      error: 'unreadable',
+      reason: `Unreadable runner session payload: ${snapshot.reason}`,
+    };
+  }
+  const data: unknown = snapshot.value;
+  // `data` is a frozen snapshot copy, so own-key reflection on it is safe. A
+  // record whose own `sessions` is missing is not a session list, and an own
+  // prototype-polluting key (`__proto__`, `constructor`, `prototype`) is
+  // refused outright rather than read past.
+  if (isPlainRecord(data)) {
+    for (const pollutingKey of ['__proto__', 'constructor', 'prototype'] as const) {
+      if (Object.hasOwn(data, pollutingKey)) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: `Runner session payload holds a prototype-polluting key (${pollutingKey})`,
+        };
+      }
+    }
+  }
+  const rawSessions: unknown =
+    Array.isArray(data)
+      ? data
+      : isPlainRecord(data) && Object.hasOwn(data, 'sessions') ? data['sessions'] : undefined;
+  if (!Array.isArray(rawSessions)) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session payload is not a session list' };
+  }
+  // `snapshotPlainData` bounds the array at `maxArrayLength` (1024) before
+  // this loop; the loop cost is still bounded explicitly.
+  if (rawSessions.length > 1024) {
+    return { ok: false, error: 'unreadable', reason: 'Runner session list exceeds its bound' };
+  }
+  const sessions: string[] = [];
+  for (const rawId of rawSessions) {
+    if (
+      typeof rawId !== 'string'
+      || rawId === ''
+      || rawId.length > SESSION_ID_MAX_LENGTH
+      || !SESSION_ID_PATTERN.test(rawId)
+    ) {
+      return { ok: false, error: 'unreadable', reason: 'Runner session payload holds an invalid session id' };
+    }
+    sessions.push(rawId);
+  }
+  return { ok: true, sessions };
 }
 
 /** A runner output line that reports the runner aborted a session. */
@@ -753,7 +870,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { ids: [], reason: `status command failed: ${String(error)}` };
     }
     if (result.exitCode === 3) {
-      const ids = statusSessionIds(result.stdout);
+      const scan = scanStatusText(result.stdout);
+      if (scan.truncated) {
+        return { ids: [], reason: 'status exit 3 output exceeds the scan bound' };
+      }
+      const ids = scan.ids;
       if (ids.length === 1) {
         return { ids, reason: 'status listed one session' };
       }
@@ -1062,7 +1183,11 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       return { state: 'idle' };
     }
     if (result.exitCode === 3) {
-      const ids = statusSessionIds(result.stdout);
+      const scan = scanStatusText(result.stdout);
+      if (scan.truncated) {
+        return { state: 'unknown', reason: 'status exit 3 output exceeds the scan bound' };
+      }
+      const ids = scan.ids;
       if (ids.length === 1) {
         return { state: 'running', sessionId: ids[0] };
       }
@@ -1105,6 +1230,186 @@ export class ExecutionRunnerAdapter implements ExecutionRunnerPort {
       outcome: 'still-running',
       reason: result.stderr || result.stdout || 'Abort did not confirm termination',
     };
+  }
+
+  /**
+   * A read-only listing of the session ids a runner reports for a worktree
+   * directory: the same recorded-runner guards as the other worktree
+   * commands, then `ocm-run --status --dir`. Exit 0 means idle (an empty
+   * list, or a JSON payload the pure parser accepts); exit 3 means running,
+   * reported as JSON or as `--status` text. Every other outcome — a failed
+   * guard, a thrown or timed-out subprocess, exit 1, exit 2, an unexpected
+   * exit code, or a malformed payload — fails closed as `unreachable` or
+   * `unreadable`, never as success and never as an empty list.
+   */
+  async listSessions(ref?: ListRunnerSessionsRef): Promise<ListRunnerSessionsResult> {
+    // Untrusted ref values are read only through the snapshot: a Proxy trap
+    // or a getter on it never executes.
+    let refData: unknown;
+    if (ref !== undefined) {
+      const snapRef = snapshotPlainData(ref, types.isProxy);
+      if (!snapRef.ok) {
+        return { ok: false, error: 'unreadable', reason: `Unreadable runner session ref: ${snapRef.reason}` };
+      }
+      refData = snapRef.value;
+    }
+    const refRecord = isPlainRecord(refData) ? refData : {};
+    const worktreePathRaw: unknown = refRecord['worktreePath'];
+    if (typeof worktreePathRaw !== 'string' || worktreePathRaw.trim() === '') {
+      return { ok: false, error: 'unreadable', reason: 'Missing or invalid worktreePath' };
+    }
+    const worktreePath: string = worktreePathRaw;
+    const runnerRaw: unknown = refRecord['runner'];
+
+    // The same host/port guards as resolveRecordedRunner: refuse an unsafe
+    // configured host, refuse an unsafe recorded host, and require the
+    // configured port and host to equal the recorded ones when a runner is
+    // given. In v2 mode a missing configured port is a refusal.
+    const configuredPort = this.configuredRemotePort();
+    const configuredHost = this.configuredRemoteHost();
+    if (configuredHost !== null && !isSafeSshHost(configuredHost)) {
+      return { ok: false, error: 'unreadable', reason: `Unsafe OCM_HOST configured: ${configuredHost}` };
+    }
+    let remotePort: number | undefined = configuredPort;
+    if (runnerRaw !== null && runnerRaw !== undefined) {
+      // A malformed non-null runner must fail closed: it is never treated as
+      // absent, so the command cannot run without matching the supplied
+      // runner.
+      if (!isPlainRecord(runnerRaw)) {
+        return { ok: false, error: 'unreadable', reason: 'Malformed recorded runner' };
+      }
+      const recordedPort: unknown = runnerRaw['remotePort'];
+      const recordedHost: unknown = runnerRaw['host'];
+      if (typeof recordedPort !== 'number' || !Number.isInteger(recordedPort)) {
+        return { ok: false, error: 'unreadable', reason: 'Attempt has no recorded runner port' };
+      }
+      // A non-string recorded host is malformed, not absent: it never falls
+      // back to a null-host comparison.
+      if (recordedHost !== null && typeof recordedHost !== 'string') {
+        return { ok: false, error: 'unreadable', reason: 'Malformed recorded runner host' };
+      }
+      if (typeof recordedHost === 'string' && !isSafeSshHost(recordedHost)) {
+        return { ok: false, error: 'unreadable', reason: `Unsafe recorded runner host: ${recordedHost}` };
+      }
+      if (
+        configuredPort !== recordedPort ||
+        (configuredHost ?? null) !== (typeof recordedHost === 'string' ? recordedHost : null)
+      ) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: 'Configured runner port or host differs from recorded runner',
+        };
+      }
+      remotePort = recordedPort;
+    } else if (this.host() !== undefined && configuredPort === undefined) {
+      return { ok: false, error: 'unreadable', reason: 'Attempt has no recorded runner port' };
+    }
+
+    let result: SubprocessResult;
+    try {
+      result = await this.run(
+        this.binPath(),
+        ['--status', '--dir', worktreePath],
+        this.remotePortEnv(remotePort, undefined),
+        { timeoutMs: RUNNER_STATUS_LOOKUP_TIMEOUT_MS },
+      );
+    } catch (error) {
+      return { ok: false, error: 'unreachable', reason: `Status command failed: ${describeThrown(error)}` };
+    }
+
+    // The subprocess result itself is untrusted: snapshot it before reading
+    // any property, so a getter or Proxy trap on it never executes.
+    const snapResult = snapshotPlainData(result, types.isProxy);
+    if (!snapResult.ok) {
+      return { ok: false, error: 'unreadable', reason: `Unreadable runner status output: ${snapResult.reason}` };
+    }
+    const snapData: unknown = snapResult.value;
+    if (!isPlainRecord(snapData)) {
+      return { ok: false, error: 'unreadable', reason: 'Unreadable runner status output shape' };
+    }
+    const exitCodeRaw: unknown = snapData['exitCode'];
+    const stdoutRaw: unknown = snapData['stdout'];
+    if (typeof exitCodeRaw !== 'number' || !Number.isInteger(exitCodeRaw) || typeof stdoutRaw !== 'string') {
+      return { ok: false, error: 'unreadable', reason: 'Unreadable runner status output shape' };
+    }
+    const stdout: string = stdoutRaw;
+    const trimmed = stdout.trim();
+
+    if (exitCodeRaw === 1) {
+      return { ok: false, error: 'unreachable', reason: 'Runner status failed: server unreachable' };
+    }
+    if (exitCodeRaw === 2) {
+      return { ok: false, error: 'unreadable', reason: 'Runner status usage error (exit 2)' };
+    }
+    if (exitCodeRaw === 0 || exitCodeRaw === 3) {
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return { ok: false, error: 'unreadable', reason: 'Runner status stdout is not valid JSON' };
+        }
+        const parsedResult = parseListSessionsPayload(parsed, types.isProxy);
+        if (!parsedResult.ok) return parsedResult;
+        // The parsed payload must agree with the exit code, or the runner's
+        // state is contradictory and the read fails closed: exit 0 means no
+        // running session, exit 3 means at least one.
+        if (exitCodeRaw === 0 && parsedResult.sessions.length > 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 but its JSON payload lists sessions',
+          };
+        }
+        if (exitCodeRaw === 3 && parsedResult.sessions.length === 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 3 but its JSON payload lists no sessions',
+          };
+        }
+        return parsedResult;
+      }
+      // Text output must be a complete `--status` listing: a truncated scan
+      // is never read as idle or as a partial list.
+      const scan = scanStatusText(stdout);
+      if (scan.truncated) {
+        return {
+          ok: false,
+          error: 'unreadable',
+          reason: 'Runner status text output exceeds the scan bound',
+        };
+      }
+      if (exitCodeRaw === 0) {
+        // Exit 0 means idle: real `--status` text output is either the
+        // `running in <dir>:` header listing no sessions or the runner's own
+        // `nothing is running in <dir>` line. Listing ids under exit 0 is contradictory,
+        // and output without the header (garbage, an empty string) is
+        // unexpected status output. Both fail closed rather than hiding a
+        // running session behind a success with no sessions.
+        if (scan.ids.length > 0) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 but its text output lists sessions',
+          };
+        }
+        if (!scan.header && !scan.idle) {
+          return {
+            ok: false,
+            error: 'unreadable',
+            reason: 'Runner status exited 0 with unrecognised text output',
+          };
+        }
+        return { ok: true, sessions: [] };
+      }
+      if (scan.ids.length === 0) {
+        return { ok: false, error: 'unreadable', reason: 'Runner status exit 3 listed no valid session ids' };
+      }
+      return { ok: true, sessions: scan.ids };
+    }
+    return { ok: false, error: 'unreadable', reason: `Runner status exited ${exitCodeRaw}` };
   }
 
   private binPath(): string {

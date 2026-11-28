@@ -879,7 +879,7 @@ function isDeclaredJournalAction(action: unknown): action is ActionJournalEntryR
 }
 
 function isDeclaredJournalStatus(status: unknown): status is ActionJournalEntryRecord['status'] {
-  return status === 'intent-recorded' || status === 'completed' || status === 'ambiguous' || status === 'refused';
+  return status === 'intent-recorded' || status === 'completed' || status === 'ambiguous' || status === 'uncertain' || status === 'refused';
 }
 
 /**

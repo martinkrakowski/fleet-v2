@@ -5,6 +5,7 @@ import {
   readAttemptRecord,
   readCapacityReservationRecord,
 } from '../execution-record-readers.js';
+import type { ActionJournalEntryRecord } from '../execution-records.js';
 import { ActionJournalEntry } from '../entities/ActionJournalEntry.js';
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -1035,5 +1036,22 @@ describe('execution-record-readers: typed journal pullRequest (WB5b)', () => {
         pullRequest: { repository: 'acme/app', number: 42 },
       } as never),
     ).toThrow(/pullRequest/);
+  });
+});
+
+describe('execution-record-readers: uncertain journal status (UN1)', () => {
+  it('ActionJournalEntry accepts uncertain only for dispatch and forge', () => {
+    const asRecord = (overrides: Record<string, unknown>): ActionJournalEntryRecord =>
+      ({ ...clone(validJournal), ...overrides }) as unknown as ActionJournalEntryRecord;
+    expect(() => ActionJournalEntry.fromRecord(asRecord({ status: 'uncertain' }))).not.toThrow();
+    expect(() => ActionJournalEntry.fromRecord(asRecord({ action: 'forge', status: 'uncertain' }))).not.toThrow();
+    expect(() => ActionJournalEntry.fromRecord(asRecord({ action: 'stop', status: 'uncertain' }))).toThrow(/uncertain only for dispatch and forge/);
+    expect(() => ActionJournalEntry.fromRecord(asRecord({ action: 'collect', status: 'uncertain' }))).toThrow(/uncertain only for dispatch and forge/);
+    expect(readActionJournalEntryRecord({ ...clone(validJournal), action: 'stop', status: 'uncertain' })).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    const forgeRead = readActionJournalEntryRecord({ ...clone(validJournal), action: 'forge', status: 'uncertain' });
+    expect(forgeRead.ok).toBe(true);
   });
 });

@@ -6,7 +6,7 @@
  * Nothing throws; another run's entries never count.
  */
 
-import { laneRunJournalDispatchResult } from './lane-run-journal.js';
+import { isNonFinalLaneRunOutcome, laneRunJournalDispatchResult } from './lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from './lane-run-journal.js';
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from './lane-run-journal.js';
 import { LANE_RUN_MAX_RETRY, buildLaneRunStepKey, parseLaneRunKey } from './lane-run-keys.js';
@@ -52,6 +52,9 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'park-escalated', // CE1: the result recording a park escalation (its detail names the mode, e.g. `commit-pending`)
   LANE_RUN_INTENT_ABANDONED_REASON_CODE, // F171: an operator stop or resume closed an ambiguous pending intent
   'gate-retry-cap-reached', // GU2: a resume of a run parked from `gating` past the bounded gate-retry cap
+  'observed-done', // UN1: the observation of an interrupted side effect proved it happened
+  'observed-not-done', // UN1: the observation proved it did not happen; resolution stays with the owner
+  'unobservable', // UN1: the side effect could not be observed either way
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -150,10 +153,10 @@ function stepIntentsOf(entries: readonly LaneRunJournalEntryRecord[], runId: str
   return out;
 }
 
-/** The key's final result (any non-ambiguous outcome), or null when it has none. */
+/** The key's final result (any non-ambiguous, non-uncertain outcome), or null when it has none. */
 function finalResultOf(entries: readonly LaneRunJournalEntryRecord[], key: string): LaneRunJournalEntryRecord | null {
   for (const entry of entries) {
-    if (entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous') {
+    if (entry.kind === 'result' && entry.key === key && !isNonFinalLaneRunOutcome(entry.outcome)) {
       return entry;
     }
   }
@@ -384,7 +387,7 @@ function finalSnapshotResultOf(
   for (const snapshot of snapshots) {
     if (
       snapshot !== null && snapshot.kind === 'result' && snapshot.runId === runId &&
-      snapshot.key === key && snapshot.outcome !== 'ambiguous'
+      snapshot.key === key && !isNonFinalLaneRunOutcome(snapshot.outcome)
     ) {
       return snapshot;
     }
@@ -487,7 +490,7 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
     // Only a settled `gate-failed` may be retried; a pending intent, a pass, a
     // congestion, an unknown or an abandonment never mints a retry.
     const final = finalSnapshotResultOf(snapshots, runId, highest.key);
-    if (final === null || final.outcome === 'ambiguous' || final.reasonCode !== 'gate-failed') {
+    if (final === null || isNonFinalLaneRunOutcome(final.outcome) || final.reasonCode !== 'gate-failed') {
       return GATE_RETRY_NONE;
     }
 
@@ -508,7 +511,7 @@ export function planGateFailedRetry(entries: unknown, runId: unknown, round: unk
         continue;
       }
       const predecessorFinal = finalSnapshotResultOf(snapshots, runId, predecessorKey);
-      if (predecessorFinal !== null && predecessorFinal.outcome !== 'ambiguous' && predecessorFinal.reasonCode === 'gate-failed') {
+      if (predecessorFinal !== null && !isNonFinalLaneRunOutcome(predecessorFinal.outcome) && predecessorFinal.reasonCode === 'gate-failed') {
         failedRetries += 1;
       }
     }
@@ -672,7 +675,7 @@ export function laneRunGateFailed(
       }
       if (
         snapshot.kind === 'result' && snapshot.runId === runId &&
-        typeof snapshot.key === 'string' && snapshot.outcome !== 'ambiguous' &&
+        typeof snapshot.key === 'string' && !isNonFinalLaneRunOutcome(snapshot.outcome) &&
         !finals.has(snapshot.key)
       ) {
         finals.set(snapshot.key, snapshot);
@@ -779,7 +782,7 @@ export function laneRunPremergePost(
   }
   let post: 'none' | 'success' | 'failure' | 'refused' = 'none';
   for (const entry of entries) {
-    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+    if (entry.kind !== 'result' || isNonFinalLaneRunOutcome(entry.outcome) || entry.key === null || entry.runId !== runId) {
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
@@ -855,7 +858,7 @@ export function laneRunMergeEnqueueFact(
   }
   let fact: LaneRunMergeEnqueueFact = 'none';
   for (const entry of entries) {
-    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+    if (entry.kind !== 'result' || isNonFinalLaneRunOutcome(entry.outcome) || entry.key === null || entry.runId !== runId) {
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
@@ -958,7 +961,7 @@ export function laneRunRecordedSeatAdvance(
   }
   let latest: LaneRunJournalEntryRecord | null = null;
   for (const entry of entries) {
-    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+    if (entry.kind !== 'result' || isNonFinalLaneRunOutcome(entry.outcome) || entry.key === null || entry.runId !== runId) {
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
@@ -993,7 +996,7 @@ export function laneRunCiFailureRecorded(
   }
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
-    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+    if (entry.kind !== 'result' || isNonFinalLaneRunOutcome(entry.outcome) || entry.key === null || entry.runId !== runId) {
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);

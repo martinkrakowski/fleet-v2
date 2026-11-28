@@ -37,6 +37,7 @@ import {
 } from './lane-run-transitions.js';
 import type { LaneRunFailureCause, RunStopMode } from './lane-run-transitions.js';
 import type { LaneRunMergeEnqueueFact } from './lane-run-step-facts.js';
+import { isUncertainStep } from './lane-run-uncertain.js';
 import { premergeCarryMatches } from './receipt-carry.js';
 import type { PremergeCarry } from './receipt-carry.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
@@ -488,7 +489,7 @@ export type LaneRunDecision =
       readonly seatIndex: number; readonly retry: number | null }
   | { readonly kind: 'enter'; readonly to: LaneRunStateValue }
   | { readonly kind: 'park'; readonly reason: LaneRunParkReason; readonly qualifier: string | null;
-      readonly parkedFrom: LaneRunStateValue }
+      readonly parkedFrom: LaneRunStateValue; readonly reasonCode?: 'uncertain' }
   | { readonly kind: 'wait'; readonly reason: LaneRunWaitReason }
   | { readonly kind: 'done' };
 
@@ -1534,6 +1535,12 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           });
         }
         return park('ambiguous', 'gate');
+      }
+      // UN1: an uncertain intent (interrupted side effect on dispatch, push,
+      // merge-enqueue or premerge) extends ambiguous and never retries: the
+      // park carries `reasonCode: 'uncertain'` so the owner sees why.
+      if (isUncertainStep(facts.pendingIntent.step)) {
+        return { kind: 'park', reason: 'ambiguous', qualifier: facts.pendingIntent.step, parkedFrom: facts.state, reasonCode: 'uncertain' };
       }
       return park('ambiguous', facts.pendingIntent.step);
     }

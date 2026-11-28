@@ -10,7 +10,7 @@ import type { ActionJournalEntryRecord } from '../execution-records.js';
 import { describeRejectedValue } from '../value-objects/AttemptState.vo.js';
 
 const ACTIONS: readonly unknown[] = ['dispatch', 'reconcile', 'stop', 'collect', 'forge', 'accept'];
-const STATUSES: readonly unknown[] = ['intent-recorded', 'completed', 'ambiguous', 'refused'];
+const STATUSES: readonly unknown[] = ['intent-recorded', 'completed', 'ambiguous', 'uncertain', 'refused'];
 
 export class ActionJournalEntry {
   private constructor(private readonly record: ActionJournalEntryRecord) {
@@ -38,6 +38,12 @@ export class ActionJournalEntry {
     }
     if (!STATUSES.includes(record.status)) {
       throw new Error('ActionJournalEntry has an invalid status: ' + describeRejectedValue(record.status));
+    }
+    // UN1: `uncertain` records an interrupted side effect, so it is only a
+    // status of the one-way dispatch/forge actions; an uncertain stop or
+    // collect would leave the attempt state unreadable.
+    if (record.status === 'uncertain' && record.action !== 'dispatch' && record.action !== 'forge') {
+      throw new Error('ActionJournalEntry accepts uncertain only for dispatch and forge');
     }
     // The typed pull-request reference (WB5b) is permitted only on `forge`
     // entries and must carry a valid (repository, number) pair.
@@ -67,8 +73,8 @@ export class ActionJournalEntry {
     return this.record.status === 'ambiguous';
   }
 
-  /** Only an intent-recorded or ambiguous entry marks an unfinished action. */
+  /** Only an intent-recorded, ambiguous or uncertain entry marks an unfinished action. */
   isUnresolved(): boolean {
-    return this.record.status === 'intent-recorded' || this.record.status === 'ambiguous';
+    return this.record.status === 'intent-recorded' || this.record.status === 'ambiguous' || this.record.status === 'uncertain';
   }
 }

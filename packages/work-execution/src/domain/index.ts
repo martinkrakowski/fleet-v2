@@ -45,6 +45,7 @@ export * from "./lane-run-records.js";
 export * from "./lane-run-review-facts.js";
 export * from "./lane-run-step-facts.js";
 export * from "./lane-run-transitions.js";
+export * from "./lane-run-uncertain.js";
 export * from "./lane-usage-log.js";
 export * from "./lane-usage-summary.js";
 export * from "./lane-waits.js";

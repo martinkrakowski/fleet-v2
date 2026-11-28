@@ -44,6 +44,7 @@ import { conductorTimeLimitSeconds, manifestTimeLimitSeconds, readVerifiedFrozen
 import { conductedRunnerOf } from './conducted-host.js';
 import { reviewFactsOf } from './review-fix.js';
 import { acceptanceFactsOf } from './merge.js';
+import { premergeCarryFactsOf } from './carry.js';
 
 /** The manifest verdict of a collected attempt: the port's outcome, `missing` when absent or unreadable. */
 export async function manifestVerdictOf(
@@ -228,6 +229,13 @@ export async function gatherFacts(ctx: AdvanceStepContext,
   const headSha = head12 === null ? null : headCommit;
   const acceptance = await acceptanceFactsOf(ctx, record, state, entries, latest, head12, request.halted);
 
+  // U6: a PR head moved by a clean base merge carries the Tier 2 release; the
+  // `premerge` post is then read at the PR head's key (the carried head).
+  const carryRead = await premergeCarryFactsOf(
+    ctx, record, state, entries, latest, attemptRecords, acceptance, request.halted, request.nowIso,
+  );
+  const premergeHead12 = carryRead.carry === null ? head12 : head12Of(carryRead.carry.toHeadSha);
+
   const reservations = await ctx.deps.executionJournal.listActiveReservations();
   const admitted = latestId !== null && reservations.some((reservation) => reservation.attemptId === latestId);
 
@@ -309,7 +317,9 @@ export async function gatherFacts(ctx: AdvanceStepContext,
       ctx.deps.reviewAssessment !== undefined &&
       ctx.deps.workOrderRepo !== undefined,
     preMerge: acceptance.preMerge,
-    premergePost: laneRunPremergePost(entries, record.runId, head12),
+    premergePost: laneRunPremergePost(entries, record.runId, premergeHead12),
+    premergeCarry: carryRead.carry,
+    premergeCarryRefused: carryRead.refused,
     mergeEnqueue: laneRunMergeEnqueueFact(entries, record.runId, record.round, head12),
     acceptance: acceptance.acceptance,
     acceptanceRetry: acceptance.acceptanceRetry,
@@ -408,7 +418,13 @@ export function refreshGatheredJournalFacts(
       briefCheck: review.briefCheck,
       codeReview: review.codeReview,
       preMergeReview: review.preMergeReview,
-      premergePost: laneRunPremergePost(entries, record.runId, head12),
+      premergePost: laneRunPremergePost(
+        entries,
+        record.runId,
+        gathered.facts.premergeCarry === null || gathered.facts.premergeCarry === undefined
+          ? head12
+          : head12Of(gathered.facts.premergeCarry.toHeadSha),
+      ),
       mergeEnqueue: laneRunMergeEnqueueFact(entries, record.runId, record.round, head12),
       ciFailureRecorded: laneRunCiFailureRecorded(entries, record.runId, record.round, head12),
       refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
@@ -509,6 +525,9 @@ export async function performAdmissionWait(ctx: AdvanceStepContext,
     });
     if (admission.outcome === 'refused') {
       return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+    }
+    if (admission.outcome === 'no-capacity' && admission.blockedBy !== undefined) {
+      return { outcome: 'waiting', reason: 'admission', blockedBy: admission.blockedBy };
     }
   }
   return { outcome: 'waiting', reason: 'admission' };

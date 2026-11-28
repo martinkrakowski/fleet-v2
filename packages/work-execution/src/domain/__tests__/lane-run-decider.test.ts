@@ -2201,6 +2201,50 @@ describe('merging state', () => {
       });
     });
 
+    describe('U6: a head move by a clean base merge carries the release', () => {
+      const FROM = `${HEAD}${'0'.repeat(28)}`;
+      const TO_12 = 'ffffffffffff';
+      const TO = `${TO_12}${'1'.repeat(28)}`;
+      const carry = (toHeadSha: string = TO) => ({
+        attemptId: 'attempt-1', fromHeadSha: FROM, toHeadSha, mainParentSha: 'c'.repeat(40), mainRangeBaseSha: 'e'.repeat(40),
+        changedPaths: ['src/a.ts'], decidedAtIso: '2026-11-27T12:00:00.000Z', reason: 'base-merge-clean' as const,
+      });
+      const moved = (extra: Partial<LaneRunFacts>): LaneRunFacts => baseFacts({
+        state: 'merging', head12: HEAD, headSha: FROM, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'none',
+        pr: { state: 'open', head12: TO_12, headSha: TO, containsLaneHead: true }, attempt: attemptFact(),
+        merge: { oneWayDoor: false, policyGrant: false }, ...extra,
+      });
+
+      it('acts premerge on the PR head key when the carry matches, and falls through to the merge tail once success is posted there', () => {
+        const actFacts = moved({ premergeCarry: carry() });
+        expect(decide(record({}), actFacts)).toEqual({
+          kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${TO_12}`, round: 0, seatIndex: 0, head12: TO_12, retry: null,
+        });
+        const posted = moved({ premergeCarry: carry(), premergePost: 'success', merge: { oneWayDoor: false, policyGrant: true } });
+        expect(decide(record({}), posted)).toMatchObject({ kind: 'act', step: 'merge-enqueue' });
+      });
+
+      it('never lets a carry for another head release the hold', () => {
+        const wrong = moved({ premergeCarry: carry(`${TO_12}${'2'.repeat(28)}`) });
+        expect(decide(record({}), wrong)).toEqual({ kind: 'wait', reason: 'premerge-pending' });
+      });
+
+      it('parks branch-behind when the carry evidence refused the move, on the act and on a pending premerge intent', () => {
+        const refused = moved({ premergeCarryRefused: true });
+        expect(decide(record({}), refused)).toEqual({ kind: 'park', reason: 'branch-behind', qualifier: null, parkedFrom: 'merging' });
+        const pending = moved({
+          premergeCarryRefused: true,
+          pendingIntent: { key: `${RUN_ID}/r0/premerge@${HEAD}`, step: 'premerge', reconciliation: 'unread' },
+        });
+        expect(decide(record({}), pending)).toEqual({ kind: 'park', reason: 'branch-behind', qualifier: null, parkedFrom: 'merging' });
+      });
+
+      it('keeps waiting premerge-pending while the carry evidence is unanswered', () => {
+        expect(decide(record({}), moved({ premergeCarryRefused: false }))).toEqual({ kind: 'wait', reason: 'premerge-pending' });
+        expect(decide(record({}), moved({}))).toEqual({ kind: 'wait', reason: 'premerge-pending' });
+      });
+    });
+
     it('RM3 helper round 2: a queue outcome on a Tier 2 run whose PR head the queue moved is handled, never masked by premerge-pending', () => {
       const headSha = `${HEAD}${'0'.repeat(28)}`;
       const movedSha = `${HEAD}${'f'.repeat(28)}`;

@@ -35,10 +35,11 @@ export {
 };
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { readBoundedDenseArray, snapshotPlainDataRecord } from '../../../domain/plain-record-reads.js';
-import { buildLaneRunStepKey, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, head12Of, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
+import { premergeCarryMatches, type PremergeCarry } from '../../../domain/receipt-carry.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performEnter, refusedResult } from './step-context.js';
 
@@ -180,6 +181,18 @@ function isPlainObjectValue(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+/**
+ * U6: the verified base-merge carry for this PR head, or null. The gathered
+ * fact (journalled or qualified by `qualifyBaseMergeCarry`) must carry exactly
+ * from the reviewed lane head `headSha` to the PR head the forge reports, at
+ * full sha precision; anything else is no carry. `O(1)`, no getter run.
+ */
+function activeCarryOf(gathered: GatheredLaneRunFacts, headSha: string): PremergeCarry | null {
+  const carry = gathered.facts.premergeCarry;
+  const prHeadSha = ownDataProp(gathered.facts.pr, 'headSha');
+  return premergeCarryMatches(carry, headSha, typeof prHeadSha === 'string' ? prHeadSha : null) ? carry : null;
+}
+
 /** The findings count above which a receipt is refused (`O(1)` before any element read). */
 const RM3_FINDINGS_MAX = 999;
 
@@ -235,7 +248,13 @@ function tier2OwnerPremergeReleased(
   // validated 40-hex read (`O(1)` descriptor read, no getter); a pr fact
   // without it, or with a different head — even one sharing the 12-character
   // prefix — never releases the hold.
-  if (gathered.facts.pr === null || ownDataProp(gathered.facts.pr, 'headSha') !== headSha) {
+  // U6: a PR head that moved only by a verified clean base merge (a carry from
+  // the reviewed head to this exact PR head) is released by the same receipt at
+  // the reviewed head; the receipt itself is never rewritten.
+  if (
+    gathered.facts.pr === null ||
+    (ownDataProp(gathered.facts.pr, 'headSha') !== headSha && activeCarryOf(gathered, headSha) === null)
+  ) {
     return false;
   }
   return true;
@@ -380,12 +399,17 @@ async function postPremerge(
   appendIntent: boolean,
   findings: number,
   receiptId: string,
+  carry: PremergeCarry | null,
 ): Promise<AdvanceLaneRunResult> {
+  // U6: a carried release is posted at the PR head (`toHeadSha`); the grant,
+  // the action and the status are all pinned to it, and the action names the
+  // reviewed head it was carried from so the use case checks the attempt there.
+  const postHeadSha = carry === null ? headSha : carry.toHeadSha;
   const conductorForgeGrant = ctx.deps.conductorForgeGrant;
   const executeForgeAction = ctx.deps.executeForgeAction;
   const actionId = 'forge-' + ctx.deps.newUlid();
   if (appendIntent) {
-    const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
+    const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId, carry ?? undefined);
     if (intentRefusal !== null) {
       return refusedResult(intentRefusal);
     }
@@ -399,7 +423,7 @@ async function postPremerge(
       workOrderId: record.workOrderId,
       attemptId: latest.id,
       forgeKind: 'post-status',
-      expectedHeadSha: headSha,
+      expectedHeadSha: postHeadSha,
       policyRevision: record.runPolicyRevision,
       acceptanceReceiptId: receiptId,
     });
@@ -415,7 +439,8 @@ async function postPremerge(
     attemptId: latest.id,
     workOrderId: record.workOrderId,
     kind: 'post-status',
-    expectedHeadSha: headSha,
+    expectedHeadSha: postHeadSha,
+    ...(carry === null ? {} : { carriedFromHeadSha: headSha }),
     authorizationGrantId: grant.grantId,
     authorizedBy: grant.decisionRevision,
     branchName: record.branchName,
@@ -484,6 +509,10 @@ export async function performPremerge(
   if (workOrder === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
+  const carry = activeCarryOf(gathered, headSha);
+  if (carry !== null && decision.head12 !== head12Of(carry.toHeadSha)) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
   const read = await premergeVerdictOf(ctx, latest, headSha);
   const rawHold = laneRunMergeHold(record.tier, read.verdict, record.round);
   if (
@@ -528,6 +557,7 @@ export async function performPremerge(
     true,
     blockingFindingsCountOf(read.receipt?.findings ?? []),
     receiptId,
+    carry,
   );
 }
 
@@ -675,7 +705,13 @@ export async function reconcilePremerge(
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
   const parsed = parseLaneRunKey(decision.key);
-  if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== gathered.facts.head12) {
+  // U6: when a verified carry moved the effective head to the PR head, the key
+  // for that head is the live one and the pending post at the reviewed head's
+  // key is overtaken (the next advance posts under the carried head's key).
+  const reviewedHeadSha = gathered.latestAttempt?.artifacts?.headCommit;
+  const carry = typeof reviewedHeadSha === 'string' ? activeCarryOf(gathered, reviewedHeadSha) : null;
+  const liveHead12 = carry === null ? gathered.facts.head12 : head12Of(carry.toHeadSha);
+  if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== liveHead12) {
     return appendPremergeResult(ctx, request, decision, 'overtaken', 'premerge-overtaken');
   }
   const rawFactHold = laneRunMergeHold(record.tier, gathered.facts.preMerge, record.round);
@@ -761,5 +797,6 @@ export async function reconcilePremerge(
     false,
     blockingFindingsCountOf(read.receipt?.findings ?? []),
     receiptId,
+    carry,
   );
 }

@@ -497,7 +497,10 @@ export function buildChainedEvent(
     if (event === null) {
       return { ok: false, reason: 'invalid-event-record' };
     }
-    const hash = hashEvent(input, previousHash, sha256Hex);
+    // Hash the validated snapshot, never the raw input: a getter on the
+    // caller's payload must not make the built hash disagree with the
+    // validated record's fields.
+    const hash = hashEvent(event, previousHash, sha256Hex);
     if (hash === null) {
       return INVALID_HASHER;
     }

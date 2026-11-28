@@ -1236,7 +1236,7 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [Organization, Project, Membership, TenantDataKey]
+        entities: [Organization, Project, Membership, TenantDataKey, ForgeInstallation]
         value_objects: [Role]
       application:
         use_cases: []

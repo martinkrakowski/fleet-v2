@@ -97,6 +97,7 @@ export * from "./state-compaction.js";
 export * from "./train-health-announcements.js";
 export * from "./train-health-rules.js";
 export * from "./value-objects/index.js";
+export * from "./watch-stream.js";
 export * from "./work-board.js";
 export * from "./work-board-facts.js";
 export * from "./work-board-steps.js";

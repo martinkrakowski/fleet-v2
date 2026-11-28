@@ -1,7 +1,7 @@
 import { snapshotPlainData } from '@fleet/shared';
 import type { IsProxy } from '@fleet/shared';
 import { readConductorHaltRecord } from '../../domain/conductor-halt.js';
-import { readExactPlainRecord } from '../../domain/plain-record-reads.js';
+import { readDataProperty, readExactPlainRecord } from '../../domain/plain-record-reads.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { KillallHaltMarkerPort } from '../ports/out/KillallHaltMarkerPort.out-port.js';
 import type { KillallTrainPausePort } from '../ports/out/KillallTrainPausePort.out-port.js';
@@ -56,20 +56,15 @@ type PortMethodRead =
   | { readonly ok: false };
 
 /**
- * One read of a port's `read` method. The port object is the first thing the
- * injected `isProxy` detector sees: a Proxy, including one that hides `read`,
- * is refused fail-closed before any trap can run. A throwing lookup is a
- * refusal too. Cost: one detector call and one property read.
+ * One read of a port's `read` method, through the domain's data-property
+ * reader: the port and every object on its prototype chain are shown to the
+ * injected `isProxy` detector before any reflection, an accessor `read` is
+ * refused without being invoked, and a throwing lookup is a refusal. A port
+ * with no `read` anywhere reads `ok: true, value: undefined`. Cost: bounded by
+ * `readDataProperty` (one detector call and descriptor read per chain link).
  */
 function readPortMethod(port: object, isProxy: IsProxy): PortMethodRead {
-  try {
-    if (isProxy(port) === true) {
-      return { ok: false };
-    }
-    return { ok: true, value: (port as { readonly read?: unknown }).read };
-  } catch {
-    return { ok: false };
-  }
+  return readDataProperty(port, 'read', isProxy);
 }
 
 /**

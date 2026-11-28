@@ -16,13 +16,18 @@ import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domai
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
-import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
-import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
+import { LANE_RUN_ONE_WAY_STEPS, reviewTransportRetryCountOf } from '../../../domain/lane-run-records.js';
+import type { LaneRunParkRecord, LaneRunRecord, LaneRunReviewRetryRecord } from '../../../domain/lane-run-records.js';
+import { readLaneRunRecord } from '../../../domain/entities/LaneRun.js';
+import { performPark } from '../advance-lane-run/step-context.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -1150,5 +1155,216 @@ describe('ResumeLaneRunUseCase GU2 bounded gate retry', () => {
       await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
     ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
     expect(gateRetryIntents(await fx.journal.listForRun(RUN_ID))).toHaveLength(0);
+  });
+});
+
+describe('reviewTransportRetry record (AB-TP4A)', () => {
+  const RETRY: LaneRunReviewRetryRecord = {
+    step: 'brief-check',
+    head12: '0123456789ab',
+    count: 1,
+    nextRetryAtIso: NOW,
+  };
+
+  function withRetry(overrides: Partial<LaneRunRecord> = {}): LaneRunRecord {
+    return runRecord({ reviewTransportRetry: RETRY, ...overrides });
+  }
+
+  it('survives LaneRun.create, toRecord, readLaneRunRecord and a JSON round-trip', () => {
+    const created = LaneRun.create(withRetry());
+    expect(created.success).toBe(true);
+    if (!created.success) {
+      throw new Error('fixture must be a valid LaneRun record');
+    }
+    const stored = created.value.toRecord();
+    expect(stored.reviewTransportRetry).toEqual(RETRY);
+    const reread = readLaneRunRecord(JSON.parse(JSON.stringify(stored)));
+    expect(reread.ok).toBe(true);
+    if (!reread.ok) {
+      throw new Error('fixture must re-read');
+    }
+    expect(reread.record.reviewTransportRetry).toEqual(RETRY);
+    // `null` is valid too: the run has left the park.
+    const cleared = LaneRun.create(runRecord({ reviewTransportRetry: null }));
+    expect(cleared.success).toBe(true);
+  });
+
+  it('round-trips through LaneRunRepositoryAdapter create, get and list in memory and file mode', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    expect(await repo.create(withRetry())).toMatchObject({ outcome: 'saved' });
+    expect((await repo.get(RUN_ID))?.reviewTransportRetry).toEqual(RETRY);
+    expect((await repo.list())[0]?.reviewTransportRetry).toEqual(RETRY);
+
+    const stateDir = mkdtempSync(join(tmpdir(), 'lane-run-retry-'));
+    try {
+      const fileRepo = new LaneRunRepositoryAdapter({ stateDir });
+      expect(await fileRepo.create(withRetry())).toMatchObject({ outcome: 'saved' });
+      expect((await fileRepo.get(RUN_ID))?.reviewTransportRetry).toEqual(RETRY);
+      const reloaded = new LaneRunRepositoryAdapter({ stateDir });
+      expect((await reloaded.get(RUN_ID))?.reviewTransportRetry).toEqual(RETRY);
+      expect((await reloaded.list())[0]?.reviewTransportRetry).toEqual(RETRY);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reviewTransportRetryCountOf reads 0 when absent or null and the count when present', () => {
+    expect(reviewTransportRetryCountOf(withRetry(), 'brief-check', '0123456789ab')).toBe(1);
+    expect(reviewTransportRetryCountOf(runRecord())).toBe(0);
+    expect(reviewTransportRetryCountOf(runRecord({ reviewTransportRetry: null }))).toBe(0);
+    expect(reviewTransportRetryCountOf(withRetry(), 'code-review')).toBe(0);
+    expect(reviewTransportRetryCountOf(withRetry(), 'brief-check', 'ffffffffffff')).toBe(0);
+    expect(reviewTransportRetryCountOf(null)).toBe(0);
+    expect(reviewTransportRetryCountOf([withRetry()])).toBe(0);
+    expect(reviewTransportRetryCountOf('run')).toBe(0);
+  });
+
+  it('reviewTransportRetryCountOf never runs a getter and returns 0', () => {
+    const throwing: Record<string, unknown> = {};
+    Object.defineProperty(throwing, 'reviewTransportRetry', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    expect(reviewTransportRetryCountOf(throwing)).toBe(0);
+    const throwingCount: Record<string, unknown> = { step: 'brief-check', head12: '0123456789ab' };
+    Object.defineProperty(throwingCount, 'count', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    expect(reviewTransportRetryCountOf({ reviewTransportRetry: throwingCount })).toBe(0);
+  });
+
+  it.each([
+    ['an extra key', { ...RETRY, extra: 1 }],
+    ['a missing key', { step: 'brief-check', head12: '0123456789ab', count: 1 }],
+    ['a bad step', { ...RETRY, step: 'gate' }],
+    ['a bad head12', { ...RETRY, head12: '0123456789' }],
+    ['an uppercase head12', { ...RETRY, head12: '0123456789AB' }],
+    ['a negative count', { ...RETRY, count: -1 }],
+    ['a non-integer count', { ...RETRY, count: 1.5 }],
+    ['a count over the cap', { ...RETRY, count: 101 }],
+    ['an impossible nextRetryAtIso', { ...RETRY, nextRetryAtIso: '2026-02-31T10:00:00.000Z' }],
+    ['a non-ISO nextRetryAtIso', { ...RETRY, nextRetryAtIso: 'not a date' }],
+    ['a null step', { ...RETRY, step: null }],
+  ] as readonly [string, unknown][])('%s is refused by LaneRun.create and LaneRunRepositoryAdapter.create', async (_name, bad) => {
+    const badRecord = { ...BASE_RECORD, reviewTransportRetry: bad };
+    const refused = LaneRun.create(badRecord);
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      throw new Error('fixture must be refused');
+    }
+    expect(refused.code).toBe('invalid');
+    expect(refused.error.message).toBe('LaneRun reviewTransportRetry is invalid');
+    const reread = readLaneRunRecord(badRecord);
+    expect(reread.ok).toBe(false);
+    expect(await new LaneRunRepositoryAdapter().create(badRecord as unknown as LaneRunRecord)).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-record',
+    });
+  });
+
+  it('a throwing getter on the retry value is refused by LaneRun.create without running the accessor', () => {
+    const throwingRetry: Record<string, unknown> = { ...RETRY };
+    Object.defineProperty(throwingRetry, 'step', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    const refused = LaneRun.create({ ...BASE_RECORD, reviewTransportRetry: throwingRetry });
+    expect(refused.success).toBe(false);
+    const throwingKey: Record<string, unknown> = { ...runRecord() };
+    Object.defineProperty(throwingKey, 'reviewTransportRetry', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    expect(LaneRun.create(throwingKey).success).toBe(false);
+  });
+
+  it('performPark clears reviewTransportRetry to null when the run parks', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    expect(await repo.create(withRetry())).toMatchObject({ outcome: 'saved' });
+    expect(
+      await repo.acquireLease(RUN_ID, {
+        holderId: HOLDER,
+        observedFence: 0,
+        leaseUntilIso: LEASE_UNTIL,
+        nowIso: NOW,
+      }),
+    ).toMatchObject({ outcome: 'saved' });
+    const before = await repo.get(RUN_ID);
+    expect(before?.reviewTransportRetry).toEqual(RETRY);
+    const ctx = { deps: { runRepo: repo, runJournal: journal, newUlid: ulidMinter() } };
+    const request = { runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: NOW };
+    expect(
+      await performPark(ctx as never, before as LaneRunRecord, 'halted', null, 'gating', request as never),
+    ).toMatchObject({ outcome: 'parked', reason: 'halted' });
+    const parked = await repo.get(RUN_ID);
+    expect(parked?.parked).not.toBeNull();
+    expect(parked?.reviewTransportRetry).toBeNull();
+    expect(reviewTransportRetryCountOf(parked)).toBe(0);
+  });
+
+  it('applyPendingResume clears reviewTransportRetry to null on the normal resume path', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const record = withRetry({ parked: PARKED, parkCount: 1, revision: 2, lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL } });
+    expect(await repo.create(withRetry())).toMatchObject({ outcome: 'saved' });
+    await repo.acquireLease(RUN_ID, {
+      holderId: HOLDER,
+      observedFence: 0,
+      leaseUntilIso: LEASE_UNTIL,
+      nowIso: NOW,
+    });
+    expect(
+      await repo.save(record, { holderId: HOLDER, fence: 1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'saved' });
+    await journal.append(laneRunConductEntry(ENTRY_5, RUN_ID, 'parked', NOW));
+    const resume = new ResumeLaneRunUseCase({ runRepo: repo, runJournal: journal, newUlid: ulidMinter() });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const resumed = await repo.get(RUN_ID);
+    expect(resumed?.parked).toBeNull();
+    expect(resumed?.reviewTransportRetry).toBeNull();
+  });
+
+  it('the crash-repair resume exit (finishConductedResumeExit) also clears reviewTransportRetry', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const record = withRetry({ parked: PARKED, parkCount: 1, revision: 2, lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL } });
+    expect(await repo.create(withRetry())).toMatchObject({ outcome: 'saved' });
+    await repo.acquireLease(RUN_ID, {
+      holderId: HOLDER,
+      observedFence: 0,
+      leaseUntilIso: LEASE_UNTIL,
+      nowIso: NOW,
+    });
+    expect(
+      await repo.save(record, { holderId: HOLDER, fence: 1, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'saved' });
+    await journal.append(laneRunConductEntry(ENTRY_5, RUN_ID, 'parked', NOW));
+    const resume = new ResumeLaneRunUseCase({ runRepo: repo, runJournal: journal, newUlid: ulidMinter() });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    // The first apply's save is refused (wrong lease): the record stays parked
+    // with the retry; the replay's conducted exit finishes it.
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: 'driver-example-2', fence: 99 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'save-refused' });
+    expect((await repo.get(RUN_ID))?.reviewTransportRetry).toEqual(RETRY);
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const resumed = await repo.get(RUN_ID);
+    expect(resumed?.parked).toBeNull();
+    expect(resumed?.reviewTransportRetry).toBeNull();
   });
 });

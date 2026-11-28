@@ -28,6 +28,7 @@ import {
   LANE_RUN_PARK_QUALIFIER,
   LANE_RUN_PARK_REASONS,
   LANE_RUN_RECORD_VERSION,
+  LANE_RUN_REVIEW_RETRY_STEPS,
   LANE_RUN_SCHEMA_VERSION,
   LANE_RUN_TIERS,
   RUN_STOP_REFUSAL_KINDS,
@@ -40,6 +41,8 @@ import type {
   LaneRunParkRecord,
   LaneRunProvenance,
   LaneRunRecord,
+  LaneRunReviewRetryRecord,
+  LaneRunReviewRetryStep,
   LaneRunTier,
   RunStopRefusalKind,
 } from '../lane-run-records.js';
@@ -83,7 +86,13 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
  * (CO28, D-R8) and `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
  * readable without a version bump; anything else is an unknown key.
  */
-const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion'];
+const OPTIONAL_RECORD_KEYS: readonly string[] = [
+  'branchName',
+  'baseBranch',
+  'provenance',
+  'schemaVersion',
+  'reviewTransportRetry',
+];
 
 const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings', 'class'];
@@ -169,6 +178,9 @@ export class LaneRun {
       ...(branchFields.branchName === undefined ? {} : { branchName: branchFields.branchName }),
       ...(branchFields.baseBranch === undefined ? {} : { baseBranch: branchFields.baseBranch }),
       ...(branchFields.provenance === undefined ? {} : { provenance: branchFields.provenance }),
+      ...(branchFields.reviewTransportRetry === undefined
+        ? {}
+        : { reviewTransportRetry: branchFields.reviewTransportRetry }),
       ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
@@ -220,6 +232,12 @@ export class LaneRun {
       ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
       ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
       ...(this.record.provenance === undefined ? {} : { provenance: this.record.provenance }),
+      ...(this.record.reviewTransportRetry === undefined
+        ? {}
+        : {
+            reviewTransportRetry:
+              this.record.reviewTransportRetry === null ? null : { ...this.record.reviewTransportRetry },
+          }),
       ...(this.record.schemaVersion === undefined ? {} : { schemaVersion: this.record.schemaVersion }),
     };
   }
@@ -480,6 +498,7 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   branchName: string | undefined;
   baseBranch: BaseBranchValue | undefined;
   provenance: LaneRunProvenance | undefined;
+  reviewTransportRetry: LaneRunReviewRetryRecord | null | undefined;
 } | { ok: false; error: string } {
   const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
   if (runPolicyRevisionError !== null) {
@@ -497,11 +516,71 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   if (!provenance.ok) {
     return { ok: false, error: provenance.error };
   }
+  const reviewTransportRetry = readOptionalReviewTransportRetry(recordInput);
+  if (!reviewTransportRetry.ok) {
+    return { ok: false, error: reviewTransportRetry.error };
+  }
   return {
     ok: true,
     branchName: branchName.branchName,
     baseBranch: baseBranch.baseBranch,
     provenance: provenance.provenance,
+    reviewTransportRetry: reviewTransportRetry.reviewTransportRetry,
+  };
+}
+
+const REVIEW_RETRY_HEAD12_PATTERN = /^[0-9a-f]{12}$/;
+const REVIEW_RETRY_MAX_COUNT = 100;
+
+/**
+ * `reviewTransportRetry` is optional (AB-TP4A): an absent key reads as absent and stays absent on
+ * the record; an explicit `null` is valid (the run left the park). When the key is present with a
+ * value, the value is snapshotted once (own enumerable keys via descriptors, no getter runs) and
+ * every field is validated; any failure is refused with the fixed message, never defaulted.
+ */
+function readOptionalReviewTransportRetry(recordInput: Record<string, unknown>): {
+  ok: true;
+  reviewTransportRetry: LaneRunReviewRetryRecord | null | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'reviewTransportRetry')) {
+    return { ok: true, reviewTransportRetry: undefined };
+  }
+  if (recordInput.reviewTransportRetry === null) {
+    return { ok: true, reviewTransportRetry: null };
+  }
+  const retrySnapshot = readExactPlainRecord(recordInput.reviewTransportRetry, [
+    'step',
+    'head12',
+    'count',
+    'nextRetryAtIso',
+  ]);
+  if (retrySnapshot === null) {
+    return { ok: false, error: 'LaneRun reviewTransportRetry is invalid' };
+  }
+  const retry = retrySnapshot as Record<string, unknown>;
+  if (
+    !LANE_RUN_REVIEW_RETRY_STEPS.includes(retry.step as LaneRunReviewRetryStep) ||
+    typeof retry.head12 !== 'string' ||
+    !REVIEW_RETRY_HEAD12_PATTERN.test(retry.head12) ||
+    typeof retry.count !== 'number' ||
+    !Number.isSafeInteger(retry.count) ||
+    (retry.count as number) < 0 ||
+    (retry.count as number) > REVIEW_RETRY_MAX_COUNT ||
+    typeof retry.nextRetryAtIso !== 'string' ||
+    !LEASE_ISO_PATTERN.test(retry.nextRetryAtIso) ||
+    !isCalendarDateTime(retry.nextRetryAtIso) ||
+    Number.isNaN(Date.parse(retry.nextRetryAtIso))
+  ) {
+    return { ok: false, error: 'LaneRun reviewTransportRetry is invalid' };
+  }
+  return {
+    ok: true,
+    reviewTransportRetry: Object.freeze({
+      step: retry.step as LaneRunReviewRetryStep,
+      head12: retry.head12,
+      count: retry.count,
+      nextRetryAtIso: new Date(retry.nextRetryAtIso).toISOString(),
+    }),
   };
 }
 

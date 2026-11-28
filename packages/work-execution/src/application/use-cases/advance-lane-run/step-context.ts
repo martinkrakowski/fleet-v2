@@ -92,7 +92,12 @@ export async function performEnter(ctx: AdvanceStepContext,
   }
   if (record.parked !== null) {
     const saved = await saveOrRefuse(ctx,
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        revision: record.revision + 1,
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+      },
       request,
     );
     if (!saved.ok) {
@@ -451,6 +456,7 @@ export async function performPark(ctx: AdvanceStepContext,
     },
     parkCount: record.parkCount + 1,
     revision: record.revision + 1,
+    ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
   };
   const saved = await saveOrRefuse(ctx, parkedRecord, request);
   if (!saved.ok) {
@@ -707,6 +713,7 @@ export async function tryEscalatePark(
     ...record,
     parked: null,
     revision: record.revision + 1,
+    ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
   }, request);
   if (!saved.ok) {
     return { outcome: 'refused', reason: saved.reason };

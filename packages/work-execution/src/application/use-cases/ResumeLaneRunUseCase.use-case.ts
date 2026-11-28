@@ -737,7 +737,12 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
     }
     const finished = await this.deps.runRepo.save(
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        revision: record.revision + 1,
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+      },
       { holderId, fence, nowIso },
     );
     if (finished.outcome !== 'saved') {
@@ -841,7 +846,12 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
 
     const saved = await this.deps.runRepo.save(
-      { ...record, parked: null, revision: record.revision + 1 },
+      {
+        ...record,
+        parked: null,
+        revision: record.revision + 1,
+        ...(record.reviewTransportRetry != null ? { reviewTransportRetry: null } : {}),
+      },
       {
         holderId,
         fence,

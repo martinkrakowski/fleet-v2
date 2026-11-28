@@ -73,7 +73,7 @@ const POLLUTING_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototyp
 
 const DIFF_HEADER = /^(?:diff --git |--- [ab]\/|\+\+\+ [ab]\/|@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)/m;
 const FENCED_CODE_BLOCK = /```|~~~/;
-const WORKTREE_SEGMENT = /\/\.worktrees\/|\/worktrees\/[A-Za-z0-9._-]+/;
+const WORKTREE_SEGMENT = /(?:^|[^A-Za-z0-9._-])\.worktrees\/|(?:^|[^A-Za-z0-9._-])worktrees\/[A-Za-z0-9._-]+/;
 
 /** A typed refusal (the `ok: false` half of the outcome). */
 type SpanSourceScanRefusal = { readonly ok: false; readonly reason: SpanSourceScanRefusalReason };

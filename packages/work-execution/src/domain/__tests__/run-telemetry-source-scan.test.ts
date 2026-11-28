@@ -368,6 +368,8 @@ describe('scanSpanForSourceText source-text markers', () => {
       '/repo/.worktrees/lane-a/src/x.ts',
       '/repo/worktrees/lane-a/src/x.ts',
       'see /.worktrees/ for details',
+      '.worktrees/lane-a/src/x.ts',
+      'worktrees/lane-a/src/x.ts',
     ];
     for (const path of cases) {
       for (const placement of [
@@ -380,6 +382,11 @@ describe('scanSpanForSourceText source-text markers', () => {
         expectNoEcho(result, path);
       }
     }
+    // A relative worktree path is refused while a lookalike word is not.
+    expect(scanSpanForSourceText({ attributes: { key: 'myworktrees/ok and my.worktrees/ok' } }, MARKERS, isProxy)).toEqual({
+      ok: true,
+      checkedAttributes: 1,
+    });
     // A marker prefix match alone (no generic segment) is refused too.
     expect(scanSpanForSourceText({ attributes: { key: '/repo/.worktrees/lane-a' } }, MARKERS, isProxy)).toEqual({
       ok: false,

@@ -76,6 +76,7 @@ export * from "./run-telemetry-ids.js";
 export * from "./run-telemetry-redaction.js";
 export * from "./run-telemetry-spans.js";
 export * from "./runner-image-window.js";
+export * from "./scoped-halt.js";
 export * from "./seat-key-mode.js";
 export * from "./seat-selection.js";
 export * from "./shadow-attestations.js";

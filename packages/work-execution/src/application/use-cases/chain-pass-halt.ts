@@ -160,7 +160,7 @@ export async function isKillallHalted(
   if (method.value === undefined) {
     // Only a port with NO `read` anywhere keeps the not-halted behaviour; an
     // explicit `read: undefined` is a present-but-invalid method and halts.
-    return method.found ? true : false;
+    return method.found;
   }
   if (typeof method.value !== 'function') {
     return true;

@@ -166,6 +166,9 @@ class WriteCountingDriverLease implements ConductorDriverLeasePort {
   async check(request: LeaseHoldRequest) {
     return this.inner.check(request);
   }
+  async verifyFence(token: unknown, nowIso: string) {
+    return this.inner.verifyFence(token, nowIso);
+  }
 }
 
 interface Fixture {
